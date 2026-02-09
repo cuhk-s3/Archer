@@ -12,38 +12,38 @@ class StopTool(FuncToolBase, LlvmDirMixin):
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
       "stop",
-      "Stop process and return the found bugs for the patch",
+      "Stop process and return the found test strategies for the patch",
       [
         FuncToolSpec.Param(
-          "bugs",
-          "list[tuple[string,string]]",
+          "strategies",
+          "list[tuple[string,string,string,string]]",
           True,
-          "A list of bugs with each being a tuple of the verified LLVM IR and the detected bug description.",
+          "A list of bug-trigger test strategies with each being a tuple of strategy name, target, rationale and expected issue.",
         ),
         FuncToolSpec.Param(
           "thoughts",
           "string",
           True,
           'The detailed thoughts for diagnosing the fix including step-by-step "'
-          '1. Understanding the Fix", '
-          '2. "Potential Issue Analysis", '
-          '3. "Proposed Bug Strategies(s)", and '
-          '4. "Conclusion".',
+          '1. "Fix Understanding", '
+          '2. "Assumptions Identified", '
+          '3. "Potential Cases to Break Assumptions", and '
+          '4. "Test Strategies".',
         ),
       ],
     )
 
-  def _call(self, *, bugs: list[tuple[str, str]], thoughts: str) -> str:
-    bugs = []
-    for _, edit in enumerate(bugs):
+  def _call(self, *, strategies: list[tuple[str, str, str, str]], thoughts: str) -> str:
+    strategies = []
+    for _, edit in enumerate(strategies):
       if len(edit) != 2:
         raise FuncToolCallException(
-          f"Each edit point must be a tuple of 2 elements (LLVM IR, bug description): {edit}"
+          f"Each edit point must be a tuple of 4 elements (strategy name, target, rationale, expected issue): {edit}"
         )
-      bugs.append((edit[0].strip(), edit[1].strip()))
+      strategies.append((edit[0].strip(), edit[1].strip()))
     return json.dumps(
       {
-        "bugs": bugs,
+        "strategies": strategies,
         "thoughts": thoughts,
       },
       indent=2,

@@ -82,11 +82,11 @@ class Environment:
       
   def apply(self):
     with TimeCompensationGuard(self):
-      llvm_helper.apply(self.test_commit)
+      llvm_helper.reset(self.test_commit)
 
   def verify_head(self):
     head = llvm_helper.git_execute(["rev-parse", "HEAD"]).strip()
-    if head != self.base_commit:
+    if head != self.test_commit:
       raise RuntimeError("invalid HEAD")
 
   def build(self):

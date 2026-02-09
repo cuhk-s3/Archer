@@ -3,7 +3,7 @@ from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
-from time import time
+import time
 from typing import List, Optional, Tuple
 
 from base.console import get_boxed_console
@@ -13,6 +13,7 @@ from lms.agent import AgentBase
 from llvm.lab_env import Environment
 from llvm.llvm import LLVM
 from llvm.llvm_helper import get_llvm_build_dir, git_execute, llvm_dir, reset, set_llvm_build_dir
+import prompts
 from tools.code import CodeTool
 from tools.debugger import DebuggerTool
 from tools.docs import DocsTool
@@ -20,7 +21,7 @@ from tools.eval import EvalTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
 from tools.langref import LangRefTool
-from tools.list import ListTool
+from tools.listn import ListNTool
 from tools.readn import ReadNTool
 from tools.stop import StopTool
 
@@ -73,11 +74,10 @@ class RunStats:
   chat_rounds: int = 0
   total_time_sec: float = 0.0
   # Fix stats
-  trans_point: Tuple[str, str] = ("<not-provided>", "<not-provided>")
-  edit_points: List[Tuple[str, int, int]] = field(
-    default_factory=lambda *_, **__: [("<not-provided>", -1, -1)]
-  )
-  reason_thou: str = "<not-provided>"
+  strategies: List[Tuple[str, str, str, str]] = field(
+    default_factory=lambda *_, **__ : [("<not-provided>", "<not-provided>", "<not-provided>", "<not-provided>")]
+  )  # (name, target, rationale, expected_issue)
+  reason_thou: str = "<not-provided>" 
   test_traj: List[str] = field(
     default_factory=list
   )  # Trajectories of patches ever tried during testing
@@ -99,12 +99,41 @@ class ReachToolBudget(Exception):
   pass
 
 
+@dataclass
+class TestStrategy:
+  name: str
+  target: str
+  rationale: str
+  expected_issue: str
+  
+  def as_tuple(self) -> Tuple[str, str, str, str]:
+    return (self.name, self.target, self.rationale, self.expected_issue)
+  
+  def __str__(self) -> str:
+    return json.dumps({
+      "name": self.name,
+      "target": self.target,
+      "rationale": self.rationale,
+      "expected_issue": self.expected_issue,
+    }, indent=2)
+
+
+def ensure_tools_available(agent: AgentBase, tools: List[str]):
+  available_tools = agent.tools.list(ignore_budget=False)
+  unavailable_tools = []
+  for tool in tools:
+    if tool not in available_tools:
+      unavailable_tools.append(tool)
+  if len(unavailable_tools) > 0:
+    raise ReachToolBudget(f"Tools [{', '.join(unavailable_tools)}] are out of budget.")
+
+
 def get_tool_list(fixenv: Environment, llvm: LLVM, debugger: DebuggerBase):
   return [
     # General tools
     (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     (GrepNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (ListTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (ListNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     (ReadNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     # LLVM-specific tools
     (CodeTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
@@ -126,15 +155,82 @@ def run_mini_agent(
   stats: RunStats,
 ) -> Optional[str]:
   agent.clear_history()
+  agent.append_system_message(prompts.PROMPT_SYSTEM)
   
   #####################################################
   # The agent runs by:
-  # 1. Analyze the issue first to reason about the root cause and propose potential edit points.
-  # 2. Leverage the provided information to guide the patch generation.
+  # 1. Analyze the fix first to reason about the possible issues and propose potential bug-trigger strategies.
+  # 2. Generate test cases and verify the proposed strategies to confirm the real bug.
   #####################################################
   
-  pass
+  console.print("Phase 1: Analyzing the fix ...")
+  agent.append_user_message(prompts.PROMPT_ANALYZE)
 
+  def response_handler(_: str) -> Tuple[bool, str]:
+    ensure_tools_available(agent, ["stop"])
+    return True, (
+      "Error: You are not calling any tool or your tool call format is incorrect. "
+      "You should always continue with tool calling and correct tool call format. "
+      "Please continue."
+      " If you are done, call the `stop` tool with the edit points."
+      " If you already called the `stop` tool, please check the format and try again."
+    )
+
+  def tool_call_handler(name: str, _: str, res: str) -> Tuple[bool, str]:
+    ensure_tools_available(agent, ["stop"])
+    if name != "stop":
+      return True, res  # Continue the process
+    try:
+      # The stop tool returns a parseable JSON string
+      json.loads(res)
+    except Exception:
+      return (True, res)  # Continue the process with an error message
+    return False, res  # Stop the process with the result
+  
+  response = agent.run(
+    # TODO: Remove the hardcoded tool names
+    [
+      # Explore codebase tools
+      f"list{MAX_ROLS_PER_TC}",
+      f"read{MAX_ROLS_PER_TC}",
+      f"find{MAX_ROLS_PER_TC}",
+      f"grep{MAX_ROLS_PER_TC}",
+      "code",
+      # Documentation tools
+      "docs",
+      "langref",
+      # Debugging tools
+      "debug",
+      "eval",
+      # Stop tool to finish the analysis
+      "stop",
+    ],
+    response_handler=response_handler,
+    tool_call_handler=tool_call_handler,
+    round_limit=MAX_CHAT_ROUNDS,
+  )
+  
+  # Parse the response to get potential test strategies
+  response = json.loads(response)
+  strategies = response.get("strategies", [])
+  reasoning_thoughts = response.get("thoughts", "")
+  test_strategies = []
+  
+  for strat in strategies:
+    try:
+      name, target, rationale, expected_issue = strat
+      test_strategies.append(TestStrategy(
+        name=name,
+        target=target,
+        rationale=rationale,
+        expected_issue=expected_issue,
+      ))
+    except Exception as e:
+      console.print(f"Warning: Invalid strategy format: {strat}: {e}", color="yellow")
+
+  stats.reason_thou = reasoning_thoughts
+  stats.strategies = [s.as_tuple() for s in test_strategies]
+  
 
 def autoreview(
   agent: AgentBase,
@@ -144,7 +240,7 @@ def autoreview(
 ):
   debugger = GDB(["/bin/true"])
   
-  tools = get_tool_list(fixenv, llvm)
+  tools = get_tool_list(fixenv, llvm, debugger)
   for to, th in tools:
     agent.register_tool(to, th)
 
@@ -152,6 +248,7 @@ def autoreview(
     debugger=debugger,
     agent=agent,
     fixenv=fixenv,
+    llvm=llvm,
     stats=stats,
   )
 
@@ -236,7 +333,7 @@ def main():
   set_llvm_build_dir(os.path.join(get_llvm_build_dir(), args.issue))
   env = Environment(
     args.issue,
-    base_model_knowledge_cutoff="2023-12-31Z",
+    base_model_knowledge_cutoff="2000-12-31Z", # FIXME: workaround for evaluation
     additional_cmake_args=ADDITIONAL_CMAKE_FLAGS,
     max_build_jobs=os.environ.get("LLVM_AUTOREVIEW_MAX_BUILD_JOBS"),
   )
@@ -275,11 +372,11 @@ def main():
   
   # Start analyzing and repairing the issue
   stats = RunStats(command=vars(args))
-  stats.total_time_sec = time()
+  stats.total_time_sec = time.time()
   try:
-    stats.bug = autoreview(agent, env, llvm, stats)
-    if not stats.bug:
-        raise NoAvailableBugFound("All efforts tried yet no available patches found.")
+    stats.strategies = autoreview(agent, env, llvm, stats)
+    # if not stats.bug:
+    #     raise NoAvailableBugFound("All efforts tried yet no available patches found.")
   except Exception as e:
     import traceback
 
