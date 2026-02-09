@@ -12,7 +12,13 @@ from llvm.gdb_support import GDB
 from lms.agent import AgentBase
 from llvm.lab_env import Environment
 from llvm.llvm import LLVM
-from llvm.llvm_helper import get_llvm_build_dir, git_execute, llvm_dir, reset, set_llvm_build_dir
+from llvm.llvm_helper import (
+    get_llvm_build_dir,
+    git_execute,
+    llvm_dir,
+    reset,
+    set_llvm_build_dir,
+)
 import prompts
 from tools.code import CodeTool
 from tools.debugger import DebuggerTool
@@ -31,7 +37,7 @@ from tools.stop import StopTool
 
 # We restrict the agent to chat at most 500 rounds for each run
 # and consume at most 5 million tokens among all runs.
-MAX_CHAT_ROUNDS = 500
+MAX_CHAT_ROUNDS = 50
 MAX_CONSUMED_TOKENS = 5_000_000
 MAX_TCS_GET_CONTEXT = 250
 MAX_ROLS_PER_TC = 250
@@ -55,6 +61,7 @@ console = get_boxed_console(debug_mode=False)
 def panic(msg: str):
   console.print(f"Error: {msg}", color="red")
   exit(1)
+
 
 @dataclass
 class RunStats:
@@ -119,16 +126,18 @@ class TestStrategy:
 
 
 def ensure_tools_available(agent: AgentBase, tools: List[str]):
-  available_tools = agent.tools.list(ignore_budget=False)
-  unavailable_tools = []
-  for tool in tools:
-    if tool not in available_tools:
-      unavailable_tools.append(tool)
-  if len(unavailable_tools) > 0:
-    raise ReachToolBudget(f"Tools [{', '.join(unavailable_tools)}] are out of budget.")
+    available_tools = agent.tools.list(ignore_budget=False)
+    unavailable_tools = []
+    for tool in tools:
+        if tool not in available_tools:
+            unavailable_tools.append(tool)
+    if len(unavailable_tools) > 0:
+        raise ReachToolBudget(
+            f"Tools [{', '.join(unavailable_tools)}] are out of budget."
+        )
 
 
-def get_tool_list(fixenv: Environment, llvm: LLVM, debugger: DebuggerBase):
+def get_tool_list(fixenv: Environment, llvm: LLVM, debugger: DebuggerBase = None):
   return [
     # General tools
     (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
@@ -136,35 +145,70 @@ def get_tool_list(fixenv: Environment, llvm: LLVM, debugger: DebuggerBase):
     (ListNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     (ReadNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     # LLVM-specific tools
-    (CodeTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
-    (DocsTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
+    # (CodeTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
+    # (DocsTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
     (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
     # Debugging tools
-    (DebuggerTool(debugger), MAX_TCS_GET_CONTEXT),
-    (EvalTool(debugger), MAX_TCS_GET_CONTEXT),
+    # (DebuggerTool(debugger), MAX_TCS_GET_CONTEXT),
+    # (EvalTool(debugger), MAX_TCS_GET_CONTEXT),
     # Stop the agent process
     (StopTool(llvm_dir), MAX_TCS_GET_CONTEXT),
   ]
 
 
+def get_component_knowledge(component: List[str]) -> str:
+  console.print(f"Retrieving knowledge for component: {component} ...")
+  
+  knowledge_dir = Path(__file__).parent / "passes"
+
+  component_to_file = {
+    "SLPVectorizer": "SLPVectorizer.md",
+    # Future:
+    # "InstCombine": "InstCombine.md",
+    # "LoopVectorize": "LoopVectorize.md",
+  }
+
+  knowledge_file = []
+  for comp_name, filename in component_to_file.items():
+    if comp_name in component:
+      knowledge_file.append(knowledge_dir / filename)
+
+  if not knowledge_file:
+    return "No specific knowledge provided for this component."
+
+  if not all(f.exists() for f in knowledge_file):
+    return f"No specific knowledge provided for this component. Missing file: {knowledge_file}"
+  
+  knowledge = [f.read_text(encoding="utf-8") for f in knowledge_file]
+
+  return "\n".join(knowledge)
+
+
 def run_mini_agent(
-  debugger: DebuggerBase,
   agent: AgentBase,
   fixenv: Environment,
   llvm: LLVM,
   stats: RunStats,
+  debugger: DebuggerBase = None,
 ) -> Optional[str]:
   agent.clear_history()
   agent.append_system_message(prompts.PROMPT_SYSTEM)
-  
+
   #####################################################
   # The agent runs by:
   # 1. Analyze the fix first to reason about the possible issues and propose potential bug-trigger strategies.
   # 2. Generate test cases and verify the proposed strategies to confirm the real bug.
   #####################################################
-  
+
   console.print("Phase 1: Analyzing the fix ...")
-  agent.append_user_message(prompts.PROMPT_ANALYZE)
+  agent.append_user_message(
+    prompts.PROMPT_ANALYZE.format(
+      bug_type=fixenv.get_bug_type(),
+      component=fixenv.bug_type,
+      patch=fixenv.get_reference_patch(),
+      knowledge=get_component_knowledge(fixenv.get_hint_components()),
+    )
+  )
 
   def response_handler(_: str) -> Tuple[bool, str]:
     ensure_tools_available(agent, ["stop"])
@@ -195,13 +239,13 @@ def run_mini_agent(
       f"read{MAX_ROLS_PER_TC}",
       f"find{MAX_ROLS_PER_TC}",
       f"grep{MAX_ROLS_PER_TC}",
-      "code",
+      # "code",
       # Documentation tools
-      "docs",
+      # "docs",
       "langref",
       # Debugging tools
-      "debug",
-      "eval",
+      # "debug",
+      # "eval",
       # Stop tool to finish the analysis
       "stop",
     ],
@@ -238,7 +282,7 @@ def autoreview(
   llvm: LLVM,
   stats: RunStats,
 ):
-  debugger = GDB(["/bin/true"])
+  debugger = None
   
   tools = get_tool_list(fixenv, llvm, debugger)
   for to, th in tools:
@@ -374,7 +418,7 @@ def main():
   stats = RunStats(command=vars(args))
   stats.total_time_sec = time.time()
   try:
-    stats.strategies = autoreview(agent, env, llvm, stats)
+    autoreview(agent, env, llvm, stats)
     # if not stats.bug:
     #     raise NoAvailableBugFound("All efforts tried yet no available patches found.")
   except Exception as e:
