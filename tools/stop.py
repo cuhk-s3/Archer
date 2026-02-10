@@ -6,7 +6,7 @@ from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
 
 class StopTool(FuncToolBase):
   def __init__(self):
-    super.__init__(self)
+    super().__init__()
 
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
@@ -17,14 +17,14 @@ class StopTool(FuncToolBase):
           "strategies",
           "list[tuple[string,string,string,string]]",
           True,
-          "A list of bug-trigger test strategies with each being a tuple of strategy name, target, rationale and expected issue."
+          "A list of bug-trigger test strategies with each being a tuple of strategy name, target, rationale and expected issue. "
           "For example, [('Strategy 1', 'target file or function', 'rationale for why this strategy can trigger the bug', 'the expected issue that can be observed when the strategy is executed'), ...].",
         ),
         FuncToolSpec.Param(
           "thoughts",
           "string",
           True,
-          'The detailed thoughts for diagnosing the fix including step-by-step "'
+          'The detailed thoughts for diagnosing the fix including '
           '1. "Fix Understanding", '
           '2. "Assumptions Identified", '
           '3. "Potential Cases to Break Assumptions", and '
