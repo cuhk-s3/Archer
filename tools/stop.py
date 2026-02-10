@@ -1,14 +1,12 @@
 import ast
 import json
-from pathlib import Path
 
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
-from tools.llvm_mixins import LlvmDirMixin
 
 
-class StopTool(FuncToolBase, LlvmDirMixin):
-  def __init__(self, llvm_dir: str):
-    self.llvm_dir = Path(llvm_dir).resolve().absolute()
+class StopTool(FuncToolBase):
+  def __init__(self):
+    super.__init__(self)
 
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
