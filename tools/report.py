@@ -15,7 +15,13 @@ class ReportTool(FuncToolBase):
           "list[string, string]",
           True,
           "A self-contained LLVM IR wrapped with ```llvm and ``` and the command to trigger the bug. "
-          "For example, ['```llvm\n; LLVM IR code\n```\n', 'the command to trigger the bug']."
+          "For example, ['```llvm\n; LLVM IR code\n```', 'the command to trigger the bug'].",
+          schema={
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 2,
+            "maxItems": 2,
+          }
         ),
         FuncToolSpec.Param(
           "thoughts",
@@ -28,7 +34,7 @@ class ReportTool(FuncToolBase):
       ]
     )
   
-  def _call(self, *, test: list[str, str], thoughts: str) -> str:
+  def _call(self, *, test: list[str], thoughts: str) -> str:
     if not isinstance(test, list) or len(test) != 2:
       raise FuncToolCallException(f"Test must be a list of two elements: {test}")
     if not (isinstance(test[0], str) and test[0].startswith("```llvm") and test[0].endswith("```")):
@@ -38,5 +44,5 @@ class ReportTool(FuncToolBase):
         "test": [test[0].strip(), test[1].strip()],
         "thoughts": thoughts.strip(),
       },
-      ident=2,
+      indent=2,
     )

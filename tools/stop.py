@@ -18,7 +18,16 @@ class StopTool(FuncToolBase):
           "list[tuple[string,string,string,string]]",
           True,
           "A list of bug-trigger test strategies with each being a tuple of strategy name, target, rationale and expected issue. "
-          "For example, [('Strategy 1', 'target file or function', 'rationale for why this strategy can trigger the bug', 'the expected issue that can be observed when the strategy is executed'), ...].",
+          "For example, [{\"name\":\"Strategy 1\",\"target\":\"target file or function\",\"rationale\":\"rationale for why this strategy can trigger the bug\",\"expected_issue\":\"the expected issue that can be observed when the strategy is executed\"}].",
+          schema={
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {"type": "string"},
+              "minItems": 4,
+              "maxItems": 4,
+            }
+          },
         ),
         FuncToolSpec.Param(
           "thoughts",
@@ -33,32 +42,42 @@ class StopTool(FuncToolBase):
       ],
     )
 
-  def _call(self, *, strategies: list[tuple[str, str, str, str]], thoughts: str) -> str:
+  def _call(self, *, strategies, thoughts: str) -> str:
     strats = []
     if isinstance(strategies, str):
         s = strategies.strip()
-        # try json first
         try:
-            strategies = json.loads(s)
-        except Exception:
-            try:
-                strategies = ast.literal_eval(s)
-            except Exception as e:
-                raise FuncToolCallException(
-                    f"strategies must be a list of 4-tuples; got a string that cannot be parsed: {strategies}"
-                ) from e
+          strategies = json.loads(s)
+        except Exception as e:
+          raise FuncToolCallException(
+            f"strategies must be a JSON array of objects; got a string that cannot be parsed: {strategies}"
+          ) from e
     # check if strategies is a list of tuples of 4 elements
     if not isinstance(strategies, list):
       raise FuncToolCallException(f"Strategies must be a list of tuples: {strategies}")
-    # check if it is list
-    if not all(isinstance(edit, tuple) for edit in strategies):
-      raise FuncToolCallException(f"Each test strategy must be a tuple: {strategies}")
-    for _, edit in enumerate(strategies):
-      if len(edit) != 4:
+    for _, s in enumerate(strategies):
+      if not isinstance(s, dict):
         raise FuncToolCallException(
-          f"Each test strategy must be a tuple of 4 elements (strategy name, target, rationale, expected issue): {edit}"
+          f"Each test strategy must be an object with keys "
+          f"(name, target, rationale, expected_issue): {s}"
         )
-      strats.append((edit[0].strip(), edit[1].strip(), edit[2].strip(), edit[3].strip()))
+      try:
+        name = s["name"]
+        target = s["target"]
+        rationale = s["rationale"]
+        expected_issue = s["expected_issue"]
+      except KeyError as e:
+        raise FuncToolCallException(
+          f"Strategy object missing required field {e}: {s}"
+        )
+      strats.append(
+        (
+          str(name).strip(),
+          str(target).strip(),
+          str(rationale).strip(),
+          str(expected_issue).strip(),
+        )
+      )
     return json.dumps(
       {
         "strategies": strats,

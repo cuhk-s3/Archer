@@ -12,11 +12,13 @@ class FuncToolSpec:
     type: str  # Type of the parameter (e.g., "string", "integer", "list[integer]" etc.)
     req: bool  # Whether the parameter is required
     desc: str  # Description of the parameter
+    schema: dict = None  # Optional JSON schema for complex types
 
-  def __init__(self, name: str, desc: str, parameters: List[Param]):
+  def __init__(self, name: str, desc: str, parameters: List[Param], schema: dict = None):
     self.name = name
     self.desc = desc
     self.params = parameters
+    self.schema = schema
 
   def render_in_claude_format(self) -> dict:
     return {
@@ -25,7 +27,12 @@ class FuncToolSpec:
       "input_schema": {
         "type": "object",
         "properties": {
-          p.name: {"type": p.type, "description": p.desc} for p in self.params
+          p.name: (
+            {**p.schema, "description": p.desc}
+            if p.schema is not None
+            else {"type": p.type, "description": p.desc}
+          )
+          for p in self.params
         },
         "required": [p.name for p in self.params if p.req],
         "additionalProperties": False,
@@ -41,7 +48,12 @@ class FuncToolSpec:
         "parameters": {
           "type": "object",
           "properties": {
-            p.name: {"type": p.type, "description": p.desc} for p in self.params
+            p.name: (
+              {**p.schema, "description": p.desc}
+              if p.schema is not None
+              else {"type": p.type, "description": p.desc}
+            )
+            for p in self.params
           },
           "required": [p.name for p in self.params if p.req],
           "additionalProperties": False,
