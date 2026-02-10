@@ -153,10 +153,10 @@ class OpenAIAgent(AgentBase):
         )
         arguments = json.loads(args)
         result = self.perform_tool_call(name, arguments)
+        self.append_function_tool_call_output(call_id=tool_call.id, result=result)
         flag, result = tool_call_handler(name, args, result)
         if not flag:
           return result
-        self.append_function_tool_call_output(call_id=tool_call.id, result=result)
 
     if curr_round == round_limit - 1:
       raise ReachRoundLimit()
