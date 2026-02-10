@@ -70,6 +70,7 @@ def panic(msg: str):
 if not ALIVE_TV_PATH:
     panic("LAB_LLVM_ALIVE_TV is not set")
 
+
 @dataclass
 class Bug:
   original_ir: str
@@ -151,7 +152,7 @@ def ensure_tools_available(agent: AgentBase, tools: List[str]):
         )
 
 
-def get_tool_list(fixenv: Environment, llvm: LLVM, debugger: DebuggerBase = None):
+def get_tool_list(fixenv: Environment, llvm: LLVM, build_dir: str, debugger: DebuggerBase = None):
   return [
     # General tools
     (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
@@ -162,8 +163,8 @@ def get_tool_list(fixenv: Environment, llvm: LLVM, debugger: DebuggerBase = None
     # (CodeTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
     # (DocsTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
     (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
-    (TransTool(llvm_dir), MAX_TCS_GET_CONTEXT),
-    (VerifyTool(llvm_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
+    (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
+    (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
     # Debugging tools
     # (DebuggerTool(debugger), MAX_TCS_GET_CONTEXT),
     # (EvalTool(debugger), MAX_TCS_GET_CONTEXT),
@@ -382,10 +383,11 @@ def autoreview(
   fixenv: Environment,
   llvm: LLVM,
   stats: RunStats,
+  build_dir: str,
 ):
   debugger = None
   
-  tools = get_tool_list(fixenv, llvm, debugger)
+  tools = get_tool_list(fixenv, llvm, build_dir, debugger)
   for to, th in tools:
     agent.register_tool(to, th)
 
@@ -475,7 +477,8 @@ def main():
       panic(f"Stats file {stats_path} already exists.")
 
   # Set up the LLVM environment
-  set_llvm_build_dir(os.path.join(get_llvm_build_dir(), args.issue))
+  build_dir = os.path.join(get_llvm_build_dir(), args.issue)
+  set_llvm_build_dir(build_dir)
   env = Environment(
     args.issue,
     base_model_knowledge_cutoff="2000-12-31Z", # FIXME: workaround for evaluation
@@ -510,8 +513,9 @@ def main():
       env.apply()
     except Exception as e:
       panic(f"Failed to reset HEAD to {env.get_hint_fix_commit()}: {e}")
-  
-  env.build()
+    
+    if not (Path(build_dir) / "bin" / "opt").exists():
+      env.build()
   
   llvm = LLVM()
   
@@ -519,7 +523,7 @@ def main():
   stats = RunStats(command=vars(args))
   stats.total_time_sec = time.time()
   try:
-    autoreview(agent, env, llvm, stats)
+    autoreview(agent, env, llvm, stats, build_dir)
     if not stats.bugs:
         raise NoAvailableBugFound("All efforts tried yet no available patches found.")
   except Exception as e:
