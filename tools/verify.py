@@ -8,9 +8,10 @@ from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
 from utils import cmdline
 
 class VerifyTool(FuncToolBase):
-  def __init__(self, llvm_dir:str, alive_path: str):
-    self.llvm_dir = Path(llvm_dir).resolve().absolute()
+  def __init__(self, build_dir: str, alive_path: str):
+    self.build_dir = Path(build_dir).resolve().absolute()
     self.alive_path = Path(alive_path).resolve().absolute()
+    print(self.build_dir, self.alive_path)
 
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
@@ -36,10 +37,10 @@ class VerifyTool(FuncToolBase):
   def _call(self, *, orig_ir: str, args: str, **kwargs) -> str:
     if not (isinstance(orig_ir, str) and orig_ir.startswith("```llvm") and orig_ir.endswith("```")):
       raise FuncToolCallException(f"orig_ir must be a self-contained LLVM IR code wrapped with ```llvm and ```: {orig_ir}")
-    opt_path = self.llvm_dir / "bin" / "opt"
+    opt_path = self.build_dir / "bin" / "opt"
     if not opt_path.is_file():
       raise FuncToolCallException(f"opt tool not found at {opt_path}")
-    alive_tv_path = self.alive_path / "alive-tv"
+    alive_tv_path = self.alive_path
     if not alive_tv_path.is_file():
       raise FuncToolCallException(f"alive-tv tool not found at {alive_tv_path}")
     
@@ -52,16 +53,16 @@ class VerifyTool(FuncToolBase):
 
       cmd = f"{opt_path} -S {args} {orig_ir_path} -o {transformed_ir_path}"
       try:
-        cmdline.check_output(cmd, cwd=self.llvm_dir)
+        cmdline.check_output(cmd)
       except CalledProcessError as e:
         raise FuncToolCallException(f"Failed to transform the LLVM IR code with opt. {e.stderr.decode('utf-8').strip() if e.stderr else str(e)}")
       
       with open(transformed_ir_path, "r") as f:
         transformed_ir_code = f.read()
       
-      cmd = f"{alive_tv_path} {args} {orig_ir_path} {transformed_ir_path}"
+      cmd = f"{alive_tv_path} {args} --disable-undef-input {orig_ir_path} {transformed_ir_path}"
       try:
-        result = cmdline.check_output(cmd, cwd=self.alive_path)
+        result = cmdline.check_output(cmd)
         verification_result = result.decode("utf-8").strip()
         m = re.search(r"(\d+)\s+incorrect transformations", verification_result)
         return json.dumps(
