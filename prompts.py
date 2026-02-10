@@ -76,6 +76,12 @@ Here are a list of test cases related to the original fix:
 
 {tests}
 
+You have proposed the following test strategies in Phase 1:
+
+{strategies}
+
+## Your Task for Phase 2 ##
+
 Based on your analysis and the test strategies you proposed, \
 generate mutated versions of the above test case. Follow the steps below:
 
