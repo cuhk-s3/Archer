@@ -13,7 +13,7 @@ class TransTool(FuncToolBase):
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
       "trans",
-      "Transform the original LLVM IR code to optimized LLVM IR code using opt with specified optimization pass. "
+      "Transform the original LLVM IR code to optimized LLVM IR code using opt with specified optimization pass.",
       [
         FuncToolSpec.Param(
           "orig_ir",

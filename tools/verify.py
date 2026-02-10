@@ -15,7 +15,7 @@ class VerifyTool(FuncToolBase):
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
       "verify",
-      "Verify if the transformation from original LLVM IR code to optimized LLVM IR code is correct using alive-tv with provided arguments. "
+      "Verify if the transformation from original LLVM IR code to optimized LLVM IR code is correct using alive-tv with provided arguments.",
       [
         FuncToolSpec.Param(
           "orig_ir",

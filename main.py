@@ -29,7 +29,10 @@ from tools.grepn import GrepNTool
 from tools.langref import LangRefTool
 from tools.listn import ListNTool
 from tools.readn import ReadNTool
+from tools.report import ReportTool
 from tools.stop import StopTool
+from tools.trans import TransTool
+from tools.verify import VerifyTool
 
 # - ===============================================
 # - Agent configurations
@@ -50,6 +53,7 @@ ADDITIONAL_CMAKE_FLAGS = [
   f"-DCMAKE_C_FLAGS_RELWITHDEBINFO={COMPILATION_FLAGS}",
   f"-DCMAKE_CXX_FLAGS_RELWITHDEBINFO={COMPILATION_FLAGS}",
 ]
+ALIVE_TV_PATH = os.environ.get("LAB_LLVM_ALIVE_TV", None)
 
 # - ================================================
 # - Statistis and output
@@ -61,6 +65,16 @@ console = get_boxed_console(debug_mode=False)
 def panic(msg: str):
   console.print(f"Error: {msg}", color="red")
   exit(1)
+  
+
+if not ALIVE_TV_PATH:
+    panic("LAB_LLVM_ALIVE_TV is not set")
+
+@dataclass
+class Bug:
+  original_ir: str
+  transformed_ir: str
+  log: str
 
 
 @dataclass
@@ -68,7 +82,7 @@ class RunStats:
   # Command to run autoreview
   command: dict
   # The generated path for successful runs
-  bug: Optional[str] = None
+  bugs: List[Bug] = field(default_factory=list)
   # The error message for failed runs
   error: Optional[str] = None
   errmsg: Optional[str] = None
@@ -148,11 +162,15 @@ def get_tool_list(fixenv: Environment, llvm: LLVM, debugger: DebuggerBase = None
     # (CodeTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
     # (DocsTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
     (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
+    (TransTool(llvm_dir), MAX_TCS_GET_CONTEXT),
+    (VerifyTool(llvm_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
     # Debugging tools
     # (DebuggerTool(debugger), MAX_TCS_GET_CONTEXT),
     # (EvalTool(debugger), MAX_TCS_GET_CONTEXT),
-    # Stop the agent process
-    (StopTool(llvm_dir), MAX_TCS_GET_CONTEXT),
+    # Stop the analysis (Phase 1)
+    (StopTool(), MAX_TCS_GET_CONTEXT),
+    # Report the bug (Phase 2)
+    (ReportTool(), MAX_TCS_GET_CONTEXT)
   ]
 
 
@@ -182,6 +200,88 @@ def get_component_knowledge(component: List[str]) -> str:
   knowledge = [f.read_text(encoding="utf-8") for f in knowledge_file]
 
   return "\n".join(knowledge)
+
+
+def generate_test(
+  agent: AgentBase,
+  fixenv: Environment,
+  llvm: LLVM,
+  stats: RunStats,
+) -> Optional[str]:
+  initial_tests = fixenv.get_tests()
+  tests_str = ""
+  
+  for _, test_file in enumerate(initial_tests):
+    commands = test_file.get("commands", [])
+    tests = test_file.get("tests", [])
+    for test_idx, test in enumerate(tests):
+      test_name = test.get("test_name", f"test_{test_idx}")
+      test_body = test.get("test_body", "")
+
+      tests_str += f"Test Case {test_idx}: {test_name}\n"
+      tests_str += f"Commands:\n{commands}\n"
+      tests_str += f"{test_body}\n\n"
+  
+  console.print("Phase 2: Generating and verifying test cases ...")
+  agent.append_user_message(
+    prompts.PROMPT_GENERATE.format(
+      tests=tests_str,
+      strategies=str(stats.strategies),
+    )
+  )
+  
+  def response_handler(_: str) -> Tuple[bool, str]:
+    ensure_tools_available(agent, ["report"])
+    return True, (
+      "Error: You are not calling any tool or your tool call format is incorrect. "
+      "You should always continue with tool calling and correct tool call format. "
+      "Please continue."
+      " If you are done, call the `report` tool with the result."
+      " If you already called the `report` tool, please check the format and try again."
+    )
+
+  def tool_call_handler(name: str, _: str, res: str) -> Tuple[bool, str]:
+    ensure_tools_available(agent, ["report", "verify"])
+    if name == "verify":
+      try:
+        bug = json.loads(res)
+        if bug.get("found", False):
+          stats.test_traj.append(res)
+          stats.bugs.append(Bug(
+            original_ir=bug["original_ir"],
+            transformed_ir=bug["transformed_ir"],
+            log=bug["log"],
+          ))
+      except Exception:
+        return (True, res)  # Continue the process with an error message
+    if name != "report":
+      return True, res  # Continue the process
+    try:
+      # The report tool returns a parseable JSON string
+      json.loads(res)
+    except Exception:
+      return (True, res)  # Continue the process with an error message
+    return False, res  # Stop the process with the result
+
+  return agent.run(
+    [
+      # Explore codebase tools
+      f"list{MAX_ROLS_PER_TC}",
+      f"read{MAX_ROLS_PER_TC}",
+      f"find{MAX_ROLS_PER_TC}",
+      f"grep{MAX_ROLS_PER_TC}",
+      # Documentation tools
+      "langref",
+      # Verification and transformation tools
+      "trans",
+      "verify",
+      # Stop tool to finish the analysis
+      "report",
+    ],
+    response_handler=response_handler,
+    tool_call_handler=tool_call_handler,
+    round_limit=MAX_CHAT_ROUNDS,
+  )
 
 
 def run_mini_agent(
@@ -239,13 +339,8 @@ def run_mini_agent(
       f"read{MAX_ROLS_PER_TC}",
       f"find{MAX_ROLS_PER_TC}",
       f"grep{MAX_ROLS_PER_TC}",
-      # "code",
       # Documentation tools
-      # "docs",
       "langref",
-      # Debugging tools
-      # "debug",
-      # "eval",
       # Stop tool to finish the analysis
       "stop",
     ],
@@ -275,6 +370,12 @@ def run_mini_agent(
   stats.reason_thou = reasoning_thoughts
   stats.strategies = [s.as_tuple() for s in test_strategies]
   
+  return generate_test(
+    agent=agent,
+    fixenv=fixenv,
+    llvm=llvm,
+    stats=stats,
+  )
 
 def autoreview(
   agent: AgentBase,
@@ -419,8 +520,8 @@ def main():
   stats.total_time_sec = time.time()
   try:
     autoreview(agent, env, llvm, stats)
-    # if not stats.bug:
-    #     raise NoAvailableBugFound("All efforts tried yet no available patches found.")
+    if not stats.bugs:
+        raise NoAvailableBugFound("All efforts tried yet no available patches found.")
   except Exception as e:
     import traceback
 
@@ -439,6 +540,17 @@ def main():
         json.dump(stats.as_dict(), fout, indent=2)
       console.print(f"Generation statistics saved to {stats_path}.")
 
+  console.print("Bugs Found")
+  console.print("----------")
+  for idx, bug in enumerate(stats.bugs):
+    console.print(f"Bug #{idx + 1}:")
+    console.print("Original LLVM IR:")
+    console.print(bug.original_ir)
+    console.print("Transformed LLVM IR:")
+    console.print(bug.transformed_ir)
+    console.print("Verification Log:")
+    console.print(bug.log)
+    console.print("----------")
   console.print("Statistics")
   console.print("----------")
   console.print(json.dumps(stats.as_dict(), indent=2))

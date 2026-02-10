@@ -13,6 +13,22 @@ You will work in two phases:
 - Original bug description and failing test case(s)
 - The code region that was modified (the fix)
 - Information about the optimization pass and component involved
+
+## Tools You Can Use ##
+
+You have multiple tools for each phase, but you should try to avoid using them with same inputs repeatedly to reduce redundant calls: \
+
+- `findN`: Search for files in the LLVM codebase related to the component or optimization pass to understand the context of the fix and find relevant tests.
+- `listN`: List files in the LLVM codebase to find relevant tests or code regions.
+- `readN`: Read the content of a file in the LLVM codebase to understand existing tests or the fix.
+- `grepN`: Search for specific patterns in the codebase to find relevant tests or code regions.
+- `langref`: Query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.
+- `trans`: Run the `opt` tool with specific arguments to see how the LLVM IR code is transformed by the optimization pass.
+- `verify`: Use alive2 to verify if the transformation from original LLVM IR code to optimized LLVM IR code is correct, which can help check the validity of generated test cases in Phase 2.
+- `stop`: End Phase 1 by submitting the identified issues and proposed test strategies.
+- `report`: End Phase 2 by submitting the generated test cases and their verification results.
+   
+You should pay special attention to `stop` and `report` tools, which are used to end Phase 1 and Phase 2 respectively. 
 """
 
 PROMPT_ANALYZE = """\
@@ -25,7 +41,8 @@ This is a patch for fixing {bug_type} bugs in {component}:
 ## Your Task for Phase 1 ##
    
 Analyze the fix above carefully and identify potential issues, edge cases, or gaps that the fix might miss. \
-According to the analysis, propose test stragtegies for exposing the issue. 
+According to the analysis, propose test strategies for exposing the issue. These strategies will be used \
+in Phase 2 to mutate existing test cases to target the identified issues.
    
 Please notice that you are analyzing the fix proposed by an expert LLVM developer. So you should pay special \
 attention to the semantics of the fix, especially regarding deep optimization correctness, rather than simple \
@@ -66,7 +83,7 @@ only focus on the semantics related to the analysis above.
    - Rationale: [Why this might expose an issue]
    - Expected Issue: [What incorrect behavior might occur]
    
-   [Continue for more test strategies]
+   [Continue for 3-5 test strategies]
 """
 
 PROMPT_GENERATE = """\
