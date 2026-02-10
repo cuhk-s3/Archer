@@ -216,7 +216,7 @@ def run_mini_agent(
       "Error: You are not calling any tool or your tool call format is incorrect. "
       "You should always continue with tool calling and correct tool call format. "
       "Please continue."
-      " If you are done, call the `stop` tool with the edit points."
+      " If you are done, call the `stop` tool with the test strategies."
       " If you already called the `stop` tool, please check the format and try again."
     )
 
