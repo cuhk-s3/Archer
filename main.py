@@ -6,6 +6,8 @@ from pathlib import Path
 import time
 from typing import List, Optional, Tuple
 
+import json_repair
+
 from base.console import get_boxed_console
 from llvm.debugger import DebuggerBase
 from llvm.gdb_support import GDB
@@ -80,8 +82,6 @@ class Bug:
 class RunStats:
   # Command to run autoreview
   command: dict
-  # The generated path for successful runs
-  bugs: List[Bug] = field(default_factory=list)
   # The error message for failed runs
   error: Optional[str] = None
   errmsg: Optional[str] = None
@@ -93,11 +93,15 @@ class RunStats:
   total_tokens: int = 0
   chat_rounds: int = 0
   total_time_sec: float = 0.0
-  # Fix stats
+  # Review stats
   strategies: List[Tuple[str, str, str, str]] = field(
     default_factory=lambda *_, **__ : [("<not-provided>", "<not-provided>", "<not-provided>", "<not-provided>")]
   )  # (name, target, rationale, expected_issue)
   reason_thou: str = "<not-provided>" 
+  # The generated bugs for successful runs
+  bugs: List[Bug] = field(default_factory=list)
+  # The tool usage
+  tool_usage: List[Tuple[str, int]] = field(default_factory=list)  # (tool_name, usage_count)
   test_traj: List[str] = field(
     default_factory=list
   )  # Trajectories of patches ever tried during testing
@@ -243,7 +247,7 @@ def generate_test(
     ensure_tools_available(agent, ["report", "verify"])
     if name == "verify":
       try:
-        bug = json.loads(res)
+        bug = json_repair.loads(res)
         if bug.get("found", False):
           stats.test_traj.append(res)
           stats.bugs.append(Bug(
@@ -427,6 +431,12 @@ def parse_args():
     help="Path to save the generation statistics as a JSON file (default: None).",
   )
   parser.add_argument(
+    "--history",
+    type=str,
+    default=None,
+    help="Path to a JSON file containing the chat history of the agent (default: None).",
+  )
+  parser.add_argument(
     "--debug",
     action="store_true",
     default=False,
@@ -474,6 +484,12 @@ def main():
     stats_path = Path(args.stats)
     if stats_path.exists():
       panic(f"Stats file {stats_path} already exists.")
+  
+  history_path = None
+  if args.history:
+    history_path = Path(args.history)
+    if history_path.exists():
+      panic(f"History file {history_path} already exists.")
 
   # Set up the LLVM environment
   build_dir = os.path.join(get_llvm_build_dir(), args.issue)
@@ -538,11 +554,20 @@ def main():
     stats.cached_tokens = agent.chat_stats["cached_tokens"]
     stats.total_tokens = agent.chat_stats["total_tokens"]
     stats.total_time_sec = time.time() - stats.total_time_sec
+    usage = []
+    for name in agent.tools.list(ignore_budget=False):
+      total = agent.tools.get_total_budget(name)
+      remaining = agent.tools.get_remaining_budget(name)
+      usage.append((name, total - remaining))
+    stats.tool_usage = usage
     if stats_path:
       with stats_path.open("w") as fout:
         json.dump(stats.as_dict(), fout, indent=2)
       console.print(f"Generation statistics saved to {stats_path}.")
-
+    if history_path:
+      with history_path.open("w") as fout:
+        json.dump([asdict(m) for m in agent.get_history()], fout, indent=2)
+      console.print(f"Chat history saved to {history_path}.")
   console.print("Bugs Found")
   console.print("----------")
   for idx, bug in enumerate(stats.bugs):
