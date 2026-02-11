@@ -92,6 +92,8 @@ class RunStats:
   cached_tokens: int = 0
   total_tokens: int = 0
   chat_rounds: int = 0
+  phase1_round: int = 0
+  phase2_round: int = 0
   total_time_sec: float = 0.0
   # Review stats
   strategies: List[dict] = field(
@@ -271,7 +273,7 @@ def generate_test(
       return (True, res)  # Continue the process with an error message
     return False, res  # Stop the process with the result
 
-  return agent.run(
+  ret = agent.run(
     [
       # Explore codebase tools
       f"list{MAX_ROLS_PER_TC}",
@@ -290,6 +292,8 @@ def generate_test(
     tool_call_handler=tool_call_handler,
     round_limit=MAX_CHAT_ROUNDS,
   )
+  stats.phase2_round = agent.chat_stats["chat_rounds"] - stats.phase1_round
+  return ret
 
 
 def run_mini_agent(
@@ -356,6 +360,7 @@ def run_mini_agent(
     tool_call_handler=tool_call_handler,
     round_limit=MAX_CHAT_ROUNDS,
   )
+  stats.phase1_round = agent.chat_stats["chat_rounds"]
   
   # Parse the response to get potential test strategies
   response = json.loads(response)
