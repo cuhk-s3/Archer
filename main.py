@@ -514,8 +514,8 @@ def main():
     except Exception as e:
       panic(f"Failed to reset HEAD to {env.get_hint_fix_commit()}: {e}")
     
-    if not (Path(build_dir) / "bin" / "opt").exists():
-      env.build()
+  if not (Path(build_dir) / "bin" / "opt").exists():
+    env.build()
   
   llvm = LLVM()
   
