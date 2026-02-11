@@ -94,14 +94,19 @@ class RunStats:
   chat_rounds: int = 0
   total_time_sec: float = 0.0
   # Review stats
-  strategies: List[Tuple[str, str, str, str]] = field(
-    default_factory=lambda *_, **__ : [("<not-provided>", "<not-provided>", "<not-provided>", "<not-provided>")]
-  )  # (name, target, rationale, expected_issue)
+  strategies: List[dict] = field(
+    default_factory=lambda *_, **__ : [{
+      "name": "<not-provided>",
+      "target": "<not-provided>",
+      "rationale": "<not-provided>",
+      "expected_issue": "<not-provided>"
+    }]
+  )
   reason_thou: str = "<not-provided>" 
   # The generated bugs for successful runs
   bugs: List[Bug] = field(default_factory=list)
   # The tool usage
-  tool_usage: List[Tuple[str, int]] = field(default_factory=list)  # (tool_name, usage_count)
+  tool_usage: List[dict] = field(default_factory=list)
   test_traj: List[str] = field(
     default_factory=list
   )  # Trajectories of patches ever tried during testing
@@ -130,16 +135,16 @@ class TestStrategy:
   rationale: str
   expected_issue: str
   
-  def as_tuple(self) -> Tuple[str, str, str, str]:
-    return (self.name, self.target, self.rationale, self.expected_issue)
-  
-  def __str__(self) -> str:
-    return json.dumps({
+  def as_dict(self) -> dict:
+    return {
       "name": self.name,
       "target": self.target,
       "rationale": self.rationale,
       "expected_issue": self.expected_issue,
-    }, indent=2)
+    }
+  
+  def __str__(self) -> str:
+    return json.dumps(self.as_dict(), indent=2)
 
 
 def ensure_tools_available(agent: AgentBase, tools: List[str]):
@@ -371,7 +376,7 @@ def run_mini_agent(
       console.print(f"Warning: Invalid strategy format: {strat}: {e}", color="yellow")
 
   stats.reason_thou = reasoning_thoughts
-  stats.strategies = [s.as_tuple() for s in test_strategies]
+  stats.strategies = [s.as_dict() for s in test_strategies]
   
   return generate_test(
     agent=agent,
@@ -558,7 +563,7 @@ def main():
     for name in agent.tools.list(ignore_budget=False):
       total = agent.tools.get_total_budget(name)
       remaining = agent.tools.get_remaining_budget(name)
-      usage.append((name, total - remaining))
+      usage.append({"name": name, "usage": total - remaining})
     stats.tool_usage = usage
     if stats_path:
       with stats_path.open("w") as fout:
