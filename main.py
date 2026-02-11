@@ -59,8 +59,6 @@ ALIVE_TV_PATH = os.environ.get("LAB_LLVM_ALIVE_TV", None)
 # - Statistis and output
 # - ================================================
 
-console = get_boxed_console(debug_mode=False)
-
 
 def panic(msg: str):
   console.print(f"Error: {msg}", color="red")
@@ -377,6 +375,7 @@ def run_mini_agent(
     llvm=llvm,
     stats=stats,
   )
+
 
 def autoreview(
   agent: AgentBase,

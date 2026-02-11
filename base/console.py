@@ -1,3 +1,4 @@
+import os
 import threading
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -95,20 +96,22 @@ class BoxedConsole(BoxedConsoleBase):
 
 
 def get_boxed_console(
-  box_title=None, box_bg_color="black", console_name="autoreview", debug_mode=False
+  box_title=None, box_bg_color="black", console_name="autoreview", debug_mode=False, configs: Optional[BoxedConsoleConfigs]=None
 ) -> BoxedConsoleBase:
+  configs = configs or BoxedConsoleConfigs()
   if debug_mode:
-    if BoxedConsoleConfigs.out_dir:
+    if configs.out_dir:
+      os.makedirs(configs.out_dir, exist_ok=True)
       return FileConsole(
         out_file=str(
-          (Path(BoxedConsoleConfigs.out_dir) / (console_name + ".traj.log")).resolve()
+          (Path(configs.out_dir) / (console_name + ".traj.log")).resolve()
         ),
         title=box_title,
-        print_to_console=BoxedConsoleConfigs.print_to_console,
+        print_to_console=configs.print_to_console,
       )
     else:
       return BoxedConsole(
-        box_width=BoxedConsoleConfigs.box_width,
+        box_width=configs.box_width,
         box_title=box_title,
         box_bg_color=box_bg_color,
       )
