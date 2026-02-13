@@ -1,0 +1,63 @@
+{
+  "bug_id": "136646",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/136646",
+  "bug_type": "miscompilation",
+  "base_commit": "2ae9a74bf1421950bd404fec099b1f9998093916",
+  "knowledge_cutoff": "2025-04-22T02:58:58Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "3e1e4062e1e95031c32c0ed9786647ef1a4141aa",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          2793,
+          2799
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "foldSelectWithFCmpToFabs"
+      ]
+    }
+  },
+  "patch": "commit 3e1e4062e1e95031c32c0ed9786647ef1a4141aa\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sat Apr 26 14:03:12 2025 +0800\n\n    [InstCombine] Preserve signbit semantics of NaN with fold to fabs (#136648)\n    \n    As per the LangRef and IEEE 754-2008 standard, the sign bit of NaN is\n    preserved if there is no floating-point operation being performed.\n    See also\n    https://github.com/llvm/llvm-project/commit/862e35e25a68502433da0a8d0819448ff5745339\n    for reference.\n    \n    Alive2: https://alive2.llvm.org/ce/z/QYtEGj\n    Closes https://github.com/llvm/llvm-project/issues/136646\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 4bba2f406b4c..5a42a5c996da 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -2793,7 +2793,14 @@ static Instruction *foldSelectWithFCmpToFabs(SelectInst &SI,\n \n     // fold (X <= +/-0.0) ? (0.0 - X) : X to fabs(X), when 'Swap' is false\n     // fold (X >  +/-0.0) ? X : (0.0 - X) to fabs(X), when 'Swap' is true\n-    if (match(TrueVal, m_FSub(m_PosZeroFP(), m_Specific(X)))) {\n+    // Note: We require \"nnan\" for this fold because fcmp ignores the signbit\n+    //       of NAN, but IEEE-754 specifies the signbit of NAN values with\n+    //       fneg/fabs operations.\n+    if (match(TrueVal, m_FSub(m_PosZeroFP(), m_Specific(X))) &&\n+        (cast<FPMathOperator>(CondVal)->hasNoNaNs() || SI.hasNoNaNs() ||\n+         isKnownNeverNaN(X, /*Depth=*/0,\n+                         IC.getSimplifyQuery().getWithInstruction(\n+                             cast<Instruction>(CondVal))))) {\n       if (!Swap && (Pred == FCmpInst::FCMP_OLE || Pred == FCmpInst::FCMP_ULE)) {\n         Value *Fabs = IC.Builder.CreateUnaryIntrinsic(Intrinsic::fabs, X, &SI);\n         return IC.replaceInstUsesWith(SI, Fabs);\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/fabs.ll",
+      "commands": [
+        [
+          "opt -mtriple=x86_64-unknown-linux-gnu < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "select_fcmp_ole_zero_no_nnan",
+          "test_body": "define double @select_fcmp_ole_zero_no_nnan(double %x) {\n; CHECK-LABEL: @select_fcmp_ole_zero_no_nnan(\n; CHECK-NEXT:    [[LEZERO:%.*]] = fcmp ole double [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    [[NEGX:%.*]] = fsub double 0.000000e+00, [[X]]\n; CHECK-NEXT:    [[FABS:%.*]] = select i1 [[LEZERO]], double [[NEGX]], double [[X]]\n; CHECK-NEXT:    ret double [[FABS]]\n  %lezero = fcmp ole double %x, 0.000000e+00\n  %negx = fsub double 0.000000e+00, %x\n  %fabs = select i1 %lezero, double %negx, double %x\n  ret double %fabs\n}",
+          "source_program": "define double @select_fcmp_ole_zero_no_nnan(double %x) {\n  %lezero = fcmp ole double %x, 0.000000e+00\n  %negx = fsub double 0.000000e+00, %x\n  %fabs = select i1 %lezero, double %negx, double %x\n  ret double %fabs\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] The sign bit of NaN is not preserved when folding `(X <= +/-0.0) ? (0.0 - X) : X to fabs(X)`",
+    "body": "Reproducer: https://alive2.llvm.org/ce/z/2JaLU9\n```\n\n----------------------------------------\ndefine half @src(half %x) {\n#0:\n  %gtzero = fcmp ugt half %x, 0x0000\n  %negx = fsub half 0x0000, %x\n  %fabs = select i1 %gtzero, half %x, half %negx\n  ret half %fabs\n}\n=>\ndefine half @src(half %x) nofree willreturn memory(none) {\n#0:\n  %fabs = fabs half %x\n  ret half %fabs\n}\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\nhalf %x = #xfd00 (SNaN)\n\nSource:\ni1 %gtzero = #x1 (1)\nhalf %negx = #xff00 (QNaN)\nhalf %fabs = #xfd00 (SNaN)\n\nTarget:\nhalf %fabs = #x7d00 (SNaN)\nSource value: #xfd00 (SNaN)\nTarget value: #x7d00 (SNaN)\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n```\nRelated issues:\nhttps://github.com/AliveToolkit/alive2/pull/1155\nhttps://github.com/llvm/llvm-project/issues/59279\n",
+    "author": "dtcxzyw",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

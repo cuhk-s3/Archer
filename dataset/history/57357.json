@@ -1,0 +1,108 @@
+{
+  "bug_id": "57357",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/57357",
+  "bug_type": "miscompilation",
+  "base_commit": "681b97e5869d49b1e5163534811f370ba5ac0e40",
+  "knowledge_cutoff": "2022-08-25T10:02:57Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "4e44c22c97be99f7c3864fb9fc68b3295835d837",
+    "components": [
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          6085,
+          6090
+        ],
+        [
+          6099,
+          6108
+        ],
+        [
+          6116,
+          6122
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "matchSelectPattern"
+      ]
+    }
+  },
+  "patch": "commit 4e44c22c97be99f7c3864fb9fc68b3295835d837\nAuthor: Sanjay Patel <spatel@rotateright.com>\nDate:   Thu Aug 25 15:43:39 2022 -0400\n\n    [ValueTracking][InstCombine] restrict FP min/max matching to avoid miscompile\n    \n    This is a long-standing FIXME with a non-FMF test that exposes\n    the bug as shown in issue #57357.\n    \n    It's possible that there's still a way to miscompile by\n    mis-identifying/mis-folding FP min/max patterns, but\n    this patch only exposes a couple of seemingly minor\n    regressions while preventing the broken transform.\n\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex b2393de81fc4..5f22714f4089 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -6085,6 +6085,7 @@ static SelectPatternResult matchSelectPattern(CmpInst::Predicate Pred,\n                                               Value *TrueVal, Value *FalseVal,\n                                               Value *&LHS, Value *&RHS,\n                                               unsigned Depth) {\n+  bool HasMismatchedZeros = false;\n   if (CmpInst::isFPPredicate(Pred)) {\n     // IEEE-754 ignores the sign of 0.0 in comparisons. So if the select has one\n     // 0.0 operand, set the compare's 0.0 operands to that same value for the\n@@ -6099,10 +6100,14 @@ static SelectPatternResult matchSelectPattern(CmpInst::Predicate Pred,\n       OutputZeroVal = FalseVal;\n \n     if (OutputZeroVal) {\n-      if (match(CmpLHS, m_AnyZeroFP()))\n+      if (match(CmpLHS, m_AnyZeroFP()) && CmpLHS != OutputZeroVal) {\n+        HasMismatchedZeros = true;\n         CmpLHS = OutputZeroVal;\n-      if (match(CmpRHS, m_AnyZeroFP()))\n+      }\n+      if (match(CmpRHS, m_AnyZeroFP()) && CmpRHS != OutputZeroVal) {\n+        HasMismatchedZeros = true;\n         CmpRHS = OutputZeroVal;\n+      }\n     }\n   }\n \n@@ -6116,7 +6121,11 @@ static SelectPatternResult matchSelectPattern(CmpInst::Predicate Pred,\n   // operands is known to not be zero or if we don't care about signed zero.\n   switch (Pred) {\n   default: break;\n-  // FIXME: Include OGT/OLT/UGT/ULT.\n+  case CmpInst::FCMP_OGT: case CmpInst::FCMP_OLT:\n+  case CmpInst::FCMP_UGT: case CmpInst::FCMP_ULT:\n+    if (!HasMismatchedZeros)\n+      break;\n+    [[fallthrough]];\n   case CmpInst::FCMP_OGE: case CmpInst::FCMP_OLE:\n   case CmpInst::FCMP_UGE: case CmpInst::FCMP_ULE:\n     if (!FMF.noSignedZeros() && !isKnownNonZero(CmpLHS) &&\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-fp.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "not_maxnum",
+          "test_body": "define float @not_maxnum(float %x) {\n; CHECK-LABEL: @not_maxnum(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp olt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[CMP]], float -0.000000e+00, float [[X]]\n; CHECK-NEXT:    ret float [[SEL]]\n  %cmp = fcmp olt float %x, 0.000000e+00\n  %sel = select i1 %cmp, float -0.000000e+00, float %x\n  ret float %sel\n}",
+          "source_program": "define float @not_maxnum(float %x) {\n  %cmp = fcmp olt float %x, 0.000000e+00\n  %sel = select i1 %cmp, float -0.000000e+00, float %x\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "fmax_fmax_zero_mismatch",
+          "test_body": "define float @fmax_fmax_zero_mismatch(float %x) {\n; CHECK-LABEL: @fmax_fmax_zero_mismatch(\n; CHECK-NEXT:    [[CMP1:%.*]] = fcmp ogt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    [[MAX1:%.*]] = select i1 [[CMP1]], float [[X]], float -0.000000e+00\n; CHECK-NEXT:    [[CMP2:%.*]] = fcmp olt float [[MAX1]], 0.000000e+00\n; CHECK-NEXT:    [[MAX2:%.*]] = select i1 [[CMP2]], float -0.000000e+00, float [[MAX1]]\n; CHECK-NEXT:    ret float [[MAX2]]\n  %cmp1 = fcmp ogt float %x, 0.000000e+00\n  %max1 = select i1 %cmp1, float %x, float -0.000000e+00\n  %cmp2 = fcmp ogt float 0.000000e+00, %max1\n  %max2 = select i1 %cmp2, float -0.000000e+00, float %max1\n  ret float %max2\n}",
+          "source_program": "define float @fmax_fmax_zero_mismatch(float %x) {\n  %cmp1 = fcmp ogt float %x, 0.000000e+00\n  %max1 = select i1 %cmp1, float %x, float -0.000000e+00\n  %cmp2 = fcmp ogt float 0.000000e+00, %max1\n  %max2 = select i1 %cmp2, float -0.000000e+00, float %max1\n  ret float %max2\n}\n"
+        },
+        {
+          "test_name": "t7",
+          "test_body": "define double @t7(float %a) {\n; CHECK-LABEL: @t7(\n; CHECK-NEXT:    [[TMP1:%.*]] = fcmp ult float [[A:%.*]], 0.000000e+00\n; CHECK-NEXT:    [[TMP2:%.*]] = fpext float [[A]] to double\n; CHECK-NEXT:    [[TMP3:%.*]] = select i1 [[TMP1]], double [[TMP2]], double -0.000000e+00\n; CHECK-NEXT:    ret double [[TMP3]]\n  %1 = fcmp ult float %a, 0.000000e+00\n  %2 = fpext float %a to double\n  %3 = select i1 %1, double %2, double -0.000000e+00\n  ret double %3\n}",
+          "source_program": "define double @t7(float %a) {\n  %1 = fcmp ult float %a, 0.000000e+00\n  %2 = fpext float %a to double\n  %3 = select i1 %1, double %2, double -0.000000e+00\n  ret double %3\n}\n"
+        },
+        {
+          "test_name": "t5",
+          "test_body": "define double @t5(float %a) {\n; CHECK-LABEL: @t5(\n; CHECK-NEXT:    [[TMP1:%.*]] = fcmp ult float [[A:%.*]], 5.000000e+00\n; CHECK-NEXT:    [[TMP2:%.*]] = fpext float [[A]] to double\n; CHECK-NEXT:    [[TMP3:%.*]] = select i1 [[TMP1]], double [[TMP2]], double 5.001000e+00\n; CHECK-NEXT:    ret double [[TMP3]]\n  %1 = fcmp ult float %a, 5.000000e+00\n  %2 = fpext float %a to double\n  %3 = select i1 %1, double %2, double 5.001000e+00\n  ret double %3\n}",
+          "source_program": "define double @t5(float %a) {\n  %1 = fcmp ult float %a, 5.000000e+00\n  %2 = fpext float %a to double\n  %3 = select i1 %1, double %2, double 5.001000e+00\n  ret double %3\n}\n"
+        },
+        {
+          "test_name": "t6",
+          "test_body": "define double @t6(float %a) {\n; CHECK-LABEL: @t6(\n; CHECK-NEXT:    [[DOTINV:%.*]] = fcmp oge float [[A:%.*]], 0.000000e+00\n; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[DOTINV]], float 0.000000e+00, float [[A]]\n; CHECK-NEXT:    [[TMP2:%.*]] = fpext float [[TMP1]] to double\n; CHECK-NEXT:    ret double [[TMP2]]\n  %1 = fcmp ult float %a, -0.000000e+00\n  %2 = fpext float %a to double\n  %3 = select i1 %1, double %2, double 0.000000e+00\n  ret double %3\n}",
+          "source_program": "define double @t6(float %a) {\n  %1 = fcmp ult float %a, -0.000000e+00\n  %2 = fpext float %a to double\n  %3 = select i1 %1, double %2, double 0.000000e+00\n  ret double %3\n}\n"
+        },
+        {
+          "test_name": "fmin_fmin_zero_mismatch",
+          "test_body": "define float @fmin_fmin_zero_mismatch(float %x) {\n; CHECK-LABEL: @fmin_fmin_zero_mismatch(\n; CHECK-NEXT:    [[CMP1:%.*]] = fcmp olt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    [[MIN2:%.*]] = select i1 [[CMP1]], float [[X]], float 0.000000e+00\n; CHECK-NEXT:    ret float [[MIN2]]\n  %cmp1 = fcmp olt float %x, -0.000000e+00\n  %min1 = select i1 %cmp1, float %x, float 0.000000e+00\n  %cmp2 = fcmp olt float %min1, 0.000000e+00\n  %min2 = select i1 %cmp2, float %min1, float 0.000000e+00\n  ret float %min2\n}",
+          "source_program": "define float @fmin_fmin_zero_mismatch(float %x) {\n  %cmp1 = fcmp olt float %x, -0.000000e+00\n  %min1 = select i1 %cmp1, float %x, float 0.000000e+00\n  %cmp2 = fcmp olt float %min1, 0.000000e+00\n  %min2 = select i1 %cmp2, float %min1, float 0.000000e+00\n  ret float %min2\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] Wrong signed zero optimization",
+    "body": "The following C snippet (see also https://godbolt.org/z/E41zbrThP)\r\n```c\r\ndouble f(double x) {\r\n    return x < 0.0 ? -0.0 : x;\r\n}\r\nint main(void) {\r\n    printf(\"%g\\n\", 1.0/f(0.0));\r\n}\r\n```\r\nprints `-inf` when compiled with `-O1` or `-O2`. Right answer is positive `inf`.\r\n\r\nClang versions since 8.0.0 and newer are affected, 7.1.0 works fine.\r\n\r\nThe problem is inside `InstCombine` which transforms \r\n```llvm\r\ndefine dso_local double @f(double %0) local_unnamed_addr #0 {\r\n  %2 = fcmp olt double %0, 0.000000e+00\r\n  %3 = select i1 %2, double -0.000000e+00, double %0\r\n  ret double %3\r\n}\r\n```\r\ninto\r\n```llvm\r\ndefine dso_local double @f(double %0) local_unnamed_addr #0 {\r\n  %2 = fcmp ole double %0, 0.000000e+00\r\n  %3 = select i1 %2, double -0.000000e+00, double %0\r\n  ret double %3\r\n}\r\n```\r\nThis is incorrect https://alive2.llvm.org/ce/z/jFq6m7\r\n\r\n```console\r\nTransformation doesn't verify!\r\n\r\nERROR: Value mismatch\r\n\r\nExample:\r\ndouble %0 = #x0000000000000000 (+0.0)\r\n\r\nSource:\r\ni1 %2 = #x0 (0)\r\ndouble %3 = #x0000000000000000 (+0.0)\r\n\r\nTarget:\r\ni1 %2 = #x1 (1)\r\ndouble %3 = #x8000000000000000 (-0.0)\r\nSource value: #x0000000000000000 (+0.0)\r\nTarget value: #x8000000000000000 (-0.0)\r\n```\r\n\r\nIt would be correct only when `select` has `nsz` fast-math flag.\r\n\r\n#49625 tells probably about the same bug, but example here is much simpler.\r\n",
+    "author": "zhroma",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "comments": [
+      {
+        "author": "rotateright",
+        "body": "The problem transform is:\r\nIC: Visiting:   %2 = fcmp olt double %0, 0.000000e+00\r\nIC: Visiting:   %3 = select i1 %2, double -0.000000e+00, double %0\r\nADD DEFERRED:   %3 = fcmp ugt double %0, -0.000000e+00\r\nADD DEFERRED:   %4 = select i1 %3, double %0, double -0.000000e+00\r\n\r\nhttps://alive2.llvm.org/ce/z/Mu46fo\r\n\r\nThis is caused by ValueTracking identifying the code here as a MAXNUM pattern. There's already a FIXME note in there, so that's probably where we should solve it."
+      },
+      {
+        "author": "rotateright",
+        "body": "Thanks for filing the bug report. This example should be fixed with 4e44c22c97be9. If you find any other cases like this, please open another issue."
+      },
+      {
+        "author": "zhroma",
+        "body": "Many thanks for fixing this so fast!"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

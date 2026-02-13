@@ -1,0 +1,110 @@
+{
+  "bug_id": "114191",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/114191",
+  "bug_type": "miscompilation",
+  "base_commit": "e577f14b670ee2ae6bb717133310b215be4331b3",
+  "knowledge_cutoff": "2024-10-30T07:41:28Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/InstSimplify"
+  ],
+  "hints": {
+    "fix_commit": "a77dedcacb4c5eb221395b69877981dd6ad98989",
+    "components": [
+      "IR",
+      "InstCombine",
+      "InstructionSimplify"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        [
+          1095,
+          1113
+        ]
+      ],
+      "llvm/lib/IR/ConstantFold.cpp": [
+        [
+          902,
+          912
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          102,
+          107
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp": [
+        [
+          1158,
+          1186
+        ],
+        [
+          1189,
+          1194
+        ],
+        [
+          2138,
+          2166
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        "simplifyDivRem"
+      ],
+      "llvm/lib/IR/ConstantFold.cpp": [
+        "llvm::ConstantFoldBinaryInstruction"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp": [
+        "InstCombinerImpl::commonIDivTransforms",
+        "InstCombinerImpl::commonIRemTransforms",
+        "foldIDivShl"
+      ]
+    }
+  },
+  "patch": "commit a77dedcacb4c5eb221395b69877981dd6ad98989\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Fri Nov 1 22:56:22 2024 +0800\n\n    [InstSimplify][InstCombine][ConstantFold] Move vector div/rem by zero fold to InstCombine (#114280)\n    \n    Previously we fold `div/rem X, C` into `poison` if any element of the\n    constant divisor `C` is zero or undef. However, it is incorrect when\n    threading udiv over an vector select:\n    https://alive2.llvm.org/ce/z/3Ninx5\n    ```\n    define <2 x i32> @vec_select_udiv_poison(<2 x i1> %x) {\n      %sel = select <2 x i1> %x, <2 x i32> <i32 -1, i32 -1>, <2 x i32> <i32 0, i32 1>\n      %div = udiv <2 x i32> <i32 42, i32 -7>, %sel\n      ret <2 x i32> %div\n    }\n    ```\n    In this case, `threadBinOpOverSelect` folds `udiv <i32 42, i32 -7>, <i32\n    -1, i32 -1>` and `udiv <i32 42, i32 -7>, <i32 0, i32 1>` into\n    `zeroinitializer` and `poison`, respectively. One solution is to\n    introduce a new flag indicating that we are threading over a vector\n    select. But it requires to modify both `InstSimplify` and\n    `ConstantFold`.\n    \n    However, this optimization doesn't provide benefits to real-world\n    programs:\n    \n    https://dtcxzyw.github.io/llvm-opt-benchmark/coverage/data/zyw/opt-ci/actions-runner/_work/llvm-opt-benchmark/llvm-opt-benchmark/llvm/llvm-project/llvm/lib/IR/ConstantFold.cpp.html#L908\n    \n    https://dtcxzyw.github.io/llvm-opt-benchmark/coverage/data/zyw/opt-ci/actions-runner/_work/llvm-opt-benchmark/llvm-opt-benchmark/llvm/llvm-project/llvm/lib/Analysis/InstructionSimplify.cpp.html#L1107\n    \n    This patch moves the fold into InstCombine to avoid breaking numerous\n    existing tests.\n    \n    Fixes #114191 and #113866 (only poison-safety issue).\n\ndiff --git a/llvm/lib/Analysis/InstructionSimplify.cpp b/llvm/lib/Analysis/InstructionSimplify.cpp\nindex d08be1e55c85..2cb2612bf611 100644\n--- a/llvm/lib/Analysis/InstructionSimplify.cpp\n+++ b/llvm/lib/Analysis/InstructionSimplify.cpp\n@@ -1095,19 +1095,6 @@ static Value *simplifyDivRem(Instruction::BinaryOps Opcode, Value *Op0,\n   if (match(Op1, m_Zero()))\n     return PoisonValue::get(Ty);\n \n-  // If any element of a constant divisor fixed width vector is zero or undef\n-  // the behavior is undefined and we can fold the whole op to poison.\n-  auto *Op1C = dyn_cast<Constant>(Op1);\n-  auto *VTy = dyn_cast<FixedVectorType>(Ty);\n-  if (Op1C && VTy) {\n-    unsigned NumElts = VTy->getNumElements();\n-    for (unsigned i = 0; i != NumElts; ++i) {\n-      Constant *Elt = Op1C->getAggregateElement(i);\n-      if (Elt && (Elt->isNullValue() || Q.isUndefValue(Elt)))\n-        return PoisonValue::get(Ty);\n-    }\n-  }\n-\n   // poison / X -> poison\n   // poison % X -> poison\n   if (isa<PoisonValue>(Op0))\ndiff --git a/llvm/lib/IR/ConstantFold.cpp b/llvm/lib/IR/ConstantFold.cpp\nindex 07dfbc41e79b..c2780faee403 100644\n--- a/llvm/lib/IR/ConstantFold.cpp\n+++ b/llvm/lib/IR/ConstantFold.cpp\n@@ -902,11 +902,6 @@ Constant *llvm::ConstantFoldBinaryInstruction(unsigned Opcode, Constant *C1,\n         Constant *ExtractIdx = ConstantInt::get(Ty, i);\n         Constant *LHS = ConstantExpr::getExtractElement(C1, ExtractIdx);\n         Constant *RHS = ConstantExpr::getExtractElement(C2, ExtractIdx);\n-\n-        // If any element of a divisor vector is zero, the whole op is poison.\n-        if (Instruction::isIntDivRem(Opcode) && RHS->isNullValue())\n-          return PoisonValue::get(VTy);\n-\n         Constant *Res = ConstantExpr::isDesirableBinOp(Opcode)\n                             ? ConstantExpr::get(Opcode, LHS, RHS)\n                             : ConstantFoldBinaryInstruction(Opcode, LHS, RHS);\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 7a060cdab2d3..adbd9186c59c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -102,6 +102,7 @@ public:\n   Instruction *visitSRem(BinaryOperator &I);\n   Instruction *visitFRem(BinaryOperator &I);\n   bool simplifyDivRemOfSelectWithZeroOp(BinaryOperator &I);\n+  Instruction *commonIDivRemTransforms(BinaryOperator &I);\n   Instruction *commonIRemTransforms(BinaryOperator &I);\n   Instruction *commonIDivTransforms(BinaryOperator &I);\n   Instruction *visitUDiv(BinaryOperator &I);\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp b/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\nindex b9c165da906d..f85a3c936513 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\n@@ -1158,29 +1158,39 @@ static Value *foldIDivShl(BinaryOperator &I, InstCombiner::BuilderTy &Builder) {\n   return nullptr;\n }\n \n-/// This function implements the transforms common to both integer division\n-/// instructions (udiv and sdiv). It is called by the visitors to those integer\n-/// division instructions.\n-/// Common integer divide transforms\n-Instruction *InstCombinerImpl::commonIDivTransforms(BinaryOperator &I) {\n-  if (Instruction *Phi = foldBinopWithPhiOperands(I))\n-    return Phi;\n-\n+/// Common integer divide/remainder transforms\n+Instruction *InstCombinerImpl::commonIDivRemTransforms(BinaryOperator &I) {\n+  assert(I.isIntDivRem() && \"Unexpected instruction\");\n   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);\n-  bool IsSigned = I.getOpcode() == Instruction::SDiv;\n+\n+  // If any element of a constant divisor fixed width vector is zero or undef\n+  // the behavior is undefined and we can fold the whole op to poison.\n+  auto *Op1C = dyn_cast<Constant>(Op1);\n   Type *Ty = I.getType();\n+  auto *VTy = dyn_cast<FixedVectorType>(Ty);\n+  if (Op1C && VTy) {\n+    unsigned NumElts = VTy->getNumElements();\n+    for (unsigned i = 0; i != NumElts; ++i) {\n+      Constant *Elt = Op1C->getAggregateElement(i);\n+      if (Elt && (Elt->isNullValue() || isa<UndefValue>(Elt)))\n+        return replaceInstUsesWith(I, PoisonValue::get(Ty));\n+    }\n+  }\n+\n+  if (Instruction *Phi = foldBinopWithPhiOperands(I))\n+    return Phi;\n \n   // The RHS is known non-zero.\n   if (Value *V = simplifyValueKnownNonZero(I.getOperand(1), *this, I))\n     return replaceOperand(I, 1, V);\n \n-  // Handle cases involving: [su]div X, (select Cond, Y, Z)\n-  // This does not apply for fdiv.\n+  // Handle cases involving: div/rem X, (select Cond, Y, Z)\n   if (simplifyDivRemOfSelectWithZeroOp(I))\n     return &I;\n \n   // If the divisor is a select-of-constants, try to constant fold all div ops:\n-  // C / (select Cond, TrueC, FalseC) --> select Cond, (C / TrueC), (C / FalseC)\n+  // C div/rem (select Cond, TrueC, FalseC) --> select Cond, (C div/rem TrueC),\n+  // (C div/rem FalseC)\n   // TODO: Adapt simplifyDivRemOfSelectWithZeroOp to allow this and other folds.\n   if (match(Op0, m_ImmConstant()) &&\n       match(Op1, m_Select(m_Value(), m_ImmConstant(), m_ImmConstant()))) {\n@@ -1189,6 +1199,21 @@ Instruction *InstCombinerImpl::commonIDivTransforms(BinaryOperator &I) {\n       return R;\n   }\n \n+  return nullptr;\n+}\n+\n+/// This function implements the transforms common to both integer division\n+/// instructions (udiv and sdiv). It is called by the visitors to those integer\n+/// division instructions.\n+/// Common integer divide transforms\n+Instruction *InstCombinerImpl::commonIDivTransforms(BinaryOperator &I) {\n+  if (Instruction *Res = commonIDivRemTransforms(I))\n+    return Res;\n+\n+  Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);\n+  bool IsSigned = I.getOpcode() == Instruction::SDiv;\n+  Type *Ty = I.getType();\n+\n   const APInt *C2;\n   if (match(Op1, m_APInt(C2))) {\n     Value *X;\n@@ -2138,29 +2163,11 @@ static Instruction *simplifyIRemMulShl(BinaryOperator &I,\n /// remainder instructions.\n /// Common integer remainder transforms\n Instruction *InstCombinerImpl::commonIRemTransforms(BinaryOperator &I) {\n-  if (Instruction *Phi = foldBinopWithPhiOperands(I))\n-    return Phi;\n+  if (Instruction *Res = commonIDivRemTransforms(I))\n+    return Res;\n \n   Value *Op0 = I.getOperand(0), *Op1 = I.getOperand(1);\n \n-  // The RHS is known non-zero.\n-  if (Value *V = simplifyValueKnownNonZero(I.getOperand(1), *this, I))\n-    return replaceOperand(I, 1, V);\n-\n-  // Handle cases involving: rem X, (select Cond, Y, Z)\n-  if (simplifyDivRemOfSelectWithZeroOp(I))\n-    return &I;\n-\n-  // If the divisor is a select-of-constants, try to constant fold all rem ops:\n-  // C % (select Cond, TrueC, FalseC) --> select Cond, (C % TrueC), (C % FalseC)\n-  // TODO: Adapt simplifyDivRemOfSelectWithZeroOp to allow this and other folds.\n-  if (match(Op0, m_ImmConstant()) &&\n-      match(Op1, m_Select(m_Value(), m_ImmConstant(), m_ImmConstant()))) {\n-    if (Instruction *R = FoldOpIntoSelect(I, cast<SelectInst>(Op1),\n-                                          /*FoldWithMultiUse*/ true))\n-      return R;\n-  }\n-\n   if (isa<Constant>(Op1)) {\n     if (Instruction *Op0I = dyn_cast<Instruction>(Op0)) {\n       if (SelectInst *SI = dyn_cast<SelectInst>(Op0I)) {\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/vector-udiv.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "vec_select_udiv_poison",
+          "test_body": "define <2 x i32> @vec_select_udiv_poison(<2 x i1> %x) {\n; CHECK-LABEL: @vec_select_udiv_poison(\n; CHECK-NEXT:    [[DIV:%.*]] = select <2 x i1> [[X:%.*]], <2 x i32> zeroinitializer, <2 x i32> <i32 poison, i32 -7>\n; CHECK-NEXT:    ret <2 x i32> [[DIV]]\n  %sel = select <2 x i1> %x, <2 x i32> splat (i32 -1), <2 x i32> <i32 0, i32 1>\n  %div = udiv <2 x i32> <i32 42, i32 -7>, %sel\n  ret <2 x i32> %div\n}",
+          "source_program": "define <2 x i32> @vec_select_udiv_poison(<2 x i1> %x) {\n  %sel = select <2 x i1> %x, <2 x i32> splat (i32 -1), <2 x i32> <i32 0, i32 1>\n  %div = udiv <2 x i32> <i32 42, i32 -7>, %sel\n  ret <2 x i32> %div\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] miscompilation of `or` of vectors",
+    "body": "Alive2 report: https://alive2.llvm.org/ce/z/LyM8sY\r\n\r\n```llvm\r\n----------------------------------------\r\ndefine <2 x i32> @or_sext_to_sel_constant_vec.3(<2 x i1> %y) {\r\n#0:\r\n  %sext = sext <2 x i1> %y to <2 x i32>\r\n  %#1 = or <2 x i32> %sext, { 0, 1 }\r\n  %#2 = udiv <2 x i32> { 42, 4294967289 }, %#1\r\n  ret <2 x i32> %#2\r\n}\r\n=>\r\ndefine <2 x i32> @or_sext_to_sel_constant_vec.3(<2 x i1> %y) {\r\n#0:\r\n  ret <2 x i32> { 0, 0 }\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Value mismatch\r\n\r\nExample:\r\n<2 x i1> %y = < #x1 (1), #x0 (0) >\r\n\r\nSource:\r\n<2 x i32> %sext = < #xffffffff (4294967295, -1), #x00000000 (0) >\r\n<2 x i32> %#1 = < #xffffffff (4294967295, -1), #x00000001 (1) >\r\n<2 x i32> %#2 = < #x00000000 (0), #xfffffff9 (4294967289, -7) >\r\n\r\nTarget:\r\nSource value: < #x00000000 (0), #xfffffff9 (4294967289, -7) >\r\nTarget value: < #x00000000 (0), #x00000000 (0) >\r\n\r\n\r\n----------------------------------------\r\ndefine <2 x i32> @or_sext_to_sel_constant_vec.2(<2 x i1> %y) {\r\n#0:\r\n  %sext = sext <2 x i1> %y to <2 x i32>\r\n  %#1 = or <2 x i32> %sext, { 0, 1 }\r\n  %#2 = sdiv <2 x i32> { 42, 4294967289 }, %#1\r\n  %#3 = udiv exact <2 x i32> %#2, %#2\r\n  %#4 = or <2 x i32> %#2, %#2\r\n  ret <2 x i32> %#4\r\n}\r\n=>\r\ndefine <2 x i32> @or_sext_to_sel_constant_vec.2(<2 x i1> %y) {\r\n#0:\r\n  ret <2 x i32> { 4294967254, 7 }\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Value mismatch\r\n\r\nExample:\r\n<2 x i1> %y = < #x1 (1), #x0 (0) >\r\n\r\nSource:\r\n<2 x i32> %sext = < #xffffffff (4294967295, -1), #x00000000 (0) >\r\n<2 x i32> %#1 = < #xffffffff (4294967295, -1), #x00000001 (1) >\r\n<2 x i32> %#2 = < #xffffffd6 (4294967254, -42), #xfffffff9 (4294967289, -7) >\r\n<2 x i32> %#3 = < #x00000001 (1), #x00000001 (1) >\r\n<2 x i32> %#4 = < #xffffffd6 (4294967254, -42), #xfffffff9 (4294967289, -7) >\r\n\r\nTarget:\r\nSource value: < #xffffffd6 (4294967254, -42), #xfffffff9 (4294967289, -7) >\r\nTarget value: < #xffffffd6 (4294967254, -42), #x00000007 (7) >\r\n\r\nSummary:\r\n  0 correct transformations\r\n  2 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```",
+    "author": "bongjunj",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine",
+      "llvm:analysis"
+    ],
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "@bongjunj Feel free to ping me if you find new InstCombine miscompilation bugs without involving undef values/NaN payloads."
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "https://github.com/llvm/llvm-project/blob/eac2c182c6f852fc187af9952250a43d6fb17b28/llvm/lib/Analysis/InstructionSimplify.cpp#L1098-L1109\r\n\r\nWe cannot do this simplification when threading udiv over selects.\r\n "
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "verified": true
+}

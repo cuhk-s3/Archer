@@ -1,0 +1,235 @@
+{
+  "bug_id": "56293",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/56293",
+  "bug_type": "miscompilation",
+  "base_commit": "5ee910fef52448c141d0cd2507cee29432541cda",
+  "knowledge_cutoff": "2022-06-29T19:05:35Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "4447603616bb43af58af89a8a6f880853f546a39",
+    "components": [
+      "SimplifyLibCalls",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Transforms/Utils/SimplifyLibCalls.h": [
+        [
+          208,
+          214
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          4266,
+          4274
+        ]
+      ],
+      "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+        [
+          75,
+          113
+        ],
+        [
+          2531,
+          2557
+        ],
+        [
+          3390,
+          3396
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "llvm::getConstantDataArrayInfo",
+        "llvm::getConstantStringInfo"
+      ],
+      "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+        "LibCallSimplifier::optimizeAtoi",
+        "LibCallSimplifier::optimizeCall",
+        "LibCallSimplifier::optimizeStrtol",
+        "LibCallSimplifier::optimizeToAscii",
+        "callHasFP128Argument",
+        "convertStrToNumber",
+        "isOnlyUsedInComparisonWithZero"
+      ]
+    }
+  },
+  "patch": "commit 4447603616bb43af58af89a8a6f880853f546a39\nAuthor: Martin Sebor <msebor@redhat.com>\nDate:   Thu Jul 7 14:35:23 2022 -0600\n\n    [InstCombine] Fold strtoul and strtoull and avoid PR #56293\n    \n    Reviewed By: efriedma\n    \n    Differential Revision: https://reviews.llvm.org/D129224\n\ndiff --git a/llvm/include/llvm/Transforms/Utils/SimplifyLibCalls.h b/llvm/include/llvm/Transforms/Utils/SimplifyLibCalls.h\nindex 79a44b667445..1b2482a2363d 100644\n--- a/llvm/include/llvm/Transforms/Utils/SimplifyLibCalls.h\n+++ b/llvm/include/llvm/Transforms/Utils/SimplifyLibCalls.h\n@@ -208,7 +208,7 @@ private:\n   Value *optimizeIsAscii(CallInst *CI, IRBuilderBase &B);\n   Value *optimizeToAscii(CallInst *CI, IRBuilderBase &B);\n   Value *optimizeAtoi(CallInst *CI, IRBuilderBase &B);\n-  Value *optimizeStrtol(CallInst *CI, IRBuilderBase &B);\n+  Value *optimizeStrToInt(CallInst *CI, IRBuilderBase &B, bool AsSigned);\n \n   // Formatting and IO Library Call Optimizations\n   Value *optimizeErrorReporting(CallInst *CI, IRBuilderBase &B,\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 89450c6c764e..2dd671b4ab9e 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -4266,9 +4266,10 @@ bool llvm::getConstantDataArrayInfo(const Value *V,\n   return true;\n }\n \n-/// This function computes the length of a null-terminated C string pointed to\n-/// by V. If successful, it returns true and returns the string in Str.\n-/// If unsuccessful, it returns false.\n+/// Extract bytes from the initializer of the constant array V, which need\n+/// not be a nul-terminated string.  On success, store the bytes in Str and\n+/// return true.  When TrimAtNul is set, Str will contain only the bytes up\n+/// to but not including the first nul.  Return false on failure.\n bool llvm::getConstantStringInfo(const Value *V, StringRef &Str,\n                                  uint64_t Offset, bool TrimAtNul) {\n   ConstantDataArraySlice Slice;\ndiff --git a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\nindex bca3b0538c5d..03087d8370d5 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n@@ -75,39 +75,109 @@ static bool callHasFP128Argument(const CallInst *CI) {\n   });\n }\n \n-static Value *convertStrToNumber(CallInst *CI, StringRef &Str, Value *EndPtr,\n-                                 int64_t Base, IRBuilderBase &B) {\n+// Convert the entire string Str representing an integer in Base, up to\n+// the terminating nul if present, to a constant according to the rules\n+// of strtoul[l] or, when AsSigned is set, of strtol[l].  On success\n+// return the result, otherwise null.\n+// The function assumes the string is encoded in ASCII and carefully\n+// avoids converting sequences (including \"\") that the corresponding\n+// library call might fail and set errno for.\n+static Value *convertStrToInt(CallInst *CI, StringRef &Str, Value *EndPtr,\n+                              uint64_t Base, bool AsSigned, IRBuilderBase &B) {\n   if (Base < 2 || Base > 36)\n-    // handle special zero base\n     if (Base != 0)\n+      // Fail for an invalid base (required by POSIX).\n       return nullptr;\n \n-  char *End;\n-  std::string nptr = Str.str();\n-  errno = 0;\n-  long long int Result = strtoll(nptr.c_str(), &End, Base);\n-  if (errno)\n-    return nullptr;\n+  // Strip leading whitespace.\n+  for (unsigned i = 0; i != Str.size(); ++i)\n+    if (!isSpace((unsigned char)Str[i])) {\n+      Str = Str.substr(i);\n+      break;\n+    }\n \n-  // if we assume all possible target locales are ASCII supersets,\n-  // then if strtoll successfully parses a number on the host,\n-  // it will also successfully parse the same way on the target\n-  if (*End != '\\0')\n+  if (Str.empty())\n+    // Fail for empty subject sequences (POSIX allows but doesn't require\n+    // strtol[l]/strtoul[l] to fail with EINVAL).\n     return nullptr;\n \n-  if (!isIntN(CI->getType()->getPrimitiveSizeInBits(), Result))\n-    return nullptr;\n+  // Strip but remember the sign.\n+  bool Negate = Str[0] == '-';\n+  if (Str[0] == '-' || Str[0] == '+') {\n+    Str = Str.drop_front();\n+    if (Str.empty())\n+      // Fail for a sign with nothing after it.\n+      return nullptr;\n+  }\n+\n+  // Set Max to the absolute value of the minimum (for signed), or\n+  // to the maximum (for unsigned) value representable in the type.\n+  Type *RetTy = CI->getType();\n+  unsigned NBits = RetTy->getPrimitiveSizeInBits();\n+  uint64_t Max = AsSigned && Negate ? 1 : 0;\n+  Max += AsSigned ? maxIntN(NBits) : maxUIntN(NBits);\n+\n+  // Autodetect Base if it's zero and consume the \"0x\" prefix.\n+  if (Str.size() > 1) {\n+    if (Str[0] == '0') {\n+      if (toUpper((unsigned char)Str[1]) == 'X') {\n+        if (Str.size() == 2 || (Base && Base != 16))\n+          // Fail if Base doesn't allow the \"0x\" prefix or for the prefix\n+          // alone that implementations like BSD set errno to EINVAL for.\n+          return nullptr;\n+\n+        Str = Str.drop_front(2);\n+        Base = 16;\n+      }\n+      else if (Base == 0)\n+        Base = 8;\n+    } else if (Base == 0)\n+      Base = 10;\n+  }\n+  else if (Base == 0)\n+    Base = 10;\n+\n+  // Convert the rest of the subject sequence, not including the sign,\n+  // to its uint64_t representation (this assumes the source character\n+  // set is ASCII).\n+  uint64_t Result = 0;\n+  for (unsigned i = 0; i != Str.size(); ++i) {\n+    unsigned char DigVal = Str[i];\n+    if (isDigit(DigVal))\n+      DigVal = DigVal - '0';\n+    else {\n+      DigVal = toUpper(DigVal);\n+      if (isAlpha(DigVal))\n+        DigVal = DigVal - 'A' + 10;\n+      else\n+        return nullptr;\n+    }\n+\n+    if (DigVal >= Base)\n+      // Fail if the digit is not valid in the Base.\n+      return nullptr;\n+\n+    // Add the digit and fail if the result is not representable in\n+    // the (unsigned form of the) destination type.\n+    bool VFlow;\n+    Result = SaturatingMultiplyAdd(Result, Base, (uint64_t)DigVal, &VFlow);\n+    if (VFlow || Result > Max)\n+      return nullptr;\n+  }\n \n   if (EndPtr) {\n     // Store the pointer to the end.\n-    uint64_t ILen = End - nptr.c_str();\n-    Value *Off = B.getInt64(ILen);\n+    Value *Off = B.getInt64(Str.size());\n     Value *StrBeg = CI->getArgOperand(0);\n     Value *StrEnd = B.CreateInBoundsGEP(B.getInt8Ty(), StrBeg, Off, \"endptr\");\n     B.CreateStore(StrEnd, EndPtr);\n   }\n \n-  return ConstantInt::get(CI->getType(), Result);\n+  if (Negate)\n+    // Unsigned negation doesn't overflow.\n+    Result = -Result;\n+\n+  return ConstantInt::get(RetTy, Result);\n }\n \n static bool isOnlyUsedInComparisonWithZero(Value *V) {\n@@ -2531,27 +2601,35 @@ Value *LibCallSimplifier::optimizeToAscii(CallInst *CI, IRBuilderBase &B) {\n                      ConstantInt::get(CI->getType(), 0x7F));\n }\n \n+// Fold calls to atoi, atol, and atoll.\n Value *LibCallSimplifier::optimizeAtoi(CallInst *CI, IRBuilderBase &B) {\n+  CI->addParamAttr(0, Attribute::NoCapture);\n+\n   StringRef Str;\n   if (!getConstantStringInfo(CI->getArgOperand(0), Str))\n     return nullptr;\n \n-  return convertStrToNumber(CI, Str, nullptr, 10, B);\n+  return convertStrToInt(CI, Str, nullptr, 10, /*AsSigned=*/true, B);\n }\n \n-Value *LibCallSimplifier::optimizeStrtol(CallInst *CI, IRBuilderBase &B) {\n-  StringRef Str;\n-  if (!getConstantStringInfo(CI->getArgOperand(0), Str))\n-    return nullptr;\n-\n+// Fold calls to strtol, strtoll, strtoul, and strtoull.\n+Value *LibCallSimplifier::optimizeStrToInt(CallInst *CI, IRBuilderBase &B,\n+                                           bool AsSigned) {\n   Value *EndPtr = CI->getArgOperand(1);\n-  if (isa<ConstantPointerNull>(EndPtr))\n+  if (isa<ConstantPointerNull>(EndPtr)) {\n+    // With a null EndPtr, this function won't capture the main argument.\n+    // It would be readonly too, except that it still may write to errno.\n+    CI->addParamAttr(0, Attribute::NoCapture);\n     EndPtr = nullptr;\n-  else if (!isKnownNonZero(EndPtr, DL))\n+  } else if (!isKnownNonZero(EndPtr, DL))\n+    return nullptr;\n+\n+  StringRef Str;\n+  if (!getConstantStringInfo(CI->getArgOperand(0), Str))\n     return nullptr;\n \n   if (ConstantInt *CInt = dyn_cast<ConstantInt>(CI->getArgOperand(2))) {\n-    return convertStrToNumber(CI, Str, EndPtr, CInt->getSExtValue(), B);\n+    return convertStrToInt(CI, Str, EndPtr, CInt->getSExtValue(), AsSigned, B);\n   }\n \n   return nullptr;\n@@ -3390,7 +3468,10 @@ Value *LibCallSimplifier::optimizeCall(CallInst *CI, IRBuilderBase &Builder) {\n       return optimizeAtoi(CI, Builder);\n     case LibFunc_strtol:\n     case LibFunc_strtoll:\n-      return optimizeStrtol(CI, Builder);\n+      return optimizeStrToInt(CI, Builder, /*AsSigned=*/true);\n+    case LibFunc_strtoul:\n+    case LibFunc_strtoull:\n+      return optimizeStrToInt(CI, Builder, /*AsSigned=*/false);\n     case LibFunc_printf:\n       return optimizePrintF(CI, Builder);\n     case LibFunc_sprintf:\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/str-int-2.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "atoi_not_const_str",
+          "test_body": "declare i32 @atoi(ptr)\n\ndefine i32 @atoi_not_const_str(ptr %s) {",
+          "source_program": "declare i32 @atoi(ptr)\n\ndefine i32 @atoi_not_const_str(ptr %s) {\n  %call = call i32 @atoi(ptr %s)\n  ret i32 %call\n}\n"
+        },
+        {
+          "test_name": "strtol_not_const_str",
+          "test_body": "declare i64 @strtol(ptr, ptr, i32)\n\ndefine i64 @strtol_not_const_str(ptr %s) {",
+          "source_program": "declare i64 @strtol(ptr, ptr, i32)\n\ndefine i64 @strtol_not_const_str(ptr %s) {\n  %call = call i64 @strtol(ptr %s, ptr null, i32 10)\n  ret i64 %call\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/str-int-4.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "fold_strtol",
+          "test_body": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i0 = external constant [3 x i8]\n@i9 = external constant [3 x i8]\n@ia = external constant [3 x i8]\n@i19azAZ = external constant [7 x i8]\n@i32min = external constant [13 x i8]\n@mo32min = external constant [15 x i8]\n@mx32min = external constant [13 x i8]\n@i32max = external constant [12 x i8]\n@x32max = external constant [12 x i8]\n\ndeclare i32 @strtol(ptr, ptr, i32)\n\ndefine void @fold_strtol(ptr %ps) {",
+          "source_program": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i0 = external constant [3 x i8]\n@i9 = external constant [3 x i8]\n@ia = external constant [3 x i8]\n@i19azAZ = external constant [7 x i8]\n@i32min = external constant [13 x i8]\n@mo32min = external constant [15 x i8]\n@mx32min = external constant [13 x i8]\n@i32max = external constant [12 x i8]\n@x32max = external constant [12 x i8]\n\ndeclare i32 @strtol(ptr, ptr, i32)\n\ndefine void @fold_strtol(ptr %ps) {\n  %pwsm123 = getelementptr [11 x i8], ptr @ws_im123, i32 0, i32 0\n  %im123 = call i32 @strtol(ptr %pwsm123, ptr null, i32 10)\n  %ps0 = getelementptr i32, ptr %ps, i32 0\n  store i32 %im123, ptr %ps0, align 4\n  %pwsp234 = getelementptr [11 x i8], ptr @ws_ip234, i32 0, i32 0\n  %ip234 = call i32 @strtol(ptr %pwsp234, ptr null, i32 10)\n  %ps1 = getelementptr i32, ptr %ps, i32 1\n  store i32 %ip234, ptr %ps1, align 4\n  %psi0 = getelementptr [3 x i8], ptr @i0, i32 0, i32 0\n  %i0 = call i32 @strtol(ptr %psi0, ptr null, i32 0)\n  %ps2 = getelementptr i32, ptr %ps, i32 2\n  store i32 %i0, ptr %ps2, align 4\n  %psi9 = getelementptr [3 x i8], ptr @i9, i32 0, i32 0\n  %i9 = call i32 @strtol(ptr %psi9, ptr null, i32 0)\n  %ps3 = getelementptr i32, ptr %ps, i32 3\n  store i32 %i9, ptr %ps3, align 4\n  %psia = getelementptr [3 x i8], ptr @ia, i32 0, i32 0\n  %ia = call i32 @strtol(ptr %psia, ptr null, i32 16)\n  %ps4 = getelementptr i32, ptr %ps, i32 4\n  store i32 %ia, ptr %ps4, align 4\n  %psi19azAZ = getelementptr [7 x i8], ptr @i19azAZ, i32 0, i32 0\n  %i19azAZ = call i32 @strtol(ptr %psi19azAZ, ptr null, i32 36)\n  %ps5 = getelementptr i32, ptr %ps, i32 5\n  store i32 %i19azAZ, ptr %ps5, align 4\n  %psmin = getelementptr [13 x i8], ptr @i32min, i32 0, i32 0\n  %min = call i32 @strtol(ptr %psmin, ptr null, i32 10)\n  %ps6 = getelementptr i32, ptr %ps, i32 6\n  store i32 %min, ptr %ps6, align 4\n  %psmo32min = getelementptr [15 x i8], ptr @mo32min, i32 0, i32 0\n  %mo32min = call i32 @strtol(ptr %psmo32min, ptr null, i32 0)\n  %ps7 = getelementptr i32, ptr %ps, i32 7\n  store i32 %mo32min, ptr %ps7, align 4\n  %psmx32min = getelementptr [13 x i8], ptr @mx32min, i32 0, i32 0\n  %mx32min_0 = call i32 @strtol(ptr %psmx32min, ptr null, i32 0)\n  %ps8 = getelementptr i32, ptr %ps, i32 8\n  store i32 %mx32min_0, ptr %ps8, align 4\n  %mx32min_16 = call i32 @strtol(ptr %psmx32min, ptr null, i32 16)\n  %ps9 = getelementptr i32, ptr %ps, i32 9\n  store i32 %mx32min_16, ptr %ps9, align 4\n  %psmax = getelementptr [12 x i8], ptr @i32max, i32 0, i32 0\n  %max = call i32 @strtol(ptr %psmax, ptr null, i32 10)\n  %ps10 = getelementptr i32, ptr %ps, i32 10\n  store i32 %max, ptr %ps10, align 4\n  %psxmax = getelementptr [12 x i8], ptr @x32max, i32 0, i32 0\n  %xmax = call i32 @strtol(ptr %psxmax, ptr null, i32 0)\n  %ps11 = getelementptr i32, ptr %ps, i32 11\n  store i32 %xmax, ptr %ps11, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "call_strtol_trailing_space",
+          "test_body": "@i_1_2_3_ = external constant [9 x i8]\n\ndeclare i32 @strtol(ptr, ptr, i32)\n\ndefine void @call_strtol_trailing_space(ptr %ps) {",
+          "source_program": "@i_1_2_3_ = external constant [9 x i8]\n\ndeclare i32 @strtol(ptr, ptr, i32)\n\ndefine void @call_strtol_trailing_space(ptr %ps) {\n  %p1 = getelementptr [9 x i8], ptr @i_1_2_3_, i32 0, i32 0\n  %n1 = call i32 @strtol(ptr %p1, ptr null, i32 10)\n  %ps1 = getelementptr i32, ptr %ps, i32 1\n  store i32 %n1, ptr %ps1, align 4\n  %p2 = getelementptr [9 x i8], ptr @i_1_2_3_, i32 0, i32 2\n  %n2 = call i32 @strtol(ptr %p2, ptr null, i32 10)\n  %ps2 = getelementptr i32, ptr %ps, i32 2\n  store i32 %n2, ptr %ps2, align 4\n  %p3 = getelementptr [9 x i8], ptr @i_1_2_3_, i32 0, i32 4\n  %n3 = call i32 @strtol(ptr %p3, ptr null, i32 10)\n  %ps3 = getelementptr i32, ptr %ps, i32 3\n  store i32 %n3, ptr %ps3, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "call_strtoll",
+          "test_body": "@ws = external constant [7 x i8]\n@i64min_m1 = external constant [22 x i8]\n@i64max_p1 = external constant [21 x i8]\n\ndeclare i64 @strtoll(ptr, ptr, i32)\n\ndefine void @call_strtoll(ptr %ps) {",
+          "source_program": "@ws = external constant [7 x i8]\n@i64min_m1 = external constant [22 x i8]\n@i64max_p1 = external constant [21 x i8]\n\ndeclare i64 @strtoll(ptr, ptr, i32)\n\ndefine void @call_strtoll(ptr %ps) {\n  %psminm1 = getelementptr [22 x i8], ptr @i64min_m1, i32 0, i32 0\n  %minm1 = call i64 @strtoll(ptr %psminm1, ptr null, i32 10)\n  %ps0 = getelementptr i64, ptr %ps, i32 0\n  store i64 %minm1, ptr %ps0, align 4\n  %psmaxp1 = getelementptr [21 x i8], ptr @i64max_p1, i32 0, i32 0\n  %maxp1 = call i64 @strtoll(ptr %psmaxp1, ptr null, i32 10)\n  %ps1 = getelementptr i64, ptr %ps, i32 1\n  store i64 %maxp1, ptr %ps1, align 4\n  %psws = getelementptr [7 x i8], ptr @ws, i32 0, i32 0\n  %nws = call i64 @strtoll(ptr %psws, ptr null, i32 10)\n  %ps2 = getelementptr i64, ptr %ps, i32 2\n  store i64 %nws, ptr %ps2, align 4\n  %pswsp6 = getelementptr [7 x i8], ptr @ws, i32 0, i32 6\n  %nwsp6 = call i64 @strtoll(ptr %pswsp6, ptr null, i32 10)\n  %ps3 = getelementptr i64, ptr %ps, i32 3\n  store i64 %nwsp6, ptr %ps3, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "call_strtol",
+          "test_body": "@ws = external constant [7 x i8]\n@wsplus = external constant [3 x i8]\n@i0 = external constant [3 x i8]\n@i8 = external constant [3 x i8]\n@ia = external constant [3 x i8]\n@x0x = external constant [3 x i8]\n@wsplusws0 = external constant [5 x i8]\n@i19azAZ = external constant [7 x i8]\n@i32min_m1 = external constant [13 x i8]\n@o32min = external constant [15 x i8]\n@x32min = external constant [13 x i8]\n@i32max_p1 = external constant [12 x i8]\n\ndeclare i32 @strtol(ptr, ptr, i32)\n\ndefine void @call_strtol(ptr %ps) {",
+          "source_program": "@ws = external constant [7 x i8]\n@wsplus = external constant [3 x i8]\n@i0 = external constant [3 x i8]\n@i8 = external constant [3 x i8]\n@ia = external constant [3 x i8]\n@x0x = external constant [3 x i8]\n@wsplusws0 = external constant [5 x i8]\n@i19azAZ = external constant [7 x i8]\n@i32min_m1 = external constant [13 x i8]\n@o32min = external constant [15 x i8]\n@x32min = external constant [13 x i8]\n@i32max_p1 = external constant [12 x i8]\n\ndeclare i32 @strtol(ptr, ptr, i32)\n\ndefine void @call_strtol(ptr %ps) {\n  %psminm1 = getelementptr [13 x i8], ptr @i32min_m1, i32 0, i32 0\n  %minm1 = call i32 @strtol(ptr %psminm1, ptr null, i32 10)\n  %ps0 = getelementptr i32, ptr %ps, i32 0\n  store i32 %minm1, ptr %ps0, align 4\n  %psmaxp1 = getelementptr [12 x i8], ptr @i32max_p1, i32 0, i32 0\n  %maxp1 = call i32 @strtol(ptr %psmaxp1, ptr null, i32 10)\n  %ps1 = getelementptr i32, ptr %ps, i32 1\n  store i32 %maxp1, ptr %ps1, align 4\n  %psplus = getelementptr [3 x i8], ptr @wsplus, i32 0, i32 0\n  %iplus = call i32 @strtol(ptr %psplus, ptr null, i32 0)\n  %ps2 = getelementptr i32, ptr %ps, i32 2\n  store i32 %iplus, ptr %ps2, align 4\n  %psia = getelementptr [3 x i8], ptr @ia, i32 0, i32 0\n  %ia = call i32 @strtol(ptr %psia, ptr null, i32 0)\n  %ps3 = getelementptr i32, ptr %ps, i32 3\n  store i32 %ia, ptr %ps3, align 4\n  %psi8 = getelementptr [3 x i8], ptr @i8, i32 0, i32 0\n  %i8 = call i32 @strtol(ptr %psi8, ptr null, i32 8)\n  %ps4 = getelementptr i32, ptr %ps, i32 4\n  store i32 %i8, ptr %ps4, align 4\n  %psx0x = getelementptr [3 x i8], ptr @x0x, i32 0, i32 0\n  %i0x = call i32 @strtol(ptr %psx0x, ptr null, i32 0)\n  %ps5 = getelementptr i32, ptr %ps, i32 5\n  store i32 %i0x, ptr %ps5, align 4\n  %pwspws0 = getelementptr [5 x i8], ptr @wsplusws0, i32 0, i32 0\n  %iwspws0 = call i32 @strtol(ptr %pwspws0, ptr null, i32 0)\n  %ps6 = getelementptr i32, ptr %ps, i32 6\n  store i32 %iwspws0, ptr %ps6, align 4\n  %psi19azAZ = getelementptr [7 x i8], ptr @i19azAZ, i32 0, i32 0\n  %i19azAZ = call i32 @strtol(ptr %psi19azAZ, ptr null, i32 35)\n  %ps7 = getelementptr i32, ptr %ps, i32 7\n  store i32 %i19azAZ, ptr %ps7, align 4\n  %pso32min = getelementptr [15 x i8], ptr @o32min, i32 0, i32 0\n  %o32min = call i32 @strtol(ptr %pso32min, ptr null, i32 0)\n  %ps8 = getelementptr i32, ptr %ps, i32 8\n  store i32 %o32min, ptr %ps8, align 4\n  %psx32min = getelementptr [13 x i8], ptr @x32min, i32 0, i32 0\n  %x32min = call i32 @strtol(ptr %psx32min, ptr null, i32 0)\n  %ps9 = getelementptr i32, ptr %ps, i32 9\n  store i32 %x32min, ptr %ps9, align 4\n  %x32min_10 = call i32 @strtol(ptr %psx32min, ptr null, i32 10)\n  %ps10 = getelementptr i32, ptr %ps, i32 10\n  store i32 %x32min_10, ptr %ps10, align 4\n  %psws = getelementptr [7 x i8], ptr @ws, i32 0, i32 0\n  %nws = call i32 @strtol(ptr %psws, ptr null, i32 10)\n  %ps11 = getelementptr i32, ptr %ps, i32 11\n  store i32 %nws, ptr %ps11, align 4\n  %pswsp6 = getelementptr [7 x i8], ptr @ws, i32 0, i32 6\n  %nwsp6 = call i32 @strtol(ptr %pswsp6, ptr null, i32 10)\n  %ps12 = getelementptr i32, ptr %ps, i32 12\n  store i32 %nwsp6, ptr %ps12, align 4\n  %psi0 = getelementptr [3 x i8], ptr @i0, i32 0, i32 0\n  %i0b1 = call i32 @strtol(ptr %psi0, ptr null, i32 1)\n  %ps13 = getelementptr i32, ptr %ps, i32 13\n  store i32 %i0b1, ptr %ps13, align 4\n  %i0b256 = call i32 @strtol(ptr %psi0, ptr null, i32 256)\n  %ps14 = getelementptr i32, ptr %ps, i32 14\n  store i32 %i0b256, ptr %ps14, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_strtoll",
+          "test_body": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i64min = external constant [22 x i8]\n@i64max = external constant [21 x i8]\n\ndeclare i64 @strtoll(ptr, ptr, i32)\n\ndefine void @fold_strtoll(ptr %ps) {",
+          "source_program": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i64min = external constant [22 x i8]\n@i64max = external constant [21 x i8]\n\ndeclare i64 @strtoll(ptr, ptr, i32)\n\ndefine void @fold_strtoll(ptr %ps) {\n  %pwsm123 = getelementptr [11 x i8], ptr @ws_im123, i32 0, i32 0\n  %im123 = call i64 @strtoll(ptr %pwsm123, ptr null, i32 10)\n  %ps0 = getelementptr i64, ptr %ps, i32 0\n  store i64 %im123, ptr %ps0, align 4\n  %pwsp234 = getelementptr [11 x i8], ptr @ws_ip234, i32 0, i32 0\n  %ip234 = call i64 @strtoll(ptr %pwsp234, ptr null, i32 10)\n  %ps1 = getelementptr i64, ptr %ps, i32 1\n  store i64 %ip234, ptr %ps1, align 4\n  %psmin = getelementptr [22 x i8], ptr @i64min, i32 0, i32 0\n  %min = call i64 @strtoll(ptr %psmin, ptr null, i32 10)\n  %ps2 = getelementptr i64, ptr %ps, i32 2\n  store i64 %min, ptr %ps2, align 4\n  %psmax = getelementptr [21 x i8], ptr @i64max, i32 0, i32 0\n  %max = call i64 @strtoll(ptr %psmax, ptr null, i32 10)\n  %ps3 = getelementptr i64, ptr %ps, i32 3\n  store i64 %max, ptr %ps3, align 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/str-int-5.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "call_strtoul",
+          "test_body": "@ws = external constant [7 x i8]\n@ui32max_p1 = external constant [12 x i8]\n@i64min_m1 = external constant [22 x i8]\n\ndeclare i32 @strtoul(ptr, ptr, i32)\n\ndefine void @call_strtoul(ptr %ps) {",
+          "source_program": "@ws = external constant [7 x i8]\n@ui32max_p1 = external constant [12 x i8]\n@i64min_m1 = external constant [22 x i8]\n\ndeclare i32 @strtoul(ptr, ptr, i32)\n\ndefine void @call_strtoul(ptr %ps) {\n  %psminm1 = getelementptr [22 x i8], ptr @i64min_m1, i32 0, i32 0\n  %minm1 = call i32 @strtoul(ptr %psminm1, ptr null, i32 10)\n  %ps0 = getelementptr i32, ptr %ps, i32 0\n  store i32 %minm1, ptr %ps0, align 4\n  %psui32maxp1 = getelementptr [12 x i8], ptr @ui32max_p1, i32 0, i32 0\n  %maxp1 = call i32 @strtoul(ptr %psui32maxp1, ptr null, i32 10)\n  %ps1 = getelementptr i32, ptr %ps, i32 1\n  store i32 %maxp1, ptr %ps1, align 4\n  %psws = getelementptr [7 x i8], ptr @ws, i32 0, i32 0\n  %nws = call i32 @strtoul(ptr %psws, ptr null, i32 10)\n  %ps2 = getelementptr i32, ptr %ps, i32 2\n  store i32 %nws, ptr %ps2, align 4\n  %pswsp6 = getelementptr [7 x i8], ptr @ws, i32 0, i32 6\n  %nwsp6 = call i32 @strtoul(ptr %pswsp6, ptr null, i32 10)\n  %ps3 = getelementptr i32, ptr %ps, i32 3\n  store i32 %nwsp6, ptr %ps3, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_strtoull",
+          "test_body": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i32min = external constant [13 x i8]\n@o32min = external constant [15 x i8]\n@x32min = external constant [13 x i8]\n@i64min = external constant [22 x i8]\n@i64min_m1 = external constant [22 x i8]\n@i64max = external constant [21 x i8]\n@i64max_p1 = external constant [21 x i8]\n@ui64max = external constant [22 x i8]\n@x64max = external constant [20 x i8]\n\ndeclare i64 @strtoull(ptr, ptr, i32)\n\ndefine void @fold_strtoull(ptr %ps) {",
+          "source_program": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i32min = external constant [13 x i8]\n@o32min = external constant [15 x i8]\n@x32min = external constant [13 x i8]\n@i64min = external constant [22 x i8]\n@i64min_m1 = external constant [22 x i8]\n@i64max = external constant [21 x i8]\n@i64max_p1 = external constant [21 x i8]\n@ui64max = external constant [22 x i8]\n@x64max = external constant [20 x i8]\n\ndeclare i64 @strtoull(ptr, ptr, i32)\n\ndefine void @fold_strtoull(ptr %ps) {\n  %pwsm123 = getelementptr [11 x i8], ptr @ws_im123, i32 0, i32 0\n  %im123 = call i64 @strtoull(ptr %pwsm123, ptr null, i32 10)\n  %ps0 = getelementptr i64, ptr %ps, i32 0\n  store i64 %im123, ptr %ps0, align 4\n  %pwsp234 = getelementptr [11 x i8], ptr @ws_ip234, i32 0, i32 0\n  %ip234 = call i64 @strtoull(ptr %pwsp234, ptr null, i32 10)\n  %ps1 = getelementptr i64, ptr %ps, i32 1\n  store i64 %ip234, ptr %ps1, align 4\n  %psi64minm1 = getelementptr [22 x i8], ptr @i64min_m1, i32 0, i32 0\n  %i64min32m1 = call i64 @strtoull(ptr %psi64minm1, ptr null, i32 10)\n  %ps2 = getelementptr i64, ptr %ps, i32 2\n  store i64 %i64min32m1, ptr %ps2, align 4\n  %psi32min = getelementptr [13 x i8], ptr @i32min, i32 0, i32 0\n  %i32min = call i64 @strtoull(ptr %psi32min, ptr null, i32 10)\n  %ps3 = getelementptr i64, ptr %ps, i32 3\n  store i64 %i32min, ptr %ps3, align 4\n  %pso32min = getelementptr [15 x i8], ptr @o32min, i32 0, i32 0\n  %o32min = call i64 @strtoull(ptr %pso32min, ptr null, i32 0)\n  %ps4 = getelementptr i64, ptr %ps, i32 4\n  store i64 %o32min, ptr %ps4, align 4\n  %psx32min = getelementptr [13 x i8], ptr @x32min, i32 0, i32 0\n  %x32min = call i64 @strtoull(ptr %psx32min, ptr null, i32 0)\n  %ps5 = getelementptr i64, ptr %ps, i32 5\n  store i64 %x32min, ptr %ps5, align 4\n  %psi64min = getelementptr [22 x i8], ptr @i64min, i32 0, i32 0\n  %i64min = call i64 @strtoull(ptr %psi64min, ptr null, i32 10)\n  %ps6 = getelementptr i64, ptr %ps, i32 6\n  store i64 %i64min, ptr %ps6, align 4\n  %psi64max = getelementptr [21 x i8], ptr @i64max, i32 0, i32 0\n  %i64max = call i64 @strtoull(ptr %psi64max, ptr null, i32 10)\n  %ps7 = getelementptr i64, ptr %ps, i32 7\n  store i64 %i64max, ptr %ps7, align 4\n  %psmax32p1 = getelementptr [21 x i8], ptr @i64max_p1, i32 0, i32 0\n  %i64max32p1 = call i64 @strtoull(ptr %psmax32p1, ptr null, i32 10)\n  %ps8 = getelementptr i64, ptr %ps, i32 8\n  store i64 %i64max32p1, ptr %ps8, align 4\n  %psmax = getelementptr [22 x i8], ptr @ui64max, i32 0, i32 0\n  %ui64max = call i64 @strtoull(ptr %psmax, ptr null, i32 10)\n  %ps9 = getelementptr i64, ptr %ps, i32 9\n  store i64 %ui64max, ptr %ps9, align 4\n  %psxmax = getelementptr [20 x i8], ptr @x64max, i32 0, i32 0\n  %x64max = call i64 @strtoull(ptr %psxmax, ptr null, i32 0)\n  %ps10 = getelementptr i64, ptr %ps, i32 10\n  store i64 %x64max, ptr %ps10, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "call_strtoull",
+          "test_body": "@ws = external constant [7 x i8]\n@ui64max_p1 = external constant [22 x i8]\n\ndeclare i64 @strtoull(ptr, ptr, i32)\n\ndefine void @call_strtoull(ptr %ps) {",
+          "source_program": "@ws = external constant [7 x i8]\n@ui64max_p1 = external constant [22 x i8]\n\ndeclare i64 @strtoull(ptr, ptr, i32)\n\ndefine void @call_strtoull(ptr %ps) {\n  %psui64maxp1 = getelementptr [22 x i8], ptr @ui64max_p1, i32 0, i32 0\n  %maxp1 = call i64 @strtoull(ptr %psui64maxp1, ptr null, i32 10)\n  %ps1 = getelementptr i64, ptr %ps, i32 1\n  store i64 %maxp1, ptr %ps1, align 4\n  %psws = getelementptr [7 x i8], ptr @ws, i32 0, i32 0\n  %nws = call i64 @strtoull(ptr %psws, ptr null, i32 10)\n  %ps2 = getelementptr i64, ptr %ps, i32 2\n  store i64 %nws, ptr %ps2, align 4\n  %pswsp6 = getelementptr [7 x i8], ptr @ws, i32 0, i32 6\n  %nwsp6 = call i64 @strtoull(ptr %pswsp6, ptr null, i32 10)\n  %ps3 = getelementptr i64, ptr %ps, i32 3\n  store i64 %nwsp6, ptr %ps3, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_strtoul",
+          "test_body": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i32min = external constant [13 x i8]\n@i32min_m1 = external constant [13 x i8]\n@o32min = external constant [15 x i8]\n@mo32min = external constant [15 x i8]\n@x32min = external constant [13 x i8]\n@mx32min = external constant [13 x i8]\n@i32max = external constant [12 x i8]\n@i32max_p1 = external constant [12 x i8]\n@mX01 = external constant [6 x i8]\n@ui32max = external constant [12 x i8]\n\ndeclare i32 @strtoul(ptr, ptr, i32)\n\ndefine void @fold_strtoul(ptr %ps) {",
+          "source_program": "@ws_im123 = external constant [11 x i8]\n@ws_ip234 = external constant [11 x i8]\n@i32min = external constant [13 x i8]\n@i32min_m1 = external constant [13 x i8]\n@o32min = external constant [15 x i8]\n@mo32min = external constant [15 x i8]\n@x32min = external constant [13 x i8]\n@mx32min = external constant [13 x i8]\n@i32max = external constant [12 x i8]\n@i32max_p1 = external constant [12 x i8]\n@mX01 = external constant [6 x i8]\n@ui32max = external constant [12 x i8]\n\ndeclare i32 @strtoul(ptr, ptr, i32)\n\ndefine void @fold_strtoul(ptr %ps) {\n  %pwsm123 = getelementptr [11 x i8], ptr @ws_im123, i32 0, i32 0\n  %im123 = call i32 @strtoul(ptr %pwsm123, ptr null, i32 10)\n  %ps0 = getelementptr i32, ptr %ps, i32 0\n  store i32 %im123, ptr %ps0, align 4\n  %pwsp234 = getelementptr [11 x i8], ptr @ws_ip234, i32 0, i32 0\n  %ip234 = call i32 @strtoul(ptr %pwsp234, ptr null, i32 10)\n  %ps1 = getelementptr i32, ptr %ps, i32 1\n  store i32 %ip234, ptr %ps1, align 4\n  %psi32minm1 = getelementptr [13 x i8], ptr @i32min_m1, i32 0, i32 0\n  %i32min32m1 = call i32 @strtoul(ptr %psi32minm1, ptr null, i32 10)\n  %ps2 = getelementptr i32, ptr %ps, i32 2\n  store i32 %i32min32m1, ptr %ps2, align 4\n  %psi32min = getelementptr [13 x i8], ptr @i32min, i32 0, i32 0\n  %i32min = call i32 @strtoul(ptr %psi32min, ptr null, i32 10)\n  %ps3 = getelementptr i32, ptr %ps, i32 3\n  store i32 %i32min, ptr %ps3, align 4\n  %pso32min = getelementptr [15 x i8], ptr @o32min, i32 0, i32 0\n  %o32min = call i32 @strtoul(ptr %pso32min, ptr null, i32 0)\n  %ps4 = getelementptr i32, ptr %ps, i32 4\n  store i32 %o32min, ptr %ps4, align 4\n  %psmo32min = getelementptr [15 x i8], ptr @mo32min, i32 0, i32 0\n  %mo32min = call i32 @strtoul(ptr %psmo32min, ptr null, i32 0)\n  %ps5 = getelementptr i32, ptr %ps, i32 5\n  store i32 %mo32min, ptr %ps5, align 4\n  %psx32min = getelementptr [13 x i8], ptr @x32min, i32 0, i32 0\n  %x32min = call i32 @strtoul(ptr %psx32min, ptr null, i32 0)\n  %ps6 = getelementptr i32, ptr %ps, i32 6\n  store i32 %x32min, ptr %ps6, align 4\n  %psmx32min = getelementptr [13 x i8], ptr @mx32min, i32 0, i32 0\n  %mx32min = call i32 @strtoul(ptr %psmx32min, ptr null, i32 0)\n  %ps7 = getelementptr i32, ptr %ps, i32 7\n  store i32 %x32min, ptr %ps7, align 4\n  %psi32max = getelementptr [12 x i8], ptr @i32max, i32 0, i32 0\n  %i32max = call i32 @strtoul(ptr %psi32max, ptr null, i32 10)\n  %ps8 = getelementptr i32, ptr %ps, i32 8\n  store i32 %i32max, ptr %ps8, align 4\n  %psmX01 = getelementptr [6 x i8], ptr @mX01, i32 0, i32 0\n  %mX01 = call i32 @strtoul(ptr %psmX01, ptr null, i32 0)\n  %ps9 = getelementptr i32, ptr %ps, i32 9\n  store i32 %mX01, ptr %ps9, align 4\n  %psmax32p1 = getelementptr [12 x i8], ptr @i32max_p1, i32 0, i32 0\n  %i32max32p1 = call i32 @strtoul(ptr %psmax32p1, ptr null, i32 10)\n  %ps10 = getelementptr i32, ptr %ps, i32 10\n  store i32 %i32max32p1, ptr %ps10, align 4\n  %psmax = getelementptr [12 x i8], ptr @ui32max, i32 0, i32 0\n  %ui32max = call i32 @strtoul(ptr %psmax, ptr null, i32 10)\n  %ps11 = getelementptr i32, ptr %ps, i32 11\n  store i32 %ui32max, ptr %ps11, align 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/str-int.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "atoll_test",
+          "test_body": "@.str.5 = external hidden unnamed_addr constant [11 x i8], align 1\n\ndeclare i32 @atoll(ptr)\n\ndefine i32 @atoll_test() {",
+          "source_program": "@.str.5 = external hidden unnamed_addr constant [11 x i8], align 1\n\ndeclare i32 @atoll(ptr)\n\ndefine i32 @atoll_test() {\n  %call = call i32 @atoll(ptr @.str.5)\n  ret i32 %call\n}\n"
+        },
+        {
+          "test_name": "atol_test",
+          "test_body": "@.str.6 = external hidden unnamed_addr constant [10 x i8], align 1\n\ndeclare i32 @atol(ptr)\n\ndefine i32 @atol_test() {",
+          "source_program": "@.str.6 = external hidden unnamed_addr constant [10 x i8], align 1\n\ndeclare i32 @atol(ptr)\n\ndefine i32 @atol_test() {\n  %call = call i32 @atol(ptr @.str.6)\n  ret i32 %call\n}\n"
+        },
+        {
+          "test_name": "atoi_not_const_str",
+          "test_body": "declare i32 @atoi(ptr)\n\ndefine i32 @atoi_not_const_str(ptr %s) {",
+          "source_program": "declare i32 @atoi(ptr)\n\ndefine i32 @atoi_not_const_str(ptr %s) {\n  %call = call i32 @atoi(ptr %s)\n  ret i32 %call\n}\n"
+        },
+        {
+          "test_name": "strtol_not_const_str",
+          "test_body": "declare i32 @strtol(ptr, ptr, i32)\n\ndefine i32 @strtol_not_const_str(ptr %s) {",
+          "source_program": "declare i32 @strtol(ptr, ptr, i32)\n\ndefine i32 @strtol_not_const_str(ptr %s) {\n  %call = call i32 @strtol(ptr %s, ptr null, i32 10)\n  ret i32 %call\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/strcall-no-nul.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "fold_atol_strtol_past_end",
+          "test_body": "@a5 = external constant [5 x i8]\n\ndeclare i64 @atol(ptr)\n\ndeclare i64 @atoll(ptr)\n\ndeclare i64 @strtol(ptr, ptr, i32)\n\ndeclare i64 @strtoll(ptr, ptr, i32)\n\ndeclare i64 @strtoul(ptr, ptr, i32)\n\ndefine void @fold_atol_strtol_past_end(ptr %ps) {",
+          "source_program": "@a5 = external constant [5 x i8]\n\ndeclare i64 @atol(ptr)\n\ndeclare i64 @atoll(ptr)\n\ndeclare i64 @strtol(ptr, ptr, i32)\n\ndeclare i64 @strtoll(ptr, ptr, i32)\n\ndeclare i64 @strtoul(ptr, ptr, i32)\n\ndefine void @fold_atol_strtol_past_end(ptr %ps) {\n  %pa5 = getelementptr [5 x i8], ptr @a5, i32 0, i32 5\n  %i0 = call i64 @atol(ptr %pa5)\n  %p0 = getelementptr i64, ptr %ps, i32 0\n  store i64 %i0, ptr %p0, align 4\n  %i1 = call i64 @atoll(ptr %pa5)\n  %p1 = getelementptr i64, ptr %ps, i32 1\n  store i64 %i1, ptr %p1, align 4\n  %i2 = call i64 @strtol(ptr %pa5, ptr null, i32 0)\n  %p2 = getelementptr i64, ptr %ps, i32 2\n  store i64 %i2, ptr %p2, align 4\n  %i3 = call i64 @strtoul(ptr %pa5, ptr null, i32 8)\n  %p3 = getelementptr i64, ptr %ps, i32 3\n  store i64 %i3, ptr %p3, align 4\n  %i4 = call i64 @strtoll(ptr %pa5, ptr null, i32 10)\n  %p4 = getelementptr i64, ptr %ps, i32 4\n  store i64 %i4, ptr %p4, align 4\n  %i5 = call i64 @strtoul(ptr %pa5, ptr null, i32 16)\n  %p5 = getelementptr i64, ptr %ps, i32 5\n  store i64 %i5, ptr %p5, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_strcspn_past_end",
+          "test_body": "@a5 = external constant [5 x i8]\n\ndeclare i64 @strcspn(ptr, ptr)\n\ndefine void @fold_strcspn_past_end(ptr %poff) {",
+          "source_program": "@a5 = external constant [5 x i8]\n\ndeclare i64 @strcspn(ptr, ptr)\n\ndefine void @fold_strcspn_past_end(ptr %poff) {\n  %p0 = getelementptr [5 x i8], ptr @a5, i32 0, i32 0\n  %p5 = getelementptr [5 x i8], ptr @a5, i32 0, i32 5\n  %o05 = call i64 @strcspn(ptr %p0, ptr %p5)\n  %po05 = getelementptr i64, ptr %poff, i32 0\n  store i64 %o05, ptr %po05, align 4\n  %o50 = call i64 @strcspn(ptr %p5, ptr %p0)\n  %po50 = getelementptr i64, ptr %poff, i32 1\n  store i64 %o50, ptr %po50, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_atoi_past_end",
+          "test_body": "@a5 = external constant [5 x i8]\n\ndeclare i32 @atoi(ptr)\n\ndefine i32 @fold_atoi_past_end() {\n; CHECK-LABEL: @fold_atoi_past_end(\n; CHECK-NEXT:    [[I:%.*]] = call i32 @atoi(i8* nocapture getelementptr inbounds ([5 x i8], [5 x i8]* @a5, i64 1, i64 0))\n; CHECK-NEXT:    ret i32 [[I]]\n  %p5 = getelementptr [5 x i8], ptr @a5, i32 0, i32 5\n  %i = call i32 @atoi(ptr %p5)\n  ret i32 %i\n}",
+          "source_program": "@a5 = external constant [5 x i8]\n\ndeclare i32 @atoi(ptr)\n\ndefine i32 @fold_atoi_past_end() {\n  %p5 = getelementptr [5 x i8], ptr @a5, i32 0, i32 5\n  %i = call i32 @atoi(ptr %p5)\n  ret i32 %i\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "difference due to atoi folding on Darwin",
+    "body": "As discussed in [D128364](https://reviews.llvm.org/D128364#3618130), by relying on nonportable `strtol` behavior on the host, the `atoi` (and `strtol`) folders can introduce an observable difference between different targets or when cross-compiling.  The following test case passes successfully on Linux but will likely abort when cross-compiling for Darwin on Linux due to the first `atoi` call having been folded to zero (with no change to `errno`) while the second call having resulted in the Darwin implementation of the function setting `errno` to `EINVAL` as POSIX allows but doesn't require.  (I don't have access to Darwin to verify this is what happens but the test failures reported in [D128364](https://reviews.llvm.org/D128364#3618130) suggest this is the case.)\r\n```c\r\n#include <errno.h>\r\n#include <stdlib.h>\r\n\r\nchar s[] = \"\";\r\n\r\nint main(void)\r\n{\r\n  errno = 0;\r\n  int i0 = atoi(\"\");\r\n  int e0 = errno;\r\n\r\n  errno = 0;\r\n  int i1 = atoi(s);\r\n  int e1 = errno;\r\n\r\n  if (i0 != i1 || e0 != e1)\r\n    abort();\r\n}\r\n```",
+    "author": "msebor",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "comments": [
+      {
+        "author": "efriedma-quic",
+        "body": "Is the idea here just to change the following from convertStrToNumber:\r\n\r\n```\r\n  if (errno)\r\n    return nullptr;\r\n```\r\nto something like the following?\r\n```\r\n  if (errno || nptr.c_str() == End)\r\n    return nullptr;\r\n```\r\n\r\nThat seems reasonable.  (Alternatively, we could switch to using llvm::consumeSignedInteger.)"
+      },
+      {
+        "author": "msebor",
+        "body": "Yes, I think that should work."
+      },
+      {
+        "author": "msebor",
+        "body": "Fixed."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}

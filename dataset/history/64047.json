@@ -1,0 +1,81 @@
+{
+  "bug_id": "64047",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/64047",
+  "bug_type": "miscompilation",
+  "base_commit": "8149989532b9c03e51275e34dd64029ad6aa8f3f",
+  "knowledge_cutoff": "2023-07-23T14:36:46Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "ac65fb869977185b44757b94dc5130bd08c6f7e2",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          3617,
+          3626
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "InnerLoopVectorizer::fixCrossIterationPHIs"
+      ]
+    }
+  },
+  "patch": "commit ac65fb869977185b44757b94dc5130bd08c6f7e2\nAuthor: Igor Kirillov <igor.kirillov@arm.com>\nDate:   Thu Aug 10 15:38:27 2023 +0000\n\n    [LoopVectorize] Fix incorrect order of invariant stores when there are multiple reductions.\n    \n    When a loop has multiple reductions, each with an intermediate invariant\n    store, the order in which those reductions are processed is not considered.\n    This can result in the invariant stores outside the loop not preserving the\n    original order.\n    This patch sorts VPReductionPHIRecipes by the order in which they have\n    stores in the original loop before running\n    `InnerLoopVectorizer::fixReduction` function, and it helps to maintain\n    the correct order of stores.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/64047\n    \n    Differential Revision: https://reviews.llvm.org/D157631\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex c11ac8e56086..f60ea9b9fe2b 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -3617,10 +3617,44 @@ void InnerLoopVectorizer::fixCrossIterationPHIs(VPTransformState &State) {\n   // the incoming edges.\n   VPBasicBlock *Header =\n       State.Plan->getVectorLoopRegion()->getEntryBasicBlock();\n+\n+  // Gather all VPReductionPHIRecipe and sort them so that Intermediate stores\n+  // sank outside of the loop would keep the same order as they had in the\n+  // original loop.\n+  SmallVector<VPReductionPHIRecipe *> ReductionPHIList;\n   for (VPRecipeBase &R : Header->phis()) {\n     if (auto *ReductionPhi = dyn_cast<VPReductionPHIRecipe>(&R))\n-      fixReduction(ReductionPhi, State);\n-    else if (auto *FOR = dyn_cast<VPFirstOrderRecurrencePHIRecipe>(&R))\n+      ReductionPHIList.emplace_back(ReductionPhi);\n+  }\n+  stable_sort(ReductionPHIList, [this](const VPReductionPHIRecipe *R1,\n+                                       const VPReductionPHIRecipe *R2) {\n+    auto *IS1 = R1->getRecurrenceDescriptor().IntermediateStore;\n+    auto *IS2 = R2->getRecurrenceDescriptor().IntermediateStore;\n+\n+    // If neither of the recipes has an intermediate store, keep the order the\n+    // same.\n+    if (!IS1 && !IS2)\n+      return false;\n+\n+    // If only one of the recipes has an intermediate store, then move it\n+    // towards the beginning of the list.\n+    if (IS1 && !IS2)\n+      return true;\n+\n+    if (!IS1 && IS2)\n+      return false;\n+\n+    // If both recipes have an intermediate store, then the recipe with the\n+    // later store should be processed earlier. So it should go to the beginning\n+    // of the list.\n+    return DT->dominates(IS2, IS1);\n+  });\n+\n+  for (VPReductionPHIRecipe *ReductionPhi : ReductionPHIList)\n+    fixReduction(ReductionPhi, State);\n+\n+  for (VPRecipeBase &R : Header->phis()) {\n+    if (auto *FOR = dyn_cast<VPFirstOrderRecurrencePHIRecipe>(&R))\n       fixFixedOrderRecurrence(FOR, State);\n   }\n }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/reduction-with-invariant-store.ll",
+      "commands": [
+        [
+          "opt < %s -passes=\"loop-vectorize\" -force-vector-interleave=1 -force-vector-width=4 -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "reduc_add_mul_store_different_ptr",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @reduc_add_mul_store_different_ptr(ptr %dst1, ptr %dst2, ptr readonly %src) {\n; CHECK-LABEL: define void @reduc_add_mul_store_different_ptr\n; CHECK:       middle.block:\n; CHECK-NEXT:    [[TMP2:%.*]] = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> [[TMP1:%.*]])\n; CHECK-NEXT:    store i32 [[TMP2]], ptr %dst1, align 4\n; CHECK-NEXT:    [[TMP4:%.*]] = call i32 @llvm.vector.reduce.mul.v4i32(<4 x i32> [[TMP3:%.*]])\n; CHECK-NEXT:    store i32 [[TMP4]], ptr %dst2, align 4\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %sum = phi i32 [ 0, %entry ], [ %sum.next, %for.body ]\n  %mul = phi i32 [ 1, %entry ], [ %mul.next, %for.body ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %0 = load i32, ptr %gep.src, align 4\n  %sum.next = add nsw i32 %sum, %0\n  store i32 %sum.next, ptr %dst1, align 4\n  %mul.next = mul nsw i32 %mul, %0\n  store i32 %mul.next, ptr %dst2, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, 1000\n  br i1 %exitcond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @reduc_add_mul_store_different_ptr(ptr %dst1, ptr %dst2, ptr readonly %src) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %sum = phi i32 [ 0, %entry ], [ %sum.next, %for.body ]\n  %mul = phi i32 [ 1, %entry ], [ %mul.next, %for.body ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %0 = load i32, ptr %gep.src, align 4\n  %sum.next = add nsw i32 %sum, %0\n  store i32 %sum.next, ptr %dst1, align 4\n  %mul.next = mul nsw i32 %mul, %0\n  store i32 %mul.next, ptr %dst2, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, 1000\n  br i1 %exitcond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "reduc_add_mul_store_same_ptr",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @reduc_add_mul_store_same_ptr(ptr %dst, ptr readonly %src) {\n; CHECK-LABEL: define void @reduc_add_mul_store_same_ptr\n; CHECK:       middle.block:\n; CHECK-NEXT:    [[TMP2:%.*]] = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> [[TMP1:%.*]])\n; CHECK-NEXT:    store i32 [[TMP2]], ptr %dst, align 4\n; CHECK-NEXT:    [[TMP4:%.*]] = call i32 @llvm.vector.reduce.mul.v4i32(<4 x i32> [[TMP3:%.*]])\n; CHECK-NEXT:    store i32 [[TMP4]], ptr %dst, align 4\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %sum = phi i32 [ 0, %entry ], [ %sum.next, %for.body ]\n  %mul = phi i32 [ 1, %entry ], [ %mul.next, %for.body ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %0 = load i32, ptr %gep.src, align 4\n  %sum.next = add nsw i32 %sum, %0\n  store i32 %sum.next, ptr %dst, align 4\n  %mul.next = mul nsw i32 %mul, %0\n  store i32 %mul.next, ptr %dst, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, 1000\n  br i1 %exitcond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}",
+          "source_program": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @reduc_add_mul_store_same_ptr(ptr %dst, ptr readonly %src) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %sum = phi i32 [ 0, %entry ], [ %sum.next, %for.body ]\n  %mul = phi i32 [ 1, %entry ], [ %mul.next, %for.body ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %0 = load i32, ptr %gep.src, align 4\n  %sum.next = add nsw i32 %sum, %0\n  store i32 %sum.next, ptr %dst, align 4\n  %mul.next = mul nsw i32 %mul, %0\n  store i32 %mul.next, ptr %dst, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, 1000\n  br i1 %exitcond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Wrong code at -O2/3 on x86_64-linux_gnu (a latent regression since Clang-15)",
+    "body": "This looks like a long-standing issue since Clang-15. Clang at -O2/3 produces the wrong code. `opt-bisect-limit` suggests that the issue might be in `LoopVectorizePass`.\r\n\r\nCompiler explorer: https://godbolt.org/z/dssMcdz55\r\n\r\n```console\r\n% cat a.c\r\nint printf(const char *, ...);\r\nlong a, c;\r\nlong *b = &a;\r\nchar d;\r\nchar *const e = &d;\r\nint f, g, h;\r\nint main() {\r\n  long i[] = {1, 4, 4, 1, 4, 4};\r\n  for (; g >= -6; g--) {\r\n    f = 0;\r\n    for (; f <= 5; f++)\r\n      c = i[f] ^= *e > *b;\r\n    *e = 1;\r\n  }\r\n  for (; h < 1; h++)\r\n    printf(\"%d\\n\", (int)c);\r\n}\r\n%\r\n% clang-tk -O0 a.c && ./a.out\r\n4\r\n% clang-tk -O2 a.c && ./a.out\r\n1\r\n% clang-tk -O3 a.c && ./a.out\r\n1\r\n%\r\n% clang-tk -v\r\nclang version 17.0.0 (https://github.com/llvm/llvm-project.git a5bba98a58b7406f81629d3942e03b1eff1e2b33)\r\nTarget: x86_64-unknown-linux-gnu\r\nThread model: posix\r\nInstalledDir: /zdata/shaoli/compilers/ccbuilder-compilers\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/10\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/9\r\nSelected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11\r\nCandidate multilib: .;@m64\r\nSelected multilib: .;@m64\r\n%\r\n```\r\n",
+    "author": "shao-hua-li",
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "vectorizers"
+    ],
+    "comments": [
+      {
+        "author": "shao-hua-li",
+        "body": "Bisect to https://github.com/llvm/llvm-project/commit/4e5e042d9a4a842c6744d91ef1359403dee2edbb, which was commited by @igogo-x86 . "
+      },
+      {
+        "author": "igogo-x86",
+        "body": "@shao-hua-li, thank you! I'll look into it."
+      },
+      {
+        "author": "igogo-x86",
+        "body": "Pre-commit - https://reviews.llvm.org/D157630\r\nFix - https://reviews.llvm.org/D157631"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

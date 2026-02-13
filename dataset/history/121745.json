@@ -1,0 +1,93 @@
+{
+  "bug_id": "121745",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/121745",
+  "bug_type": "miscompilation",
+  "base_commit": "3874c64418d2a7e36eab9af9253d905b48b36078",
+  "knowledge_cutoff": "2025-01-06T10:26:21Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "f9369cc602272796c15de1065a782f812e791df3",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        [
+          562,
+          582
+        ],
+        [
+          1086,
+          1103
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        "VPlanTransforms::adjustFixedOrderRecurrences",
+        "VPlanTransforms::clearReductionWrapFlags",
+        "collectUsersRecursively",
+        "createScalarIVSteps",
+        "legalizeAndOptimizeInductions"
+      ]
+    }
+  },
+  "patch": "commit f9369cc602272796c15de1065a782f812e791df3\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Mon Jan 6 22:40:41 2025 +0000\n\n    [VPlan] Make sure last IV increment value is available if needed.\n    \n    Legalize extract-from-ends using uniform VPReplicateRecipe of wide\n    inductions to use regular VPReplicateRecipe, so the correct end value\n    is available.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/121745.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 395287bde76f..3e3f5adf73a0 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -562,21 +562,63 @@ createScalarIVSteps(VPlan &Plan, InductionDescriptor::InductionKind Kind,\n   return Builder.createScalarIVSteps(InductionOpcode, FPBinOp, BaseIV, Step);\n }\n \n+static SmallVector<VPUser *> collectUsersRecursively(VPValue *V) {\n+  SetVector<VPUser *> Users(V->user_begin(), V->user_end());\n+  for (unsigned I = 0; I != Users.size(); ++I) {\n+    VPRecipeBase *Cur = cast<VPRecipeBase>(Users[I]);\n+    if (isa<VPHeaderPHIRecipe>(Cur))\n+      continue;\n+    for (VPValue *V : Cur->definedValues())\n+      Users.insert(V->user_begin(), V->user_end());\n+  }\n+  return Users.takeVector();\n+}\n+\n /// Legalize VPWidenPointerInductionRecipe, by replacing it with a PtrAdd\n /// (IndStart, ScalarIVSteps (0, Step)) if only its scalar values are used, as\n /// VPWidenPointerInductionRecipe will generate vectors only. If some users\n /// require vectors while other require scalars, the scalar uses need to extract\n /// the scalars from the generated vectors (Note that this is different to how\n-/// int/fp inductions are handled). Also optimize VPWidenIntOrFpInductionRecipe,\n-/// if any of its users needs scalar values, by providing them scalar steps\n-/// built on the canonical scalar IV and update the original IV's users. This is\n-/// an optional optimization to reduce the needs of vector extracts.\n+/// int/fp inductions are handled). Legalize extract-from-ends using uniform\n+/// VPReplicateRecipe of wide inductions to use regular VPReplicateRecipe, so\n+/// the correct end value is available. Also optimize\n+/// VPWidenIntOrFpInductionRecipe, if any of its users needs scalar values, by\n+/// providing them scalar steps built on the canonical scalar IV and update the\n+/// original IV's users. This is an optional optimization to reduce the needs of\n+/// vector extracts.\n static void legalizeAndOptimizeInductions(VPlan &Plan) {\n+  using namespace llvm::VPlanPatternMatch;\n   SmallVector<VPRecipeBase *> ToRemove;\n   VPBasicBlock *HeaderVPBB = Plan.getVectorLoopRegion()->getEntryBasicBlock();\n   bool HasOnlyVectorVFs = !Plan.hasVF(ElementCount::getFixed(1));\n   VPBuilder Builder(HeaderVPBB, HeaderVPBB->getFirstNonPhi());\n   for (VPRecipeBase &Phi : HeaderVPBB->phis()) {\n+    auto *PhiR = dyn_cast<VPHeaderPHIRecipe>(&Phi);\n+    if (!PhiR)\n+      break;\n+\n+    // Check if any uniform VPReplicateRecipes using the phi recipe are used by\n+    // ExtractFromEnd. Those must be replaced by a regular VPReplicateRecipe to\n+    // ensure the final value is available.\n+    // TODO: Remove once uniformity analysis is done on VPlan.\n+    for (VPUser *U : collectUsersRecursively(PhiR)) {\n+      auto *ExitIRI = dyn_cast<VPIRInstruction>(U);\n+      VPValue *Op;\n+      if (!ExitIRI || !match(ExitIRI->getOperand(0),\n+                             m_VPInstruction<VPInstruction::ExtractFromEnd>(\n+                                 m_VPValue(Op), m_VPValue())))\n+        continue;\n+      auto *RepR = dyn_cast<VPReplicateRecipe>(Op);\n+      if (!RepR || !RepR->isUniform())\n+        continue;\n+      assert(!RepR->isPredicated() && \"RepR must not be predicated\");\n+      Instruction *I = RepR->getUnderlyingInstr();\n+      auto *Clone =\n+          new VPReplicateRecipe(I, RepR->operands(), /*IsUniform*/ false);\n+      Clone->insertAfter(RepR);\n+      RepR->replaceAllUsesWith(Clone);\n+    }\n+\n     // Replace wide pointer inductions which have only their scalars used by\n     // PtrAdd(IndStart, ScalarIVSteps (0, Step)).\n     if (auto *PtrIV = dyn_cast<VPWidenPointerInductionRecipe>(&Phi)) {\n@@ -1086,18 +1128,6 @@ bool VPlanTransforms::adjustFixedOrderRecurrences(VPlan &Plan,\n   return true;\n }\n \n-static SmallVector<VPUser *> collectUsersRecursively(VPValue *V) {\n-  SetVector<VPUser *> Users(V->user_begin(), V->user_end());\n-  for (unsigned I = 0; I != Users.size(); ++I) {\n-    VPRecipeBase *Cur = cast<VPRecipeBase>(Users[I]);\n-    if (isa<VPHeaderPHIRecipe>(Cur))\n-      continue;\n-    for (VPValue *V : Cur->definedValues())\n-      Users.insert(V->user_begin(), V->user_end());\n-  }\n-  return Users.takeVector();\n-}\n-\n void VPlanTransforms::clearReductionWrapFlags(VPlan &Plan) {\n   for (VPRecipeBase &R :\n        Plan.getVectorLoopRegion()->getEntryBasicBlock()->phis()) {\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/iv_outside_user.ll",
+      "commands": [
+        [
+          "opt -S -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=2 < %s",
+          "FileCheck --check-prefixes=CHECK,VEC,INTERLEAVE %s"
+        ],
+        [
+          "opt -S -passes=loop-vectorize -force-vector-interleave=2 -force-vector-width=1 < %s",
+          "FileCheck --check-prefixes=CHECK,VEC,INTERLEAVE %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_iv_uniform_with_outside_use_scev_simplification",
+          "test_body": "define i32 @test_iv_uniform_with_outside_use_scev_simplification(ptr %dst) {\n; VEC-LABEL: define i32 @test_iv_uniform_with_outside_use_scev_simplification(\n; VEC-SAME: ptr [[DST:%.*]]) {\n; VEC-NEXT:  [[ENTRY:.*]]:\n; VEC-NEXT:    [[STEP_1:%.*]] = sext i8 0 to i32\n; VEC-NEXT:    [[STEP_2:%.*]] = add nsw i32 [[STEP_1]], 1\n; VEC-NEXT:    br i1 false, label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n; VEC:       [[VECTOR_PH]]:\n; VEC-NEXT:    br label %[[VECTOR_BODY:.*]]\n; VEC:       [[VECTOR_BODY]]:\n; VEC-NEXT:    [[INDEX:%.*]] = phi i32 [ 0, %[[VECTOR_PH]] ], [ [[INDEX_NEXT:%.*]], %[[VECTOR_BODY]] ]\n; VEC-NEXT:    [[TMP0:%.*]] = add i32 [[INDEX]], 0\n; VEC-NEXT:    [[TMP6:%.*]] = add i32 [[INDEX]], 1\n; VEC-NEXT:    [[TMP1:%.*]] = getelementptr inbounds i16, ptr [[DST]], i32 [[TMP0]]\n; VEC-NEXT:    [[TMP2:%.*]] = getelementptr inbounds i16, ptr [[TMP1]], i32 0\n; VEC-NEXT:    store <2 x i16> zeroinitializer, ptr [[TMP2]], align 2\n; VEC-NEXT:    [[TMP4:%.*]] = add i32 [[STEP_2]], [[TMP0]]\n; VEC-NEXT:    [[TMP5:%.*]] = add i32 [[STEP_2]], [[TMP6]]\n; VEC-NEXT:    [[INDEX_NEXT]] = add nuw i32 [[INDEX]], 2\n; VEC-NEXT:    [[TMP3:%.*]] = icmp eq i32 [[INDEX_NEXT]], 8\n; VEC-NEXT:    br i1 [[TMP3]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], {{!llvm.loop ![0-9]+}}\n; VEC:       [[MIDDLE_BLOCK]]:\n; VEC-NEXT:    br i1 true, label %[[E_EXIT:.*]], label %[[SCALAR_PH]]\n; VEC:       [[SCALAR_PH]]:\n; VEC-NEXT:    [[BC_RESUME_VAL:%.*]] = phi i32 [ 8, %[[MIDDLE_BLOCK]] ], [ 0, %[[ENTRY]] ]\n; VEC-NEXT:    br label %[[LOOP:.*]]\n; VEC:       [[LOOP]]:\n; VEC-NEXT:    [[IV:%.*]] = phi i32 [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ], [ [[IV_NEXT:%.*]], %[[LOOP]] ]\n; VEC-NEXT:    [[GEP_DST:%.*]] = getelementptr inbounds i16, ptr [[DST]], i32 [[IV]]\n; VEC-NEXT:    store i16 0, ptr [[GEP_DST]], align 2\n; VEC-NEXT:    [[IV_NEXT]] = add i32 [[STEP_2]], [[IV]]\n; VEC-NEXT:    [[CMP_I:%.*]] = icmp slt i32 [[IV_NEXT]], 8\n; VEC-NEXT:    br i1 [[CMP_I]], label %[[LOOP]], label %[[E_EXIT]], {{!llvm.loop ![0-9]+}}\n; VEC:       [[E_EXIT]]:\n; VEC-NEXT:    [[RES:%.*]] = phi i32 [ [[IV_NEXT]], %[[LOOP]] ], [ [[TMP5]], %[[MIDDLE_BLOCK]] ]\n; VEC-NEXT:    ret i32 [[RES]]\nentry:\n  %step.1 = sext i8 0 to i32\n  %step.2 = add nsw i32 %step.1, 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.dst = getelementptr inbounds i16, ptr %dst, i32 %iv\n  store i16 0, ptr %gep.dst, align 2\n  %iv.next = add i32 %step.2, %iv\n  %cmp.i = icmp slt i32 %iv.next, 8\n  br i1 %cmp.i, label %loop, label %e.exit\n\ne.exit:                                           ; preds = %loop\n  %res = phi i32 [ %iv.next, %loop ]\n  ret i32 %res\n}",
+          "source_program": "define i32 @test_iv_uniform_with_outside_use_scev_simplification(ptr %dst) {\nentry:\n  %step.1 = sext i8 0 to i32\n  %step.2 = add nsw i32 %step.1, 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.dst = getelementptr inbounds i16, ptr %dst, i32 %iv\n  store i16 0, ptr %gep.dst, align 2\n  %iv.next = add i32 %step.2, %iv\n  %cmp.i = icmp slt i32 %iv.next, 8\n  br i1 %cmp.i, label %loop, label %e.exit\n\ne.exit:                                           ; preds = %loop\n  %res = phi i32 [ %iv.next, %loop ]\n  ret i32 %res\n}\n"
+        },
+        {
+          "test_name": "test_iv_uniform_with_outside_use_scev_simplification_2",
+          "test_body": "define i32 @test_iv_uniform_with_outside_use_scev_simplification_2(ptr %dst) {\n; VEC-LABEL: define i32 @test_iv_uniform_with_outside_use_scev_simplification_2(\n; VEC-SAME: ptr [[DST:%.*]]) {\n; VEC-NEXT:  [[ENTRY:.*]]:\n; VEC-NEXT:    [[STEP_1:%.*]] = sext i8 0 to i32\n; VEC-NEXT:    [[STEP_2:%.*]] = add nsw i32 [[STEP_1]], 1\n; VEC-NEXT:    br i1 false, label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n; VEC:       [[VECTOR_PH]]:\n; VEC-NEXT:    [[BROADCAST_SPLATINSERT:%.*]] = insertelement <2 x i32> poison, i32 [[STEP_2]], i64 0\n; VEC-NEXT:    [[BROADCAST_SPLAT:%.*]] = shufflevector <2 x i32> [[BROADCAST_SPLATINSERT]], <2 x i32> poison, <2 x i32> zeroinitializer\n; VEC-NEXT:    br label %[[VECTOR_BODY:.*]]\n; VEC:       [[VECTOR_BODY]]:\n; VEC-NEXT:    [[INDEX:%.*]] = phi i32 [ 0, %[[VECTOR_PH]] ], [ [[INDEX_NEXT:%.*]], %[[VECTOR_BODY]] ]\n; VEC-NEXT:    [[VEC_IND:%.*]] = phi <2 x i32> [ <i32 0, i32 2>, %[[VECTOR_PH]] ], [ [[VEC_IND_NEXT:%.*]], %[[VECTOR_BODY]] ]\n; VEC-NEXT:    [[OFFSET_IDX:%.*]] = mul i32 [[INDEX]], 2\n; VEC-NEXT:    [[TMP0:%.*]] = add i32 [[OFFSET_IDX]], 0\n; VEC-NEXT:    [[TMP1:%.*]] = add i32 [[OFFSET_IDX]], 2\n; VEC-NEXT:    [[TMP2:%.*]] = getelementptr inbounds i16, ptr [[DST]], i32 [[TMP0]]\n; VEC-NEXT:    [[TMP3:%.*]] = getelementptr inbounds i16, ptr [[DST]], i32 [[TMP1]]\n; VEC-NEXT:    store i16 0, ptr [[TMP2]], align 2\n; VEC-NEXT:    store i16 0, ptr [[TMP3]], align 2\n; VEC-NEXT:    [[TMP4:%.*]] = add <2 x i32> [[VEC_IND]], splat (i32 1)\n; VEC-NEXT:    [[TMP5:%.*]] = add <2 x i32> [[BROADCAST_SPLAT]], [[TMP4]]\n; VEC-NEXT:    [[INDEX_NEXT]] = add nuw i32 [[INDEX]], 2\n; VEC-NEXT:    [[VEC_IND_NEXT]] = add <2 x i32> [[VEC_IND]], splat (i32 4)\n; VEC-NEXT:    [[TMP6:%.*]] = icmp eq i32 [[INDEX_NEXT]], 4\n; VEC-NEXT:    br i1 [[TMP6]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], {{!llvm.loop ![0-9]+}}\n; VEC:       [[MIDDLE_BLOCK]]:\n; VEC-NEXT:    [[TMP7:%.*]] = extractelement <2 x i32> [[TMP5]], i32 1\n; VEC-NEXT:    br i1 true, label %[[E_EXIT:.*]], label %[[SCALAR_PH]]\n; VEC:       [[SCALAR_PH]]:\n; VEC-NEXT:    [[BC_RESUME_VAL:%.*]] = phi i32 [ 8, %[[MIDDLE_BLOCK]] ], [ 0, %[[ENTRY]] ]\n; VEC-NEXT:    br label %[[LOOP:.*]]\n; VEC:       [[LOOP]]:\n; VEC-NEXT:    [[IV:%.*]] = phi i32 [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ], [ [[IV_NEXT:%.*]], %[[LOOP]] ]\n; VEC-NEXT:    [[GEP_DST:%.*]] = getelementptr inbounds i16, ptr [[DST]], i32 [[IV]]\n; VEC-NEXT:    store i16 0, ptr [[GEP_DST]], align 2\n; VEC-NEXT:    [[INC:%.*]] = add i32 [[IV]], 1\n; VEC-NEXT:    [[IV_NEXT]] = add i32 [[STEP_2]], [[INC]]\n; VEC-NEXT:    [[CMP_I:%.*]] = icmp slt i32 [[IV_NEXT]], 8\n; VEC-NEXT:    br i1 [[CMP_I]], label %[[LOOP]], label %[[E_EXIT]], {{!llvm.loop ![0-9]+}}\n; VEC:       [[E_EXIT]]:\n; VEC-NEXT:    [[RES:%.*]] = phi i32 [ [[IV_NEXT]], %[[LOOP]] ], [ [[TMP7]], %[[MIDDLE_BLOCK]] ]\n; VEC-NEXT:    ret i32 [[RES]]\nentry:\n  %step.1 = sext i8 0 to i32\n  %step.2 = add nsw i32 %step.1, 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.dst = getelementptr inbounds i16, ptr %dst, i32 %iv\n  store i16 0, ptr %gep.dst, align 2\n  %inc = add i32 %iv, 1\n  %iv.next = add i32 %step.2, %inc\n  %cmp.i = icmp slt i32 %iv.next, 8\n  br i1 %cmp.i, label %loop, label %e.exit\n\ne.exit:                                           ; preds = %loop\n  %res = phi i32 [ %iv.next, %loop ]\n  ret i32 %res\n}",
+          "source_program": "define i32 @test_iv_uniform_with_outside_use_scev_simplification_2(ptr %dst) {\nentry:\n  %step.1 = sext i8 0 to i32\n  %step.2 = add nsw i32 %step.1, 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.dst = getelementptr inbounds i16, ptr %dst, i32 %iv\n  store i16 0, ptr %gep.dst, align 2\n  %inc = add i32 %iv, 1\n  %iv.next = add i32 %step.2, %inc\n  %cmp.i = icmp slt i32 %iv.next, 8\n  br i1 %cmp.i, label %loop, label %e.exit\n\ne.exit:                                           ; preds = %loop\n  %res = phi i32 [ %iv.next, %loop ]\n  ret i32 %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[clang] Miscompilation at -O2/3",
+    "body": "This code prints 8 at `-O0/1` and prints 1 at `-O2/3`:\n\n```c\nint printf(const char *, ...);\nstatic char a;\nstatic char *b = &a;\nstatic int c;\nshort d;\nvoid e() {\n  short f[8];\n  char **g[] = {&b, &b};\n  c = 0;\n  for (; c < 8; c = 81 + 462704684 + *b - 462704765 + c + 1)\n    f[c] = 0;\n  d = f[5];\n}\nint main() {\n  e();\n  printf(\"%d\\n\", c);\n}\n```\n\nCompiler Explorer: https://godbolt.org/z/MEKz8oncP\n\nBisected to https://github.com/llvm/llvm-project/commit/df4a615c988f3ae56f7e68a7df86acb60f16493a, which was committed by @fhahn ",
+    "author": "cardigan1008",
+    "labels": [
+      "miscompilation",
+      "vectorizers"
+    ],
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "Reduced testcase: https://alive2.llvm.org/ce/z/6Bg63G\n```\n; bin/opt -passes=loop-vectorize test.ll -S\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @src() {\nentry:\n  %f.i = alloca [8 x i16], align 16\n  %conv.i = sext i8 0 to i32\n  %invariant.op.i = add nsw i32 %conv.i, 1\n  br label %for.body.i\n\nfor.body.i:                                       ; preds = %for.body.i, %entry\n  %0 = phi i32 [ 0, %entry ], [ %add2.reass.i, %for.body.i ]\n  %idxprom.i = sext i32 %0 to i64\n  %arrayidx.i = getelementptr [8 x i16], ptr %f.i, i64 0, i64 %idxprom.i\n  store i16 0, ptr %arrayidx.i, align 2\n  %add2.reass.i = add i32 %invariant.op.i, %0\n  %cmp.i = icmp slt i32 %add2.reass.i, 8\n  br i1 %cmp.i, label %for.body.i, label %e.exit\n\ne.exit:                                           ; preds = %for.body.i\n  %add2.reass.i.lcssa = phi i32 [ %add2.reass.i, %for.body.i ]\n  ret i32 %add2.reass.i.lcssa\n}\n```"
+      },
+      {
+        "author": "fhahn",
+        "body": "Looking into it now, thanks"
+      },
+      {
+        "author": "yaoxinliu",
+        "body": "Thank God! clang19 works as expected."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": false
+}

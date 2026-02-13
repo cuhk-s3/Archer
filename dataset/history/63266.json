@@ -1,0 +1,109 @@
+{
+  "bug_id": "63266",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/63266",
+  "bug_type": "miscompilation",
+  "base_commit": "51b0398b76fae2b85b9eec440c7ed63908bf30f3",
+  "knowledge_cutoff": "2023-06-12T14:52:53Z",
+  "lit_test_dir": [
+    "llvm/test/Analysis/BasicAA"
+  ],
+  "hints": {
+    "fix_commit": "c31eb827b72da784d7f18512a51e5396ac302d72",
+    "components": [
+      "AliasAnalysis"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/BasicAliasAnalysis.cpp": [
+        [
+          461,
+          466
+        ],
+        [
+          470,
+          476
+        ],
+        [
+          659,
+          665
+        ],
+        [
+          1151,
+          1159
+        ],
+        [
+          1220,
+          1226
+        ],
+        [
+          1701,
+          1706
+        ],
+        [
+          1715,
+          1721
+        ],
+        [
+          1737,
+          1743
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/BasicAliasAnalysis.cpp": [
+        "BasicAAResult::DecomposeGEPExpression",
+        "BasicAAResult::aliasGEP",
+        "BasicAAResult::constantOffsetHeuristic",
+        "BasicAAResult::subtractDecomposedGEPs",
+        "dump",
+        "print"
+      ]
+    }
+  },
+  "patch": "commit c31eb827b72da784d7f18512a51e5396ac302d72\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Mon Jun 19 14:21:40 2023 +0200\n\n    [BasicAA] Fix nsw handling for negated scales (PR63266)\n    \n    We currently preserve the nsw flag when negating scales, which is\n    incorrect for INT_MIN.\n    \n    However, just dropping the NSW flag in this case makes BasicAA\n    behavior unreliable and asymmetric, because we may or may not\n    drop the NSW flag depending on which side gets subtracted.\n    \n    Instead, leave the Scale alone and add an additional IsNegated flag,\n    which indicates that the whole VarIndex should be interpreted as a\n    subtraction. This allows us to retain the NSW flag.\n    \n    When accumulating the offset range, we need to use subtraction\n    instead of adding for IsNegated indices. Everything else works on\n    the absolute value of the scale, so the negation does not matter\n    there.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/63266.\n    \n    Differential Revision: https://reviews.llvm.org/D153270\n\ndiff --git a/llvm/lib/Analysis/BasicAliasAnalysis.cpp b/llvm/lib/Analysis/BasicAliasAnalysis.cpp\nindex ec523748e974..16e0e1f66524 100644\n--- a/llvm/lib/Analysis/BasicAliasAnalysis.cpp\n+++ b/llvm/lib/Analysis/BasicAliasAnalysis.cpp\n@@ -461,6 +461,17 @@ struct VariableGEPIndex {\n   /// True if all operations in this expression are NSW.\n   bool IsNSW;\n \n+  /// True if the index should be subtracted rather than added. We don't simply\n+  /// negate the Scale, to avoid losing the NSW flag: X - INT_MIN*1 may be\n+  /// non-wrapping, while X + INT_MIN*(-1) wraps.\n+  bool IsNegated;\n+\n+  bool hasNegatedScaleOf(const VariableGEPIndex &Other) const {\n+    if (IsNegated == Other.IsNegated)\n+      return Scale == -Other.Scale;\n+    return Scale == Other.Scale;\n+  }\n+\n   void dump() const {\n     print(dbgs());\n     dbgs() << \"\\n\";\n@@ -470,7 +481,9 @@ struct VariableGEPIndex {\n        << \", zextbits=\" << Val.ZExtBits\n        << \", sextbits=\" << Val.SExtBits\n        << \", truncbits=\" << Val.TruncBits\n-       << \", scale=\" << Scale << \")\";\n+       << \", scale=\" << Scale\n+       << \", nsw=\" << IsNSW\n+       << \", negated=\" << IsNegated << \")\";\n   }\n };\n }\n@@ -659,7 +672,8 @@ BasicAAResult::DecomposeGEPExpression(const Value *V, const DataLayout &DL,\n       Scale = adjustToIndexSize(Scale, IndexSize);\n \n       if (!!Scale) {\n-        VariableGEPIndex Entry = {LE.Val, Scale, CxtI, LE.IsNSW};\n+        VariableGEPIndex Entry = {LE.Val, Scale, CxtI, LE.IsNSW,\n+                                  /* IsNegated */ false};\n         Decomposed.VarIndices.push_back(Entry);\n       }\n     }\n@@ -1151,9 +1165,14 @@ AliasResult BasicAAResult::aliasGEP(\n     assert(OffsetRange.getBitWidth() == Scale.getBitWidth() &&\n            \"Bit widths are normalized to MaxIndexSize\");\n     if (Index.IsNSW)\n-      OffsetRange = OffsetRange.add(CR.smul_sat(ConstantRange(Scale)));\n+      CR = CR.smul_sat(ConstantRange(Scale));\n+    else\n+      CR = CR.smul_fast(ConstantRange(Scale));\n+\n+    if (Index.IsNegated)\n+      OffsetRange = OffsetRange.sub(CR);\n     else\n-      OffsetRange = OffsetRange.add(CR.smul_fast(ConstantRange(Scale)));\n+      OffsetRange = OffsetRange.add(CR);\n   }\n \n   // We now have accesses at two offsets from the same base:\n@@ -1220,7 +1239,7 @@ AliasResult BasicAAResult::aliasGEP(\n     // inequality of values across loop iterations.\n     const VariableGEPIndex &Var0 = DecompGEP1.VarIndices[0];\n     const VariableGEPIndex &Var1 = DecompGEP1.VarIndices[1];\n-    if (Var0.Scale == -Var1.Scale && Var0.Val.TruncBits == 0 &&\n+    if (Var0.hasNegatedScaleOf(Var1) && Var0.Val.TruncBits == 0 &&\n         Var0.Val.hasSameCastsAs(Var1.Val) && !AAQI.MayBeCrossIteration &&\n         isKnownNonEqual(Var0.Val.V, Var1.Val.V, DL, &AC, /* CxtI */ nullptr,\n                         DT))\n@@ -1701,6 +1720,13 @@ void BasicAAResult::subtractDecomposedGEPs(DecomposedGEP &DestGEP,\n           !Dest.Val.hasSameCastsAs(Src.Val))\n         continue;\n \n+      // Normalize IsNegated if we're going to lose the NSW flag anyway.\n+      if (Dest.IsNegated) {\n+        Dest.Scale = -Dest.Scale;\n+        Dest.IsNegated = false;\n+        Dest.IsNSW = false;\n+      }\n+\n       // If we found it, subtract off Scale V's from the entry in Dest.  If it\n       // goes to zero, remove the entry.\n       if (Dest.Scale != Src.Scale) {\n@@ -1715,7 +1741,8 @@ void BasicAAResult::subtractDecomposedGEPs(DecomposedGEP &DestGEP,\n \n     // If we didn't consume this entry, add it to the end of the Dest list.\n     if (!Found) {\n-      VariableGEPIndex Entry = {Src.Val, -Src.Scale, Src.CxtI, Src.IsNSW};\n+      VariableGEPIndex Entry = {Src.Val, Src.Scale, Src.CxtI, Src.IsNSW,\n+                                /* IsNegated */ true};\n       DestGEP.VarIndices.push_back(Entry);\n     }\n   }\n@@ -1737,7 +1764,7 @@ bool BasicAAResult::constantOffsetHeuristic(const DecomposedGEP &GEP,\n   const VariableGEPIndex &Var0 = GEP.VarIndices[0], &Var1 = GEP.VarIndices[1];\n \n   if (Var0.Val.TruncBits != 0 || !Var0.Val.hasSameCastsAs(Var1.Val) ||\n-      Var0.Scale != -Var1.Scale ||\n+      !Var0.hasNegatedScaleOf(Var1) ||\n       Var0.Val.V->getType() != Var1.Val.V->getType())\n     return false;\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/BasicAA/range.ll",
+      "commands": [
+        [
+          "opt < %s -aa-pipeline=basic-aa -passes=aa-eval -print-all-alias-modref-info -disable-output 2>&1",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "benign_overflow",
+          "test_body": "define void @benign_overflow(ptr %p, i64 %o) {\n  %c = icmp sge i64 %o, -1\n  call void @llvm.assume(i1 %c)\n  %p.neg1 = getelementptr i8, ptr %p, i64 -1\n  %p.o = getelementptr i8, ptr %p, i64 %o\n  %p.o.1 = getelementptr i8, ptr %p.o, i64 1\n  %1 = load i8, ptr %p, align 1\n  %2 = load i8, ptr %p.neg1, align 1\n  %3 = load i8, ptr %p.o, align 1\n  %4 = load i8, ptr %p.o.1, align 1\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }",
+          "source_program": "define void @benign_overflow(ptr %p, i64 %o) {\n  %c = icmp sge i64 %o, -1\n  call void @llvm.assume(i1 %c)\n  %p.neg1 = getelementptr i8, ptr %p, i64 -1\n  %p.o = getelementptr i8, ptr %p, i64 %o\n  %p.o.1 = getelementptr i8, ptr %p.o, i64 1\n  %1 = load i8, ptr %p, align 1\n  %2 = load i8, ptr %p.neg1, align 1\n  %3 = load i8, ptr %p.o, align 1\n  %4 = load i8, ptr %p.o.1, align 1\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "pr63266",
+          "test_body": "define void @pr63266(i1 %c, ptr %base) {\nentry:\n  %offset16 = getelementptr inbounds i8, ptr %base, i64 16\n  %gep1 = getelementptr i8, ptr %base, i64 -9223372036854775792\n  br i1 %c, label %if, label %join\n\nif:                                               ; preds = %entry\n  br label %join\n\njoin:                                             ; preds = %if, %entry\n  %phi = phi i64 [ -9223372036854775808, %if ], [ 0, %entry ]\n  %gep2 = getelementptr i8, ptr %gep1, i64 %phi\n  store i8 0, ptr %gep2, align 1\n  %0 = load i8, ptr %offset16, align 1\n  ret void\n}",
+          "source_program": "define void @pr63266(i1 %c, ptr %base) {\nentry:\n  %offset16 = getelementptr inbounds i8, ptr %base, i64 16\n  %gep1 = getelementptr i8, ptr %base, i64 -9223372036854775792\n  br i1 %c, label %if, label %join\n\nif:                                               ; preds = %entry\n  br label %join\n\njoin:                                             ; preds = %if, %entry\n  %phi = phi i64 [ -9223372036854775808, %if ], [ 0, %entry ]\n  %gep2 = getelementptr i8, ptr %gep1, i64 %phi\n  store i8 0, ptr %gep2, align 1\n  %0 = load i8, ptr %offset16, align 1\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[BasicAA] Incorrect AA result due to overflow",
+    "body": "```llvm\r\n; RUN: opt -passes=aa-eval -print-all-alias-modref-info < %s\r\ndefine void @test(i1 %c, ptr %base) {\r\nentry:\r\n  %offset16 = getelementptr inbounds i8, ptr %base, i64 16\r\n  %gep1 = getelementptr i8, ptr %base, i64 -9223372036854775792\r\n  br i1 %c, label %if, label %join\r\n\r\nif:\r\n  br label %join\r\n\r\njoin:\r\n  %phi = phi i64 [ -9223372036854775808, %if ], [ 0, %entry ]\r\n  %gep2 = getelementptr i8, ptr %gep1, i64 %phi\r\n  store i8 0, ptr %gep2\r\n  load i8, ptr %offset16\r\n  ret void\r\n}\r\n```\r\nProduces:\r\n```\r\n  NoAlias:\ti8* %gep2, i8* %offset16\r\n```\r\nWhich is incorrect.",
+    "author": "nikic",
+    "labels": [
+      "miscompilation",
+      "llvm:optimizations"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "The post-subtract decomposed GEP is:\r\n```\r\n(DecomposedGEP Base=base, Offset=-9223372036854775808, VarIndices=[(V=phi, zextbits=0, sextbits=0, truncbits=0, scale=-1)])\r\n```\r\nWhat this doesn't tell you is that the index has `IsNSW` set, which is incorrect, because we'll end up multiplying `INT_MIN` by `-1`. This ultimately results in incorrectly computed offset ranges.\r\n\r\nThis is because https://github.com/llvm/llvm-project/blob/3401a5f7584a2f12a90a7538aee2ae37038c82a9/llvm/lib/Analysis/BasicAliasAnalysis.cpp#L1721 always preserves the IsNSW flag when negating the scale. \r\n\r\nJust dropping the NSW flag there may be quite problematic though, because this cause symmetry issues, where we produce different results depending on the order of the GEPs, and which one will contribute the negative scales."
+      },
+      {
+        "author": "nikic",
+        "body": "Candidate patch: https://reviews.llvm.org/D153270"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "bug_id": "63936",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/63936",
+  "bug_type": "miscompilation",
+  "base_commit": "c0682840877a21960f4c21a97b5f497d4ccc82d5",
+  "knowledge_cutoff": "2023-07-18T06:02:02Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/FunctionAttrs"
+  ],
+  "hints": {
+    "fix_commit": "86f3dc83e1ee12869cac7c10730d8ab9178c3aae",
+    "components": [
+      "FunctionAttrs"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/IPO/FunctionAttrs.cpp": [
+        [
+          151,
+          168
+        ],
+        [
+          173,
+          185
+        ],
+        [
+          232,
+          243
+        ],
+        [
+          245,
+          262
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/IPO/FunctionAttrs.cpp": [
+        "addMemoryAttrs",
+        "checkFunctionMemoryAccess",
+        "llvm::computeFunctionBodyMemoryAccess"
+      ]
+    }
+  },
+  "patch": "commit 86f3dc83e1ee12869cac7c10730d8ab9178c3aae\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Fri Jul 21 16:37:28 2023 +0200\n\n    [FunctionAttrs] Consider recursive argmem effects (PR63936)\n    \n    When inspecting the function body, we can't simply ignore effects\n    of functions in the SCC entirely, because an argmem access of a\n    recursive call might result in an access to another location in\n    the callee.\n    \n    Fix this by separately tracking memory effects that would occur if\n    the SCC accesses argmem, and then later add those.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/63936.\n    \n    Differential Revision: https://reviews.llvm.org/D155956\n\ndiff --git a/llvm/lib/Transforms/IPO/FunctionAttrs.cpp b/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\nindex 7a6fc02e783e..95b3204d02be 100644\n--- a/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\n+++ b/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\n@@ -151,18 +151,25 @@ static void addArgLocs(MemoryEffects &ME, const CallBase *Call,\n /// result will be based only on AA results for the function declaration; it\n /// will be assumed that some other (perhaps less optimized) version of the\n /// function may be selected at link time.\n-static MemoryEffects checkFunctionMemoryAccess(Function &F, bool ThisBody,\n-                                               AAResults &AAR,\n-                                               const SCCNodeSet &SCCNodes) {\n+///\n+/// The return value is split into two parts: Memory effects that always apply,\n+/// and additional memory effects that apply if any of the functions in the SCC\n+/// can access argmem.\n+static std::pair<MemoryEffects, MemoryEffects>\n+checkFunctionMemoryAccess(Function &F, bool ThisBody, AAResults &AAR,\n+                          const SCCNodeSet &SCCNodes) {\n   MemoryEffects OrigME = AAR.getMemoryEffects(&F);\n   if (OrigME.doesNotAccessMemory())\n     // Already perfect!\n-    return OrigME;\n+    return {OrigME, MemoryEffects::none()};\n \n   if (!ThisBody)\n-    return OrigME;\n+    return {OrigME, MemoryEffects::none()};\n \n   MemoryEffects ME = MemoryEffects::none();\n+  // Additional locations accessed if the SCC accesses argmem.\n+  MemoryEffects RecursiveArgME = MemoryEffects::none();\n+\n   // Inalloca and preallocated arguments are always clobbered by the call.\n   if (F.getAttributes().hasAttrSomewhere(Attribute::InAlloca) ||\n       F.getAttributes().hasAttrSomewhere(Attribute::Preallocated))\n@@ -173,13 +180,19 @@ static MemoryEffects checkFunctionMemoryAccess(Function &F, bool ThisBody,\n     // Some instructions can be ignored even if they read or write memory.\n     // Detect these now, skipping to the next instruction if one is found.\n     if (auto *Call = dyn_cast<CallBase>(&I)) {\n-      // Ignore calls to functions in the same SCC, as long as the call sites\n-      // don't have operand bundles.  Calls with operand bundles are allowed to\n-      // have memory effects not described by the memory effects of the call\n-      // target.\n+      // We can optimistically ignore calls to functions in the same SCC, with\n+      // two caveats:\n+      //  * Calls with operand bundles may have additional effects.\n+      //  * Argument memory accesses may imply additional effects depending on\n+      //    what the argument location is.\n       if (!Call->hasOperandBundles() && Call->getCalledFunction() &&\n-          SCCNodes.count(Call->getCalledFunction()))\n+          SCCNodes.count(Call->getCalledFunction())) {\n+        // Keep track of which additional locations are accessed if the SCC\n+        // turns out to access argmem.\n+        addArgLocs(RecursiveArgME, Call, ModRefInfo::ModRef, AAR);\n         continue;\n+      }\n+\n       MemoryEffects CallME = AAR.getMemoryEffects(Call);\n \n       // If the call doesn't access memory, we're done.\n@@ -232,12 +245,12 @@ static MemoryEffects checkFunctionMemoryAccess(Function &F, bool ThisBody,\n     addLocAccess(ME, *Loc, MR, AAR);\n   }\n \n-  return OrigME & ME;\n+  return {OrigME & ME, RecursiveArgME};\n }\n \n MemoryEffects llvm::computeFunctionBodyMemoryAccess(Function &F,\n                                                     AAResults &AAR) {\n-  return checkFunctionMemoryAccess(F, /*ThisBody=*/true, AAR, {});\n+  return checkFunctionMemoryAccess(F, /*ThisBody=*/true, AAR, {}).first;\n }\n \n /// Deduce readonly/readnone/writeonly attributes for the SCC.\n@@ -245,18 +258,27 @@ template <typename AARGetterT>\n static void addMemoryAttrs(const SCCNodeSet &SCCNodes, AARGetterT &&AARGetter,\n                            SmallSet<Function *, 8> &Changed) {\n   MemoryEffects ME = MemoryEffects::none();\n+  MemoryEffects RecursiveArgME = MemoryEffects::none();\n   for (Function *F : SCCNodes) {\n     // Call the callable parameter to look up AA results for this function.\n     AAResults &AAR = AARGetter(*F);\n     // Non-exact function definitions may not be selected at link time, and an\n     // alternative version that writes to memory may be selected.  See the\n     // comment on GlobalValue::isDefinitionExact for more details.\n-    ME |= checkFunctionMemoryAccess(*F, F->hasExactDefinition(), AAR, SCCNodes);\n+    auto [FnME, FnRecursiveArgME] =\n+        checkFunctionMemoryAccess(*F, F->hasExactDefinition(), AAR, SCCNodes);\n+    ME |= FnME;\n+    RecursiveArgME |= FnRecursiveArgME;\n     // Reached bottom of the lattice, we will not be able to improve the result.\n     if (ME == MemoryEffects::unknown())\n       return;\n   }\n \n+  // If the SCC accesses argmem, add recursive accesses resulting from that.\n+  ModRefInfo ArgMR = ME.getModRef(IRMemLocation::ArgMem);\n+  if (ArgMR != ModRefInfo::NoModRef)\n+    ME |= RecursiveArgME & MemoryEffects(ArgMR);\n+\n   for (Function *F : SCCNodes) {\n     MemoryEffects OldME = F->getMemoryEffects();\n     MemoryEffects NewME = ME & OldME;\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/FunctionAttrs/argmemonly.ll",
+      "commands": [
+        [
+          "opt -passes=function-attrs -S < %s",
+          "FileCheck --check-prefixes=COMMON,FNATTRS,ATTRIBUTOR %s"
+        ],
+        [
+          "opt -passes=attributor-light -S < %s",
+          "FileCheck --check-prefixes=COMMON,FNATTRS,ATTRIBUTOR %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "test_scc_argmem_read_1",
+          "test_body": "define void @test_scc_argmem_read_1(ptr %p) {\n; FNATTRS: Function Attrs: nofree nosync nounwind memory(read, inaccessiblemem: none)\n; FNATTRS-LABEL: define void @test_scc_argmem_read_1\n; FNATTRS-SAME: (ptr nocapture readonly [[P:%.*]]) #[[ATTR16]] {\n; FNATTRS-NEXT:    [[PVAL:%.*]] = load ptr, ptr [[P]], align 8\n; FNATTRS-NEXT:    call void @test_scc_argmem_read_2(ptr [[PVAL]])\n; FNATTRS-NEXT:    ret void\n  %pval = load ptr, ptr %p, align 8\n  call void @test_scc_argmem_read_2(ptr %pval)\n  ret void\n}\n\ndeclare void @test_scc_argmem_read_2(ptr)",
+          "source_program": "define void @test_scc_argmem_read_1(ptr %p) {\n  %pval = load ptr, ptr %p, align 8\n  call void @test_scc_argmem_read_2(ptr %pval)\n  ret void\n}\n\ndeclare void @test_scc_argmem_read_2(ptr)\n"
+        },
+        {
+          "test_name": "test_inaccessiblememonly_readonly",
+          "test_body": "; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare void @fn_inaccessiblememonly() #0\n\ndefine void @test_inaccessiblememonly_readonly() {\n; FNATTRS: Function Attrs: nofree memory(inaccessiblemem: read)\n; FNATTRS-LABEL: define void @test_inaccessiblememonly_readonly\n; FNATTRS-SAME: () #[[ATTR13:[0-9]+]] {\n; FNATTRS-NEXT:    call void @fn_inaccessiblememonly() #[[ATTR19:[0-9]+]]\n; FNATTRS-NEXT:    ret void\n  call void @fn_inaccessiblememonly() #1\n  ret void\n}\n\nattributes #0 = { memory(inaccessiblemem: readwrite) }\nattributes #1 = { memory(read) }",
+          "source_program": "; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare void @fn_inaccessiblememonly() #0\n\ndefine void @test_inaccessiblememonly_readonly() {\n  call void @fn_inaccessiblememonly() #1\n  ret void\n}\n\nattributes #0 = { memory(inaccessiblemem: readwrite) }\nattributes #1 = { memory(read) }\n"
+        },
+        {
+          "test_name": "test_inaccessibleorargmemonly_readonly",
+          "test_body": "; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare void @fn_inaccessiblememonly() #0\n\ndefine void @test_inaccessibleorargmemonly_readonly(ptr %arg) {\n; FNATTRS: Function Attrs: nofree memory(argmem: read, inaccessiblemem: read)\n; FNATTRS-LABEL: define void @test_inaccessibleorargmemonly_readonly\n; FNATTRS-SAME: (ptr nocapture readonly [[ARG:%.*]]) #[[ATTR14:[0-9]+]] {\n; FNATTRS-NEXT:    [[TMP1:%.*]] = load i32, ptr [[ARG]], align 4\n; FNATTRS-NEXT:    call void @fn_inaccessiblememonly() #[[ATTR19]]\n; FNATTRS-NEXT:    ret void\n  %1 = load i32, ptr %arg, align 4\n  call void @fn_inaccessiblememonly() #1\n  ret void\n}\n\nattributes #0 = { memory(inaccessiblemem: readwrite) }\nattributes #1 = { memory(read) }",
+          "source_program": "; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare void @fn_inaccessiblememonly() #0\n\ndefine void @test_inaccessibleorargmemonly_readonly(ptr %arg) {\n  %1 = load i32, ptr %arg, align 4\n  call void @fn_inaccessiblememonly() #1\n  ret void\n}\n\nattributes #0 = { memory(inaccessiblemem: readwrite) }\nattributes #1 = { memory(read) }\n"
+        },
+        {
+          "test_name": "test_inaccessibleorargmemonly_readwrite",
+          "test_body": "; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare void @fn_inaccessiblememonly() #0\n\ndefine void @test_inaccessibleorargmemonly_readwrite(ptr %arg) {\n; FNATTRS: Function Attrs: memory(argmem: write, inaccessiblemem: read)\n; FNATTRS-LABEL: define void @test_inaccessibleorargmemonly_readwrite\n; FNATTRS-SAME: (ptr nocapture writeonly [[ARG:%.*]]) #[[ATTR15:[0-9]+]] {\n; FNATTRS-NEXT:    store i32 0, ptr [[ARG]], align 4\n; FNATTRS-NEXT:    call void @fn_inaccessiblememonly() #[[ATTR19]]\n; FNATTRS-NEXT:    ret void\n  store i32 0, ptr %arg, align 4\n  call void @fn_inaccessiblememonly() #1\n  ret void\n}\n\nattributes #0 = { memory(inaccessiblemem: readwrite) }\nattributes #1 = { memory(read) }",
+          "source_program": "; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare void @fn_inaccessiblememonly() #0\n\ndefine void @test_inaccessibleorargmemonly_readwrite(ptr %arg) {\n  store i32 0, ptr %arg, align 4\n  call void @fn_inaccessiblememonly() #1\n  ret void\n}\n\nattributes #0 = { memory(inaccessiblemem: readwrite) }\nattributes #1 = { memory(read) }\n"
+        },
+        {
+          "test_name": "test_recursive_argmem_read",
+          "test_body": "define void @test_recursive_argmem_read(ptr %p) {\n; FNATTRS: Function Attrs: nofree nosync nounwind memory(read, inaccessiblemem: none)\n; FNATTRS-LABEL: define void @test_recursive_argmem_read\n; FNATTRS-SAME: (ptr nocapture readonly [[P:%.*]]) #[[ATTR16:[0-9]+]] {\n; FNATTRS-NEXT:    [[PVAL:%.*]] = load ptr, ptr [[P]], align 8\n; FNATTRS-NEXT:    call void @test_recursive_argmem_read(ptr [[PVAL]])\n; FNATTRS-NEXT:    ret void\n  %pval = load ptr, ptr %p, align 8\n  call void @test_recursive_argmem_read(ptr %pval)\n  ret void\n}",
+          "source_program": "define void @test_recursive_argmem_read(ptr %p) {\n  %pval = load ptr, ptr %p, align 8\n  call void @test_recursive_argmem_read(ptr %pval)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_recursive_argmem_readwrite",
+          "test_body": "define void @test_recursive_argmem_readwrite(ptr %p) {\n; FNATTRS: Function Attrs: nofree nosync nounwind memory(readwrite, inaccessiblemem: none)\n; FNATTRS-LABEL: define void @test_recursive_argmem_readwrite\n; FNATTRS-SAME: (ptr nocapture [[P:%.*]]) #[[ATTR17:[0-9]+]] {\n; FNATTRS-NEXT:    [[PVAL:%.*]] = load ptr, ptr [[P]], align 8\n; FNATTRS-NEXT:    store i32 0, ptr [[P]], align 4\n; FNATTRS-NEXT:    call void @test_recursive_argmem_readwrite(ptr [[PVAL]])\n; FNATTRS-NEXT:    ret void\n  %pval = load ptr, ptr %p, align 8\n  store i32 0, ptr %p, align 4\n  call void @test_recursive_argmem_readwrite(ptr %pval)\n  ret void\n}",
+          "source_program": "define void @test_recursive_argmem_readwrite(ptr %p) {\n  %pval = load ptr, ptr %p, align 8\n  store i32 0, ptr %p, align 4\n  call void @test_recursive_argmem_readwrite(ptr %pval)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_scc_argmem_read_2",
+          "test_body": "declare void @test_scc_argmem_read_1(ptr)\n\ndefine void @test_scc_argmem_read_2(ptr %p) {\n; FNATTRS: Function Attrs: nofree nosync nounwind memory(read, inaccessiblemem: none)\n; FNATTRS-LABEL: define void @test_scc_argmem_read_2\n; FNATTRS-SAME: (ptr nocapture readonly [[P:%.*]]) #[[ATTR16]] {\n; FNATTRS-NEXT:    call void @test_scc_argmem_read_1(ptr [[P]])\n; FNATTRS-NEXT:    ret void\n  call void @test_scc_argmem_read_1(ptr %p)\n  ret void\n}",
+          "source_program": "declare void @test_scc_argmem_read_1(ptr)\n\ndefine void @test_scc_argmem_read_2(ptr %p) {\n  call void @test_scc_argmem_read_1(ptr %p)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_recursive_argmem_read_alloca",
+          "test_body": "define void @test_recursive_argmem_read_alloca(ptr %p) {\n; FNATTRS: Function Attrs: nofree nosync nounwind memory(argmem: read)\n; FNATTRS-LABEL: define void @test_recursive_argmem_read_alloca\n; FNATTRS-SAME: (ptr nocapture readonly [[P:%.*]]) #[[ATTR18:[0-9]+]] {\n; FNATTRS-NEXT:    [[A:%.*]] = alloca ptr, align 8\n; FNATTRS-NEXT:    [[TMP1:%.*]] = load i32, ptr [[P]], align 4\n; FNATTRS-NEXT:    call void @test_recursive_argmem_read_alloca(ptr [[A]])\n; FNATTRS-NEXT:    ret void\n  %a = alloca ptr, align 8\n  %1 = load i32, ptr %p, align 4\n  call void @test_recursive_argmem_read_alloca(ptr %a)\n  ret void\n}",
+          "source_program": "define void @test_recursive_argmem_read_alloca(ptr %p) {\n  %a = alloca ptr, align 8\n  %1 = load i32, ptr %p, align 4\n  call void @test_recursive_argmem_read_alloca(ptr %a)\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[FunctionAttrs] Recursive calls can have different effects",
+    "body": "Function Attrs assumes recursive calls (or any call in the SCC) has the same effect as the SCC (at most). This is not true:\r\n\r\nhttps://godbolt.org/z/fjj3r9v7q\r\n```ll\r\n@G = global i32 0\r\n\r\ndefine void @bar(ptr %p) {\r\n  %pval = load ptr, ptr %p\r\n  call void @bar(ptr %pval)\r\n  store i32 0, ptr @G\r\n  ret void\r\n}\r\n```\r\nThe function itself, w/o the recursive call, only loads argument memory and writes global memory. The recursive call however, reads non-argument memory, at least in my understanding of `argmemonly/argmem`.\r\n\r\nTag (@nikic @fhahn @aeubanks)",
+    "author": "jdoerfert",
+    "labels": [
+      "miscompilation",
+      "llvm:optimizations"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Interesting case! I agree that this shouldn't be argmemonly."
+      },
+      {
+        "author": "nikic",
+        "body": "Candidate patch: https://reviews.llvm.org/D155956"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

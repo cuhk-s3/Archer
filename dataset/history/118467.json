@@ -1,0 +1,80 @@
+{
+  "bug_id": "118467",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/118467",
+  "bug_type": "miscompilation",
+  "base_commit": "73731d6873b6fb0757c3065aaf2452eaccd0eebc",
+  "knowledge_cutoff": "2024-12-03T10:44:21Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/AggressiveInstCombine"
+  ],
+  "hints": {
+    "fix_commit": "f68b0e36997322eeda8fd199ea80deb1b49c5410",
+    "components": [
+      "AggressiveInstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp": [
+        [
+          803,
+          810
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp": [
+        "foldConsecutiveLoads"
+      ]
+    }
+  },
+  "patch": "commit f68b0e36997322eeda8fd199ea80deb1b49c5410\nAuthor: Antonio Frighetto <me@antoniofrighetto.com>\nDate:   Wed Dec 4 10:15:11 2024 +0100\n\n    [AggressiveInstCombine] Use APInt and avoid truncation when folding loads\n    \n    A miscompilation issue has been addressed with improved handling.\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/118467.\n\ndiff --git a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\nindex b5b561797f75..45ee2d472a11 100644\n--- a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n+++ b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n@@ -803,8 +803,7 @@ static bool foldConsecutiveLoads(Instruction &I, const DataLayout &DL,\n     APInt Offset1(DL.getIndexTypeSizeInBits(Load1Ptr->getType()), 0);\n     Load1Ptr = Load1Ptr->stripAndAccumulateConstantOffsets(\n         DL, Offset1, /* AllowNonInbounds */ true);\n-    Load1Ptr = Builder.CreatePtrAdd(Load1Ptr,\n-                                    Builder.getInt32(Offset1.getZExtValue()));\n+    Load1Ptr = Builder.CreatePtrAdd(Load1Ptr, Builder.getInt(Offset1));\n   }\n   // Generate wider load.\n   NewLoad = Builder.CreateAlignedLoad(WiderType, Load1Ptr, LI1->getAlign(),\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/AggressiveInstCombine/X86/or-load.ll",
+      "commands": [
+        [
+          "opt < %s -passes=aggressive-instcombine -mtriple x86_64-none-eabi -mattr=avx2 -data-layout=\"e-n64\" -S",
+          "FileCheck %s --check-prefixes=ALL,LE,BE"
+        ],
+        [
+          "opt < %s -passes=aggressive-instcombine -mtriple x86_64-none-eabi -mattr=avx2 -data-layout=\"E-n64\" -S",
+          "FileCheck %s --check-prefixes=ALL,LE,BE"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "loadcombine_consecutive_idx_64",
+          "test_body": "define i32 @loadcombine_consecutive_idx_64(ptr %data) {\n; LE-LABEL: @loadcombine_consecutive_idx_64(\n; LE-NEXT:  entry:\n; LE-NEXT:    [[TMP0:%.*]] = getelementptr i8, ptr [[DATA:%.*]], i64 2149675576\n; LE-NEXT:    [[VAL_2:%.*]] = load i16, ptr [[TMP0]], align 1\n; LE-NEXT:    [[TMP1:%.*]] = zext i16 [[VAL_2]] to i32\n; LE-NEXT:    ret i32 [[TMP1]]\nentry:\n  %arrayidx = getelementptr inbounds nuw i8, ptr %data, i64 2149675577\n  %val = load i8, ptr %arrayidx, align 1\n  %conv = zext i8 %val to i32\n  %arrayidx.2 = getelementptr inbounds nuw i8, ptr %data, i64 2149675576\n  %val.2 = load i8, ptr %arrayidx.2, align 1\n  %conv.2 = zext i8 %val.2 to i32\n  %shl = shl nuw nsw i32 %conv, 8\n  %or = or disjoint i32 %shl, %conv.2\n  ret i32 %or\n}",
+          "source_program": "define i32 @loadcombine_consecutive_idx_64(ptr %data) {\nentry:\n  %arrayidx = getelementptr inbounds nuw i8, ptr %data, i64 2149675577\n  %val = load i8, ptr %arrayidx, align 1\n  %conv = zext i8 %val to i32\n  %arrayidx.2 = getelementptr inbounds nuw i8, ptr %data, i64 2149675576\n  %val.2 = load i8, ptr %arrayidx.2, align 1\n  %conv.2 = zext i8 %val.2 to i32\n  %shl = shl nuw nsw i32 %conv, 8\n  %or = or disjoint i32 %shl, %conv.2\n  ret i32 %or\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Invalid LLVM IR code generated on x86-64 with a very simple sample (crash the generated executable code)",
+    "body": "Below is a very simple program that's loading 16 bits table value into a 32 bits variable from a 8 bits table.\nOn **x86-64** with **-O2** or **-O3** flags, this program works fine with LLVM 16.0.0 and below, but since LLVM 17.0.0, the LLVM IR and the generated assembly code are using a wrong calculated offset on the table (doesn't occurs on LLVM armv8 whatever the version).\nAs you can see below, the offset in the table which is supposed to be **2149675576** (**0x80217238**) has its 32 upper bits inverted for **-2145291720** (**0xFFFFFFFF80217238**).\n\n```c\n\n#include <stdint.h>\n\n// Load 16 bits into 32 bits value from data offset 0x80217238\n\nuint32_t Test(const uint8_t* data)\n{        \n    uint32_t a, b, c;    \n\tb = 0xFFFF8022 << 16;\n    b += 0xFFFFE808;    \n    a = data[b + 0xFFFF8A31];\n    c = data[b + 0xFFFF8A30];\n    c &= ~0x0000FF00;\n    c |= ((a << 8) | (a >> 24)) & 0x0000FF00;\n\treturn c;\n}\n\n```\n\nLLVM IR with LLVM 16.0.0 (from Compiler Explorer)\n```ll\ndefine dso_local noundef i32 @Test(unsigned char const*)(ptr nocapture noundef readonly %data) local_unnamed_addr {\nentry:\n  %arrayidx4 = getelementptr inbounds i8, ptr %data, i64 2149675576\n  %0 = load i16, ptr %arrayidx4, align 1\n  %1 = zext i16 %0 to i32\n  ret i32 %1\n}\n\ndeclare void @llvm.dbg.value(metadata, metadata, metadata) #1\n```\nLLVM IR with LLVM 19.1.0 and trunk (from Compiler Explorer)\n```ll\ndefine dso_local noundef range(i32 0, 65536) i32 @Test(unsigned char const*)(ptr nocapture noundef readonly %data) local_unnamed_addr {\nentry:\n  %0 = getelementptr i8, ptr %data, i64 -2145291720\n  %1 = load i16, ptr %0, align 1\n  %2 = zext i16 %1 to i32\n  ret i32 %2\n}\n```\n\n\n\n\n\n",
+    "author": "dje64240",
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "topperc",
+        "body": "opt-bisect suggests AggressiveInstCominer. There were two separate loads that got merged. The resulting GEP had an index of `i32 -2145291720` with trunk and `i64 2149675576` with clang 16. Those would be the same number if GEP zero extended indices instead of sign extending."
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "Alive2: https://alive2.llvm.org/ce/z/G5CgkD."
+      },
+      {
+        "author": "AZero13",
+        "body": "> opt-bisect suggests AggressiveInstCominer. There were two separate loads that got merged. The resulting GEP had an index of `i32 -2145291720` with trunk and `i64 2149675576` with clang 16. Those would be the same number if GEP zero extended indices instead of sign extending.\n\nSee my PR for 19.x "
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

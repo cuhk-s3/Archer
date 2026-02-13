@@ -1,0 +1,62 @@
+{
+  "bug_id": "91369",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/91369",
+  "bug_type": "miscompilation",
+  "base_commit": "9a28814f59e8f52cc63ae3d17023cee8348d9b53",
+  "knowledge_cutoff": "2024-05-07T18:12:26Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "082c81ae4ab9db6bb0acd52098288223dd58501a",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          8841,
+          8848
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "LoopVectorizationPlanner::tryToBuildVPlanWithVPRecipes"
+      ]
+    }
+  },
+  "patch": "commit 082c81ae4ab9db6bb0acd52098288223dd58501a\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Tue May 7 21:31:40 2024 +0100\n\n    [LV] Properly extend versioned constant strides.\n    \n    We only version unknown strides to 1. If the original type is i1, then\n    the sign of the extension matters. Properly extend the stride value\n    before replacing it.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/91369.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 3be0102bea3e..261933966b74 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8841,8 +8841,10 @@ LoopVectorizationPlanner::tryToBuildVPlanWithVPRecipes(VFRange &Range) {\n       VPValue *StrideVPV = Plan->getLiveIn(U);\n       if (!StrideVPV)\n         continue;\n-      VPValue *CI = Plan->getOrAddLiveIn(ConstantInt::get(\n-          U->getType(), ScevStride->getAPInt().getSExtValue()));\n+      unsigned BW = U->getType()->getScalarSizeInBits();\n+      APInt C = isa<SExtInst>(U) ? ScevStride->getAPInt().sext(BW)\n+                                 : ScevStride->getAPInt().zext(BW);\n+      VPValue *CI = Plan->getOrAddLiveIn(ConstantInt::get(U->getType(), C));\n       StrideVPV->replaceAllUsesWith(CI);\n     }\n   }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/version-stride-with-integer-casts.ll",
+      "commands": [
+        [
+          "opt -passes=loop-vectorize -force-vector-width=4 -S %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "zext_of_i1_stride",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\n; Function Attrs: mustprogress\ndefine void @zext_of_i1_stride(i1 %g, ptr %dst) #0 {",
+          "source_program": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\n; Function Attrs: mustprogress\ndefine void @zext_of_i1_stride(i1 %g, ptr %dst) #0 {\nentry:\n  %g.16 = zext i1 %g to i16\n  %g.64 = zext i1 %g to i64\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep = getelementptr inbounds i16, ptr %dst, i64 %iv\n  store i16 %g.16, ptr %gep, align 2\n  %iv.next = add nuw nsw i64 %iv, %g.64\n  %cmp = icmp ult i64 %iv.next, 16\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { mustprogress }\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LoopVectorize] Sign-extension miscompile",
+    "body": "C Testcase:\r\n```c\r\nlong a, d;\r\nshort b[20];\r\nshort c[20];\r\n_Bool e[20];\r\nint f(_Bool g) {\r\n  for (long h = 0; h < 16; h += g)\r\n    b[h] = (short) g;\r\n  for (int i = 0; i < 12; i++)\r\n    for (int j = d; j; j++)\r\n      c[i] = (short) a < e[i];\r\n  return (int) b[0];\r\n}\r\nint main() {\r\n  __builtin_printf(\"%X\\n\", f(1));\r\n}\r\n```\r\nGodbolt: https://godbolt.org/z/3E8frs1Me\r\n\r\nWith loop-vectorize: `FFFFFFFF`\r\nWithout loop-vectorize: `1`\r\n\r\nReduced LLVM IR:\r\n```llvm ir\r\n; ModuleID = 'red.ll'\r\nsource_filename = \"red.c\"\r\ntarget datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\r\ntarget triple = \"riscv64-unknown-linux-gnu\"\r\n\r\n@b = global [20 x i16] zeroinitializer, align 2\r\n@.str = constant [4 x i8] c\"%X\\0A\\00\"\r\n\r\n; Function Attrs: nofree norecurse nosync nounwind memory(readwrite, argmem: none, inaccessiblemem: none) uwtable vscale_range(2,1024)\r\ndefine i32 @f(i1 %g) #0 {\r\nentry:\r\n  %conv = zext i1 %g to i16\r\n  %zext.g.i64 = zext i1 %g to i64\r\n  br label %for.body\r\n\r\nfor.cond3.preheader:                              ; preds = %for.body\r\n  %0 = load i64, ptr @b, align 2\r\n  %zero = and i64 %0, 0\r\n  %true = icmp eq i64 %zero, 0\r\n  %2 = load i16, ptr @b, align 2\r\n  %conv26 = sext i16 %2 to i32\r\n  ret i32 %conv26\r\n\r\nfor.body:                                         ; preds = %for.body, %entry\r\n  %phi.0 = phi i64 [ 0, %entry ], [ %add, %for.body ]\r\n  %idx.0 = getelementptr inbounds [20 x i16], ptr @b, i64 0, i64 %phi.0\r\n  store i16 %conv, ptr %idx.0, align 2\r\n  %add = add nuw nsw i64 %phi.0, %zext.g.i64\r\n  %cmp = icmp ult i64 %add, 16\r\n  br i1 %cmp, label %for.body, label %for.cond3.preheader, !llvm.loop !0\r\n}\r\n\r\n; Function Attrs: nofree nounwind uwtable vscale_range(2,1024)\r\ndefine noundef signext i32 @main() #1 {\r\nentry:\r\n  %call = tail call signext i32 @f(i1 noundef zeroext true)\r\n  %call1 = tail call signext i32 (ptr, ...) @printf(ptr noundef nonnull @.str, i32 noundef signext %call) #3\r\n  ret i32 0\r\n}\r\n\r\n; Function Attrs: nofree nounwind\r\ndeclare noundef signext i32 @printf(ptr nocapture noundef readonly, ...) #2\r\n\r\nattributes #0 = { nofree norecurse nosync nounwind memory(readwrite, argmem: none, inaccessiblemem: none) uwtable vscale_range(2,1024) \"no-trapping-math\"=\"true\" \"stack-protector-buffer-size\"=\"8\" \"target-cpu\"=\"generic-rv64\" \"target-features\"=\"+64bit,+a,+c,+d,+f,+m,+relax,+v,+zicsr,+zifencei,+zve32f,+zve32x,+zve64d,+zve64f,+zve64x,+zvl128b,+zvl32b,+zvl64b,-e,-experimental-smmpm,-experimental-smnpm,-experimental-ssnpm,-experimental-sspm,-experimental-ssqosid,-experimental-supm,-experimental-zaamo,-experimental-zabha,-experimental-zalasr,-experimental-zalrsc,-experimental-zfbfmin,-experimental-zicfilp,-experimental-zicfiss,-experimental-ztso,-experimental-zvfbfmin,-experimental-zvfbfwma,-h,-shcounterenw,-shgatpa,-shtvala,-shvsatpa,-shvstvala,-shvstvecd,-smaia,-smepmp,-smstateen,-ssaia,-ssccptr,-sscofpmf,-sscounterenw,-ssstateen,-ssstrict,-sstc,-sstvala,-sstvecd,-ssu64xl,-svade,-svadu,-svbare,-svinval,-svnapot,-svpbmt,-xcvalu,-xcvbi,-xcvbitmanip,-xcvelw,-xcvmac,-xcvmem,-xcvsimd,-xsfcease,-xsfvcp,-xsfvfnrclipxfqf,-xsfvfwmaccqqq,-xsfvqmaccdod,-xsfvqmaccqoq,-xsifivecdiscarddlone,-xsifivecflushdlone,-xtheadba,-xtheadbb,-xtheadbs,-xtheadcmo,-xtheadcondmov,-xtheadfmemidx,-xtheadmac,-xtheadmemidx,-xtheadmempair,-xtheadsync,-xtheadvdot,-xventanacondops,-za128rs,-za64rs,-zacas,-zama16b,-zawrs,-zba,-zbb,-zbc,-zbkb,-zbkc,-zbkx,-zbs,-zca,-zcb,-zcd,-zce,-zcf,-zcmop,-zcmp,-zcmt,-zdinx,-zfa,-zfh,-zfhmin,-zfinx,-zhinx,-zhinxmin,-zic64b,-zicbom,-zicbop,-zicboz,-ziccamoa,-ziccif,-zicclsm,-ziccrse,-zicntr,-zicond,-zihintntl,-zihintpause,-zihpm,-zimop,-zk,-zkn,-zknd,-zkne,-zknh,-zkr,-zks,-zksed,-zksh,-zkt,-zmmul,-zvbb,-zvbc,-zvfh,-zvfhmin,-zvkb,-zvkg,-zvkn,-zvknc,-zvkned,-zvkng,-zvknha,-zvknhb,-zvks,-zvksc,-zvksed,-zvksg,-zvksh,-zvkt,-zvl1024b,-zvl16384b,-zvl2048b,-zvl256b,-zvl32768b,-zvl4096b,-zvl512b,-zvl65536b,-zvl8192b\" }\r\nattributes #1 = { nofree nounwind uwtable vscale_range(2,1024) \"no-trapping-math\"=\"true\" \"stack-protector-buffer-size\"=\"8\" \"target-cpu\"=\"generic-rv64\" \"target-features\"=\"+64bit,+a,+c,+d,+f,+m,+relax,+v,+zicsr,+zifencei,+zve32f,+zve32x,+zve64d,+zve64f,+zve64x,+zvl128b,+zvl32b,+zvl64b,-e,-experimental-smmpm,-experimental-smnpm,-experimental-ssnpm,-experimental-sspm,-experimental-ssqosid,-experimental-supm,-experimental-zaamo,-experimental-zabha,-experimental-zalasr,-experimental-zalrsc,-experimental-zfbfmin,-experimental-zicfilp,-experimental-zicfiss,-experimental-ztso,-experimental-zvfbfmin,-experimental-zvfbfwma,-h,-shcounterenw,-shgatpa,-shtvala,-shvsatpa,-shvstvala,-shvstvecd,-smaia,-smepmp,-smstateen,-ssaia,-ssccptr,-sscofpmf,-sscounterenw,-ssstateen,-ssstrict,-sstc,-sstvala,-sstvecd,-ssu64xl,-svade,-svadu,-svbare,-svinval,-svnapot,-svpbmt,-xcvalu,-xcvbi,-xcvbitmanip,-xcvelw,-xcvmac,-xcvmem,-xcvsimd,-xsfcease,-xsfvcp,-xsfvfnrclipxfqf,-xsfvfwmaccqqq,-xsfvqmaccdod,-xsfvqmaccqoq,-xsifivecdiscarddlone,-xsifivecflushdlone,-xtheadba,-xtheadbb,-xtheadbs,-xtheadcmo,-xtheadcondmov,-xtheadfmemidx,-xtheadmac,-xtheadmemidx,-xtheadmempair,-xtheadsync,-xtheadvdot,-xventanacondops,-za128rs,-za64rs,-zacas,-zama16b,-zawrs,-zba,-zbb,-zbc,-zbkb,-zbkc,-zbkx,-zbs,-zca,-zcb,-zcd,-zce,-zcf,-zcmop,-zcmp,-zcmt,-zdinx,-zfa,-zfh,-zfhmin,-zfinx,-zhinx,-zhinxmin,-zic64b,-zicbom,-zicbop,-zicboz,-ziccamoa,-ziccif,-zicclsm,-ziccrse,-zicntr,-zicond,-zihintntl,-zihintpause,-zihpm,-zimop,-zk,-zkn,-zknd,-zkne,-zknh,-zkr,-zks,-zksed,-zksh,-zkt,-zmmul,-zvbb,-zvbc,-zvfh,-zvfhmin,-zvkb,-zvkg,-zvkn,-zvknc,-zvkned,-zvkng,-zvknha,-zvknhb,-zvks,-zvksc,-zvksed,-zvksg,-zvksh,-zvkt,-zvl1024b,-zvl16384b,-zvl2048b,-zvl256b,-zvl32768b,-zvl4096b,-zvl512b,-zvl65536b,-zvl8192b\" }\r\nattributes #2 = { nofree nounwind \"no-trapping-math\"=\"true\" \"stack-protector-buffer-size\"=\"8\" \"target-cpu\"=\"generic-rv64\" \"target-features\"=\"+64bit,+a,+c,+d,+f,+m,+relax,+v,+zicsr,+zifencei,+zve32f,+zve32x,+zve64d,+zve64f,+zve64x,+zvl128b,+zvl32b,+zvl64b,-e,-experimental-smmpm,-experimental-smnpm,-experimental-ssnpm,-experimental-sspm,-experimental-ssqosid,-experimental-supm,-experimental-zaamo,-experimental-zabha,-experimental-zalasr,-experimental-zalrsc,-experimental-zfbfmin,-experimental-zicfilp,-experimental-zicfiss,-experimental-ztso,-experimental-zvfbfmin,-experimental-zvfbfwma,-h,-shcounterenw,-shgatpa,-shtvala,-shvsatpa,-shvstvala,-shvstvecd,-smaia,-smepmp,-smstateen,-ssaia,-ssccptr,-sscofpmf,-sscounterenw,-ssstateen,-ssstrict,-sstc,-sstvala,-sstvecd,-ssu64xl,-svade,-svadu,-svbare,-svinval,-svnapot,-svpbmt,-xcvalu,-xcvbi,-xcvbitmanip,-xcvelw,-xcvmac,-xcvmem,-xcvsimd,-xsfcease,-xsfvcp,-xsfvfnrclipxfqf,-xsfvfwmaccqqq,-xsfvqmaccdod,-xsfvqmaccqoq,-xsifivecdiscarddlone,-xsifivecflushdlone,-xtheadba,-xtheadbb,-xtheadbs,-xtheadcmo,-xtheadcondmov,-xtheadfmemidx,-xtheadmac,-xtheadmemidx,-xtheadmempair,-xtheadsync,-xtheadvdot,-xventanacondops,-za128rs,-za64rs,-zacas,-zama16b,-zawrs,-zba,-zbb,-zbc,-zbkb,-zbkc,-zbkx,-zbs,-zca,-zcb,-zcd,-zce,-zcf,-zcmop,-zcmp,-zcmt,-zdinx,-zfa,-zfh,-zfhmin,-zfinx,-zhinx,-zhinxmin,-zic64b,-zicbom,-zicbop,-zicboz,-ziccamoa,-ziccif,-zicclsm,-ziccrse,-zicntr,-zicond,-zihintntl,-zihintpause,-zihpm,-zimop,-zk,-zkn,-zknd,-zkne,-zknh,-zkr,-zks,-zksed,-zksh,-zkt,-zmmul,-zvbb,-zvbc,-zvfh,-zvfhmin,-zvkb,-zvkg,-zvkn,-zvknc,-zvkned,-zvkng,-zvknha,-zvknhb,-zvks,-zvksc,-zvksed,-zvksg,-zvksh,-zvkt,-zvl1024b,-zvl16384b,-zvl2048b,-zvl256b,-zvl32768b,-zvl4096b,-zvl512b,-zvl65536b,-zvl8192b\" }\r\nattributes #3 = { nounwind }\r\n\r\n!0 = distinct !{!0, !1}\r\n!1 = !{!\"llvm.loop.mustprogress\"}\r\n```\r\nLoopVectorize pass.\r\n\r\nLooks like a sext/zext related issue.",
+    "author": "patrick-rivos",
+    "labels": [
+      "miscompilation",
+      "vectorizers"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

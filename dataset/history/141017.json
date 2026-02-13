@@ -1,0 +1,73 @@
+{
+  "bug_id": "141017",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/141017",
+  "bug_type": "miscompilation",
+  "base_commit": "b3fd2ea88875e58c66dd67870ff822cedf2570cf",
+  "knowledge_cutoff": "2025-05-22T07:55:25Z",
+  "lit_test_dir": [
+    "llvm/test/CodeGen",
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/PhaseOrdering"
+  ],
+  "hints": {
+    "fix_commit": "1984c7539ebeb2697233f8163a051a2ce0d4fa50",
+    "components": [
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        [
+          889,
+          895
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          8898,
+          8916
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "llvm::matchDecomposedSelectPattern",
+        "llvm::matchSelectPattern"
+      ]
+    }
+  },
+  "patch": "commit 1984c7539ebeb2697233f8163a051a2ce0d4fa50\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Mon Jun 2 18:21:14 2025 +0800\n\n    [ValueTracking] Do not use FMF from fcmp (#142266)\n    \n    This patch introduces an FMF parameter for\n    `matchDecomposedSelectPattern` to pass FMF flags from select, instead of\n    fcmp.\n    \n    Closes https://github.com/llvm/llvm-project/issues/137998.\n    Closes https://github.com/llvm/llvm-project/issues/141017.\n\ndiff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex d81c3f10bba9..feb7a1fa2cb3 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -889,7 +889,8 @@ inline SelectPatternResult matchSelectPattern(const Value *V, const Value *&LHS,\n /// predicate and given values as its true/false operands would match.\n LLVM_ABI SelectPatternResult matchDecomposedSelectPattern(\n     CmpInst *CmpI, Value *TrueVal, Value *FalseVal, Value *&LHS, Value *&RHS,\n-    Instruction::CastOps *CastOp = nullptr, unsigned Depth = 0);\n+    FastMathFlags FMF = FastMathFlags(), Instruction::CastOps *CastOp = nullptr,\n+    unsigned Depth = 0);\n \n /// Determine the pattern for predicate `X Pred Y ? X : Y`.\n LLVM_ABI SelectPatternResult getSelectPattern(\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 3d8bb6249eaf..7f30cd73d57c 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -8898,19 +8898,20 @@ SelectPatternResult llvm::matchSelectPattern(Value *V, Value *&LHS, Value *&RHS,\n   Value *TrueVal = SI->getTrueValue();\n   Value *FalseVal = SI->getFalseValue();\n \n-  return llvm::matchDecomposedSelectPattern(CmpI, TrueVal, FalseVal, LHS, RHS,\n-                                            CastOp, Depth);\n+  return llvm::matchDecomposedSelectPattern(\n+      CmpI, TrueVal, FalseVal, LHS, RHS,\n+      isa<FPMathOperator>(SI) ? SI->getFastMathFlags() : FastMathFlags(),\n+      CastOp, Depth);\n }\n \n SelectPatternResult llvm::matchDecomposedSelectPattern(\n     CmpInst *CmpI, Value *TrueVal, Value *FalseVal, Value *&LHS, Value *&RHS,\n-    Instruction::CastOps *CastOp, unsigned Depth) {\n+    FastMathFlags FMF, Instruction::CastOps *CastOp, unsigned Depth) {\n   CmpInst::Predicate Pred = CmpI->getPredicate();\n   Value *CmpLHS = CmpI->getOperand(0);\n   Value *CmpRHS = CmpI->getOperand(1);\n-  FastMathFlags FMF;\n-  if (isa<FPMathOperator>(CmpI))\n-    FMF = CmpI->getFastMathFlags();\n+  if (isa<FPMathOperator>(CmpI) && CmpI->hasNoNaNs())\n+    FMF.setNoNaNs();\n \n   // Bail out early.\n   if (CmpI->isEquality())\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/unordered-fcmp-select.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "pr141017",
+          "test_body": "define float @pr141017(float %x) {\n; CHECK-LABEL: @pr141017(\n; CHECK-NEXT:    [[CMP:%.*]] = fcmp nsz olt float [[X:%.*]], 0.000000e+00\n; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[CMP]], float -0.000000e+00, float [[X]]\n; CHECK-NEXT:    ret float [[SEL]]\n  %cmp = fcmp nsz olt float %x, 0.000000e+00\n  %sel = select i1 %cmp, float -0.000000e+00, float %x\n  ret float %sel\n}",
+          "source_program": "define float @pr141017(float %x) {\n  %cmp = fcmp nsz olt float %x, 0.000000e+00\n  %sel = select i1 %cmp, float -0.000000e+00, float %x\n  ret float %sel\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] Miscompilation `select (fcmp nsz olt X, 0.0), -0.0, X -> select (fcmp nsz ole X, -0.0), -0.0, X`",
+    "body": "Reproducer: https://alive2.llvm.org/ce/z/Uydp8F\n```\ndefine float @src(float %x) {\n  %cmp = fcmp nsz olt float %x, 0.0\n  %sel = select i1 %cmp, float -0.0, float %x\n  ret float %sel\n}\n\ndefine float @tgt(float %x) {\n  %.inv = fcmp nsz ole float %x, -0.000000e+00\n  %sel1 = select i1 %.inv, float -0.000000e+00, float %x\n  ret float %sel1\n}\n```\n```\nTransformation doesn't verify!\n\nERROR: Target's return value is more undefined\n\nExample:\nfloat %x = #x00000000 (+0.0)\n\nSource:\ni1 %cmp = #x0 (0)\nfloat %sel = #x00000000 (+0.0)\n\nTarget:\ni1 %.inv = #x1 (1)\nfloat %sel1 = #x00000000 (+0.0)\nSource value: #x00000000 (+0.0)\nTarget value: #x00000000 (+0.0)\n```\n",
+    "author": "dtcxzyw",
+    "labels": [
+      "miscompilation",
+      "floating-point",
+      "llvm:analysis"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true
+}

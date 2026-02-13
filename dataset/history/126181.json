@@ -1,0 +1,93 @@
+{
+  "bug_id": "126181",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/126181",
+  "bug_type": "miscompilation",
+  "base_commit": "317a644ae6d501f1a1ec54d17ea8559bcdea35c0",
+  "knowledge_cutoff": "2025-02-07T05:51:32Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/DeadStoreElimination"
+  ],
+  "hints": {
+    "fix_commit": "2d31a12dbe2339d20844ede70cbb54dbaf4ceea9",
+    "components": [
+      "DeadStoreElimination"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+        [
+          2283,
+          2289
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+        "DSEState::getInitializesArgMemLoc"
+      ]
+    }
+  },
+  "patch": "commit 2d31a12dbe2339d20844ede70cbb54dbaf4ceea9\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Mon Feb 10 10:34:03 2025 +0100\n\n    [DSE] Don't use initializes on byval argument (#126259)\n    \n    There are two ways we can fix this problem, depending on how the\n    semantics of byval and initializes should interact:\n    \n    * Don't infer initializes on byval arguments. initializes on byval\n    refers to the original caller memory (or having both attributes is made\n    a verifier error).\n    * Infer initializes on byval, but don't use it in DSE. initializes on\n    byval refers to the callee copy. This matches the semantics of readonly\n    on byval. This is slightly more powerful, for example, we could do a\n    backend optimization where byval + initializes will allocate the full\n    size of byval on the stack but not copy over the parts covered by\n    initializes.\n    \n    I went with the second variant here, skipping byval + initializes in DSE\n    (FunctionAttrs already doesn't propagate initializes past byval). I'm\n    open to going in the other direction though.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/126181.\n\ndiff --git a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\nindex 05b4f176bfc3..38454053b039 100644\n--- a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n@@ -2283,7 +2283,9 @@ DSEState::getInitializesArgMemLoc(const Instruction *I) {\n   for (unsigned Idx = 0, Count = CB->arg_size(); Idx < Count; ++Idx) {\n     ConstantRangeList Inits;\n     Attribute InitializesAttr = CB->getParamAttr(Idx, Attribute::Initializes);\n-    if (InitializesAttr.isValid())\n+    // initializes on byval arguments refers to the callee copy, not the\n+    // original memory the caller passed in.\n+    if (InitializesAttr.isValid() && !CB->isByValArgument(Idx))\n       Inits = InitializesAttr.getValueAsConstantRangeList();\n \n     Value *CurArg = CB->getArgOperand(Idx);\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/DeadStoreElimination/inter-procedural.ll",
+      "commands": [
+        [
+          "opt < %s -passes=dse -enable-dse-initializes-attr-improvement -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "global_var_alias",
+          "test_body": "@g = external global i16, align 2\n\n; Function Attrs: nounwind memory(read, argmem: write, inaccessiblemem: none)\ndeclare void @read_global(ptr nocapture noundef initializes((0, 2))) #0\n\ndefine i16 @global_var_alias() {\n; CHECK-LABEL: @global_var_alias(\n; CHECK-NEXT:    store i16 0, ptr @g, align 4\n; CHECK-NEXT:    call void @read_global(ptr @g)\n; CHECK-NEXT:    [[L:%.*]] = load i16, ptr @g, align 2\n; CHECK-NEXT:    ret i16 [[L]]\n  store i16 0, ptr @g, align 4\n  call void @read_global(ptr @g)\n  %l = load i16, ptr @g, align 2\n  ret i16 %l\n}\n\nattributes #0 = { nounwind memory(read, argmem: write, inaccessiblemem: none) }",
+          "source_program": "@g = external global i16, align 2\n\n; Function Attrs: nounwind memory(read, argmem: write, inaccessiblemem: none)\ndeclare void @read_global(ptr nocapture noundef initializes((0, 2))) #0\n\ndefine i16 @global_var_alias() {\n  store i16 0, ptr @g, align 4\n  call void @read_global(ptr @g)\n  %l = load i16, ptr @g, align 2\n  ret i16 %l\n}\n\nattributes #0 = { nounwind memory(read, argmem: write, inaccessiblemem: none) }\n"
+        },
+        {
+          "test_name": "test_byval",
+          "test_body": "declare void @byval_fn(ptr byval(i32) initializes((0, 4)))\n\ndefine void @test_byval() {\n; CHECK-LABEL: @test_byval(\n; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4\n; CHECK-NEXT:    store i32 0, ptr [[A]], align 4\n; CHECK-NEXT:    call void @byval_fn(ptr [[A]])\n; CHECK-NEXT:    ret void\n  %a = alloca i32, align 4\n  store i32 0, ptr %a, align 4\n  call void @byval_fn(ptr %a)\n  ret void\n}",
+          "source_program": "declare void @byval_fn(ptr byval(i32) initializes((0, 4)))\n\ndefine void @test_byval() {\n  %a = alloca i32, align 4\n  store i32 0, ptr %a, align 4\n  call void @byval_fn(ptr %a)\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[FuncAttrs] `initializes` is incorrectly set on parameters with `byval`",
+    "body": "Reproducer: https://godbolt.org/z/Mcx1nY4E7\n```\n; bin/opt -passes=function-attrs reduced.ll -S\n%struct.a = type { i32, i64, i32, i32 }\n\n@e = dso_local global { i32, [4 x i8], i64, i32, i32 } { i32 5, [4 x i8] zeroinitializer, i64 0, i32 1, i32 90986701 }, align 8\n\ndefine i8 @ad(ptr byval(%struct.a) %ah) {\nentry:\n  store i32 0, ptr %ah, align 8\n  %call = call i64 @af(ptr %ah)\n  %0 = load i8, ptr %ah, align 1\n  ret i8 %0\n}\n\ndefine i64 @af(ptr byval(%struct.a) %am) {\nentry:\n  call void @llvm.memcpy.p0.p0.i64(ptr noundef nonnull align 8 dereferenceable(24) %am, ptr noundef nonnull align 8 dereferenceable(24) @e, i64 24, i1 false)\n  ret i64 0\n}\n\n```\n```\ndefine i8 @ad(ptr byval(%struct.a) captures(none) initializes((0, 4)) %ah) #0 {\n  store i32 0, ptr %ah, align 8\n  %call = call i64 @af(ptr %ah)\n  %0 = load i8, ptr %ah, align 1\n  ret i8 %0\n}\n\ndefine noundef i64 @af(ptr writeonly byval(%struct.a) captures(none) initializes((0, 24)) %am) #0 {\n  call void @llvm.memcpy.p0.p0.i64(ptr noundef nonnull align 8 dereferenceable(24) %am, ptr noundef nonnull align 8 dereferenceable(24) @e, i64 24, i1 false)\n  ret i64 0\n}\n```\nAfter DSE:\n```\ndefine i8 @ad(ptr byval(%struct.a) captures(none) initializes((0, 4)) %ah) #0 {\n  %call = call i64 @af(ptr %ah)\n  %0 = load i8, ptr %ah, align 1\n  ret i8 %0\n}\n\ndefine noundef i64 @af(ptr writeonly byval(%struct.a) captures(none) initializes((0, 24)) %am) #0 {\n  ret i64 0\n}\n```\n\nllvm version: d21fc58aeeaa7f0369a24dbe70a0360e0edbf76f\n",
+    "author": "dtcxzyw",
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "> We should also emit the padding for %struct.a.\n\nWithout commenting on whether we should or shouldn't, why is not having the padding a miscompile? As this is not a packed struct, for a i64:64 target, LLVM will implicitly insert the padding and it should have the correct size."
+      },
+      {
+        "author": "dtcxzyw",
+        "body": ">  As this is not a packed struct, for a i64:64 target, LLVM will implicitly insert the padding and it should have the correct size.\n\nSorry. It is a DSE bug.\n"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "cc @haopliu "
+      },
+      {
+        "author": "nikic",
+        "body": "@dtcxzyw I think your new IR is over-reduced. You have `initializes((0, 24)` on `@af`, so I think eliminating the store is correct."
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "> [@dtcxzyw](https://github.com/dtcxzyw) I think your new IR is over-reduced. You have `initializes((0, 24)` on `@af`, so I think eliminating the store is correct.\n\nFixed."
+      },
+      {
+        "author": "nikic",
+        "body": "There are two ways we can fix this, depending on what we want the semantics to do:\n\n 1. Don't infer initializes on byval arguments. initializes on byval refers to the original caller memory (or having both attributes is made a verifier error).\n 2. Infer initializes on byval, but don't use it in DSE. initializes on byval refers to the callee copy. This matches the semantics of readonly on byval.\n\nI think variant 2 is marginally more powerful. For example, we could do a backend optimization where byval + initializes will allocate the full size of byval on the stack but not copy over the parts covered by initializes."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": false
+}

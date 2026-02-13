@@ -1,0 +1,149 @@
+{
+  "bug_id": "59279",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/59279",
+  "bug_type": "miscompilation",
+  "base_commit": "8f1e11c5a7d70f96943a72649daa69f152d73e90",
+  "knowledge_cutoff": "2022-12-01T09:03:59Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "93099c7d21727dd94383783020de4c89a6c5809c",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp": [
+        [
+          2408,
+          2421
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp": [
+        "InstCombinerImpl::visitFNeg"
+      ]
+    }
+  },
+  "patch": "commit 93099c7d21727dd94383783020de4c89a6c5809c\nAuthor: Sanjay Patel <spatel@rotateright.com>\nDate:   Fri Dec 9 10:58:27 2022 -0500\n\n    [InstCombine] allow more fast-math-flags to propagate in fneg-of-select fold\n    \n    We were conservatively intersecting flags, but we can take the union here\n    because forbidden special values (nsz/nnan/ninf) are not altered by fneg.\n    So if they were guaranteed not present on the select or fneg, then they\n    are guaranteed not present on the new select. Alive2 appears to agree on\n    the test diffs (reduced to not include irrelevant flags like reassoc):\n    https://alive2.llvm.org/ce/z/ViqqrO\n    \n    This prevents a potential regression if we tighten up the FMF behavior\n    for fabs with NAN as suggested in issue #59279.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\nindex 6f1b0b9b070b..9c6624f86f13 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n@@ -2408,14 +2408,18 @@ Instruction *InstCombinerImpl::visitFNeg(UnaryOperator &I) {\n   Value *Cond;\n   if (match(Op, m_OneUse(m_Select(m_Value(Cond), m_Value(X), m_Value(Y))))) {\n     // Unlike most transforms, this one is not safe to propagate nsz unless\n-    // it is present on the original select. (We are conservatively intersecting\n-    // the nsz flags from the select and root fneg instruction.)\n+    // it is present on the original select. We union the flags from the select\n+    // and fneg and then remove nsz if needed.\n     auto propagateSelectFMF = [&](SelectInst *S, bool CommonOperand) {\n       S->copyFastMathFlags(&I);\n-      if (auto *OldSel = dyn_cast<SelectInst>(Op))\n+      if (auto *OldSel = dyn_cast<SelectInst>(Op)) {\n+        FastMathFlags FMF = I.getFastMathFlags();\n+        FMF |= OldSel->getFastMathFlags();\n+        S->setFastMathFlags(FMF);\n         if (!OldSel->hasNoSignedZeros() && !CommonOperand &&\n             !isGuaranteedNotToBeUndefOrPoison(OldSel->getCondition()))\n           S->setHasNoSignedZeros(false);\n+      }\n     };\n     // -(Cond ? -P : Y) --> Cond ? P : -Y\n     Value *P;\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/fneg.ll",
+      "commands": [
+        [
+          "opt < %s -passes=instcombine -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "select_fneg_false",
+          "test_body": "define <2 x float> @select_fneg_false(<2 x float> %x, <2 x float> %y, <2 x i1> %b) {\n; CHECK-LABEL: @select_fneg_false(\n; CHECK-NEXT:    [[X_NEG:%.*]] = fneg nnan nsz <2 x float> [[X:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select nnan ninf <2 x i1> [[B:%.*]], <2 x float> [[X_NEG]], <2 x float> [[Y:%.*]]\n; CHECK-NEXT:    ret <2 x float> [[R]]\n  %ny = fneg nnan <2 x float> %y\n  %s = select ninf <2 x i1> %b, <2 x float> %x, <2 x float> %ny\n  %r = fneg nnan nsz <2 x float> %s\n  ret <2 x float> %r\n}",
+          "source_program": "define <2 x float> @select_fneg_false(<2 x float> %x, <2 x float> %y, <2 x i1> %b) {\n  %ny = fneg nnan <2 x float> %y\n  %s = select ninf <2 x i1> %b, <2 x float> %x, <2 x float> %ny\n  %r = fneg nnan nsz <2 x float> %s\n  ret <2 x float> %r\n}\n"
+        },
+        {
+          "test_name": "select_fneg_true",
+          "test_body": "define float @select_fneg_true(float %x, float %y, i1 %b) {\n; CHECK-LABEL: @select_fneg_true(\n; CHECK-NEXT:    [[Y_NEG:%.*]] = fneg float [[Y:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select i1 [[B:%.*]], float [[X:%.*]], float [[Y_NEG]]\n; CHECK-NEXT:    ret float [[R]]\n  %nx = fneg float %x\n  %s = select i1 %b, float %nx, float %y\n  %r = fneg float %s\n  ret float %r\n}",
+          "source_program": "define float @select_fneg_true(float %x, float %y, i1 %b) {\n  %nx = fneg float %x\n  %s = select i1 %b, float %nx, float %y\n  %r = fneg float %s\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "select_fneg_use1",
+          "test_body": "declare void @use(float)\n\ndefine float @select_fneg_use1(float %x, float %y, i1 %b) {\n; CHECK-LABEL: @select_fneg_use1(\n; CHECK-NEXT:    [[NX:%.*]] = fneg ninf float [[X:%.*]]\n; CHECK-NEXT:    call void @use(float [[NX]])\n; CHECK-NEXT:    [[Y_NEG:%.*]] = fneg float [[Y:%.*]]\n; CHECK-NEXT:    [[R:%.*]] = select fast i1 [[B:%.*]], float [[X]], float [[Y_NEG]]\n; CHECK-NEXT:    ret float [[R]]\n  %nx = fneg ninf float %x\n  call void @use(float %nx)\n  %s = select fast i1 %b, float %nx, float %y\n  %r = fneg float %s\n  ret float %r\n}",
+          "source_program": "declare void @use(float)\n\ndefine float @select_fneg_use1(float %x, float %y, i1 %b) {\n  %nx = fneg ninf float %x\n  call void @use(float %nx)\n  %s = select fast i1 %b, float %nx, float %y\n  %r = fneg float %s\n  ret float %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "InstCombine: incorrect fabs formation",
+    "body": "Test `Transforms/InstCombine/fabs.ll` shows the following transformation:\r\n```llvm\r\ndefine double @select_fcmp_ole_zero(double %x) {\r\n  %lezero = fcmp ole double %x, 0.000000\r\n  %negx = fsub double 0.000000, %x, exceptions=ignore\r\n  %fabs = select i1 %lezero, double %negx, double %x\r\n  ret double %fabs\r\n}\r\n=>\r\ndefine double @select_fcmp_ole_zero(double %x) {\r\n  %1 = fabs double %x, exceptions=ignore\r\n  ret double %1\r\n}\r\n```\r\n\r\nThis is not correct as `fabs` produces a non-deterministic NaN payload, while the original function preserved the NaN payload when x > 0.\r\n\r\ncc @arsenm @jcranmer-intel @jyknight @rotateright",
+    "author": "nunoplopes",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "comments": [
+      {
+        "author": "nunoplopes",
+        "body": "Similar pattern in `Transforms/InstCombine/fneg-fabs.ll`:\r\n```llvm\r\ndefine double @select_nsz_nfabs_ult(double %x) {\r\n  %cmp = fcmp ult double %x, 0.000000\r\n  %negX = fneg double %x\r\n  %sel = select nsz i1 %cmp, double %x, double %negX\r\n  ret double %sel\r\n}\r\n=>\r\ndefine double @select_nsz_nfabs_ult(double %x) {\r\n  %1 = fabs nsz double %x\r\n  %sel = fneg nsz double %1\r\n  ret double %sel\r\n}\r\n```"
+      },
+      {
+        "author": "rotateright",
+        "body": "We don't state it explicitly in the LangRef, but fabs is purely a signbit operation (as is fneg).\r\n\r\nSo the LLVM 'fabs' conforms to the libm 'fabs' which implements the IEEE-754 abs() that says (in section 5.5.1 of the 2008 version):\r\n\"Implementations shall provide the following homogeneous quiet-computational sign bit operations for all supported arithmetic formats; they only affect the sign bit. The operations treat floating-point numbers and NaNs alike, and signal no exception. These operations may propagate non-canonical encodings.\"\r\n\r\nSo if we're transforming to fabs, the payload isn't changed?"
+      },
+      {
+        "author": "jcranmer-intel",
+        "body": "Yes, `fabs`, `fneg`, `copysign` should all touch only the sign bit, preserving NaN payload."
+      },
+      {
+        "author": "nunoplopes",
+        "body": "I had it like that, but several optimizations were failing. I'll collect a few so you can decide the semantics you want :)"
+      },
+      {
+        "author": "nunoplopes",
+        "body": "Ok, I can only see only real failure from `InstCombine/fneg.ll`:\r\n```llvm\r\ndefine float @fnabs_2(float %a) {\r\n  %fneg = fneg float %a\r\n  %cmp = fcmp olt float %a, %fneg\r\n  %sel = select nsz i1 %cmp, float %fneg, float %a\r\n  %fneg1 = fneg float %sel\r\n  ret float %fneg1\r\n}\r\n=>\r\ndefine float @fnabs_2(float %a) {\r\n  %1 = fabs nsz float %a\r\n  %fneg1 = fneg float %1\r\n  ret float %fneg1\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Value mismatch\r\n\r\nExample:\r\nfloat %a = #xff810000 (NaN)\r\n\r\nSource:\r\nfloat %fneg = #x7f810000 (NaN)\r\ni1 %cmp = #x0 (0)\r\nfloat %sel = #xff810000 (NaN)\r\nfloat %fneg1 = #x7f810000 (NaN)\r\n\r\nTarget:\r\nfloat %1 = #x7f810000 (NaN)\r\nfloat %fneg1 = #xff810000 (NaN)\r\nSource value: #x7f810000 (NaN)\r\nTarget value: #xff810000 (NaN)\r\n```\r\n\r\nShould we just restrict this to ops with `nnan`?\r\n\r\nFWIW, there are two more cases, but they involve undef, so I think we can ignore them while we quietly work on removing undef from LLVM.."
+      },
+      {
+        "author": "arsenm",
+        "body": "> Ok, I can only see only real failure from `InstCombine/fneg.ll`:\r\n\r\n>```\r\n> Source value: #x7f810000 (NaN)\r\n> Target value: #xff810000 (NaN)\r\n> ```\r\n\r\nThe sign bit of a NaN is meaningless, so this isn't wrong"
+      },
+      {
+        "author": "nunoplopes",
+        "body": "Ok, I've changed fabs/fneg/copysign to return a non-deterministic sign when the input is NaN.\r\nI'm seeing only 2 related failures now:\r\n```llvm\r\n; InstCombine/fabs.ll\r\ndefine double @select_fcmp_ole_zero(double %x) {\r\n  %lezero = fcmp ole double %x, 0.000000\r\n  %negx = fsub double 0.000000, %x\r\n  %fabs = select i1 %lezero, double %negx, double %x\r\n  ret double %fabs\r\n}\r\n=>\r\ndefine double @select_fcmp_ole_zero(double %x) {\r\n  %1 = fabs double %x\r\n  ret double %1\r\n}\r\nTransformation doesn't verify! (unsound)\r\nERROR: Target's return value is more undefined\r\n\r\nExample:\r\ndouble %x = #xfff0004000000000 (NaN)\r\ni1 %lezero = #x0 (0)\r\n```\r\n\r\nThe issue is that the fcmp in source evaluates to false when the input is NaN. That makes the select return the *original, unmodified* %x.\r\nHowever, the tgt program returns %x with a non-deterministic sign bit.\r\nSo either the transformation is changed to have some nnan attribute, for example. Or it needs to be removed. It's not correct under this semantics of a non-deterministic NaN sign bit (@RalfJung)."
+      },
+      {
+        "author": "nunoplopes",
+        "body": "The other failure:\r\n```llvm\r\n; InstCombine/fneg-fabs.ll\r\ndefine double @select_nsz_nfabs_ult(double %x) {\r\n  %cmp = fcmp ult double %x, 0.000000\r\n  %negX = fneg double %x\r\n  %sel = select nsz i1 %cmp, double %x, double %negX\r\n  ret double %sel\r\n}\r\n=>\r\ndefine double @select_nsz_nfabs_ult(double %x) {\r\n  %1 = fabs nsz double %x\r\n  %sel = fneg nsz double %1\r\n  ret double %sel\r\n}\r\n```"
+      },
+      {
+        "author": "jyknight",
+        "body": ">> The sign bit of a NaN is meaningless, so this isn't wrong\r\n\r\n> I've changed fabs/fneg/copysign to return a non-deterministic sign when the input is NaN.\r\n\r\nNo, that's wrong. Yes, the sign is \"meaningless\", and is effectively arbitrary when resulting from a floating-point operation. But, the sign-manipulation operations are considered bit-manipulation instructions, not as floating-point operations. They affect ONLY the sign bit of the values, and have deterministic outcome even for NaNs -- even for signaling NaN.\r\n\r\nTherefore, the fnabs_2 example was indeed incorrect. All of the operations there -- except the compare -- only manipulate sign bits. And olt is fully defined for qNaNs. So, the outcome is entirely deterministic, no wiggle-room available. The transformed version similarly only has sign-manipulation, so no wiggle room there either.\r\n\r\n"
+      },
+      {
+        "author": "nunoplopes",
+        "body": "Ok, so the sign bit of fabs should always be 0 irrespective of the input?\r\n\r\nI can flip the semantics again in Alive2; I just want you guys to converge first. And maybe to fix some of the optimizations above as they can't all be correct. We (you) have to choose which ones to keep and which ones to restrict to fast-math."
+      },
+      {
+        "author": "jyknight",
+        "body": "> Ok, so the sign bit of fabs should always be 0 irrespective of the input?\r\n\r\nYes. Or, well, at least...that is the behavior specified by IEEE754, (typically) implemented in FP hardware, and specified by [WebAssembly](https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#floating-point-absolute-value). \r\n\r\nIt's not currently documented precisely in LangRef, but, I think those are the most sensible semantics for LLVM IR as well."
+      },
+      {
+        "author": "RalfJung",
+        "body": "There's a short list of functions that are specified as behaving \"bitwise\" and they should probably be modeled as fully deterministic, not clobbering NaN payload and sign bits: copy, negate, abs, copySign. ([Source 1](https://rust-lang.zulipchat.com/#narrow/stream/146212-t-compiler.2Fconst-eval/topic/const.20floats.20and.20const.20guarantees/near/311066997), [Source 2](https://webassembly.github.io/spec/core/exec/numerics.html#nan-propagation))"
+      },
+      {
+        "author": "jcranmer-intel",
+        "body": "The IEEE 754 names for the operations are as WASM calls them; in C terms, the operations are (from F.3) `memcpy` (and friends) or `+(x)`, `-(x)`, `fabs`, and `copysign`. In LLVM, it's `llvm.copysign`, `fneg`, and `llvm.fabs`."
+      },
+      {
+        "author": "nunoplopes",
+        "body": "I've changed the semantics in Alive2 again so these operations are strictly bitwise, and there are only 2 failing tests: the fnabs_2 above, and another one (square fabs(x) -> square x) that is correct if undef didn't exist, so let's ignore for now."
+      },
+      {
+        "author": "rotateright",
+        "body": "A one-line patch to require 'nnan' on the fabs transform shows many test diffs:\r\n[fabs.nnan.patch.txt](https://github.com/llvm/llvm-project/files/10196883/fabs.nnan.patch.txt)\r\n\r\nIf all of the tests besides \"fnabs_2\" are correct as-is, then there should be some more limited constraint that we can use. But these all seem similar to me. For example, is the 1st changed test in the patch \"/llvm/test/Transforms/InstCombine/fabs.ll - @select_fcmp_ogt_fneg\" really correct without nnan?"
+      },
+      {
+        "author": "nunoplopes",
+        "body": "It's also wrong. Online Alive2 is a few days old, so it's not catching it up.\r\n```llvm\r\ndefine float @select_fcmp_ogt_fneg(float %a) {\r\n  %fneg = fneg float %a, exceptions=ignore\r\n  %cmp = fcmp ogt float %a, %fneg\r\n  %r = select nsz i1 %cmp, float %a, float %fneg\r\n  ret float %r\r\n}\r\n=>\r\ndefine float @select_fcmp_ogt_fneg(float %a) {\r\n  %1 = fabs nsz float %a, exceptions=ignore\r\n  ret float %1\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Value mismatch\r\n\r\nExample:\r\nfloat %a = #x7f810000 (NaN)\r\n```"
+      },
+      {
+        "author": "rotateright",
+        "body": "Ok - I wasn't imagining the diffs. :)\r\nI'll stamp out copies of the changed tests that include 'nnan', so we have coverage for both variants. Hopefully, the extra 'nnan' constraint isn't meaningful in the real-world (I expect most users that want faster FP use that option)."
+      },
+      {
+        "author": "rotateright",
+        "body": "https://reviews.llvm.org/D139785"
+      },
+      {
+        "author": "rotateright",
+        "body": "I think this problem is solved with:\r\n862e35e25a685024\r\n\r\nPlease re-open or file new bugs if we are still not handling neg/abs as expected."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  }
+}

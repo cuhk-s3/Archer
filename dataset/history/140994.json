@@ -1,0 +1,74 @@
+{
+  "bug_id": "140994",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/140994",
+  "bug_type": "miscompilation",
+  "base_commit": "7c080e267722ba14439e2f35789c5c293672ab84",
+  "knowledge_cutoff": "2025-05-22T02:48:33Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/PhaseOrdering"
+  ],
+  "hints": {
+    "fix_commit": "3ec0c5c7fef03985b43432c6b914c289d8a5435e",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          25,
+          30
+        ],
+        [
+          3879,
+          3889
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "InstCombinerImpl::visitSelectInst"
+      ]
+    }
+  },
+  "patch": "commit 3ec0c5c7fef03985b43432c6b914c289d8a5435e\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sat May 31 16:25:10 2025 +0800\n\n    [InstCombine] Propagate FMF from select instead of fcmp (#141010)\n    \n    Previously,\n    https://github.com/llvm/llvm-project/commit/3d6b53980ce4ee855484fc8ae6ac3f99c85e48c3\n    propagates FMF from fcmp to avoid performance regressions. With the help\n    of https://github.com/llvm/llvm-project/pull/139861,\n    https://github.com/llvm/llvm-project/pull/141015, and\n    https://github.com/llvm/llvm-project/pull/141914, we can still convert\n    SPF into fabs/minnum/maxnum intrinsics even if some flags are missing.\n    This patch propagates FMF from select to address the long-standing\n    issue.\n    \n    Closes https://github.com/llvm/llvm-project/issues/140994.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex a791fc5db669..cca5705f6b58 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -25,6 +25,7 @@\n #include \"llvm/IR/ConstantRange.h\"\n #include \"llvm/IR/Constants.h\"\n #include \"llvm/IR/DerivedTypes.h\"\n+#include \"llvm/IR/FMF.h\"\n #include \"llvm/IR/IRBuilder.h\"\n #include \"llvm/IR/InstrTypes.h\"\n #include \"llvm/IR/Instruction.h\"\n@@ -3879,11 +3880,16 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n       // (X ugt Y) ? X : Y -> (X ole Y) ? Y : X\n       if (FCmp->hasOneUse() && FCmpInst::isUnordered(Pred)) {\n         FCmpInst::Predicate InvPred = FCmp->getInversePredicate();\n-        // FIXME: The FMF should propagate from the select, not the fcmp.\n         Value *NewCond = Builder.CreateFCmpFMF(InvPred, Cmp0, Cmp1, FCmp,\n                                                FCmp->getName() + \".inv\");\n+        // Propagate ninf/nnan from fcmp to select.\n+        FastMathFlags FMF = SI.getFastMathFlags();\n+        if (FCmp->hasNoNaNs())\n+          FMF.setNoNaNs(true);\n+        if (FCmp->hasNoInfs())\n+          FMF.setNoInfs(true);\n         Value *NewSel =\n-            Builder.CreateSelectFMF(NewCond, FalseVal, TrueVal, FCmp);\n+            Builder.CreateSelectFMF(NewCond, FalseVal, TrueVal, FMF);\n         return replaceInstUsesWith(SI, NewSel);\n       }\n     }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-fp.ll",
+      "commands": [
+        [
+          "opt -S -passes=instcombine < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "fsub_fmax",
+          "test_body": "define <2 x float> @fsub_fmax(<2 x float> %x, <2 x float> %y) {\n; CHECK-LABEL: @fsub_fmax(\n; CHECK-NEXT:    [[COND_INV:%.*]] = fcmp nnan nsz ogt <2 x float> [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[MAX_V:%.*]] = select nnan <2 x i1> [[COND_INV]], <2 x float> [[Y]], <2 x float> [[X]]\n; CHECK-NEXT:    [[MAX:%.*]] = fneg <2 x float> [[MAX_V]]\n; CHECK-NEXT:    ret <2 x float> [[MAX]]\n  %n1 = fsub <2 x float> splat (float -0.000000e+00), %x\n  %n2 = fsub <2 x float> splat (float -0.000000e+00), %y\n  %cond = fcmp nnan nsz uge <2 x float> %n1, %n2\n  %max = select <2 x i1> %cond, <2 x float> %n1, <2 x float> %n2\n  ret <2 x float> %max\n}",
+          "source_program": "define <2 x float> @fsub_fmax(<2 x float> %x, <2 x float> %y) {\n  %n1 = fsub <2 x float> splat (float -0.000000e+00), %x\n  %n2 = fsub <2 x float> splat (float -0.000000e+00), %y\n  %cond = fcmp nnan nsz uge <2 x float> %n1, %n2\n  %max = select <2 x i1> %cond, <2 x float> %n1, <2 x float> %n2\n  ret <2 x float> %max\n}\n"
+        },
+        {
+          "test_name": "fneg_fmin",
+          "test_body": "define double @fneg_fmin(double %x, double %y) {\n; CHECK-LABEL: @fneg_fmin(\n; CHECK-NEXT:    [[COND_INV:%.*]] = fcmp nnan nsz olt double [[X:%.*]], [[Y:%.*]]\n; CHECK-NEXT:    [[MAX_V:%.*]] = select nnan i1 [[COND_INV]], double [[Y]], double [[X]]\n; CHECK-NEXT:    [[MAX:%.*]] = fneg double [[MAX_V]]\n; CHECK-NEXT:    ret double [[MAX]]\n  %n1 = fneg double %x\n  %n2 = fneg double %y\n  %cond = fcmp nnan nsz ule double %n1, %n2\n  %max = select i1 %cond, double %n1, double %n2\n  ret double %max\n}",
+          "source_program": "define double @fneg_fmin(double %x, double %y) {\n  %n1 = fneg double %x\n  %n2 = fneg double %y\n  %cond = fcmp nnan nsz ule double %n1, %n2\n  %max = select i1 %cond, double %n1, double %n2\n  ret double %max\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] `(fcmp une T, F) ? T : F --> T` should not rely on the nsz flag on fcmp",
+    "body": "Reproducer: https://alive2.llvm.org/ce/z/_FgncC\n```\ndefine double @src(double %x, double %y) {\n  %cmp = fcmp nsz une double %x, %y\n  %cond = select i1 %cmp, double %x, double %y\n  ret double %cond\n}\n\ndefine double @tgt(double returned %x, double %y) {\n  ret double %x\n}\n```\n```\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ndouble %x = #x8000000000000000 (-0.0)\ndouble %y = #x0000000000000000 (+0.0)\n\nSource:\ni1 %cmp = #x0 (0)\ndouble %cond = #x0000000000000000 (+0.0)\n\nTarget:\nSource value: #x0000000000000000 (+0.0)\nTarget value: #x8000000000000000 (-0.0)\n```\n`nsz` flag should not be propagated from fcmp into select.\n",
+    "author": "dtcxzyw",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine",
+      "floating-point"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

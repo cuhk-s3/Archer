@@ -1,0 +1,167 @@
+{
+  "bug_id": "91417",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/91417",
+  "bug_type": "miscompilation",
+  "base_commit": "d9507a3e10d1750d88dd518c14b9a9a62b9eefcd",
+  "knowledge_cutoff": "2024-05-08T01:40:37Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/Reassociate"
+  ],
+  "hints": {
+    "fix_commit": "645fb04a3389e69801d401e669eae9ee42d70217",
+    "components": [
+      "Reassociate"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/Reassociate.cpp": [
+        [
+          302,
+          399
+        ],
+        [
+          475,
+          481
+        ],
+        [
+          490,
+          497
+        ],
+        [
+          509,
+          515
+        ],
+        [
+          518,
+          525
+        ],
+        [
+          528,
+          534
+        ],
+        [
+          562,
+          568
+        ],
+        [
+          625,
+          634
+        ],
+        [
+          642,
+          648
+        ],
+        [
+          1188,
+          1195
+        ],
+        [
+          2368,
+          2374
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/Reassociate.cpp": [
+        "CarmichaelShift",
+        "IncorporateWeight",
+        "LinearizeExprTree",
+        "LowerNegateToMultiply",
+        "ReassociatePass::ReassociateExpression",
+        "ReassociatePass::RemoveFactorFromExpression"
+      ]
+    }
+  },
+  "patch": "commit 645fb04a3389e69801d401e669eae9ee42d70217\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sat Jun 8 22:28:56 2024 +0800\n\n    [Reassociate] Use uint64_t for repeat count (#94232)\n    \n    This patch relands #91469 and uses `uint64_t` for repeat count to avoid\n    a miscompilation caused by overflow\n    https://github.com/llvm/llvm-project/pull/91469#discussion_r1623925158.\n\ndiff --git a/llvm/lib/Transforms/Scalar/Reassociate.cpp b/llvm/lib/Transforms/Scalar/Reassociate.cpp\nindex c73d7c8d83be..f36e21b296bd 100644\n--- a/llvm/lib/Transforms/Scalar/Reassociate.cpp\n+++ b/llvm/lib/Transforms/Scalar/Reassociate.cpp\n@@ -302,98 +302,7 @@ static BinaryOperator *LowerNegateToMultiply(Instruction *Neg) {\n   return Res;\n }\n \n-/// Returns k such that lambda(2^Bitwidth) = 2^k, where lambda is the Carmichael\n-/// function. This means that x^(2^k) === 1 mod 2^Bitwidth for\n-/// every odd x, i.e. x^(2^k) = 1 for every odd x in Bitwidth-bit arithmetic.\n-/// Note that 0 <= k < Bitwidth, and if Bitwidth > 3 then x^(2^k) = 0 for every\n-/// even x in Bitwidth-bit arithmetic.\n-static unsigned CarmichaelShift(unsigned Bitwidth) {\n-  if (Bitwidth < 3)\n-    return Bitwidth - 1;\n-  return Bitwidth - 2;\n-}\n-\n-/// Add the extra weight 'RHS' to the existing weight 'LHS',\n-/// reducing the combined weight using any special properties of the operation.\n-/// The existing weight LHS represents the computation X op X op ... op X where\n-/// X occurs LHS times.  The combined weight represents  X op X op ... op X with\n-/// X occurring LHS + RHS times.  If op is \"Xor\" for example then the combined\n-/// operation is equivalent to X if LHS + RHS is odd, or 0 if LHS + RHS is even;\n-/// the routine returns 1 in LHS in the first case, and 0 in LHS in the second.\n-static void IncorporateWeight(APInt &LHS, const APInt &RHS, unsigned Opcode) {\n-  // If we were working with infinite precision arithmetic then the combined\n-  // weight would be LHS + RHS.  But we are using finite precision arithmetic,\n-  // and the APInt sum LHS + RHS may not be correct if it wraps (it is correct\n-  // for nilpotent operations and addition, but not for idempotent operations\n-  // and multiplication), so it is important to correctly reduce the combined\n-  // weight back into range if wrapping would be wrong.\n-\n-  // If RHS is zero then the weight didn't change.\n-  if (RHS.isMinValue())\n-    return;\n-  // If LHS is zero then the combined weight is RHS.\n-  if (LHS.isMinValue()) {\n-    LHS = RHS;\n-    return;\n-  }\n-  // From this point on we know that neither LHS nor RHS is zero.\n-\n-  if (Instruction::isIdempotent(Opcode)) {\n-    // Idempotent means X op X === X, so any non-zero weight is equivalent to a\n-    // weight of 1.  Keeping weights at zero or one also means that wrapping is\n-    // not a problem.\n-    assert(LHS == 1 && RHS == 1 && \"Weights not reduced!\");\n-    return; // Return a weight of 1.\n-  }\n-  if (Instruction::isNilpotent(Opcode)) {\n-    // Nilpotent means X op X === 0, so reduce weights modulo 2.\n-    assert(LHS == 1 && RHS == 1 && \"Weights not reduced!\");\n-    LHS = 0; // 1 + 1 === 0 modulo 2.\n-    return;\n-  }\n-  if (Opcode == Instruction::Add || Opcode == Instruction::FAdd) {\n-    // TODO: Reduce the weight by exploiting nsw/nuw?\n-    LHS += RHS;\n-    return;\n-  }\n-\n-  assert((Opcode == Instruction::Mul || Opcode == Instruction::FMul) &&\n-         \"Unknown associative operation!\");\n-  unsigned Bitwidth = LHS.getBitWidth();\n-  // If CM is the Carmichael number then a weight W satisfying W >= CM+Bitwidth\n-  // can be replaced with W-CM.  That's because x^W=x^(W-CM) for every Bitwidth\n-  // bit number x, since either x is odd in which case x^CM = 1, or x is even in\n-  // which case both x^W and x^(W - CM) are zero.  By subtracting off multiples\n-  // of CM like this weights can always be reduced to the range [0, CM+Bitwidth)\n-  // which by a happy accident means that they can always be represented using\n-  // Bitwidth bits.\n-  // TODO: Reduce the weight by exploiting nsw/nuw?  (Could do much better than\n-  // the Carmichael number).\n-  if (Bitwidth > 3) {\n-    /// CM - The value of Carmichael's lambda function.\n-    APInt CM = APInt::getOneBitSet(Bitwidth, CarmichaelShift(Bitwidth));\n-    // Any weight W >= Threshold can be replaced with W - CM.\n-    APInt Threshold = CM + Bitwidth;\n-    assert(LHS.ult(Threshold) && RHS.ult(Threshold) && \"Weights not reduced!\");\n-    // For Bitwidth 4 or more the following sum does not overflow.\n-    LHS += RHS;\n-    while (LHS.uge(Threshold))\n-      LHS -= CM;\n-  } else {\n-    // To avoid problems with overflow do everything the same as above but using\n-    // a larger type.\n-    unsigned CM = 1U << CarmichaelShift(Bitwidth);\n-    unsigned Threshold = CM + Bitwidth;\n-    assert(LHS.getZExtValue() < Threshold && RHS.getZExtValue() < Threshold &&\n-           \"Weights not reduced!\");\n-    unsigned Total = LHS.getZExtValue() + RHS.getZExtValue();\n-    while (Total >= Threshold)\n-      Total -= CM;\n-    LHS = Total;\n-  }\n-}\n-\n-using RepeatedValue = std::pair<Value*, APInt>;\n+using RepeatedValue = std::pair<Value *, uint64_t>;\n \n /// Given an associative binary expression, return the leaf\n /// nodes in Ops along with their weights (how many times the leaf occurs).  The\n@@ -475,7 +384,6 @@ static bool LinearizeExprTree(Instruction *I,\n   assert((isa<UnaryOperator>(I) || isa<BinaryOperator>(I)) &&\n          \"Expected a UnaryOperator or BinaryOperator!\");\n   LLVM_DEBUG(dbgs() << \"LINEARIZE: \" << *I << '\\n');\n-  unsigned Bitwidth = I->getType()->getScalarType()->getPrimitiveSizeInBits();\n   unsigned Opcode = I->getOpcode();\n   assert(I->isAssociative() && I->isCommutative() &&\n          \"Expected an associative and commutative operation!\");\n@@ -490,8 +398,8 @@ static bool LinearizeExprTree(Instruction *I,\n   // with their weights, representing a certain number of paths to the operator.\n   // If an operator occurs in the worklist multiple times then we found multiple\n   // ways to get to it.\n-  SmallVector<std::pair<Instruction*, APInt>, 8> Worklist; // (Op, Weight)\n-  Worklist.push_back(std::make_pair(I, APInt(Bitwidth, 1)));\n+  SmallVector<std::pair<Instruction *, uint64_t>, 8> Worklist; // (Op, Weight)\n+  Worklist.push_back(std::make_pair(I, 1));\n   bool Changed = false;\n \n   // Leaves of the expression are values that either aren't the right kind of\n@@ -509,7 +417,7 @@ static bool LinearizeExprTree(Instruction *I,\n \n   // Leaves - Keeps track of the set of putative leaves as well as the number of\n   // paths to each leaf seen so far.\n-  using LeafMap = DenseMap<Value *, APInt>;\n+  using LeafMap = DenseMap<Value *, uint64_t>;\n   LeafMap Leaves; // Leaf -> Total weight so far.\n   SmallVector<Value *, 8> LeafOrder; // Ensure deterministic leaf output order.\n   const DataLayout DL = I->getModule()->getDataLayout();\n@@ -518,8 +426,8 @@ static bool LinearizeExprTree(Instruction *I,\n   SmallPtrSet<Value *, 8> Visited; // For checking the iteration scheme.\n #endif\n   while (!Worklist.empty()) {\n-    std::pair<Instruction*, APInt> P = Worklist.pop_back_val();\n-    I = P.first; // We examine the operands of this binary operator.\n+    // We examine the operands of this binary operator.\n+    auto [I, Weight] = Worklist.pop_back_val();\n \n     if (isa<OverflowingBinaryOperator>(I)) {\n       Flags.HasNUW &= I->hasNoUnsignedWrap();\n@@ -528,7 +436,6 @@ static bool LinearizeExprTree(Instruction *I,\n \n     for (unsigned OpIdx = 0; OpIdx < I->getNumOperands(); ++OpIdx) { // Visit operands.\n       Value *Op = I->getOperand(OpIdx);\n-      APInt Weight = P.second; // Number of paths to this operand.\n       LLVM_DEBUG(dbgs() << \"OPERAND: \" << *Op << \" (\" << Weight << \")\\n\");\n       assert(!Op->use_empty() && \"No uses, so how did we get to it?!\");\n \n@@ -562,7 +469,8 @@ static bool LinearizeExprTree(Instruction *I,\n                \"In leaf map but not visited!\");\n \n         // Update the number of paths to the leaf.\n-        IncorporateWeight(It->second, Weight, Opcode);\n+        It->second += Weight;\n+        assert(It->second >= Weight && \"Weight overflows\");\n \n         // If we still have uses that are not accounted for by the expression\n         // then it is not safe to modify the value.\n@@ -625,10 +533,7 @@ static bool LinearizeExprTree(Instruction *I,\n       // Node initially thought to be a leaf wasn't.\n       continue;\n     assert(!isReassociableOp(V, Opcode) && \"Shouldn't be a leaf!\");\n-    APInt Weight = It->second;\n-    if (Weight.isMinValue())\n-      // Leaf already output or weight reduction eliminated it.\n-      continue;\n+    uint64_t Weight = It->second;\n     // Ensure the leaf is only output once.\n     It->second = 0;\n     Ops.push_back(std::make_pair(V, Weight));\n@@ -642,7 +547,7 @@ static bool LinearizeExprTree(Instruction *I,\n   if (Ops.empty()) {\n     Constant *Identity = ConstantExpr::getBinOpIdentity(Opcode, I->getType());\n     assert(Identity && \"Associative operation without identity!\");\n-    Ops.emplace_back(Identity, APInt(Bitwidth, 1));\n+    Ops.emplace_back(Identity, 1);\n   }\n \n   return Changed;\n@@ -1188,8 +1093,7 @@ Value *ReassociatePass::RemoveFactorFromExpression(Value *V, Value *Factor) {\n   Factors.reserve(Tree.size());\n   for (unsigned i = 0, e = Tree.size(); i != e; ++i) {\n     RepeatedValue E = Tree[i];\n-    Factors.append(E.second.getZExtValue(),\n-                   ValueEntry(getRank(E.first), E.first));\n+    Factors.append(E.second, ValueEntry(getRank(E.first), E.first));\n   }\n \n   bool FoundFactor = false;\n@@ -2368,7 +2272,7 @@ void ReassociatePass::ReassociateExpression(BinaryOperator *I) {\n   SmallVector<ValueEntry, 8> Ops;\n   Ops.reserve(Tree.size());\n   for (const RepeatedValue &E : Tree)\n-    Ops.append(E.second.getZExtValue(), ValueEntry(getRank(E.first), E.first));\n+    Ops.append(E.second, ValueEntry(getRank(E.first), E.first));\n \n   LLVM_DEBUG(dbgs() << \"RAIn:\\t\"; PrintOps(I, Ops); dbgs() << '\\n');\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Reassociate/repeats.ll",
+      "commands": [
+        [
+          "opt < %s -passes=reassociate -S",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "foo3x5",
+          "test_body": "define i3 @foo3x5(i3 %x) {\n; Can be done with two multiplies.\n; CHECK-LABEL: define i3 @foo3x5(\n; CHECK-SAME: i3 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i3 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i3 [[TMP3]], [[X]]\n; CHECK-NEXT:    [[TMP5:%.*]] = mul i3 [[TMP4]], [[TMP3]]\n; CHECK-NEXT:    ret i3 [[TMP5]]\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul i3 %tmp3, %x\n  ret i3 %tmp4\n}",
+          "source_program": "define i3 @foo3x5(i3 %x) {\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul i3 %tmp3, %x\n  ret i3 %tmp4\n}\n"
+        },
+        {
+          "test_name": "foo3x5_nsw",
+          "test_body": "define i3 @foo3x5_nsw(i3 %x) {\n; Can be done with two multiplies.\n; CHECK-LABEL: define i3 @foo3x5_nsw(\n; CHECK-SAME: i3 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i3 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP2:%.*]] = mul i3 [[TMP3]], [[X]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i3 [[TMP2]], [[TMP3]]\n; CHECK-NEXT:    ret i3 [[TMP4]]\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul nsw i3 %tmp3, %x\n  ret i3 %tmp4\n}",
+          "source_program": "define i3 @foo3x5_nsw(i3 %x) {\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul nsw i3 %tmp3, %x\n  ret i3 %tmp4\n}\n"
+        },
+        {
+          "test_name": "foo4x10",
+          "test_body": "define i4 @foo4x10(i4 %x) {\n; Can be done with three multiplies.\n; CHECK-LABEL: define i4 @foo4x10(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i4 [[TMP1]], [[TMP1]]\n; CHECK-NEXT:    [[TMP2:%.*]] = mul i4 [[TMP4]], [[X]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i4 [[TMP2]], [[TMP2]]\n; CHECK-NEXT:    ret i4 [[TMP3]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  ret i4 %tmp9\n}",
+          "source_program": "define i4 @foo4x10(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  ret i4 %tmp9\n}\n"
+        },
+        {
+          "test_name": "foo4x11",
+          "test_body": "define i4 @foo4x11(i4 %x) {\n; Can be done with four multiplies.\n; CHECK-LABEL: define i4 @foo4x11(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i4 [[TMP1]], [[TMP1]]\n; CHECK-NEXT:    [[TMP2:%.*]] = mul i4 [[TMP4]], [[X]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i4 [[TMP2]], [[X]]\n; CHECK-NEXT:    [[TMP10:%.*]] = mul i4 [[TMP3]], [[TMP2]]\n; CHECK-NEXT:    ret i4 [[TMP10]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  ret i4 %tmp10\n}",
+          "source_program": "define i4 @foo4x11(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  ret i4 %tmp10\n}\n"
+        },
+        {
+          "test_name": "foo4x15",
+          "test_body": "define i4 @foo4x15(i4 %x) {\n; Can be done with four multiplies.\n; CHECK-LABEL: define i4 @foo4x15(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP6:%.*]] = mul i4 [[TMP1]], [[X]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i4 [[TMP6]], [[TMP6]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i4 [[TMP3]], [[X]]\n; CHECK-NEXT:    [[TMP5:%.*]] = mul i4 [[TMP4]], [[X]]\n; CHECK-NEXT:    [[TMP14:%.*]] = mul i4 [[TMP5]], [[TMP4]]\n; CHECK-NEXT:    ret i4 [[TMP14]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  %tmp12 = mul i4 %tmp11, %x\n  %tmp13 = mul i4 %tmp12, %x\n  %tmp14 = mul i4 %tmp13, %x\n  ret i4 %tmp14\n}",
+          "source_program": "define i4 @foo4x15(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  %tmp12 = mul i4 %tmp11, %x\n  %tmp13 = mul i4 %tmp12, %x\n  %tmp14 = mul i4 %tmp13, %x\n  ret i4 %tmp14\n}\n"
+        },
+        {
+          "test_name": "foo3x7",
+          "test_body": "define i3 @foo3x7(i3 %x) {\n; Can be done with two multiplies.\n; CHECK-LABEL: define i3 @foo3x7(\n; CHECK-SAME: i3 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP5:%.*]] = mul i3 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP6:%.*]] = mul i3 [[TMP5]], [[X]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i3 [[TMP6]], [[X]]\n; CHECK-NEXT:    [[TMP7:%.*]] = mul i3 [[TMP3]], [[TMP6]]\n; CHECK-NEXT:    ret i3 [[TMP7]]\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul i3 %tmp3, %x\n  %tmp5 = mul i3 %tmp4, %x\n  %tmp6 = mul i3 %tmp5, %x\n  ret i3 %tmp6\n}",
+          "source_program": "define i3 @foo3x7(i3 %x) {\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul i3 %tmp3, %x\n  %tmp5 = mul i3 %tmp4, %x\n  %tmp6 = mul i3 %tmp5, %x\n  ret i3 %tmp6\n}\n"
+        },
+        {
+          "test_name": "foo3x6",
+          "test_body": "define i3 @foo3x6(i3 %x) {\n; Can be done with two multiplies.\n; CHECK-LABEL: define i3 @foo3x6(\n; CHECK-SAME: i3 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i3 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i3 [[TMP1]], [[X]]\n; CHECK-NEXT:    [[TMP2:%.*]] = mul i3 [[TMP3]], [[TMP3]]\n; CHECK-NEXT:    ret i3 [[TMP2]]\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul i3 %tmp3, %x\n  %tmp5 = mul i3 %tmp4, %x\n  ret i3 %tmp5\n}",
+          "source_program": "define i3 @foo3x6(i3 %x) {\n  %tmp1 = mul i3 %x, %x\n  %tmp2 = mul i3 %tmp1, %x\n  %tmp3 = mul i3 %tmp2, %x\n  %tmp4 = mul i3 %tmp3, %x\n  %tmp5 = mul i3 %tmp4, %x\n  ret i3 %tmp5\n}\n"
+        },
+        {
+          "test_name": "foo4x9",
+          "test_body": "define i4 @foo4x9(i4 %x) {\n; Can be done with three multiplies.\n; CHECK-LABEL: define i4 @foo4x9(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP2:%.*]] = mul i4 [[TMP1]], [[TMP1]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i4 [[TMP2]], [[X]]\n; CHECK-NEXT:    [[TMP8:%.*]] = mul i4 [[TMP3]], [[TMP2]]\n; CHECK-NEXT:    ret i4 [[TMP8]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  ret i4 %tmp8\n}",
+          "source_program": "define i4 @foo4x9(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  ret i4 %tmp8\n}\n"
+        },
+        {
+          "test_name": "foo4x12",
+          "test_body": "define i4 @foo4x12(i4 %x) {\n; Can be done with two multiplies.\n; CHECK-LABEL: define i4 @foo4x12(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i4 [[TMP1]], [[X]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i4 [[TMP4]], [[TMP4]]\n; CHECK-NEXT:    [[TMP2:%.*]] = mul i4 [[TMP3]], [[TMP3]]\n; CHECK-NEXT:    ret i4 [[TMP2]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  ret i4 %tmp11\n}",
+          "source_program": "define i4 @foo4x12(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  ret i4 %tmp11\n}\n"
+        },
+        {
+          "test_name": "foo4x8",
+          "test_body": "define i4 @foo4x8(i4 %x) {\n; Can be done with two multiplies.\n; CHECK-LABEL: define i4 @foo4x8(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i4 [[TMP1]], [[TMP1]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i4 [[TMP4]], [[TMP4]]\n; CHECK-NEXT:    ret i4 [[TMP3]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  ret i4 %tmp7\n}",
+          "source_program": "define i4 @foo4x8(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  ret i4 %tmp7\n}\n"
+        },
+        {
+          "test_name": "foo4x13",
+          "test_body": "define i4 @foo4x13(i4 %x) {\n; Can be done with three multiplies.\n; CHECK-LABEL: define i4 @foo4x13(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP2:%.*]] = mul i4 [[TMP1]], [[X]]\n; CHECK-NEXT:    [[TMP3:%.*]] = mul i4 [[TMP2]], [[TMP2]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i4 [[TMP3]], [[X]]\n; CHECK-NEXT:    [[TMP12:%.*]] = mul i4 [[TMP4]], [[TMP3]]\n; CHECK-NEXT:    ret i4 [[TMP12]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  %tmp12 = mul i4 %tmp11, %x\n  ret i4 %tmp12\n}",
+          "source_program": "define i4 @foo4x13(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  %tmp12 = mul i4 %tmp11, %x\n  ret i4 %tmp12\n}\n"
+        },
+        {
+          "test_name": "foo4x14",
+          "test_body": "define i4 @foo4x14(i4 %x) {\n; Can be done with three multiplies.\n; CHECK-LABEL: define i4 @foo4x14(\n; CHECK-SAME: i4 [[X:%.*]]) {\n; CHECK-NEXT:    [[TMP1:%.*]] = mul i4 [[X]], [[X]]\n; CHECK-NEXT:    [[TMP6:%.*]] = mul i4 [[TMP1]], [[X]]\n; CHECK-NEXT:    [[TMP7:%.*]] = mul i4 [[TMP6]], [[TMP6]]\n; CHECK-NEXT:    [[TMP4:%.*]] = mul i4 [[TMP7]], [[X]]\n; CHECK-NEXT:    [[TMP5:%.*]] = mul i4 [[TMP4]], [[TMP4]]\n; CHECK-NEXT:    ret i4 [[TMP5]]\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  %tmp12 = mul i4 %tmp11, %x\n  %tmp13 = mul i4 %tmp12, %x\n  ret i4 %tmp13\n}",
+          "source_program": "define i4 @foo4x14(i4 %x) {\n  %tmp1 = mul i4 %x, %x\n  %tmp2 = mul i4 %tmp1, %x\n  %tmp3 = mul i4 %tmp2, %x\n  %tmp4 = mul i4 %tmp3, %x\n  %tmp5 = mul i4 %tmp4, %x\n  %tmp6 = mul i4 %tmp5, %x\n  %tmp7 = mul i4 %tmp6, %x\n  %tmp8 = mul i4 %tmp7, %x\n  %tmp9 = mul i4 %tmp8, %x\n  %tmp10 = mul i4 %tmp9, %x\n  %tmp11 = mul i4 %tmp10, %x\n  %tmp12 = mul i4 %tmp11, %x\n  %tmp13 = mul i4 %tmp12, %x\n  ret i4 %tmp13\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "incorrect reassociation at low bitwidth",
+    "body": "here's a function:\r\n```llvm\r\ndefine i3 @f(i3 %0) {\r\n  %2 = mul i3 %0, %0\r\n  %3 = mul i3 %2, %0\r\n  %4 = mul i3 %3, %0\r\n  %5 = mul nsw i3 %4, %0\r\n  ret i3 %5\r\n}\r\n```\r\n\r\nreassociate seems to be getting it wrong:\r\n```\r\nJohns-MacBook-Pro:reduce regehr$ ~/alive2-regehr/build/alive-tv reduced.ll -passes=reassociate\r\n\r\n----------------------------------------\r\ndefine i3 @f(i3 %#0) {\r\n#1:\r\n  %#2 = mul i3 %#0, %#0\r\n  %#3 = mul i3 %#2, %#0\r\n  %#4 = mul i3 %#3, %#0\r\n  %#5 = mul nsw i3 %#4, %#0\r\n  ret i3 %#5\r\n}\r\n=>\r\ndefine i3 @f(i3 %#0) {\r\n#1:\r\n  %#2 = mul i3 %#0, %#0\r\n  %#3 = mul nsw i3 %#2, %#0\r\n  ret i3 %#3\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nExample:\r\ni3 %#0 = #x6 (6, -2)\r\n\r\nSource:\r\ni3 %#2 = #x4 (4, -4)\r\ni3 %#3 = #x0 (0)\r\ni3 %#4 = #x0 (0)\r\ni3 %#5 = #x0 (0)\r\n\r\nTarget:\r\ni3 %#2 = #x4 (4, -4)\r\ni3 %#3 = poison\r\nSource value: #x0 (0)\r\nTarget value: poison\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\nJohns-MacBook-Pro:reduce regehr$ \r\n```\r\n\r\ncc @nunoplopes ",
+    "author": "regehr",
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "Introduced by https://github.com/llvm/llvm-project/commit/d7aeefebd6b049f017711cd7c6ef5f217a17b673.\r\n"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  }
+}

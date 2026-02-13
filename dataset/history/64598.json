@@ -1,0 +1,123 @@
+{
+  "bug_id": "64598",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/64598",
+  "bug_type": "miscompilation",
+  "base_commit": "2c8b6f16a60e99f5a39c55a91fde747e899c5422",
+  "knowledge_cutoff": "2023-08-10T14:04:38Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/GVN"
+  ],
+  "hints": {
+    "fix_commit": "7c229f6e85478bb0626a5e598f47b7be94bb50b0",
+    "components": [
+      "GVN",
+      "Local"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Transforms/Utils/Local.h": [
+        [
+          162,
+          169
+        ]
+      ],
+      "llvm/lib/Transforms/Scalar/GVN.cpp": [
+        [
+          2766,
+          2772
+        ]
+      ],
+      "llvm/lib/Transforms/Utils/Local.cpp": [
+        [
+          1247,
+          1253
+        ],
+        [
+          1263,
+          1274
+        ],
+        [
+          1279,
+          1285
+        ],
+        [
+          1343,
+          1354
+        ],
+        [
+          1361,
+          1374
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/GVN.cpp": [
+        "GVNPass::processBlock"
+      ],
+      "llvm/lib/Transforms/Utils/Local.cpp": [
+        "EliminateDuplicatePHINodesNaiveImpl",
+        "EliminateDuplicatePHINodesSetBasedImpl",
+        "llvm::EliminateDuplicatePHINodes",
+        "llvm::TryToSimplifyUncondBranchFromEmptyBlock"
+      ]
+    }
+  },
+  "patch": "commit 7c229f6e85478bb0626a5e598f47b7be94bb50b0\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Thu Aug 17 16:37:32 2023 +0200\n\n    [GVN] Invalidate MDA when deduplicating phi nodes\n    \n    Duplicate phi nodes were being directly removed, without\n    invalidating MDA. This could result in a new phi node being\n    allocated at the same address, incorrectly reusing a cache entry.\n    \n    Fix this by optionally allowing EliminateDuplicatePHINodes() to\n    collect phi nodes to remove into a vector, which allows GVN to\n    handle removal itself.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/64598.\n    \n    Differential Revision: https://reviews.llvm.org/D158849\n\ndiff --git a/llvm/include/llvm/Transforms/Utils/Local.h b/llvm/include/llvm/Transforms/Utils/Local.h\nindex 56db5facb518..81de70a2fb4c 100644\n--- a/llvm/include/llvm/Transforms/Utils/Local.h\n+++ b/llvm/include/llvm/Transforms/Utils/Local.h\n@@ -162,8 +162,18 @@ bool TryToSimplifyUncondBranchFromEmptyBlock(BasicBlock *BB,\n /// Check for and eliminate duplicate PHI nodes in this block. This doesn't try\n /// to be clever about PHI nodes which differ only in the order of the incoming\n /// values, but instcombine orders them so it usually won't matter.\n+///\n+/// This overload removes the duplicate PHI nodes directly.\n bool EliminateDuplicatePHINodes(BasicBlock *BB);\n \n+/// Check for and eliminate duplicate PHI nodes in this block. This doesn't try\n+/// to be clever about PHI nodes which differ only in the order of the incoming\n+/// values, but instcombine orders them so it usually won't matter.\n+///\n+/// This overload collects the PHI nodes to be removed into the ToRemove set.\n+bool EliminateDuplicatePHINodes(BasicBlock *BB,\n+                                SmallPtrSetImpl<PHINode *> &ToRemove);\n+\n /// This function is used to do simplification of a CFG.  For example, it\n /// adjusts branches to branches to eliminate the extra hop, it eliminates\n /// unreachable basic blocks, and does other peephole optimization of the CFG.\ndiff --git a/llvm/lib/Transforms/Scalar/GVN.cpp b/llvm/lib/Transforms/Scalar/GVN.cpp\nindex 041591553499..6731ac373966 100644\n--- a/llvm/lib/Transforms/Scalar/GVN.cpp\n+++ b/llvm/lib/Transforms/Scalar/GVN.cpp\n@@ -2766,7 +2766,10 @@ bool GVNPass::processBlock(BasicBlock *BB) {\n   // use our normal hash approach for phis.  Instead, simply look for\n   // obvious duplicates.  The first pass of GVN will tend to create\n   // identical phis, and the second or later passes can eliminate them.\n-  ChangedFunction |= EliminateDuplicatePHINodes(BB);\n+  SmallPtrSet<PHINode *, 8> PHINodesToRemove;\n+  ChangedFunction |= EliminateDuplicatePHINodes(BB, PHINodesToRemove);\n+  for (PHINode *PN : PHINodesToRemove)\n+    removeInstruction(PN);\n \n   for (BasicBlock::iterator BI = BB->begin(), BE = BB->end();\n        BI != BE;) {\ndiff --git a/llvm/lib/Transforms/Utils/Local.cpp b/llvm/lib/Transforms/Utils/Local.cpp\nindex bda67022c148..e11c4aac66ad 100644\n--- a/llvm/lib/Transforms/Utils/Local.cpp\n+++ b/llvm/lib/Transforms/Utils/Local.cpp\n@@ -1247,7 +1247,9 @@ bool llvm::TryToSimplifyUncondBranchFromEmptyBlock(BasicBlock *BB,\n   return true;\n }\n \n-static bool EliminateDuplicatePHINodesNaiveImpl(BasicBlock *BB) {\n+static bool\n+EliminateDuplicatePHINodesNaiveImpl(BasicBlock *BB,\n+                                    SmallPtrSetImpl<PHINode *> &ToRemove) {\n   // This implementation doesn't currently consider undef operands\n   // specially. Theoretically, two phis which are identical except for\n   // one having an undef where the other doesn't could be collapsed.\n@@ -1263,12 +1265,14 @@ static bool EliminateDuplicatePHINodesNaiveImpl(BasicBlock *BB) {\n     // Note that we only look in the upper square's triangle,\n     // we already checked that the lower triangle PHI's aren't identical.\n     for (auto J = I; PHINode *DuplicatePN = dyn_cast<PHINode>(J); ++J) {\n+      if (ToRemove.contains(DuplicatePN))\n+        continue;\n       if (!DuplicatePN->isIdenticalToWhenDefined(PN))\n         continue;\n       // A duplicate. Replace this PHI with the base PHI.\n       ++NumPHICSEs;\n       DuplicatePN->replaceAllUsesWith(PN);\n-      DuplicatePN->eraseFromParent();\n+      ToRemove.insert(DuplicatePN);\n       Changed = true;\n \n       // The RAUW can change PHIs that we already visited.\n@@ -1279,7 +1283,9 @@ static bool EliminateDuplicatePHINodesNaiveImpl(BasicBlock *BB) {\n   return Changed;\n }\n \n-static bool EliminateDuplicatePHINodesSetBasedImpl(BasicBlock *BB) {\n+static bool\n+EliminateDuplicatePHINodesSetBasedImpl(BasicBlock *BB,\n+                                       SmallPtrSetImpl<PHINode *> &ToRemove) {\n   // This implementation doesn't currently consider undef operands\n   // specially. Theoretically, two phis which are identical except for\n   // one having an undef where the other doesn't could be collapsed.\n@@ -1343,12 +1349,14 @@ static bool EliminateDuplicatePHINodesSetBasedImpl(BasicBlock *BB) {\n   // Examine each PHI.\n   bool Changed = false;\n   for (auto I = BB->begin(); PHINode *PN = dyn_cast<PHINode>(I++);) {\n+    if (ToRemove.contains(PN))\n+      continue;\n     auto Inserted = PHISet.insert(PN);\n     if (!Inserted.second) {\n       // A duplicate. Replace this PHI with its duplicate.\n       ++NumPHICSEs;\n       PN->replaceAllUsesWith(*Inserted.first);\n-      PN->eraseFromParent();\n+      ToRemove.insert(PN);\n       Changed = true;\n \n       // The RAUW can change PHIs that we already visited. Start over from the\n@@ -1361,14 +1369,23 @@ static bool EliminateDuplicatePHINodesSetBasedImpl(BasicBlock *BB) {\n   return Changed;\n }\n \n-bool llvm::EliminateDuplicatePHINodes(BasicBlock *BB) {\n+bool llvm::EliminateDuplicatePHINodes(BasicBlock *BB,\n+                                      SmallPtrSetImpl<PHINode *> &ToRemove) {\n   if (\n #ifndef NDEBUG\n       !PHICSEDebugHash &&\n #endif\n       hasNItemsOrLess(BB->phis(), PHICSENumPHISmallSize))\n-    return EliminateDuplicatePHINodesNaiveImpl(BB);\n-  return EliminateDuplicatePHINodesSetBasedImpl(BB);\n+    return EliminateDuplicatePHINodesNaiveImpl(BB, ToRemove);\n+  return EliminateDuplicatePHINodesSetBasedImpl(BB, ToRemove);\n+}\n+\n+bool llvm::EliminateDuplicatePHINodes(BasicBlock *BB) {\n+  SmallPtrSet<PHINode *, 8> ToRemove;\n+  bool Changed = EliminateDuplicatePHINodes(BB, ToRemove);\n+  for (PHINode *PN : ToRemove)\n+    PN->eraseFromParent();\n+  return Changed;\n }\n \n /// If the specified pointer points to an object that we control, try to modify\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/GVN/pr64598.ll",
+      "commands": [
+        [
+          "opt -S -passes=gvn < %s",
+          "FileCheck %s"
+        ]
+      ],
+      "tests": [
+        {
+          "test_name": "main",
+          "test_body": "define i32 @main(i64 %x, ptr %d, ptr noalias %p) {\n; CHECK-LABEL: define i32 @main\n; CHECK-SAME: (i64 [[X:%.*]], ptr [[D:%.*]], ptr noalias [[P:%.*]]) {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    [[T1_PRE_PRE_PRE:%.*]] = load ptr, ptr [[P]], align 8\n; CHECK-NEXT:    [[T2_PRE_PRE_PRE:%.*]] = load ptr, ptr [[T1_PRE_PRE_PRE]], align 8, !tbaa [[TBAA0:![0-9]+]]\n; CHECK-NEXT:    [[T3_PRE_PRE_PRE:%.*]] = load ptr, ptr [[T2_PRE_PRE_PRE]], align 8\n; CHECK-NEXT:    br label [[LOOP:%.*]]\n; CHECK:       loop:\n; CHECK-NEXT:    [[T2_PRE_PRE:%.*]] = phi ptr [ [[T2_PRE_PRE23:%.*]], [[LOOP_LATCH:%.*]] ], [ [[T2_PRE_PRE_PRE]], [[ENTRY:%.*]] ]\n; CHECK-NEXT:    [[T1_PRE_PRE:%.*]] = phi ptr [ [[T1_PRE_PRE19:%.*]], [[LOOP_LATCH]] ], [ [[T1_PRE_PRE_PRE]], [[ENTRY]] ]\n; CHECK-NEXT:    br label [[LOOP2:%.*]]\n; CHECK:       loop2:\n; CHECK-NEXT:    [[T2_PRE_PRE25:%.*]] = phi ptr [ [[T2_PRE_PRE23]], [[LOOP2_LATCH_LOOP2_CRIT_EDGE:%.*]] ], [ [[T2_PRE_PRE]], [[LOOP]] ]\n; CHECK-NEXT:    [[T1_PRE_PRE21:%.*]] = phi ptr [ [[T1_PRE_PRE19]], [[LOOP2_LATCH_LOOP2_CRIT_EDGE]] ], [ [[T1_PRE_PRE]], [[LOOP]] ]\n; CHECK-NEXT:    [[T3_PRE:%.*]] = phi ptr [ [[T3_PRE16:%.*]], [[LOOP2_LATCH_LOOP2_CRIT_EDGE]] ], [ [[T3_PRE_PRE_PRE]], [[LOOP]] ]\n; CHECK-NEXT:    [[T2_PRE:%.*]] = phi ptr [ [[T2_PRE13:%.*]], [[LOOP2_LATCH_LOOP2_CRIT_EDGE]] ], [ [[T2_PRE_PRE]], [[LOOP]] ]\n; CHECK-NEXT:    [[T1_PRE:%.*]] = phi ptr [ [[T1_PRE10:%.*]], [[LOOP2_LATCH_LOOP2_CRIT_EDGE]] ], [ [[T1_PRE_PRE]], [[LOOP]] ]\n; CHECK-NEXT:    br label [[LOOP3:%.*]]\n; CHECK:       loop3:\n; CHECK-NEXT:    [[T2_PRE_PRE24:%.*]] = phi ptr [ [[T2_PRE_PRE23]], [[LOOP3_LATCH:%.*]] ], [ [[T2_PRE_PRE25]], [[LOOP2]] ]\n; CHECK-NEXT:    [[T1_PRE_PRE20:%.*]] = phi ptr [ [[T1_PRE_PRE19]], [[LOOP3_LATCH]] ], [ [[T1_PRE_PRE21]], [[LOOP2]] ]\n; CHECK-NEXT:    [[T3_PRE17:%.*]] = phi ptr [ [[T3_PRE16]], [[LOOP3_LATCH]] ], [ [[T3_PRE]], [[LOOP2]] ]\n; CHECK-NEXT:    [[T2_PRE14:%.*]] = phi ptr [ [[T2_PRE13]], [[LOOP3_LATCH]] ], [ [[T2_PRE]], [[LOOP2]] ]\n; CHECK-NEXT:    [[T1_PRE11:%.*]] = phi ptr [ [[T1_PRE10]], [[LOOP3_LATCH]] ], [ [[T1_PRE]], [[LOOP2]] ]\n; CHECK-NEXT:    [[T78:%.*]] = phi ptr [ [[T7:%.*]], [[LOOP3_LATCH]] ], [ [[T3_PRE]], [[LOOP2]] ]\n; CHECK-NEXT:    [[T66:%.*]] = phi ptr [ [[T6:%.*]], [[LOOP3_LATCH]] ], [ [[T2_PRE]], [[LOOP2]] ]\n; CHECK-NEXT:    [[T54:%.*]] = phi ptr [ [[T5:%.*]], [[LOOP3_LATCH]] ], [ [[T1_PRE]], [[LOOP2]] ]\n; CHECK-NEXT:    [[TOBOOL_NOT2_I:%.*]] = icmp eq i64 [[X]], 0\n; CHECK-NEXT:    br i1 false, label [[LOOP3_LOOP3_LATCH_CRIT_EDGE:%.*]], label [[FOR_BODY_LR_PH_I:%.*]]\n; CHECK:       loop3.loop3.latch_crit_edge:\n; CHECK-NEXT:    br label [[LOOP3_LATCH]]\n; CHECK:       for.body.lr.ph.i:\n; CHECK-NEXT:    store i32 0, ptr [[P]], align 4\n; CHECK-NEXT:    [[T5_PRE:%.*]] = load ptr, ptr [[P]], align 8\n; CHECK-NEXT:    [[T6_PRE:%.*]] = load ptr, ptr [[T5_PRE]], align 8, !tbaa [[TBAA0]]\n; CHECK-NEXT:    [[T7_PRE:%.*]] = load ptr, ptr [[T6_PRE]], align 8\n; CHECK-NEXT:    br label [[LOOP3_LATCH]]\n; CHECK:       loop3.latch:\n; CHECK-NEXT:    [[T2_PRE_PRE23]] = phi ptr [ [[T2_PRE_PRE24]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T6_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    [[T1_PRE_PRE19]] = phi ptr [ [[T1_PRE_PRE20]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T5_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    [[T3_PRE16]] = phi ptr [ [[T3_PRE17]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T7_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    [[T2_PRE13]] = phi ptr [ [[T2_PRE14]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T6_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    [[T1_PRE10]] = phi ptr [ [[T1_PRE11]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T5_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    [[T7]] = phi ptr [ [[T78]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T7_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    [[T6]] = phi ptr [ [[T66]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T6_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    [[T5]] = phi ptr [ [[T54]], [[LOOP3_LOOP3_LATCH_CRIT_EDGE]] ], [ [[T5_PRE]], [[FOR_BODY_LR_PH_I]] ]\n; CHECK-NEXT:    br i1 false, label [[LOOP2_LATCH:%.*]], label [[LOOP3]]\n; CHECK:       loop2.latch:\n; CHECK-NEXT:    br i1 false, label [[LOOP2_LATCH_LOOP2_CRIT_EDGE]], label [[LOOP_LATCH]]\n; CHECK:       loop2.latch.loop2_crit_edge:\n; CHECK-NEXT:    br label [[LOOP2]]\n; CHECK:       loop.latch:\n; CHECK-NEXT:    store i32 0, ptr [[D]], align 4, !tbaa [[TBAA4:![0-9]+]]\n; CHECK-NEXT:    br label [[LOOP]]\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.latch, %entry\n  br label %loop2\n\nloop2:                                            ; preds = %loop2.latch, %loop\n  br label %loop3\n\nloop3:                                            ; preds = %loop3.latch, %loop2\n  %t1 = load ptr, ptr %p, align 8\n  %t2 = load ptr, ptr %t1, align 8, !tbaa !0\n  %t3 = load ptr, ptr %t2, align 8\n  %t4 = load i8, ptr %t3, align 1\n  %tobool.not2.i = icmp eq i64 %x, 0\n  br i1 false, label %loop3.latch, label %for.body.lr.ph.i\n\nfor.body.lr.ph.i:                                 ; preds = %loop3\n  store i32 0, ptr %p, align 4\n  br label %w.exit.loopexit\n\nw.exit.loopexit:                                  ; preds = %for.body.lr.ph.i\n  br label %loop3.latch\n\nloop3.latch:                                      ; preds = %w.exit.loopexit, %loop3\n  %t5 = load ptr, ptr %p, align 8\n  %t6 = load ptr, ptr %t5, align 8, !tbaa !0\n  %t7 = load ptr, ptr %t6, align 8\n  br i1 false, label %loop2.latch, label %loop3\n\nloop2.latch:                                      ; preds = %loop3.latch\n  br i1 false, label %loop2, label %loop.latch\n\nloop.latch:                                       ; preds = %loop2.latch\n  store i32 0, ptr %d, align 4, !tbaa !4\n  br label %loop\n}\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"any pointer\", !2, i64 0}\n!2 = !{!\"omnipotent char\", !3, i64 0}\n!3 = !{!\"Simple C/C++ TBAA\"}\n!4 = !{!5, !5, i64 0}\n!5 = !{!\"int\", !2, i64 0}",
+          "source_program": "define i32 @main(i64 %x, ptr %d, ptr noalias %p) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.latch, %entry\n  br label %loop2\n\nloop2:                                            ; preds = %loop2.latch, %loop\n  br label %loop3\n\nloop3:                                            ; preds = %loop3.latch, %loop2\n  %t1 = load ptr, ptr %p, align 8\n  %t2 = load ptr, ptr %t1, align 8, !tbaa !0\n  %t3 = load ptr, ptr %t2, align 8\n  %t4 = load i8, ptr %t3, align 1\n  %tobool.not2.i = icmp eq i64 %x, 0\n  br i1 false, label %loop3.latch, label %for.body.lr.ph.i\n\nfor.body.lr.ph.i:                                 ; preds = %loop3\n  store i32 0, ptr %p, align 4\n  br label %w.exit.loopexit\n\nw.exit.loopexit:                                  ; preds = %for.body.lr.ph.i\n  br label %loop3.latch\n\nloop3.latch:                                      ; preds = %w.exit.loopexit, %loop3\n  %t5 = load ptr, ptr %p, align 8\n  %t6 = load ptr, ptr %t5, align 8, !tbaa !0\n  %t7 = load ptr, ptr %t6, align 8\n  br i1 false, label %loop2.latch, label %loop3\n\nloop2.latch:                                      ; preds = %loop3.latch\n  br i1 false, label %loop2, label %loop.latch\n\nloop.latch:                                       ; preds = %loop2.latch\n  store i32 0, ptr %d, align 4, !tbaa !4\n  br label %loop\n}\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"any pointer\", !2, i64 0}\n!2 = !{!\"omnipotent char\", !3, i64 0}\n!3 = !{!\"Simple C/C++ TBAA\"}\n!4 = !{!5, !5, i64 0}\n!5 = !{!\"int\", !2, i64 0}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Wrong code at -O2 on x86_64 (recent regression in GVN pass)",
+    "body": "Clang at -O2 emits the wrong code.\r\n\r\nBisected to 84bcfa0e1b34938d1d11a44e9e17c6e222dd2f42, which was committed by @weiguozhi \r\n\r\nCompiler explorer: https://godbolt.org/z/rW9chv3hj\r\n\r\n```console\r\n% cat a.c\r\nint printf(const char *, ...);\r\nint a, d, e, f, h, j, t, q;\r\nchar c, s;\r\nsigned char g;\r\nsigned char *i = &g;\r\nint *k = &h;\r\nint **l = &k;\r\nsigned char **m = &i;\r\nsigned char ***r = &m;\r\nstatic signed char ****n = &r;\r\nlong o, u;\r\nint p[7];\r\nvoid v() {\r\n  t = 0;\r\n  for (; t < 9; t++) {\r\n    q = 0;\r\n    for (; c + q; q++)\r\n      p[q] = 3;\r\n  }\r\n}\r\nvoid w(long x, char y) {\r\n  for (; o;) {\r\n    v();\r\n    s = x;\r\n    u = y;\r\n  }\r\n}\r\nint main() {\r\n  for (; d <= 3; d++) {\r\n    e = 0;\r\n    for (; e <= 3; e++) {\r\n      int *b;\r\n      f = 3;\r\n      for (; f; f--) {\r\n        w(****n, **l);\r\n        b = &j;\r\n        *b = **l + ***r;\r\n      }\r\n    }\r\n  }\r\n  for (; **l;)\r\n    ;\r\n  printf(\"%X\\n\", a);\r\n}\r\n%\r\n% clang -O0 a.c  && ./a.out\r\n0\r\n% clang -O2 a.c && ./a.out\r\nSegmentation fault\r\n%\r\n```",
+    "author": "shao-hua-li",
+    "labels": [
+      "regression",
+      "miscompilation",
+      "llvm:GVN"
+    ],
+    "comments": [
+      {
+        "author": "weiguozhi",
+        "body": "Thanks for the report! Will investigate it."
+      },
+      {
+        "author": "weiguozhi",
+        "body": "It looks unrelated bug triggered by the patch https://github.com/llvm/llvm-project/commit/84bcfa0e1b34938d1d11a44e9e17c6e222dd2f42.\r\n\r\nThe function iterateOnFunction is called 5 times on main. The patch was triggered only once in the first iteration. If I limit the number of call to iterateOnFunction once or twice, the generated code can work correctly, but if I allow 3 times of call to iterateOnFunction, I will get wrong code."
+      },
+      {
+        "author": "weiguozhi",
+        "body": "The problem is in function GVNPass::processBlock, it calls EliminateDuplicatePHINodes to delete duplicated PHI instructions. But GVN uses MemoryDependenceResults *MD to maintain memory dependence information, any deleted instructions must notify MD through MD->removeInstruction, like GVNPass::removeInstruction.\r\n\r\nBut function EliminateDuplicatePHINodes just silently delete PHI instructions without notify MD, and left some garbage in MD. Later when a new PHI instruction is created at the same address as a deleted PHI instruction, MD may automatically (wrongly) contain dependence information for it. When it is used for optimization, wrong code is generated as the reported test case shows."
+      },
+      {
+        "author": "nikic",
+        "body": "Confirmed that https://gist.github.com/nikic/ebaa9312e4f3b1a451ee74ef2c710407 would fix the issue."
+      },
+      {
+        "author": "nikic",
+        "body": "I was wondering whether we could make detecting this easier through the use of AssertingVH, but the relevant value is part of `using ValueIsLoadPair = PointerIntPair<const Value *, 1, bool>`, and there's no easy way to use AssertingVH in there. (Just using `std::pair` under `LLVM_ENABLE_ABI_BREAKING_CHECKS` is not enough, because this is also used inside SmallPtrSet, etc.)"
+      },
+      {
+        "author": "nikic",
+        "body": "Candidate patch: https://reviews.llvm.org/D158849"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  }
+}
