@@ -24,6 +24,7 @@ from llvm.llvm_helper import (
 import prompts
 from tools.code import CodeTool
 from tools.debugger import DebuggerTool
+from tools.difftest import DiffTestTool
 from tools.docs import DocsTool
 from tools.eval import EvalTool
 from tools.findn import FindNTool
@@ -56,6 +57,8 @@ ADDITIONAL_CMAKE_FLAGS = [
   f"-DCMAKE_CXX_FLAGS_RELWITHDEBINFO={COMPILATION_FLAGS}",
 ]
 ALIVE_TV_PATH = os.environ.get("LAB_LLVM_ALIVE_TV", None)
+# TODO: integrate llubi to env scripts
+LLUBI_PATH = "deps/llvm-ub-aware-interpreter/build/llubi"
 
 # - ================================================
 # - Statistis and output
@@ -175,6 +178,7 @@ def get_tool_list(fixenv: Environment, llvm: LLVM, build_dir: str, debugger: Deb
     (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
     (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
     (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
+    (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT),
     # Debugging tools
     # (DebuggerTool(debugger), MAX_TCS_GET_CONTEXT),
     # (EvalTool(debugger), MAX_TCS_GET_CONTEXT),
@@ -286,6 +290,7 @@ def generate_test(
       # Verification and transformation tools
       "trans",
       "verify",
+      "difftest",
       # Stop tool to finish the analysis
       "report",
     ],

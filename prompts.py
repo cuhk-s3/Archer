@@ -25,6 +25,7 @@ You have multiple tools for each phase, but you should try to avoid using them w
 - `langref`: Query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.
 - `trans`: Run the `opt` tool with specific arguments to see how the LLVM IR code is transformed by the optimization pass.
 - `verify`: Use alive2 to verify if the transformation from original LLVM IR code to optimized LLVM IR code is correct, which can help check the validity of generated test cases in Phase 2.
+- `difftest`: Use llubi to perform differential testing on the original and transformed LLVM IR code, which can help check if the generated test cases cannot be proved by alive2.
 - `stop`: End Phase 1 by submitting the identified issues and proposed test strategies.
 - `report`: End Phase 2 by submitting the generated test cases and their verification results.
    
@@ -119,7 +120,10 @@ If the `verify` tool fails to find any issues, try to refine the test case only 
 Otherwise, you can continue to generate more test cases based on the same or different test strategies you proposed in Phase 1. 
 
 Instructions for refining test cases (if needed):
-- If alive2 reports failed-to-prove, try to reduce the test case to a smaller example that still fails. This can help isolate the specific conditions that cause the issue.
+- If alive2 reports failed-to-prove, you can try two approaches:
+  - try to reduce the test case to a smaller example that still fails. This can help isolate the specific conditions that cause the issue.
+  - try to call `difftest` to run the test case with specific input value that you think can trigger the issue based on your analysis. \
+This can help check if the issue can be exposed by actual execution even if it cannot be proved by alive2.
 - If alive2 reports alive2 errors, try to call `trans` to run opt with the same command arguments and adjust the test case or command arguments to fix. 
 - If alive2 reports correct transformation, try to first analyze if the test strategy is correct and then decide to refine the test case or continue to generate other test cases.
 
