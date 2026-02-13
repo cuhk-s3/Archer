@@ -129,7 +129,8 @@ class OpenAIAgent(AgentBase):
           )
         self.chat_stats["output_tokens"] += completion.usage.completion_tokens
         self.chat_stats["total_tokens"] += completion.usage.total_tokens
-        self.chat_stats["total_cost"] += completion.usage.cost
+        if completion.usage.cost:
+          self.chat_stats["total_cost"] += completion.usage.cost
 
       response = completion.choices[0].message
 
