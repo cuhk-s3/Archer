@@ -91,6 +91,7 @@ class RunStats:
   output_tokens: int = 0
   cached_tokens: int = 0
   total_tokens: int = 0
+  chat_cost: float = 0.0
   chat_rounds: int = 0
   phase1_round: int = 0
   phase2_round: int = 0
@@ -563,6 +564,7 @@ def main():
     stats.output_tokens = agent.chat_stats["output_tokens"]
     stats.cached_tokens = agent.chat_stats["cached_tokens"]
     stats.total_tokens = agent.chat_stats["total_tokens"]
+    stats.chat_cost = agent.chat_stats["total_cost"]
     stats.total_time_sec = time.time() - stats.total_time_sec
     usage = []
     for name in agent.tools.list(ignore_budget=False):
