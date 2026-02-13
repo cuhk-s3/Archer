@@ -445,3 +445,15 @@ def batch_compute_O3_output(tasks: List[str], jobs: int) -> Dict[str, str]:
         continue
       hashes[file] = hash
   return hashes
+
+def strip_llvm_fence(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        # Drop opening fence (```llvm / ```), keep body, drop trailing fence if present.
+        if len(lines) >= 1 and lines[0].startswith("```"):
+            lines = lines[1:]
+        if len(lines) >= 1 and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return s
