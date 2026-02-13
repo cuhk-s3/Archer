@@ -86,6 +86,7 @@ class AgentBase:
       "cached_tokens": 0,
       "output_tokens": 0,
       "total_tokens": 0,
+      "total_cost": 0.0,
     }
     self.console = get_boxed_console(debug_mode=debug_mode)
 
