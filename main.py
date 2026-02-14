@@ -99,6 +99,8 @@ class RunStats:
   phase1_round: int = 0
   phase2_round: int = 0
   total_time_sec: float = 0.0
+  # The tool usage
+  tool_usage: List[dict] = field(default_factory=list)
   # Review stats
   strategies: List[dict] = field(
     default_factory=lambda *_, **__ : [{
@@ -111,8 +113,6 @@ class RunStats:
   reason_thou: str = "<not-provided>" 
   # The generated bugs for successful runs
   bugs: List[Bug] = field(default_factory=list)
-  # The tool usage
-  tool_usage: List[dict] = field(default_factory=list)
   test_traj: List[str] = field(
     default_factory=list
   )  # Trajectories of patches ever tried during testing
@@ -256,7 +256,7 @@ def generate_test(
     )
 
   def tool_call_handler(name: str, _: str, res: str) -> Tuple[bool, str]:
-    ensure_tools_available(agent, ["report", "verify"])
+    ensure_tools_available(agent, ["report", "verify", "difftest"])
     if name == "verify":
       try:
         bug = json_repair.loads(res)
@@ -266,6 +266,18 @@ def generate_test(
             original_ir=bug["original_ir"],
             transformed_ir=bug["transformed_ir"],
             log=bug["log"],
+          ))
+      except Exception:
+        return (True, res)  # Continue the process with an error message
+    if name == "difftest":
+      try:
+        diff_result = json.loads(res)
+        if diff_result.get("found", False):
+          stats.test_traj.append(res)
+          stats.bugs.append(Bug(
+            original_ir=diff_result["original_ir"],
+            transformed_ir=diff_result["transformed_ir"],
+            log=json.dumps(diff_result["log"]),
           ))
       except Exception:
         return (True, res)  # Continue the process with an error message

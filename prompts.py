@@ -114,7 +114,9 @@ generate mutated versions of the above test case. Follow the steps below:
 Please provide each test case in a separate ```llvm ... ``` code block. 
 
 After generating the test cases, use the `verify` tool to submit the generated test cases along with detailed reasoning for each mutation. \
-The `verify` tool will use alive2 to check if the generated test cases can expose any issues with the fix. 
+The `verify` tool will use alive2 to check if the generated test cases can expose any issues with the fix. \
+You can also use `difftest` tool to check if the generated test cases trigger the expected issues by specific input values. \
+The `difftest` tool will execute the original and optimized LLVM IR code which is transformed by opt, and check if there is any difference in the execution results.
 
 If the `verify` tool fails to find any issues, try to refine the test case only if you believe there are still unexplored potential issues based on your analysis. \
 Otherwise, you can continue to generate more test cases based on the same or different test strategies you proposed in Phase 1. 

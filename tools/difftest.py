@@ -12,7 +12,7 @@ from llvm.llvm_helper import strip_llvm_fence
 TEMPLATE = """
 {ir}
 
-define {type} @main() {{
+define {type} @main(i32 %argc, ptr %argv) {{
 entry:
   %r = {call_instr}
   ret {type} %r
@@ -116,10 +116,12 @@ class DiffTestTool(FuncToolBase):
 
       return json.dumps(
         {
-          "test_result": test_result,
+          "found": test_result is False,
           "original_ir": orig_ir_body,
           "transformed_ir": transformed_ir_body,
-          "original_test_output": out1,
-          "transformed_test_output": out2,
+          "log": {
+            "original_test_output": out1,
+            "transformed_test_output": out2,
+          },
         }
       )
