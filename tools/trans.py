@@ -62,4 +62,4 @@ class TransTool(FuncToolBase):
         )
 
     def _call(self, *, orig_ir: str, args: str, **kwargs) -> str:
-        return self.transform(orig_ir, args, self.build_dir)
+        return transform(orig_ir, args, self.build_dir)
