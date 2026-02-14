@@ -22,11 +22,7 @@ from llvm.llvm_helper import (
     set_llvm_build_dir,
 )
 import prompts
-from tools.code import CodeTool
-from tools.debugger import DebuggerTool
 from tools.difftest import DiffTestTool
-from tools.docs import DocsTool
-from tools.eval import EvalTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
 from tools.langref import LangRefTool
@@ -173,15 +169,10 @@ def get_tool_list(fixenv: Environment, llvm: LLVM, build_dir: str, debugger: Deb
     (ListNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     (ReadNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     # LLVM-specific tools
-    # (CodeTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
-    # (DocsTool(llvm, debugger), MAX_TCS_GET_CONTEXT),
     (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
     (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
     (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
     (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT),
-    # Debugging tools
-    # (DebuggerTool(debugger), MAX_TCS_GET_CONTEXT),
-    # (EvalTool(debugger), MAX_TCS_GET_CONTEXT),
     # Stop the analysis (Phase 1)
     (StopTool(), MAX_TCS_GET_CONTEXT),
     # Report the bug (Phase 2)
