@@ -68,12 +68,12 @@ The test cases should be a pair of original LLVM IR code and optimized LLVM IR c
 the optimized code is the result of applying the optimization pass that contains the bug.
 
 ## Output Format ##
-The output should be in JSON format and follow this structure:
+Only output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:
 
 ```json
-{
+{{
   "original_ir": "The original LLVM IR code that can trigger the bug.",
   "optimized_ir": "The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation."
-}
+}}
 ```
 """
