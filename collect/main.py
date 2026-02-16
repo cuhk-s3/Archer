@@ -68,8 +68,9 @@ class RunStats:
 
 
 class SimpleOpenAIClient:
-  def __init__(self, model: str):
+  def __init__(self, model: str, debug: bool = False):
     self.model = model
+    self.debug = debug
     end_point = os.environ.get("LLVM_AUTOREVIEW_LM_API_ENDPOINT")
     token = os.environ.get("LLVM_AUTOREVIEW_LM_API_KEY")
     if not end_point or not token:
@@ -105,8 +106,9 @@ class SimpleOpenAIClient:
   @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
   def chat(self, temperature=0, max_tokens=4096):
     try:
-      for msg in self.history:
-        print(f"[{msg['role'].upper()}]:\n{msg['content']}\n")
+      if self.debug:
+        for msg in self.history:
+          print(f"[{msg['role'].upper()}]:\n{msg['content']}\n")
 
       response = self.client.chat.completions.create(
         model=self.model,
@@ -132,7 +134,8 @@ class SimpleOpenAIClient:
 
       content = response.choices[0].message.content
 
-      print(f"[ASSISTANT]:\n{content}")
+      if self.debug:
+        print(f"[ASSISTANT]:\n{content}")
 
       # Append assistant response to history
       self.history.append({"role": "assistant", "content": content})
@@ -332,6 +335,11 @@ def parse_args():
     default="log",
     help="Directory to save full execution logs",
   )
+  parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="Enable debug mode for more verbose output",
+  )
   return parser.parse_args()
 
 
@@ -357,7 +365,7 @@ def main():
     data = load_issue_data(args.dataset_dir, args.issue)
 
     # 1. Analyze
-    agent1 = SimpleOpenAIClient(args.model)
+    agent1 = SimpleOpenAIClient(args.model, debug=args.debug)
     try:
       md_paths, strategy = analyze_bug(agent1, data, args.issue, args.passes_dir)
       stats.strategies.append({"content": strategy})
@@ -367,7 +375,7 @@ def main():
       raise e
 
     # 2. Generate and Verify
-    agent2 = SimpleOpenAIClient(args.model)
+    agent2 = SimpleOpenAIClient(args.model, debug=args.debug)
     verification_success = False
     try:
       src_ir, tgt_ir = generate_and_verify(
