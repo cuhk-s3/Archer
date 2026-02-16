@@ -355,6 +355,12 @@ def parse_args():
 def main():
   args = parse_args()
 
+  # Check if log already exists
+  log_path = Path(args.log_dir) / f"{args.issue}.json"
+  if log_path.exists():
+    logger.info(f"Log file {log_path} already exists. Skipping.")
+    return
+
   stats = RunStats(command=vars(args))
   stats.total_time_sec = time.time()
 
