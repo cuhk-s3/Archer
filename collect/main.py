@@ -104,7 +104,7 @@ class SimpleOpenAIClient:
     self.history.append({"role": "user", "content": content})
 
   @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-  def chat(self, temperature=0, max_tokens=4096):
+  def chat(self, temperature=0):
     try:
       if self.debug:
         for msg in self.history:
@@ -114,7 +114,6 @@ class SimpleOpenAIClient:
         model=self.model,
         messages=self.history,
         temperature=temperature,
-        max_tokens=max_tokens,
       )
 
       # Update usage stats
@@ -275,7 +274,7 @@ def generate_and_verify(
   verification_success = False
   try:
     # alive-tv usage: alive-tv source.ll target.ll
-    cmd = [alive_tv_path, src_path, tgt_path]
+    cmd = [alive_tv_path, "--disable-undef-input", src_path, tgt_path]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
     if "Transformation seems to be correct" in result.stdout:
