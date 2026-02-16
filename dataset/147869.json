@@ -1,0 +1,74 @@
+{
+  "bug_id": "147869",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/147869",
+  "base_commit": "33bfbacdcba2ec9f81162637a7cf15c13975af0b",
+  "knowledge_cutoff": "2025-07-10T01:27:29Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopSimplifyCFG"
+  ],
+  "hints": {
+    "fix_commit": "04107209856bb39e041aa38cf40de0afa90a6b2d",
+    "components": [
+      "LoopSimplifyCFG"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/LoopSimplifyCFG.cpp": [
+        [
+          128,
+          133
+        ],
+        [
+          216,
+          221
+        ],
+        [
+          546,
+          551
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/LoopSimplifyCFG.cpp": [
+        "analyze",
+        "run"
+      ]
+    }
+  },
+  "patch": "commit 04107209856bb39e041aa38cf40de0afa90a6b2d\nAuthor: Justus Klausecker <117751770+Justus2308@users.noreply.github.com>\nDate:   Tue Jul 22 16:01:49 2025 +0200\n\n    [LoopSimplifyCFG] Add check for missing loop preheader (#149743)\n    \n    Closes #147869\n    Closes #149679\n    \n    Adds a check for a missing loop preheader during analysis. This fixes a\n    nullptr dereference that happened whenever LoopSimplify was unable to\n    generate a preheader because the loop was entered by an indirectbr\n    instruction (as stated in the LoopSimplify.cpp doc comment).\n\ndiff --git a/llvm/lib/Transforms/Scalar/LoopSimplifyCFG.cpp b/llvm/lib/Transforms/Scalar/LoopSimplifyCFG.cpp\nindex 221094f170ac..b9546c5fa236 100644\n--- a/llvm/lib/Transforms/Scalar/LoopSimplifyCFG.cpp\n+++ b/llvm/lib/Transforms/Scalar/LoopSimplifyCFG.cpp\n@@ -128,6 +128,8 @@ private:\n   // from any other block. So this variable set to true means that loop's latch\n   // has become unreachable from loop header.\n   bool DeleteCurrentLoop = false;\n+  // Whether or not we enter the loop through an indirectbr.\n+  bool HasIndirectEntry = false;\n \n   // The blocks of the original loop that will still be reachable from entry\n   // after the constant folding.\n@@ -216,6 +218,19 @@ private:\n       return;\n     }\n \n+    // We need a loop preheader to split in handleDeadExits(). If LoopSimplify\n+    // wasn't able to form one because the loop can be entered through an\n+    // indirectbr we cannot continue.\n+    if (!L.getLoopPreheader()) {\n+      assert(any_of(predecessors(L.getHeader()),\n+                    [&](BasicBlock *Pred) {\n+                      return isa<IndirectBrInst>(Pred->getTerminator());\n+                    }) &&\n+             \"Loop should have preheader if it is not entered indirectly\");\n+      HasIndirectEntry = true;\n+      return;\n+    }\n+\n     // Collect live and dead loop blocks and exits.\n     LiveLoopBlocks.insert(L.getHeader());\n     for (auto I = DFS.beginRPO(), E = DFS.endRPO(); I != E; ++I) {\n@@ -546,6 +561,12 @@ public:\n       return false;\n     }\n \n+    if (HasIndirectEntry) {\n+      LLVM_DEBUG(dbgs() << \"Loops which can be entered indirectly are not\"\n+                           \" supported!\\n\");\n+      return false;\n+    }\n+\n     // Nothing to constant-fold.\n     if (FoldCandidates.empty()) {\n       LLVM_DEBUG(\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopSimplifyCFG/enter-through-indirectbr.ll",
+      "commands": [
+        "opt -S -enable-loop-simplifycfg-term-folding=true -passes='require<domtree>,loop(loop-simplifycfg)' -verify-loop-info -verify-dom-info -verify-loop-lcssa < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ndefine void @test(ptr %addr) {\n;\n\n  indirectbr ptr %addr, [label %A, label %C]\n\nA:\n  br i1 true, label %B, label %C\n\nB:\n  br i1 true, label %A, label %C\n\nC:\n  unreachable\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "`loop-simplifycfg` optimisation pass segfault",
+    "body": "I first had this issue with Zig, corresponding issue on the Zig tracker is https://github.com/ziglang/zig/issues/24383, but I've been told this is likely an LLVM problem so I'm reporting it here as well.\n\nLLVM version is 20.1.7, distro is Chimera Linux.\n\nFailing IR (reduced with `llvm-reduce`):\n```\n; ModuleID = 'reduced.bc'\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux6.15.2-musl\"\n\ndefine fastcc void @vm.VM.runNoClear() {\nEntry:\n  indirectbr ptr null, [label %Case, label %Case38]\n\nCase:                                             ; preds = %Then104, %Entry\n  ret void\n\nCase38:                                           ; preds = %Then104, %Entry\n  br i1 true, label %Then104, label %Else66\n\nThen104:                                          ; preds = %Case38\n  indirectbr ptr null, [label %Case, label %Case38]\n\nElse66:                                           ; preds = %Case38\n  unreachable\n}\n```\n\nTo get the segfault, run:\n```console\n$ llvm-as reduced.ll\n$ opt -passes=loop-simplifycfg -disable-output reduced.bc\n```\n\nHere's the full backtrace:\n```\n* thread #1, name = 'opt', stop reason = SIGSEGV: address not mapped to object (fault address=0x30)\n  * frame #0: 0x00007536157612aa libLLVM.so.20.1`::run() [inlined] getPrev at ilist_node_base.h:27:38\n    frame #1: 0x00007536157612aa libLLVM.so.20.1`::run() [inlined] getPrev at ilist_node.h:121:59\n    frame #2: 0x00007536157612aa libLLVM.so.20.1`::run() [inlined] empty at ilist_node.h:313:45\n    frame #3: 0x00007536157612aa libLLVM.so.20.1`::run() [inlined] empty at simple_ilist.h:139:54\n    frame #4: 0x00007536157612aa libLLVM.so.20.1`::run() [inlined] getTerminator at BasicBlock.h:241:18\n    frame #5: 0x00007536157612a6 libLLVM.so.20.1`::run() [inlined] getTerminator at BasicBlock.h:247:48\n    frame #6: 0x00007536157612a6 libLLVM.so.20.1`::run() [inlined] handleDeadExits at LoopSimplifyCFG.cpp:353:31\n    frame #7: 0x000075361576128a libLLVM.so.20.1`::run() [inlined] run at LoopSimplifyCFG.cpp:602:5\n    frame #8: 0x0000753615760109 libLLVM.so.20.1`::run() [inlined] constantFoldTerminators at LoopSimplifyCFG.cpp:655:31\n    frame #9: 0x000075361575f68b libLLVM.so.20.1`::run() [inlined] simplifyLoopCFG at LoopSimplifyCFG.cpp:701:14\n    frame #10: 0x000075361575f68b libLLVM.so.20.1`::run() at LoopSimplifyCFG.cpp:722:8\n    frame #11: 0x0000753618bb92b2 libLLVM.so.20.1`llvm::detail::PassModel<llvm::Loop, llvm::LoopSimplifyCFGPass, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&>::run(llvm::Loop&, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>&, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&) at PassManagerInternal.h:91:17\n    frame #12: 0x0000753615757aec libLLVM.so.20.1`::runSinglePass<llvm::Loop, std::__1::unique_ptr<llvm::detail::PassConcept<llvm::Loop, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults &>, llvm::LoopStandardAnalysisResults &, llvm::LPMUpdater &>, std::__1::default_delete<llvm::detail::PassConcept<llvm::Loop, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults &>, llvm::LoopStandardAnalysisResults &, llvm::LPMUpdater &> > > >() at LoopPassManager.h:375:32\n    frame #13: 0x0000753615757841 libLLVM.so.20.1`::runWithoutLoopNestPasses() at LoopPassManager.cpp:160:9\n    frame #14: 0x000075361575657d libLLVM.so.20.1`::run() at LoopPassManager.cpp:31:32\n    frame #15: 0x0000753618b3ddf2 libLLVM.so.20.1`llvm::detail::PassModel<llvm::Loop, llvm::PassManager<llvm::Loop, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&>, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&>::run(llvm::Loop&, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>&, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&) at PassManagerInternal.h:91:17\n    frame #16: 0x00007536157587a1 libLLVM.so.20.1`::run() at LoopPassManager.cpp:302:38\n    frame #17: 0x0000753617201982 libLLVM.so.20.1`llvm::detail::PassModel<llvm::Function, llvm::FunctionToLoopPassAdaptor, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) at PassManagerInternal.h:91:17\n    frame #18: 0x000075361419e634 libLLVM.so.20.1`::run() at PassManagerImpl.h:81:38\n    frame #19: 0x00007536171d7512 libLLVM.so.20.1`llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) at PassManagerInternal.h:91:17\n    frame #20: 0x00007536141a3e94 libLLVM.so.20.1`::run() at PassManager.cpp:124:38\n    frame #21: 0x00007536171ec972 libLLVM.so.20.1`llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) at PassManagerInternal.h:91:17\n    frame #22: 0x000075361419cc4b libLLVM.so.20.1`::run() at PassManagerImpl.h:81:38\n    frame #23: 0x00005af58f144970 opt`::runPassPipeline() at NewPMDriver.cpp:541:7\n    frame #24: 0x00005af58f135f34 opt`::optMain() at optdriver.cpp:739:12\n    frame #25: 0x000075361d1f0d7d ld-musl-x86_64.so.1`libc_start_main_stage2(main=(opt`main), argc=<unavailable>, argv=0x00007ffc033f4558) at __libc_start_main.c:95:7\n    frame #26: 0x00005af58f1314c6 opt`_start + 22\n```",
+    "author": "triallax",
+    "labels": [
+      "loopoptim",
+      "confirmed",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "hstk30-hw",
+        "body": "https://godbolt.org/z/nvMrcWaE6"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "Cannot find a good commit"
+}

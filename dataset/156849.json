@@ -1,0 +1,78 @@
+{
+  "bug_id": "156849",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/156849",
+  "bug_type": "miscompilation",
+  "base_commit": "85dbe18beef4537dcdfaf9a009b1dd3dbdab608b",
+  "knowledge_cutoff": "2025-09-04T10:35:34Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopDistribute",
+    "llvm/test/Transforms/LoopVectorize",
+    "llvm/test/Transforms/LoopVersioning"
+  ],
+  "hints": {
+    "fix_commit": "f8972c8280d28660aaff888c093a9e01b9ee71e6",
+    "components": [
+      "ScalarEvolution"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        [
+          2187,
+          2194
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        "SCEVExpander::generateOverflowCheck"
+      ]
+    }
+  },
+  "patch": "commit f8972c8280d28660aaff888c093a9e01b9ee71e6\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Fri Sep 5 16:13:11 2025 +0100\n\n    [SCEVExp] Fix early exit in ComputeEndCheck. (#156910)\n    \n    ComputeEndCheck incorrectly returned false for unsigned predicates\n    starting at zero and a positive step.\n    \n    The AddRec could still wrap if Step * trunc ExitCount wraps or trunc\n    ExitCount strips leading 1s.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/156849.\n    \n    PR: https://github.com/llvm/llvm-project/pull/156910\n\ndiff --git a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\nindex 3e3d51bffff3..7c12dac73f3d 100644\n--- a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n+++ b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n@@ -2187,8 +2187,15 @@ Value *SCEVExpander::generateOverflowCheck(const SCEVAddRecExpr *AR,\n   // negative. If Step is known to be positive or negative, only create\n   // either 1. or 2.\n   auto ComputeEndCheck = [&]() -> Value * {\n-    // Checking <u 0 is always false.\n-    if (!Signed && Start->isZero() && SE.isKnownPositive(Step))\n+    // Checking <u 0 is always false, if (Step * trunc ExitCount) does not wrap.\n+    // TODO: Predicates that can be proven true/false should be discarded when\n+    // the predicates are created, not late during expansion.\n+    if (!Signed && Start->isZero() && SE.isKnownPositive(Step) &&\n+        DstBits < SrcBits &&\n+        ExitCount == SE.getZeroExtendExpr(SE.getTruncateExpr(ExitCount, ARTy),\n+                                          ExitCount->getType()) &&\n+        SE.willNotOverflow(Instruction::Mul, Signed, Step,\n+                           SE.getTruncateExpr(ExitCount, ARTy)))\n       return ConstantInt::getFalse(Loc->getContext());\n \n     // Get the backedge taken count and truncate or extended to the AR type.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/interleaved-accesses-requiring-scev-predicates.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses=true %s"
+      ],
+      "tests": [
+        {
+          "test_name": "wrap_predicate_for_interleave_group_wraps_for_known_trip_count",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine void @wrap_predicate_for_interleave_group_wraps_for_known_trip_count(ptr noalias %x, ptr noalias %out) {\nstart:\n  br label %loop\n\nloop:                                             ; preds = %loop, %start\n  %iv = phi i64 [ 0, %start ], [ %iv.next, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %iv.mul5 = mul nuw nsw i64 %iv, 5\n  %iv.mul5.masked = and i64 %iv.mul5, 15\n  %gep = getelementptr inbounds nuw i32, ptr %x, i64 %iv.mul5.masked\n  %v = load i32, ptr %gep, align 4\n  %out.i = getelementptr inbounds nuw i32, ptr %out, i64 %iv\n  store i32 %v, ptr %out.i, align 4\n  %exitcond.not = icmp eq i64 %iv.next, 16\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "additional_args": "-src-unroll=16 -tgt-unroll=16"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LoopVectorize] Miscompile with masked IV",
+    "body": "```llvm\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; out[i] = x[(i * 5) & 16]\ndefine void @test(ptr noalias %x, ptr noalias %out) {\nstart:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %start ], [ %iv.next, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %iv.mul5 = mul nuw nsw i64 %iv, 5\n  %iv.mul5.masked = and i64 %iv.mul5, 15\n  %gep = getelementptr inbounds nuw i32, ptr %x, i64 %iv.mul5.masked\n  %v = load i32, ptr %gep, align 4\n  %out.i = getelementptr inbounds nuw i32, ptr %out, i64 %iv\n  store i32 %v, ptr %out.i, align 4\n  %exitcond.not = icmp eq i64 %iv.next, 16\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:\n  ret void\n}\n```\nProduces:\n```llvm\ndefine void @test(ptr noalias %x, ptr noalias %out) {\nstart:\n  br i1 false, label %scalar.ph, label %vector.ph\n\nvector.ph:\n  br label %vector.body\n\nvector.body:\n  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]\n  %0 = mul nuw nsw i64 %index, 5\n  %1 = and i64 %0, 15\n  %2 = getelementptr inbounds nuw i32, ptr %x, i64 %1\n  %wide.vec = load <20 x i32>, ptr %2, align 4\n  %strided.vec = shufflevector <20 x i32> %wide.vec, <20 x i32> poison, <4 x i32> <i32 0, i32 5, i32 10, i32 15>\n  %3 = getelementptr inbounds nuw i32, ptr %out, i64 %index\n  store <4 x i32> %strided.vec, ptr %3, align 4\n  %index.next = add nuw i64 %index, 4\n  %4 = icmp eq i64 %index.next, 12\n  br i1 %4, label %middle.block, label %vector.body\n\nmiddle.block:\n  br label %scalar.ph\n\nscalar.ph:\n  %bc.resume.val = phi i64 [ 12, %middle.block ], [ 0, %start ]\n  br label %loop\n\nloop:\n  %iv = phi i64 [ %bc.resume.val, %scalar.ph ], [ %iv.next, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %iv.mul5 = mul nuw nsw i64 %iv, 5\n  %iv.mul5.masked = and i64 %iv.mul5, 15\n  %gep = getelementptr inbounds nuw i32, ptr %x, i64 %iv.mul5.masked\n  %v = load i32, ptr %gep, align 4\n  %out.i = getelementptr inbounds nuw i32, ptr %out, i64 %iv\n  store i32 %v, ptr %out.i, align 4\n  %exitcond.not = icmp eq i64 %iv.next, 16\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:\n  ret void\n}\n```\n\nWhat's happening here with the load and shufflevector doesn't really make sense. It seems like the masking on the IV ended up being ignored?",
+    "author": "nikic",
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "release:cherry-pick-failed",
+      "llvm:SCEV"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "cc @fhahn "
+      },
+      {
+        "author": "fhahn",
+        "body": "Looks like an SCEVExpander issue, will share a fix soon"
+      },
+      {
+        "author": "nikic",
+        "body": "Backport PR: https://github.com/llvm/llvm-project/pull/157410"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true,
+  "bisect": "Cannot find a good commit"
+}

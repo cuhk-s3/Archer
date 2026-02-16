@@ -1,0 +1,92 @@
+{
+  "bug_id": "165998",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/165998",
+  "base_commit": "39221718519f2ea3710cc3f5940adb13639b4f80",
+  "knowledge_cutoff": "2025-11-01T15:21:36Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopUnroll"
+  ],
+  "hints": {
+    "fix_commit": "1aa86ca521b8fea5ff728945d5ea5cdef97a6250",
+    "components": [
+      "LoopUnrollRuntime"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp": [
+        [
+          202,
+          207
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp": [
+        "probOfNextInRemainder"
+      ]
+    }
+  },
+  "patch": "commit 1aa86ca521b8fea5ff728945d5ea5cdef97a6250\nAuthor: Joel E. Denny <jdenny.ornl@gmail.com>\nDate:   Tue Nov 4 12:49:33 2025 -0500\n\n    [LoopUnroll] Fix division by zero (#166258)\n    \n    PR #159163's probability computation for epilogue loops does not handle\n    the possibility of an original loop probability of one. Runtime loop\n    unrolling does not make sense for such an infinite loop, and a division\n    by zero results. This patch works around that case.\n    \n    Issue #165998.\n\ndiff --git a/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp b/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp\nindex 1e8f6cc76900..6c9467bf4a00 100644\n--- a/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp\n+++ b/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp\n@@ -202,6 +202,27 @@ static void ConnectProlog(Loop *L, Value *BECount, unsigned Count,\n /// probability of executing at least one more iteration?\n static BranchProbability\n probOfNextInRemainder(BranchProbability OriginalLoopProb, unsigned N) {\n+  // OriginalLoopProb == 1 would produce a division by zero in the calculation\n+  // below.  The problem is that case indicates an always infinite loop, but a\n+  // remainder loop cannot be calculated at run time if the original loop is\n+  // infinite as infinity % UnrollCount is undefined.  We then choose\n+  // probabilities indicating that all remainder loop iterations will always\n+  // execute.\n+  //\n+  // Currently, the remainder loop here is an epilogue, which cannot be reached\n+  // if the original loop is infinite, so the aforementioned choice is\n+  // arbitrary.\n+  //\n+  // FIXME: Branch weights still need to be fixed in the case of prologues\n+  // (issue #135812).  In that case, the aforementioned choice seems reasonable\n+  // for the goal of maintaining the original loop's block frequencies.  That\n+  // is, an infinite loop's initial iterations are not skipped, and the prologue\n+  // loop body might have unique blocks that execute a finite number of times\n+  // if, for example, the original loop body contains conditionals like i <\n+  // UnrollCount.\n+  if (OriginalLoopProb == BranchProbability::getOne())\n+    return BranchProbability::getOne();\n+\n   // Each of these variables holds the original loop's probability that the\n   // number of iterations it will execute is some m in the specified range.\n   BranchProbability ProbOne = OriginalLoopProb;                // 1 <= m\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/loop-probability-one.ll",
+      "commands": [
+        "opt < %s -unroll-count=3 -passes=loop-unroll -unroll-runtime -unroll-runtime-epilog=true -S",
+        "opt < %s -unroll-count=3 -passes=loop-unroll -unroll-runtime -unroll-runtime-epilog=false -S"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "; Check that a loop probability of one (indicating an always infinite loop) does\n; not crash or otherwise break LoopUnroll behavior when it tries to compute new\n; probabilities from it.\n;\n; That case indicates an always infinite loop.  A remainder loop cannot be\n; calculated at run time when the original loop is infinite as infinity %\n; UnrollCount is undefined, so consistent remainder loop probabilities are\n; difficult or impossible to reason about.  The implementation chooses\n; probabilities indicating that all remainder loop iterations will always\n; execute.\n\n; DEFINE: %{unroll} = opt < %s -unroll-count=3 -passes=loop-unroll -S\n; DEFINE: %{rt} = %{unroll} -unroll-runtime\n\n\ndefine void @test(i32 %n) {\nentry:\n  br label %loop\n\nloop:\n  %i = phi i32 [ 0, %entry ], [ %inc, %loop ]\n  %inc = add i32 %i, 1\n  %c = icmp slt i32 %inc, %n\n  br i1 %c, label %loop, label %end, !prof !0\n\nend:\n  ret void\n}\n\n\n!0 = !{!\"branch_weights\", i32 1, i32 0}\n\n; UNROLL: define void @test(i32 %n) {\n; UNROLL: entry:\n; UNROLL:   br label %loop\n; UNROLL: loop:\n; UNROLL:   br i1 %c, label %loop.1, label %end, !prof !0\n; UNROLL: loop.1:\n; UNROLL:   br i1 %c.1, label %loop.2, label %end, !prof !0\n; UNROLL: loop.2:\n; UNROLL:   br i1 %c.2, label %loop, label %end, !prof !0, !llvm.loop !1\n; UNROLL-NOT: loop.3\n; UNROLL: end:\n; UNROLL:   ret void\n; UNROLL: }\n;\n; Infinite unrolled loop.\n; UNROLL: !0 = !{!\"branch_weights\", i32 1, i32 0}\n\n; EPILOG: define void @test(i32 %n) {\n; EPILOG: entry:\n; EPILOG:   br i1 %{{.*}}, label %loop.epil.preheader, label %entry.new, !prof !0\n; EPILOG: entry.new:\n; EPILOG:   br label %loop\n; EPILOG: loop:\n; EPILOG:   br i1 %{{.*}}, label %loop, label %end.unr-lcssa, !prof !1\n; EPILOG: end.unr-lcssa:\n; EPILOG:   br i1 %{{.*}}, label %loop.epil.preheader, label %end, !prof !1\n; EPILOG: loop.epil.preheader:\n; EPILOG:   br label %loop.epil\n; EPILOG: loop.epil:\n; EPILOG:   br i1 %{{.*}}, label %loop.epil, label %end.epilog-lcssa, !prof !4\n; EPILOG: end.epilog-lcssa:\n; EPILOG:   br label %end\n; EPILOG: end:\n; EPILOG:   ret void\n; EPILOG: }\n;\n; Unrolled loop guard: Unrolled loop is always entered.\n; EPILOG: !0 = !{!\"branch_weights\", i32 0, i32 -2147483648}\n;\n; Unrolled loop latch: Unrolled loop is infinite.\n; Epilogue loop guard: Epilogue loop is always entered if unrolled loop exits.\n; EPILOG: !1 = !{!\"branch_weights\", i32 -2147483648, i32 0}\n;\n; Epilogue loop latch: Epilogue loop executes both of its 2 iterations.\n; EPILOG: !4 = !{!\"branch_weights\", i32 1073741824, i32 1073741824}\n\n; PROLOG: define void @test(i32 %n) {\n; PROLOG: entry:\n; PROLOG:   br i1 %{{.*}}, label %loop.prol.preheader, label %loop.prol.loopexit, !prof !0\n; PROLOG: loop.prol.preheader:\n; PROLOG:   br label %loop.prol\n; PROLOG: loop.prol:\n; PROLOG:   br i1 %{{.*}}, label %loop.prol, label %loop.prol.loopexit.unr-lcssa, !prof !1\n; PROLOG: loop.prol.loopexit.unr-lcssa:\n; PROLOG:   br label %loop.prol.loopexit\n; PROLOG: loop.prol.loopexit:\n; PROLOG:   br i1 %{{.*}}, label %end, label %entry.new, !prof !0\n; PROLOG: entry.new:\n; PROLOG:   br label %loop\n; PROLOG: loop:\n; PROLOG:   br i1 %{{.*}}, label %loop, label %end.unr-lcssa, !prof !4\n; PROLOG: end.unr-lcssa:\n; PROLOG:   br label %end\n; PROLOG: end:\n; PROLOG:   ret void\n; PROLOG: }\n;\n; FIXME: Branch weights still need to be fixed in the case of prologues (issue\n; #135812), so !0 and !1 do not yet match their comments below.  When we do\n; fix it, this test will hopefully catch any bug like issue #165998, which\n; impacted the case of epilogues.\n;\n; Prologue loop guard: Prologue loop is always entered.\n; Unrolled loop guard: Unrolled loop is always entered.\n; PROLOG: !0 = !{!\"branch_weights\", i32 1, i32 127}\n;\n; Prologue loop latch: Prologue loop executes both of its 2 iterations.\n; PROLOG: !1 = !{!\"branch_weights\", i32 0, i32 1}\n;\n; Unrolled loop latch: Unrolled loop is infinite.\n; PROLOG: !4 = !{!\"branch_weights\", i32 1, i32 0}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "lld crash: Running pass \"loop-unroll<O2>\" on function \"svt_dav1d_highbd_inv_txfm_add_avx2\"",
+    "body": "PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.\nStack dump:\n0.      Running pass \"function<eager-inv>(drop-unnecessary-assumes,float2int,lower-constant-intrinsics,loop(loop-rotate<header-duplication;no-prepare-for-lto>,loop-deletion),loop-distribute,inject-tli-mappings,loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>,infer-alignment,loop-load-elim,instcombine<max-iterations=1;no-verify-fixpoint>,simplifycfg<bonus-inst-threshold=1;forward-switch-cond;switch-range-to-icmp;switch-to-arithmetic;switch-to-lookup;no-keep-loops;hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>,vector-combine,instcombine<max-iterations=1;no-verify-fixpoint>,loop-unroll<O2>,transform-warning,sroa<preserve-cfg>,infer-alignment,instcombine<max-iterations=1;no-verify-fixpoint>,loop-mssa(licm<allowspeculation>),alignment-from-assumptions,loop-sink,instsimplify,div-rem-pairs,tailcallelim,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;speculate-unpredictables>)\" on module \"build/packages/svtav1-psy-prefix/src/svtav1-psy-build/libSvtAv1Enc.ahighbd_inv_txfm_avx2.c.obj18483466\"\n1.      Running pass \"loop-unroll<O2>\" on function \"svt_dav1d_highbd_inv_txfm_add_avx2\"\n#0 0x000059ef412cccae PrintStackTraceSignalHandler(void*) (.llvm.12027265274519014927) Signals.cpp:0:0\nFloating point exception   (core dumped) /build/install/llvmbin/lld-link @response.txt\n\n[crash.zip](https://github.com/user-attachments/files/23283657/crash.zip)",
+    "author": "Andarwinux",
+    "labels": [
+      "crash-on-valid",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "Andarwinux",
+        "body": "[crash2.zip](https://github.com/user-attachments/files/23289213/crash2.zip)\n\nstill crash with -mllvm -pgso=false -mllvm -unroll-runtime-multi-exit after https://github.com/llvm/llvm-project/pull/165938"
+      },
+      {
+        "author": "Andarwinux",
+        "body": "[crash3.tar.7z.zip](https://github.com/user-attachments/files/23289408/crash3.tar.7z.zip) (rename to 7z)\nstill crash with -mllvm -pgso=false after https://github.com/llvm/llvm-project/pull/165938"
+      },
+      {
+        "author": "Andarwinux",
+        "body": "https://github.com/llvm/llvm-project/issues/166092 seems to be caused by the same reason, but has a simpler reproducer."
+      },
+      {
+        "author": "jdenny-ornl",
+        "body": "How do I reproduce this bug? I didn't find any instructions."
+      },
+      {
+        "author": "jdenny-ornl",
+        "body": "Never mind.  I found the cause and will post a fix today."
+      },
+      {
+        "author": "Andarwinux",
+        "body": "> How do I reproduce this bug? I didn't find any instructions.\n\nTo reproduce this issue, unzip the reproducer, then enter the directory same as response.txt and run lld-link @response.txt.\n\n> Never mind. I found the cause and will post a fix today.\n\nThanks!"
+      },
+      {
+        "author": "jdenny-ornl",
+        "body": "PR #166258 fixes it for me."
+      },
+      {
+        "author": "Andarwinux",
+        "body": "> PR [#166258](https://github.com/llvm/llvm-project/pull/166258) fixes it for me.\n\nThanks! I can confirm the problem has been fixed."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

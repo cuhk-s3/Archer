@@ -1,0 +1,89 @@
+{
+  "bug_id": "80113",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/80113",
+  "bug_type": "miscompilation",
+  "base_commit": "24a804101b67676aa9fa7f1097043ddd9e2ac1b6",
+  "knowledge_cutoff": "2024-01-31T08:09:28Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/BDCE"
+  ],
+  "hints": {
+    "fix_commit": "b210cbbd0eb8ef7cd2735e99570474e6e53ee00b",
+    "components": [
+      "BDCE"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/BDCE.cpp": [
+        [
+          45,
+          59
+        ],
+        [
+          79,
+          90
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/BDCE.cpp": [
+        "clearAssumptionsOfUsers"
+      ]
+    }
+  },
+  "patch": "commit b210cbbd0eb8ef7cd2735e99570474e6e53ee00b\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Wed Jan 31 11:01:03 2024 +0100\n\n    [BDCE] Fix clearing of poison-generating flags\n    \n    If the demanded bits of an instruction are full, we don't have to\n    recurse to its users, but we may still have to clear flags on the\n    instruction itself.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/80113.\n\ndiff --git a/llvm/lib/Transforms/Scalar/BDCE.cpp b/llvm/lib/Transforms/Scalar/BDCE.cpp\nindex e99210ce2f22..6e6fa6c8ffc4 100644\n--- a/llvm/lib/Transforms/Scalar/BDCE.cpp\n+++ b/llvm/lib/Transforms/Scalar/BDCE.cpp\n@@ -45,15 +45,17 @@ static void clearAssumptionsOfUsers(Instruction *I, DemandedBits &DB) {\n   assert(I->getType()->isIntOrIntVectorTy() &&\n          \"Trivializing a non-integer value?\");\n \n+  // If all bits of a user are demanded, then we know that nothing below that\n+  // in the def-use chain needs to be changed.\n+  if (DB.getDemandedBits(I).isAllOnes())\n+    return;\n+\n   // Initialize the worklist with eligible direct users.\n   SmallPtrSet<Instruction *, 16> Visited;\n   SmallVector<Instruction *, 16> WorkList;\n   for (User *JU : I->users()) {\n-    // If all bits of a user are demanded, then we know that nothing below that\n-    // in the def-use chain needs to be changed.\n-    auto *J = dyn_cast<Instruction>(JU);\n-    if (J && J->getType()->isIntOrIntVectorTy() &&\n-        !DB.getDemandedBits(J).isAllOnes()) {\n+    auto *J = cast<Instruction>(JU);\n+    if (J->getType()->isIntOrIntVectorTy()) {\n       Visited.insert(J);\n       WorkList.push_back(J);\n     }\n@@ -79,12 +81,14 @@ static void clearAssumptionsOfUsers(Instruction *I, DemandedBits &DB) {\n     // 1. llvm.assume demands its operand, so trivializing can't change it.\n     // 2. range metadata only applies to memory accesses which demand all bits.\n \n+    // If all bits of a user are demanded, then we know that nothing below\n+    // that in the def-use chain needs to be changed.\n+    if (DB.getDemandedBits(J).isAllOnes())\n+      continue;\n+\n     for (User *KU : J->users()) {\n-      // If all bits of a user are demanded, then we know that nothing below\n-      // that in the def-use chain needs to be changed.\n-      auto *K = dyn_cast<Instruction>(KU);\n-      if (K && Visited.insert(K).second && K->getType()->isIntOrIntVectorTy() &&\n-          !DB.getDemandedBits(K).isAllOnes())\n+      auto *K = cast<Instruction>(KU);\n+      if (Visited.insert(K).second && K->getType()->isIntOrIntVectorTy())\n         WorkList.push_back(K);\n     }\n   }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/BDCE/invalidate-assumptions.ll",
+      "commands": [
+        "opt -passes=bdce %s -S"
+      ],
+      "tests": [
+        {
+          "test_name": "disjoint_indirect",
+          "test_body": "define i32 @disjoint_indirect(i64 %x) {\n  %and = and i64 %x, 1\n  %trunc = trunc i64 %and to i32\n  %or = or disjoint i32 %trunc, -2\n  ret i32 %or\n}\n"
+        },
+        {
+          "test_name": "disjoint",
+          "test_body": "define i64 @disjoint(i64 %x) {\n  %and = and i64 %x, 1\n  %or = or disjoint i64 %and, -2\n  ret i64 %or\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Wrong code at -O2/3 on x86-64_linux-gnu (recent regression)",
+    "body": "clang at -O2/3 produced the wrong code. This is a recent regression.\r\n\r\nBisected to 20737825c9122b6e0a8912731cfa7e0558fe025d, which was committed by @antoniofrighetto \r\n\r\nCompiler explorer: https://godbolt.org/z/55z1WT3MM\r\n\r\n```console\r\n% cat reduced.c\r\nint printf(const char *, ...);\r\nshort a, f = 6;\r\nint b, e, g;\r\nint c[7][1];\r\nstatic int *d = &b;\r\nlong h;\r\nint *const *i;\r\nstatic unsigned char j(long k, short *n) {\r\n  int *l = &c[5][0];\r\n  int *const **m = &i;\r\n  i = &l;\r\n  *d = 0;\r\n  for (; e < 60; e++)\r\n    ***m = ((h = *d == (1 ^ k)) & *n + f) - 2;\r\n  return 0;\r\n}\r\nint main() {\r\n  j(1, &a);\r\n  printf(\"%d\\n\", c[5][0]);\r\n}\r\n%\r\n% clang -O0 reduced.c &&./a.out\r\n-2\r\n% clang -O2 reduced.c &&./a.out\r\n4\r\n%\r\n```",
+    "author": "shao-hua-li",
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Looks like poison flags don't get cleared as expected."
+      },
+      {
+        "author": "nikic",
+        "body": "Minimized:\r\n```llvm\r\ndefine i32 @test(i64 %x) {\r\n  %and = and i64 %x, 1\r\n  %trunc = trunc i64 %and to i32\r\n  %or = or disjoint i32 %trunc, -2\r\n  ret i32 %or\r\n}\r\n```\r\nThe `%and` gets dropped but `disjoint` is kept."
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "@nikic, could you kindly elaborate this? I'm having a hard time getting this, the transformation looks correct with simple `or` (https://alive2.llvm.org/ce/z/ui3yFf). Semantics for `disjoint`:\r\n> If the disjoint flag is set, and the or has a one and the same bit in both arguments, the result is poison.\r\n\r\nHowever, here:\r\n```llvm\r\n  %add = add nuw nsw i64 %conv5, %conv4\r\n  %and = and i64 %add, 1\r\n  %2 = trunc i64 %and to i32\r\n  %conv7 = or disjoint i32 %2, -2\r\n```\r\nThe two or operands do not seem to have any same bit in both arguments."
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "OK, I got it now, the `disjoint` should not be there at all after the transformation. Makes sense, thank you."
+      },
+      {
+        "author": "nikic",
+        "body": "Fixed another issue I noticed in this code in https://github.com/llvm/llvm-project/commit/cb6240d247b3419dea29eb99261171ea239b1c5c."
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "20737825c9122b6e0a8912731cfa7e0558fe025d"
+}

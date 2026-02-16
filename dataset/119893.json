@@ -1,0 +1,97 @@
+{
+  "bug_id": "119893",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/119893",
+  "base_commit": "cd093c2e1bac35dd2c6b914d0b64ce56683cb50a",
+  "knowledge_cutoff": "2024-12-13T16:00:39Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/EarlyCSE"
+  ],
+  "hints": {
+    "fix_commit": "5528388e3664c6d7d292f20a739f1bf1c8ef768d",
+    "components": [
+      "EarlyCSE",
+      "IR"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/IR/CmpPredicate.h": [
+        [
+          71,
+          83
+        ]
+      ],
+      "llvm/lib/IR/Instructions.cpp": [
+        [
+          3946,
+          3955
+        ]
+      ],
+      "llvm/lib/Transforms/Scalar/EarlyCSE.cpp": [
+        [
+          290,
+          296
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/IR/Instructions.cpp": [
+        "CmpPredicate::getSwapped",
+        "llvm::hash_value"
+      ],
+      "llvm/lib/Transforms/Scalar/EarlyCSE.cpp": [
+        "getHashValueImpl"
+      ]
+    }
+  },
+  "patch": "commit 5528388e3664c6d7d292f20a739f1bf1c8ef768d\nAuthor: Ramkumar Ramachandra <ramkumar.ramachandra@codasip.com>\nDate:   Fri Dec 13 22:06:39 2024 +0000\n\n    EarlyCSE: fix CmpPredicate duplicate-hashing (#119902)\n    \n    Strip hash_value() for CmpPredicate, as different callers have different\n    hashing use-cases. In this case, there is just one caller, namely\n    EarlyCSE, which calls hash_combine() on a CmpPredicate, which used to\n    call hash_combine() on a CmpInst::Predicate prior to 4a0d53a\n    (PatternMatch: migrate to CmpPredicate). This has uncovered a bug where\n    two icmp instructions differing in just the fact that one of them has\n    the samesign flag on it are hashed differently, leading to divergent\n    hashing, and a crash. Fix this crash by dropping samesign information on\n    icmp instructions before hashing them, preserving the former behavior.\n    \n    Fixes #119893.\n\ndiff --git a/llvm/include/llvm/IR/CmpPredicate.h b/llvm/include/llvm/IR/CmpPredicate.h\nindex ce78e4311f9f..9aa1449465f5 100644\n--- a/llvm/include/llvm/IR/CmpPredicate.h\n+++ b/llvm/include/llvm/IR/CmpPredicate.h\n@@ -71,13 +71,7 @@ public:\n \n   /// Get the swapped predicate of a CmpInst.\n   static CmpPredicate getSwapped(const CmpInst *Cmp);\n-\n-  /// Provided to facilitate storing a CmpPredicate in data structures that\n-  /// require hashing.\n-  friend hash_code hash_value(const CmpPredicate &Arg); // NOLINT\n };\n-\n-[[nodiscard]] hash_code hash_value(const CmpPredicate &Arg);\n } // namespace llvm\n \n #endif\ndiff --git a/llvm/lib/IR/Instructions.cpp b/llvm/lib/IR/Instructions.cpp\nindex d1da02c744f1..2d6fe40f4c1d 100644\n--- a/llvm/lib/IR/Instructions.cpp\n+++ b/llvm/lib/IR/Instructions.cpp\n@@ -3946,10 +3946,6 @@ CmpPredicate CmpPredicate::getSwapped(const CmpInst *Cmp) {\n   return getSwapped(get(Cmp));\n }\n \n-hash_code llvm::hash_value(const CmpPredicate &Arg) { // NOLINT\n-  return hash_combine(Arg.Pred, Arg.HasSameSign);\n-}\n-\n //===----------------------------------------------------------------------===//\n //                        SwitchInst Implementation\n //===----------------------------------------------------------------------===//\ndiff --git a/llvm/lib/Transforms/Scalar/EarlyCSE.cpp b/llvm/lib/Transforms/Scalar/EarlyCSE.cpp\nindex 682c5c3d8c63..3a0ae6b01a11 100644\n--- a/llvm/lib/Transforms/Scalar/EarlyCSE.cpp\n+++ b/llvm/lib/Transforms/Scalar/EarlyCSE.cpp\n@@ -290,7 +290,8 @@ static unsigned getHashValueImpl(SimpleValue Val) {\n       Pred = CmpInst::getInversePredicate(Pred);\n       std::swap(A, B);\n     }\n-    return hash_combine(Inst->getOpcode(), Pred, X, Y, A, B);\n+    return hash_combine(Inst->getOpcode(),\n+                        static_cast<CmpInst::Predicate>(Pred), X, Y, A, B);\n   }\n \n   if (CastInst *CI = dyn_cast<CastInst>(Inst))\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/EarlyCSE/pr119893.ll",
+      "commands": [
+        "opt -passes=early-cse -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "samesign_hash_bug",
+          "test_body": "define i32 @samesign_hash_bug(i16 %v) {\n  %zext = zext i16 %v to i32\n  %icmp.samesign = icmp samesign ugt i32 %zext, 31\n  %select.icmp.samesign = select i1 %icmp.samesign, i32 0, i32 1\n  %ashr = ashr i32 0, %select.icmp.samesign\n  %icmp = icmp ugt i32 %zext, 31\n  %select.icmp = select i1 %icmp, i32 1, i32 0\n  %ret = add i32 %ashr, %select.icmp\n  ret i32 %ret\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[EarlyCSE] Assertion `!FoundVal && \"Key already in new map?\"' failed.",
+    "body": "Reproducer:\n```\n; bin/opt -passes=early-cse reduced.ll -S\n\ndefine i32 @func_207(i16 %p_208.coerce, i32 %conv, i32 %0, i64 %1, ptr %p) {\nentry:\n  %conv1 = zext i16 %p_208.coerce to i32\n  %conv31 = sext i32 %conv to i64\n  %cmp.i = icmp eq i64 %conv31, 0\n  %xor = xor i32 %conv, 1\n  store i32 %xor, ptr %p, align 4\n  %cmp2.i = icmp samesign ugt i32 %conv1, 31\n  %shr.i601 = select i1 %cmp2.i, i32 0, i32 %conv1\n  %cond.i602 = ashr i32 1, %shr.i601\n  %conv6.i603 = trunc i32 %cond.i602 to i16\n  %conv245 = trunc i16 %p_208.coerce to i8\n  %mul.i628 = mul i8 -107, %conv245\n  %conv247 = sext i8 %mul.i628 to i64\n  %cond.i629 = call i64 @llvm.smin.i64(i64 0, i64 %conv247)\n  %cmp249 = icmp slt i64 %cond.i629, 0\n  %conv251 = zext i1 %cmp249 to i64\n  %cmp1.i630 = icmp ugt i32 %conv1, 31\n  %narrow.i631 = select i1 %cmp1.i630, i32 0, i32 %conv1\n  %shr.i632 = zext i32 %narrow.i631 to i64\n  %cond.i633 = lshr i64 %conv251, %shr.i632\n  %cmp258 = icmp slt i16 %p_208.coerce, 0\n  %2 = zext i1 %cmp258 to i16\n  %cmp261 = icmp ugt i16 1, %2\n  %conv263 = zext i1 %cmp261 to i64\n  %cmp344 = icmp eq i16 %p_208.coerce, 0\n  %conv345 = zext i1 %cmp344 to i32\n  store i32 %conv345, ptr %p, align 4\n  %conv351 = sext i32 %0 to i64\n  %sub.i641 = call i64 @llvm.ucmp.i64.i64(i64 0, i64 %conv351)\n  %conv353 = trunc i64 %sub.i641 to i16\n  %3 = mul i16 %conv353, -1\n  %conv355 = zext i16 %3 to i64\n  %cmp356 = icmp sle i64 1, %conv355\n  %conv357 = zext i1 %cmp356 to i32\n  %conv359 = trunc i32 %conv357 to i8\n  %conv.i650 = sext i8 %conv359 to i32\n  %4 = icmp ugt i32 %conv, 0\n  %shr.i652 = lshr i32 1, %conv\n  %cmp9.i = icmp slt i32 %shr.i652, 1\n  %or.cond.i = select i1 %4, i1 false, i1 %cmp9.i\n  %shl.i653 = shl i32 %conv.i650, 1\n  %5 = trunc i32 %shl.i653 to i8\n  %cond.i654 = select i1 %or.cond.i, i8 0, i8 %5\n  %conv3612 = sext i8 %cond.i654 to i32\n  %conv3623 = trunc i64 %1 to i32\n  %6 = or i32 1, %conv3612\n  %or.cond.i655 = icmp slt i32 %6, 0\n  %cmp3.i = icmp sgt i32 %conv3623, 0\n  %or.cond4.i = or i1 %cmp3.i, %or.cond.i655\n  %shr.i656 = select i1 %or.cond4.i, i32 0, i32 1\n  %cond.i657 = ashr i32 %conv, %shr.i656\n  %cmp.i658 = icmp slt i32 %cond.i657, 0\n  %shr.i660 = select i1 %cmp.i658, i32 0, i32 1\n  %cond.i661 = ashr i32 1, %shr.i660\n  %conv365 = trunc i32 %cond.i661 to i16\n  %add.i662 = or i16 1, %conv365\n  %conv368 = sext i16 %add.i662 to i32\n  ret i32 %conv368\n}\n```\n```\nopt: /data/zyw/llvm-project/llvm/include/llvm/ADT/DenseMap.h:419: void llvm::DenseMapBase<DerivedT, KeyT, ValueT, KeyInfoT, BucketT>::moveFromOldBuckets(BucketT*, BucketT*) [with DerivedT = llvm::DenseMap<{anonymous}::SimpleValue, llvm::ScopedHashTableVal<{anonymous}::SimpleValue, llvm::Value*>*, llvm::DenseMapInfo<{anonymous}::SimpleValue>, llvm::detail::DenseMapPair<{anonymous}::SimpleValue, llvm::ScopedHashTableVal<{anonymous}::SimpleValue, llvm::Value*>*> >; KeyT = {anonymous}::SimpleValue; ValueT = llvm::ScopedHashTableVal<{anonymous}::SimpleValue, llvm::Value*>*; KeyInfoT = llvm::DenseMapInfo<{anonymous}::SimpleValue>; BucketT = llvm::detail::DenseMapPair<{anonymous}::SimpleValue, llvm::ScopedHashTableVal<{anonymous}::SimpleValue, llvm::Value*>*>]: Assertion `!FoundVal && \"Key already in new map?\"' failed.\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\nStack dump:\n0.      Program arguments: /data/zyw/llvm-build/bin/opt -passes=early-cse reduced.ll\n1.      Running pass \"function(early-cse<>)\" on module \"reduced.ll\"\n2.      Running pass \"early-cse<>\" on function \"func_207\"\n #0 0x00007ffff7def832 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/data/zyw/llvm-build/bin/../lib/libLLVMSupport.so.20.0git+0x1ef832)\n #1 0x00007ffff7dec9ef llvm::sys::RunSignalHandlers() (/data/zyw/llvm-build/bin/../lib/libLLVMSupport.so.20.0git+0x1ec9ef)\n #2 0x00007ffff7decb35 SignalHandler(int) Signals.cpp:0:0\n #3 0x00007ffff7842520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\n #4 0x00007ffff78969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\n #5 0x00007ffff7842476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\n #6 0x00007ffff78287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\n #7 0x00007ffff782871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\n #8 0x00007ffff7839e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\n #9 0x00007ffff4efa75e llvm::DenseMap<(anonymous namespace)::SimpleValue, llvm::ScopedHashTableVal<(anonymous namespace)::SimpleValue, llvm::Value*>*, llvm::DenseMapInfo<(anonymous namespace)::SimpleValue, void>, llvm::detail::DenseMapPair<(anonymous namespace)::SimpleValue, llvm::ScopedHashTableVal<(anonymous namespace)::SimpleValue, llvm::Value*>*>>::grow(unsigned int) EarlyCSE.cpp:0:0\n#10 0x00007ffff4efbd5a llvm::ScopedHashTable<(anonymous namespace)::SimpleValue, llvm::Value*, llvm::DenseMapInfo<(anonymous namespace)::SimpleValue, void>, llvm::RecyclingAllocator<llvm::BumpPtrAllocatorImpl<llvm::MallocAllocator, 4096ul, 4096ul, 128ul>, llvm::ScopedHashTableVal<(anonymous namespace)::SimpleValue, llvm::Value*>, 32ul, 8ul>>::insertIntoScope(llvm::ScopedHashTableScope<(anonymous namespace)::SimpleValue, llvm::Value*, llvm::DenseMapInfo<(anonymous namespace)::SimpleValue, void>, llvm::RecyclingAllocator<llvm::BumpPtrAllocatorImpl<llvm::MallocAllocator, 4096ul, 4096ul, 128ul>, llvm::ScopedHashTableVal<(anonymous namespace)::SimpleValue, llvm::Value*>, 32ul, 8ul>>*, (anonymous namespace)::SimpleValue const&, llvm::Value* const&) EarlyCSE.cpp:0:0\n#11 0x00007ffff4efdf19 (anonymous namespace)::EarlyCSE::processNode(llvm::DomTreeNodeBase<llvm::BasicBlock>*) (.isra.0) EarlyCSE.cpp:0:0\n#12 0x00007ffff4efeef5 (anonymous namespace)::EarlyCSE::run() EarlyCSE.cpp:0:0\n#13 0x00007ffff4f00796 llvm::EarlyCSEPass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/data/zyw/llvm-build/bin/../lib/../lib/libLLVMScalarOpts.so.20.0git+0x100796)\n#14 0x00007ffff6684345 llvm::detail::PassModel<llvm::Function, llvm::EarlyCSEPass, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/data/zyw/llvm-build/bin/../lib/../lib/libLLVMPasses.so.20.0git+0x84345)\n#15 0x00007ffff38ee63d llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/data/zyw/llvm-build/bin/../lib/../lib/libLLVMCore.so.20.0git+0x2ee63d)\n#16 0x00007ffff70a9445 llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/data/zyw/llvm-build/bin/../lib/../lib/libLLVMX86CodeGen.so.20.0git+0xa9445)\n#17 0x00007ffff38ec628 llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/data/zyw/llvm-build/bin/../lib/../lib/libLLVMCore.so.20.0git+0x2ec628)\n#18 0x00007ffff70a9e05 llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/data/zyw/llvm-build/bin/../lib/../lib/libLLVMX86CodeGen.so.20.0git+0xa9e05)\n#19 0x00007ffff38ed28d llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/data/zyw/llvm-build/bin/../lib/../lib/libLLVMCore.so.20.0git+0x2ed28d)\n#20 0x00007ffff7f9b1eb llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/data/zyw/llvm-build/bin/../lib/libLLVMOptDriver.so.20.0git+0x241eb)\n#21 0x00007ffff7fa5619 optMain (/data/zyw/llvm-build/bin/../lib/libLLVMOptDriver.so.20.0git+0x2e619)\n#22 0x00007ffff7829d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\n#23 0x00007ffff7829e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\n#24 0x0000555555555095 _start (/data/zyw/llvm-build/bin/opt+0x1095)\nAborted (core dumped)\n```",
+    "author": "dtcxzyw",
+    "labels": [
+      "crash-on-valid",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "Reverting 4a0d53a0b0a58a3c6980a7c551357ac71ba3db10 fixes this issue.\ncc @artagnon @nikic Can you double check the implementation of `hash_value(const CmpPredicate&)`?\n"
+      },
+      {
+        "author": "nikic",
+        "body": "Yeah, the implementation is incorrect for EarlyCSE (which should not take into account poison generating flags). I think we should remove the hash_value implementation and make the caller handler it appropriately."
+      },
+      {
+        "author": "artagnon",
+        "body": "Not sure I understand. The backtrace points to EarlyCSE.cpp:1558, and the Instruction it crashes on is an `or`. With surrounding context it is:\n\nhttps://github.com/llvm/llvm-project/blob/main/llvm/lib/Transforms/Scalar/EarlyCSE.cpp#L1392-L1560"
+      },
+      {
+        "author": "artagnon",
+        "body": "So I think this would fix the issue, although I'm not sure I understand the underlying issue:\n\n```diff\ndiff --git a/llvm/lib/Transforms/Scalar/EarlyCSE.cpp b/llvm/lib/Transforms/Scalar/EarlyCSE.cpp\nindex 682c5c3d8c63..8e87f8b9a457 100644\n--- a/llvm/lib/Transforms/Scalar/EarlyCSE.cpp\n+++ b/llvm/lib/Transforms/Scalar/EarlyCSE.cpp\n@@ -290,7 +290,7 @@ static unsigned getHashValueImpl(SimpleValue Val) {\n       Pred = CmpInst::getInversePredicate(Pred);\n       std::swap(A, B);\n     }\n-    return hash_combine(Inst->getOpcode(), Pred, X, Y, A, B);\n+    return hash_combine(Inst->getOpcode(), static_cast<CmpInst::Predicate>(Pred), X, Y, A, B);\n   }\n\n   if (CastInst *CI = dyn_cast<CastInst>(Inst))\n```"
+      },
+      {
+        "author": "artagnon",
+        "body": "We hash two equal predicates, one with with samesign information (leading to a divergent hash), leading to a divergent hash_combine call, and hence a duplicate insertion into DenseMap:\n\n```cpp\n  SelectPatternFlavor SPF;\n  Value *Cond, *A, *B;\n  if (matchSelectWithOptionalNotCond(Inst, Cond, A, B, SPF)) {\n    // Hash min/max (cmp + select) to allow for commuted operands.\n    // Min/max may also have non-canonical compare predicate (eg, the compare for\n    // smin may use 'sgt' rather than 'slt'), and non-canonical operands in the\n    // compare.\n    // TODO: We should also detect FP min/max.\n    if (SPF == SPF_SMIN || SPF == SPF_SMAX ||\n        SPF == SPF_UMIN || SPF == SPF_UMAX) {\n      if (A > B)\n        std::swap(A, B);\n      return hash_combine(Inst->getOpcode(), SPF, A, B);\n    }\n\n    // Hash general selects to allow matching commuted true/false operands.\n\n    // If we do not have a compare as the condition, just hash in the condition.\n    CmpPredicate Pred;\n    Value *X, *Y;\n    if (!match(Cond, m_Cmp(Pred, m_Value(X), m_Value(Y))))\n      return hash_combine(Inst->getOpcode(), Cond, A, B);\n\n    // Similar to cmp normalization (above) - canonicalize the predicate value:\n    // select (icmp Pred, X, Y), A, B --> select (icmp InvPred, X, Y), B, A\n    if (CmpInst::getInversePredicate(Pred) < Pred) {\n      Pred = CmpInst::getInversePredicate(Pred);\n      std::swap(A, B);\n    }\n    return hash_combine(Inst->getOpcode(), static_cast<CmpInst::Predicate>(Pred), X, Y, A, B); /// fixed\n  }\n```\n\nThese are the duplicates:\n\n```llvm\n  %cmp2.i = icmp samesign ugt i32 %conv1, 31\n  %cmp1.i630 = icmp ugt i32 %conv1, 31\n```"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "bisect": "4a0d53a0b0a58a3c6980a7c551357ac71ba3db10"
+}

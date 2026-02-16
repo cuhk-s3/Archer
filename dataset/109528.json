@@ -1,0 +1,73 @@
+{
+  "bug_id": "109528",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/109528",
+  "base_commit": "586736226e3a25b1fd647d3257270c1388f907bf",
+  "knowledge_cutoff": "2024-09-21T14:20:16Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "6d6eea92e36c301e34a7ec11b2a40e3080f79f53",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          8420,
+          8440
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "VPRecipeBuilder::tryToWiden"
+      ]
+    }
+  },
+  "patch": "commit 6d6eea92e36c301e34a7ec11b2a40e3080f79f53\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Wed Oct 2 13:45:48 2024 +0100\n\n    [LV] Use SCEV to simplify wide binop operand to constant.\n    \n    The legacy cost model uses SCEV to determine if the second operand of a\n    binary op is a constant. Update the VPlan construction logic to mirror\n    the current legacy behavior, to fix a difference in the cost models.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/109528.\n    Fixes https://github.com/llvm/llvm-project/issues/110440.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex e1f9f29ac6d9..de3b981a4fe3 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8420,21 +8420,28 @@ VPWidenRecipe *VPRecipeBuilder::tryToWiden(Instruction *I,\n   case Instruction::Sub:\n   case Instruction::Xor:\n   case Instruction::Freeze:\n-    if (I->getOpcode() == Instruction::Mul) {\n-      // Simplify operands of multiplications using SCEV. This is needed at the\n-      // moment to match the behavior of the legacy cost-model.\n-      // TODO: Generalize to any opcode and move to VPlan transformation.\n-      SmallVector<VPValue *> NewOps(Operands);\n+    SmallVector<VPValue *> NewOps(Operands);\n+    if (Instruction::isBinaryOp(I->getOpcode())) {\n+      // The legacy cost model uses SCEV to check if some of the operands are\n+      // constants. To match the legacy cost model's behavior, use SCEV to try\n+      // to replace operands with constants.\n       ScalarEvolution &SE = *PSE.getSE();\n-      for (unsigned I = 0; I < Operands.size(); ++I) {\n-        Value *V = NewOps[I]->getUnderlyingValue();\n-        if (!isa<Constant>(V) && SE.isSCEVable(V->getType()))\n-          if (auto *C = dyn_cast<SCEVConstant>(PSE.getSE()->getSCEV(V)))\n-            NewOps[I] = Plan.getOrAddLiveIn(C->getValue());\n-      }\n-      return new VPWidenRecipe(*I, make_range(NewOps.begin(), NewOps.end()));\n+      auto GetConstantViaSCEV = [this, &SE](VPValue *Op) {\n+        Value *V = Op->getUnderlyingValue();\n+        if (isa<Constant>(V) || !SE.isSCEVable(V->getType()))\n+          return Op;\n+        auto *C = dyn_cast<SCEVConstant>(SE.getSCEV(V));\n+        if (!C)\n+          return Op;\n+        return Plan.getOrAddLiveIn(C->getValue());\n+      };\n+      // For Mul, the legacy cost model checks both operands.\n+      if (I->getOpcode() == Instruction::Mul)\n+        NewOps[0] = GetConstantViaSCEV(NewOps[0]);\n+      // For other binops, the legacy cost model only checks the second operand.\n+      NewOps[1] = GetConstantViaSCEV(NewOps[1]);\n     }\n-    return new VPWidenRecipe(*I, make_range(Operands.begin(), Operands.end()));\n+    return new VPWidenRecipe(*I, make_range(NewOps.begin(), NewOps.end()));\n   };\n }\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/cost-constant-known-via-scev.ll",
+      "commands": [
+        "opt -p loop-vectorize -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_foldable_live_in_via_scev",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @test_foldable_live_in_via_scev() {\nentry:\n  %conv = zext i16 -6 to i64\n  %add = add nsw i64 %conv, -65528\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 1, %entry ], [ %iv.next, %loop ]\n  %red = phi i64 [ 1, %entry ], [ %mul, %loop ]\n  %mul = mul nsw i64 %red, %add\n  %iv.next = add nsw i32 %iv, 1\n  %ec = icmp eq i32 %iv.next, 100\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %ret = phi i64 [ %mul, %loop ]\n  ret i64 %ret\n}\n"
+        },
+        {
+          "test_name": "second_lshr_operand_zero_via_scev",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @second_lshr_operand_zero_via_scev() {\nentry:\n  %ext.0 = sext i8 0 to i32\n  br label %loops\n\nloops:                                            ; preds = %loops, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loops ]\n  %red = phi i64 [ 0, %entry ], [ %red.next, %loops ]\n  %c = icmp eq i64 %iv, 0\n  %and = and i64 %iv, 0\n  %0 = trunc i64 %iv to i32\n  %shr = lshr i32 %0, %ext.0\n  %conv.1 = zext i32 %shr to i64\n  %red.next.v = select i1 %c, i64 %and, i64 %conv.1\n  %red.next = or i64 %red.next.v, %red\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 0\n  br i1 %ec, label %exit, label %loops\n\nexit:                                             ; preds = %loops\n  %res = phi i64 [ %red.next, %loops ]\n  ret i64 %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[clang] Assertion failed in Vectorize",
+    "body": "When I compiled this code with O2 flag, it crashed:\r\n\r\n```c\r\n#include <stdint.h>\r\nstatic uint64_t\r\nsafe_sub_func_uint64_t_u_u(uint64_t ui1, uint64_t ui2)\r\n{\r\n  return ui1 - ui2;\r\n}\r\nlong a;\r\nstatic int8_t c;\r\nvoid b(long d, int f) {\r\n  int e = 0;\r\n  for (; e < 64; e++)\r\n    if (e - f)\r\n      a |= e >> f;\r\n    else\r\n      a |= d & e;\r\n}\r\nuint32_t g() {\r\n  b(6, c);\r\n  for (;; c = safe_sub_func_uint64_t_u_u(c, 4))\r\n    ;\r\n}\r\n```\r\n\r\nThe crash is:\r\n```\r\nclang: /root/llvm-project/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp:7383: llvm::VectorizationFactor llvm::LoopVectorizationPlanner::computeBestVF(): Assertion `(BestFactor.Width == LegacyVF.Width || planContainsAdditionalSimplifications(getPlanFor(BestFactor.Width), CostCtx, OrigLoop)) && \" VPlan cost model and legacy cost model disagreed\"' failed.\r\n```\r\n\r\nDetails can be found here: https://godbolt.org/z/7733x1hvP",
+    "author": "cardigan1008",
+    "labels": [
+      "vectorizers",
+      "confirmed",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "shafik",
+        "body": "This looks like a regression in trunk: https://godbolt.org/z/eo7WG1e66"
+      },
+      {
+        "author": "hiraditya",
+        "body": "Probably a recent change caused this? cc: @ayalz @fhahn "
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "533e6bbd0d344a710c491a9eb0ce0ba0852b08cb"
+}

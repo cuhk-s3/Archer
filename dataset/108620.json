@@ -1,0 +1,92 @@
+{
+  "bug_id": "108620",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/108620",
+  "base_commit": "03618ceabd003be94190b068db11b607fd1108ef",
+  "knowledge_cutoff": "2024-09-13T18:15:02Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "1e3536ef3141d6429f3616af624b81b6d6ab2959",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          1283,
+          1293
+        ],
+        [
+          14222,
+          14235
+        ],
+        [
+          14373,
+          14378
+        ],
+        [
+          14426,
+          14436
+        ],
+        [
+          14530,
+          14537
+        ],
+        [
+          14757,
+          14762
+        ],
+        [
+          17660,
+          17666
+        ],
+        [
+          17956,
+          17961
+        ],
+        [
+          18024,
+          18031
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::vectorizeTree",
+        "tryToReduce"
+      ]
+    }
+  },
+  "patch": "commit 1e3536ef3141d6429f3616af624b81b6d6ab2959\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Fri Sep 13 15:40:22 2024 -0700\n\n    [SLP]Fix PR108620: Need to check, if the reduced value was transformed\n    \n    Before trying to include the scalar into the list of\n    ExternallyUsedValues, need to check, if it was transformed in previous\n    iteration and use the transformed value, not the original one, to avoid\n    compiler crash when building external uses.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/108620\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 0afe02fc08ff..5f2bf082fb87 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -1283,11 +1283,8 @@ public:\n   /// Vectorize the tree but with the list of externally used values \\p\n   /// ExternallyUsedValues. Values in this MapVector can be replaced but the\n   /// generated extractvalue instructions.\n-  /// \\param ReplacedExternals containd list of replaced external values\n-  /// {scalar, replace} after emitting extractelement for external uses.\n   Value *\n   vectorizeTree(const ExtraValueToDebugLocsMap &ExternallyUsedValues,\n-                SmallVectorImpl<std::pair<Value *, Value *>> &ReplacedExternals,\n                 Instruction *ReductionRoot = nullptr);\n \n   /// \\returns the cost incurred by unwanted spills and fills, caused by\n@@ -14222,14 +14219,12 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E, bool PostponedPHIs) {\n \n Value *BoUpSLP::vectorizeTree() {\n   ExtraValueToDebugLocsMap ExternallyUsedValues;\n-  SmallVector<std::pair<Value *, Value *>> ReplacedExternals;\n-  return vectorizeTree(ExternallyUsedValues, ReplacedExternals);\n+  return vectorizeTree(ExternallyUsedValues);\n }\n \n-Value *BoUpSLP::vectorizeTree(\n-    const ExtraValueToDebugLocsMap &ExternallyUsedValues,\n-    SmallVectorImpl<std::pair<Value *, Value *>> &ReplacedExternals,\n-    Instruction *ReductionRoot) {\n+Value *\n+BoUpSLP::vectorizeTree(const ExtraValueToDebugLocsMap &ExternallyUsedValues,\n+                       Instruction *ReductionRoot) {\n   // All blocks must be scheduled before any instructions are inserted.\n   for (auto &BSIter : BlocksSchedules) {\n     scheduleBlock(BSIter.second.get());\n@@ -14373,6 +14368,7 @@ Value *BoUpSLP::vectorizeTree(\n   SmallDenseSet<Value *, 4> UsedInserts;\n   DenseMap<std::pair<Value *, Type *>, Value *> VectorCasts;\n   SmallDenseSet<Value *, 4> ScalarsWithNullptrUser;\n+  SmallDenseSet<ExtractElementInst *, 4> IgnoredExtracts;\n   // Extract all of the elements with the external uses.\n   for (const auto &ExternalUse : ExternalUses) {\n     Value *Scalar = ExternalUse.Scalar;\n@@ -14426,11 +14422,16 @@ Value *BoUpSLP::vectorizeTree(\n           if (ReplaceInst) {\n             // Leave the instruction as is, if it cheaper extracts and all\n             // operands are scalar.\n-            auto *CloneInst = Inst->clone();\n-            CloneInst->insertBefore(Inst);\n-            if (Inst->hasName())\n-              CloneInst->takeName(Inst);\n-            Ex = CloneInst;\n+            if (auto *EE = dyn_cast<ExtractElementInst>(Inst)) {\n+              IgnoredExtracts.insert(EE);\n+              Ex = EE;\n+            } else {\n+              auto *CloneInst = Inst->clone();\n+              CloneInst->insertBefore(Inst);\n+              if (Inst->hasName())\n+                CloneInst->takeName(Inst);\n+              Ex = CloneInst;\n+            }\n           } else if (auto *ES = dyn_cast<ExtractElementInst>(Scalar);\n                      ES && isa<Instruction>(Vec)) {\n             Value *V = ES->getVectorOperand();\n@@ -14530,8 +14531,12 @@ Value *BoUpSLP::vectorizeTree(\n       }\n       Value *NewInst = ExtractAndExtendIfNeeded(Vec);\n       // Required to update internally referenced instructions.\n-      Scalar->replaceAllUsesWith(NewInst);\n-      ReplacedExternals.emplace_back(Scalar, NewInst);\n+      if (Scalar != NewInst) {\n+        assert((!isa<ExtractElementInst>(Scalar) ||\n+                !IgnoredExtracts.contains(cast<ExtractElementInst>(Scalar))) &&\n+               \"Extractelements should not be replaced.\");\n+        Scalar->replaceAllUsesWith(NewInst);\n+      }\n       continue;\n     }\n \n@@ -14757,6 +14762,9 @@ Value *BoUpSLP::vectorizeTree(\n       if (Entry->getOpcode() == Instruction::GetElementPtr &&\n           !isa<GetElementPtrInst>(Scalar))\n         continue;\n+      if (auto *EE = dyn_cast<ExtractElementInst>(Scalar);\n+          EE && IgnoredExtracts.contains(EE))\n+        continue;\n #ifndef NDEBUG\n       Type *Ty = Scalar->getType();\n       if (!Ty->isVoidTy()) {\n@@ -17660,7 +17668,6 @@ public:\n     // because of the vectorization.\n     DenseMap<Value *, WeakTrackingVH> TrackedVals(ReducedVals.size() *\n                                                   ReducedVals.front().size());\n-    SmallVector<std::pair<Value *, Value *>> ReplacedExternals;\n \n     // The compare instruction of a min/max is the insertion point for new\n     // instructions and may be replaced with a new compare instruction.\n@@ -17956,6 +17963,8 @@ public:\n           if (Cnt >= Pos && Cnt < Pos + ReduxWidth)\n             continue;\n           Value *RdxVal = Candidates[Cnt];\n+          if (auto It = TrackedVals.find(RdxVal); It != TrackedVals.end())\n+            RdxVal = It->second;\n           if (!Visited.insert(RdxVal).second)\n             continue;\n           // Check if the scalar was vectorized as part of the vectorization\n@@ -18024,8 +18033,8 @@ public:\n           InsertPt = GetCmpForMinMaxReduction(RdxRootInst);\n \n         // Vectorize a tree.\n-        Value *VectorizedRoot = V.vectorizeTree(LocalExternallyUsedValues,\n-                                                ReplacedExternals, InsertPt);\n+        Value *VectorizedRoot =\n+            V.vectorizeTree(LocalExternallyUsedValues, InsertPt);\n \n         Builder.SetInsertPoint(InsertPt);\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/reduced-val-extracted-and-externally-used.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(i32 %arg) {\nbb:\n  br label %bb1\n\nbb1:                                              ; preds = %bb1, %bb\n  %phi = phi i32 [ 0, %bb ], [ %add27, %bb1 ]\n  %phi2 = phi i32 [ 0, %bb ], [ %add24, %bb1 ]\n  %phi3 = phi i32 [ 0, %bb ], [ %xor26, %bb1 ]\n  %add = add i32 %phi2, 0\n  %add4 = add i32 %phi2, 0\n  %xor = xor i32 %add, %add4\n  %add5 = add i32 %phi, 0\n  %add6 = add i32 %phi2, 0\n  %add7 = add i32 %phi2, 0\n  %xor8 = xor i32 %add6, %xor\n  %xor9 = xor i32 %xor8, %add5\n  %xor10 = xor i32 %xor9, %add7\n  %add11 = add i32 %phi, 0\n  %add12 = add i32 %phi2, 0\n  %add13 = add i32 %phi2, 0\n  %xor14 = xor i32 %add12, %xor10\n  %xor15 = xor i32 %xor14, %add11\n  %xor16 = xor i32 %xor15, %add13\n  %add17 = add i32 %phi, 0\n  %add18 = add i32 %phi2, 0\n  %add19 = add i32 %phi2, 0\n  %xor20 = xor i32 %add18, %xor16\n  %xor21 = xor i32 %xor20, %add17\n  %xor22 = xor i32 %xor21, %add19\n  %add23 = add i32 %phi2, 0\n  %add24 = add i32 %arg, 0\n  %xor25 = xor i32 %add23, %xor22\n  %xor26 = xor i32 %xor25, %add24\n  %add27 = add i32 1, 0\n  %icmp = icmp ult i32 %add27, 0\n  br label %bb1\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Assertion `(I->use_empty() || all_of(I->uses(), [&](Use &U) { return isDeleted( cast<Instruction>(U.getUser())); })) && \"trying to erase instruction with users.\"' failed.",
+    "body": "To reproduce run the following test with -passes=slp-vectorizer\r\n```\r\n; ModuleID = './reduced.ll'\r\nsource_filename = \"./reduced.ll\"\r\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\r\ntarget triple = \"x86_64-unknown-linux-gnu\"\r\n\r\ndefine void @wombat(i32 %arg) gc \"statepoint-example\" {\r\nbb:\r\n  br label %bb1\r\n\r\nbb1:                                              ; preds = %bb1, %bb\r\n  %phi = phi i32 [ 0, %bb ], [ %add27, %bb1 ]\r\n  %phi2 = phi i32 [ 0, %bb ], [ %add24, %bb1 ]\r\n  %phi3 = phi i32 [ 0, %bb ], [ %xor26, %bb1 ]\r\n  %add = add i32 %phi2, 0\r\n  %add4 = add i32 %phi2, 0\r\n  %xor = xor i32 %add, %add4\r\n  %add5 = add i32 %phi, 0\r\n  %add6 = add i32 %phi2, 0\r\n  %add7 = add i32 %phi2, 0\r\n  %xor8 = xor i32 %add6, %xor\r\n  %xor9 = xor i32 %xor8, %add5\r\n  %xor10 = xor i32 %xor9, %add7\r\n  %add11 = add i32 %phi, 0\r\n  %add12 = add i32 %phi2, 0\r\n  %add13 = add i32 %phi2, 0\r\n  %xor14 = xor i32 %add12, %xor10\r\n  %xor15 = xor i32 %xor14, %add11\r\n  %xor16 = xor i32 %xor15, %add13\r\n  %add17 = add i32 %phi, 0\r\n  %add18 = add i32 %phi2, 0\r\n  %add19 = add i32 %phi2, 0\r\n  %xor20 = xor i32 %add18, %xor16\r\n  %xor21 = xor i32 %xor20, %add17\r\n  %xor22 = xor i32 %xor21, %add19\r\n  %add23 = add i32 %phi2, 0\r\n  %add24 = add i32 %arg, 0\r\n  %xor25 = xor i32 %add23, %xor22\r\n  %xor26 = xor i32 %xor25, %add24\r\n  %add27 = add i32 1, 0\r\n  %icmp = icmp ult i32 %add27, 0\r\n  br label %bb1\r\n}\r\n```\r\nReproducer: https://godbolt.org/z/77hKre61P\r\n\r\nStack dump:\r\n```\r\nopt: /root/llvm-project/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp:2663: void llvm::slpvectorizer::BoUpSLP::removeInstructionsAndOperands(llvm::ArrayRef<U*>) [with T = llvm::Instruction]: Assertion `(I->use_empty() || all_of(I->uses(), [&](Use &U) { return isDeleted( cast<Instruction>(U.getUser())); })) && \"trying to erase instruction with users.\"' failed.\r\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\r\nStack dump:\r\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -passes=slp-vectorizer <source>\r\n1.\tRunning pass \"function(slp-vectorizer)\" on module \"<source>\"\r\n2.\tRunning pass \"slp-vectorizer\" on function \"wombat\"\r\n #0 0x00000000050106b8 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x50106b8)\r\n #1 0x000000000500ddfc SignalHandler(int) Signals.cpp:0:0\r\n #2 0x0000737fffa42520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\r\n #3 0x0000737fffa969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\r\n #4 0x0000737fffa42476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\r\n #5 0x0000737fffa287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\r\n #6 0x0000737fffa2871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\r\n #7 0x0000737fffa39e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\r\n #8 0x00000000040b91cf void llvm::slpvectorizer::BoUpSLP::removeInstructionsAndOperands<llvm::Instruction>(llvm::ArrayRef<llvm::Instruction*>) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x40b91cf)\r\n #9 0x000000000410b80a llvm::slpvectorizer::BoUpSLP::vectorizeTree(llvm::MapVector<llvm::Value*, llvm::SmallVector<llvm::Instruction*, 2u>, llvm::DenseMap<llvm::Value*, unsigned int, llvm::DenseMapInfo<llvm::Value*, void>, llvm::detail::DenseMapPair<llvm::Value*, unsigned int>>, llvm::SmallVector<std::pair<llvm::Value*, llvm::SmallVector<llvm::Instruction*, 2u>>, 0u>> const&, llvm::SmallVectorImpl<std::pair<llvm::Value*, llvm::Value*>>&, llvm::Instruction*) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x410b80a)\r\n#10 0x0000000004115bed (anonymous namespace)::HorizontalReduction::tryToReduce(llvm::slpvectorizer::BoUpSLP&, llvm::DataLayout const&, llvm::TargetTransformInfo*, llvm::TargetLibraryInfo const&) SLPVectorizer.cpp:0:0\r\n#11 0x0000000004118321 llvm::SLPVectorizerPass::vectorizeHorReduction(llvm::PHINode*, llvm::Instruction*, llvm::BasicBlock*, llvm::slpvectorizer::BoUpSLP&, llvm::TargetTransformInfo*, llvm::SmallVectorImpl<llvm::WeakTrackingVH>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4118321)\r\n#12 0x000000000411cb18 llvm::SLPVectorizerPass::vectorizeRootInstruction(llvm::PHINode*, llvm::Instruction*, llvm::BasicBlock*, llvm::slpvectorizer::BoUpSLP&, llvm::TargetTransformInfo*) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x411cb18)\r\n#13 0x00000000041212fa llvm::SLPVectorizerPass::vectorizeChainsInBlock(llvm::BasicBlock*, llvm::slpvectorizer::BoUpSLP&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x41212fa)\r\n#14 0x0000000004127719 llvm::SLPVectorizerPass::runImpl(llvm::Function&, llvm::ScalarEvolution*, llvm::TargetTransformInfo*, llvm::TargetLibraryInfo*, llvm::AAResults*, llvm::LoopInfo*, llvm::DominatorTree*, llvm::AssumptionCache*, llvm::DemandedBits*, llvm::OptimizationRemarkEmitter*) (.part.0) SLPVectorizer.cpp:0:0\r\n#15 0x00000000041283cb llvm::SLPVectorizerPass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x41283cb)\r\n#16 0x0000000002efda4e llvm::detail::PassModel<llvm::Function, llvm::SLPVectorizerPass, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x2efda4e)\r\n#17 0x0000000004e12948 llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4e12948)\r\n#18 0x0000000000e06f8e llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xe06f8e)\r\n#19 0x0000000004e1136e llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4e1136e)\r\n#20 0x0000000000e0679e llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xe0679e)\r\n#21 0x0000000004e10da0 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4e10da0)\r\n#22 0x00000000008fb642 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8fb642)\r\n#23 0x00000000008ee4cc optMain (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8ee4cc)\r\n#24 0x0000737fffa29d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\r\n#25 0x0000737fffa29e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\r\n#26 0x00000000008e5f9e _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8e5f9e)\r\nProgram terminated with signal: SIGSEGV\r\nCompiler returned: 139\r\n```",
+    "author": "TatyanaDoubts",
+    "labels": [
+      "llvm:SLPVectorizer",
+      "crash"
+    ],
+    "comments": []
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "b10ecfa914dd1bc2013584917d0505ba5f15f75c"
+}

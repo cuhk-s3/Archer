@@ -1,0 +1,90 @@
+{
+  "bug_id": "162530",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/162530",
+  "base_commit": "c940bfd7e6218c01c6a517e8d6afc8067e933ffd",
+  "knowledge_cutoff": "2025-10-08T18:41:41Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "3ad5765e2341b53bff480b7992b1ed428dc603d6",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          7933,
+          7938
+        ],
+        [
+          8116,
+          8126
+        ],
+        [
+          8154,
+          8162
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "VPRecipeBuilder::collectScaledReductions",
+        "VPRecipeBuilder::getScaledReductions",
+        "VPRecipeBuilder::tryToCreatePartialReduction",
+        "VPRecipeBuilder::tryToCreateWidenRecipe"
+      ]
+    }
+  },
+  "patch": "commit 3ad5765e2341b53bff480b7992b1ed428dc603d6\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Thu Nov 6 21:45:57 2025 +0000\n\n    [LV] Check all users of partial reductions in chain have same scale. (#162822)\n    \n    Check that all partial reductions in a chain are only used by other\n    partial reductions with the same scale factor. Otherwise we end up\n    creating users of scaled reductions where the types of the other\n    operands don't match.\n    \n    A similar issue was addressed in\n    https://github.com/llvm/llvm-project/pull/158603, but misses the chained\n    cases.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/162530.\n    \n    PR: https://github.com/llvm/llvm-project/pull/162822\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 906fa2f857c2..b7224a33f47b 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -7933,6 +7933,26 @@ void VPRecipeBuilder::collectScaledReductions(VFRange &Range) {\n         (!Chain.ExtendB || ExtendIsOnlyUsedByPartialReductions(Chain.ExtendB)))\n       ScaledReductionMap.try_emplace(Chain.Reduction, Pair.second);\n   }\n+\n+  // Check that all partial reductions in a chain are only used by other\n+  // partial reductions with the same scale factor. Otherwise we end up creating\n+  // users of scaled reductions where the types of the other operands don't\n+  // match.\n+  for (const auto &[Chain, Scale] : PartialReductionChains) {\n+    auto AllUsersPartialRdx = [ScaleVal = Scale, this](const User *U) {\n+      auto *UI = cast<Instruction>(U);\n+      if (isa<PHINode>(UI) && UI->getParent() == OrigLoop->getHeader()) {\n+        return all_of(UI->users(), [ScaleVal, this](const User *U) {\n+          auto *UI = cast<Instruction>(U);\n+          return ScaledReductionMap.lookup_or(UI, 0) == ScaleVal;\n+        });\n+      }\n+      return ScaledReductionMap.lookup_or(UI, 0) == ScaleVal ||\n+             !OrigLoop->contains(UI->getParent());\n+    };\n+    if (!all_of(Chain.Reduction->users(), AllUsersPartialRdx))\n+      ScaledReductionMap.erase(Chain.Reduction);\n+  }\n }\n \n bool VPRecipeBuilder::getScaledReductions(\n@@ -8116,11 +8136,8 @@ VPRecipeBase *VPRecipeBuilder::tryToCreateWidenRecipe(VPSingleDefRecipe *R,\n   if (isa<LoadInst>(Instr) || isa<StoreInst>(Instr))\n     return tryToWidenMemory(Instr, Operands, Range);\n \n-  if (std::optional<unsigned> ScaleFactor = getScalingForReduction(Instr)) {\n-    if (auto PartialRed =\n-            tryToCreatePartialReduction(Instr, Operands, ScaleFactor.value()))\n-      return PartialRed;\n-  }\n+  if (std::optional<unsigned> ScaleFactor = getScalingForReduction(Instr))\n+    return tryToCreatePartialReduction(Instr, Operands, ScaleFactor.value());\n \n   if (!shouldWiden(Instr, Range))\n     return nullptr;\n@@ -8154,9 +8171,9 @@ VPRecipeBuilder::tryToCreatePartialReduction(Instruction *Reduction,\n       isa<VPPartialReductionRecipe>(BinOpRecipe))\n     std::swap(BinOp, Accumulator);\n \n-  if (ScaleFactor !=\n-      vputils::getVFScaleFactor(Accumulator->getDefiningRecipe()))\n-    return nullptr;\n+  assert(ScaleFactor ==\n+             vputils::getVFScaleFactor(Accumulator->getDefiningRecipe()) &&\n+         \"all accumulators in chain must have same scale factor\");\n \n   unsigned ReductionOpcode = Reduction->getOpcode();\n   if (ReductionOpcode == Instruction::Sub) {\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-incomplete-chains.ll",
+      "commands": [
+        "opt --mattr=+neon,+dotprod -passes=loop-vectorize -force-vector-interleave=1 -enable-epilogue-vectorization=false -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_incomplete_chain_without_mul",
+          "test_body": "target triple = \"arm64-apple-macosx\"\n\ndefine i16 @test_incomplete_chain_without_mul(ptr noalias %dst, ptr %A, ptr %B) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %red = phi i16 [ 0, %entry ], [ %red.next, %loop ]\n  %l.a = load i8, ptr %A, align 1\n  %a.ext = zext i8 %l.a to i16\n  store i16 %a.ext, ptr %dst, align 2\n  %l.b = load i8, ptr %B, align 1\n  %b.ext = zext i8 %l.b to i16\n  %add = add i16 %red, %b.ext\n  %add.1 = add i16 %add, %a.ext\n  %red.next = add i16 %add.1, %b.ext\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ult i64 %iv, 1024\n  br i1 %ec, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret i16 %red.next\n}\n\nattributes #0 = { \"target-cpu\"=\"grace\" }\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LV] operands with different vscale types",
+    "body": "Compiling this reproducer:\n\n```\nshort a;\nextern short b[];\nvoid c(bool d[][1][1]) {\n#pragma clang loop vectorize_predicate(enable)\n  for (short e = 0; e < 858; e += 3) {\n    b[e] = d[0644][e][1];\n    for (char f = 0; f < 21; f++)\n      a += d[0644][e][f];\n  }\n}\n```\n\nwith `-O2 -mcpu=grace` results in:\n\n```\n #4 0x000000000518a9aa llvm::SelectionDAG::isConstantIntBuildVectorOrConstantInt(llvm::SDValue, bool) const (/opt/compiler-explorer/clang-trunk/bin/clang+++0x518a9aa)\n #5 0x000000000518ab8b llvm::SelectionDAG::canonicalizeCommutativeBinop(unsigned int, llvm::SDValue&, llvm::SDValue&) const (/opt/compiler-explorer/clang-trunk/bin/clang+++0x518ab8b)\n #6 0x00000000051ad64d llvm::SelectionDAG::getNode(unsigned int, llvm::SDLoc const&, llvm::EVT, llvm::SDValue, llvm::SDValue, llvm::SDNodeFlags) (/opt/compiler-explorer/clang-trunk/bin/clang+++0x51ad64d)\n #7 0x000000000533de2e llvm::DAGTypeLegalizer::PromoteIntRes_SimpleIntBinOp(llvm::SDNode*) (/opt/compiler-explorer/clang-trunk/bin/clang+++0x533de2e)\n #8 0x000000000535821b llvm::DAGTypeLegalizer::PromoteIntegerResult(llvm::SDNode*, unsigned int) (/opt/compiler-explorer/clang-trunk/bin/clang+++0x535821b)\n #9 0x00000000052771da llvm::DAGTypeLegalizer::run() (/opt/compiler-explorer/clang-trunk/bin/clang+++0x52771da)\n#10 0x0000000005277821 llvm::SelectionDAG::LegalizeTypes() \n```\n\nSee also: https://godbolt.org/z/vz87Koh4q\n\nI've tried creating an IR reproducer, but ran into some troubles that might be hint what is going on: `%20` is a`8 x i16`, which is used in an add in `%26` and mixed with a `4 x i16` operand:\n\n```\n ...\n  %20 = zext nneg <vscale x 8 x i8> %19 to <vscale x 8 x i16>\n  %21 = getelementptr inbounds nuw i16, ptr @b, <vscale x 8 x i64> %15\n  tail call void @llvm.masked.scatter.nxv8i16.nxv8p0(<vscale x 8 x i16> %20, <vscale x 8 x ptr> %21, i32 2, <vscale x 8 x i1> %14)\n  %22 = tail call <vscale x 8 x i8> @llvm.masked.gather.nxv8i8.nxv8p0(<vscale x 8 x ptr> %17, i32 1, <vscale x 8 x i1> %14, <vscale x 8 x i8> poison)\n  %23 = zext nneg <vscale x 8 x i8> %22 to <vscale x 8 x i16>\n  %24 = select <vscale x 8 x i1> %14, <vscale x 8 x i16> %23, <vscale x 8 x i16> zeroinitializer\n  %25 = tail call <vscale x 4 x i16> @llvm.vector.partial.reduce.add.nxv4i16.nxv8i16(<vscale x 4 x i16> %16, <vscale x 8 x i16> %24)\n  %26 = add <vscale x 4 x i16> %25, <vscale x 8 x i16> %20\n...\n```\n\n",
+    "author": "sjoerdmeijer",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "sjoerdmeijer",
+        "body": "CC: @paulwalker-arm , @david-arm , @sdesmalen-arm , @fhahn "
+      },
+      {
+        "author": "topperc",
+        "body": "An assertions build fails earlier in IRBuilder https://godbolt.org/z/zadvTnne8"
+      },
+      {
+        "author": "sdesmalen-arm",
+        "body": "@SamTebbs33 it seems the result from the partial reduction here is a `<vscale x 4 x i16>`, whereas the use (an `add`) of this value assumes a `<vscale x 8 x i16>`. Can you investigate?"
+      },
+      {
+        "author": "fhahn",
+        "body": "IR reproducer: https://llvm.godbolt.org/z/Mz5xe8vK1"
+      },
+      {
+        "author": "fhahn",
+        "body": "@sjoerdmeijer you might want to use `-Xclang -llvm-verify-each` if you are not building with assertions. This makes it a bit easier to pin-point which pass creates invalid IR."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true
+}

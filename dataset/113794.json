@@ -1,0 +1,74 @@
+{
+  "bug_id": "113794",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/113794",
+  "base_commit": "21895a84cf466f0a0632cfca0175f7e617a6dd5a",
+  "knowledge_cutoff": "2024-10-27T05:55:32Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "17bad1a9da228ade0c0b9b020ee99769b188d9b3",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          6389,
+          6397
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "LoopVectorizationCostModel::getInstructionCost",
+        "LoopVectorizationCostModel::shouldConsiderInvariant"
+      ]
+    }
+  },
+  "patch": "commit 17bad1a9da228ade0c0b9b020ee99769b188d9b3\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Fri Nov 1 20:51:25 2024 +0000\n\n    [LV] Bail out on header phis in shouldConsiderInvariant.\n    \n    This fixes an infinite recursion in rare cases.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/113794.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 659b4c30a58a..1c64bd2982d7 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -6389,9 +6389,11 @@ bool LoopVectorizationCostModel::shouldConsiderInvariant(Value *Op) {\n     return false;\n   // Consider Op invariant, if it or its operands aren't predicated\n   // instruction in the loop. In that case, it is not trivially hoistable.\n-  return !isa<Instruction>(Op) || !TheLoop->contains(cast<Instruction>(Op)) ||\n-         (!isPredicatedInst(cast<Instruction>(Op)) &&\n-          all_of(cast<Instruction>(Op)->operands(),\n+  auto *OpI = dyn_cast<Instruction>(Op);\n+  return !OpI || !TheLoop->contains(OpI) ||\n+         (!isPredicatedInst(OpI) &&\n+          (!isa<PHINode>(OpI) || OpI->getParent() != TheLoop->getHeader()) &&\n+          all_of(OpI->operands(),\n                  [this](Value *Op) { return shouldConsiderInvariant(Op); }));\n }\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/phi-cost.ll",
+      "commands": [
+        "opt < %s -passes='function(loop-vectorize,instcombine)' -force-vector-width=2 -force-vector-interleave=1 -debug-only=loop-vectorize -disable-output -print-after=instcombine 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "red_phi_0",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine i32 @red_phi_0(i32 %start, ptr %src) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %red = phi i32 [ %start, %entry ], [ %red.next, %loop ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %red.next = add i32 0, %red\n  %iv.next = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 100\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %red.next, %loop ]\n  ret i32 %res\n}\n"
+        },
+        {
+          "test_name": "phi_three_incoming_values",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @phi_three_incoming_values(ptr noalias %a, ptr noalias %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %if.end, %entry\n  %i = phi i64 [ %i.next, %if.end ], [ 0, %entry ]\n  %tmp0 = getelementptr inbounds i32, ptr %a, i64 %i\n  %tmp1 = load i32, ptr %tmp0, align 4\n  %tmp2 = getelementptr inbounds i32, ptr %b, i64 %i\n  %tmp3 = load i32, ptr %tmp2, align 4\n  %tmp4 = icmp sgt i32 %tmp1, %tmp3\n  br i1 %tmp4, label %if.then, label %if.end\n\nif.then:                                          ; preds = %for.body\n  %tmp5 = icmp sgt i32 %tmp1, 19\n  br i1 %tmp5, label %if.end, label %if.else\n\nif.else:                                          ; preds = %if.then\n  %tmp6 = icmp slt i32 %tmp3, 4\n  %tmp7 = select i1 %tmp6, i32 4, i32 5\n  br label %if.end\n\nif.end:                                           ; preds = %if.else, %if.then, %for.body\n  %tmp8 = phi i32 [ 9, %for.body ], [ 3, %if.then ], [ %tmp7, %if.else ]\n  store i32 %tmp8, ptr %tmp0, align 4\n  %i.next = add i64 %i, 1\n  %cond = icmp eq i64 %i, %n\n  br i1 %cond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %if.end\n  ret void\n}\n"
+        },
+        {
+          "test_name": "phi_two_incoming_values",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @phi_two_incoming_values(ptr noalias %a, ptr noalias %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %if.end, %entry\n  %i = phi i64 [ %i.next, %if.end ], [ 0, %entry ]\n  %tmp0 = getelementptr inbounds i32, ptr %a, i64 %i\n  %tmp1 = load i32, ptr %tmp0, align 4\n  %tmp2 = getelementptr inbounds i32, ptr %b, i64 %i\n  %tmp3 = icmp sgt i32 %tmp1, 0\n  br i1 %tmp3, label %if.then, label %if.end\n\nif.then:                                          ; preds = %for.body\n  %tmp4 = add i32 %tmp1, 1\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %for.body\n  %tmp5 = phi i32 [ %tmp1, %for.body ], [ %tmp4, %if.then ]\n  store i32 %tmp5, ptr %tmp2, align 4\n  %i.next = add i64 %i, 1\n  %cond = icmp eq i64 %i, %n\n  br i1 %cond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %if.end\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[clang] Segmentation fault in loop vectorization cost model during optimization pass",
+    "body": "When I compiled this code with -O2 flag, it crashed:\r\n\r\n```c\r\n#include <stdint.h>\r\n#define UNDEFINED(x) ((x), 0)\r\nlong b;\r\nstatic int64_t j = 1;\r\nstatic int64_t *k = &j;\r\nstatic int64_t **l = &k;\r\nint64_t m;\r\nstatic uint64_t n;\r\nint16_t ***o;\r\nstatic int64_t ***p = &l;\r\nuint64_t **q;\r\n\r\nuint16_t\r\nsafe_mod_func_uint16_t_u_u(uint16_t ui1, uint16_t ui2)\r\n{\r\n  return \r\n#ifndef UNSAFE\r\n    (ui2 == 0) ? \r\n    (UNDEFINED(ui1)) : \r\n#endif\r\n    (ui1 % ui2);\r\n}\r\n\r\nint64_t\r\nsafe_mod_func_int64_t_s_s(int64_t si1, int64_t si2)\r\n{\r\n  return \r\n#ifndef UNSAFE\r\n    ((si2 == 0) || ((si1 == INT64_MIN) && (si2 == (-1)))) ? \r\n    (UNDEFINED(si1)) : \r\n#endif\r\n    (si1 % si2);\r\n}\r\n\r\nint a(int, int, int, int, int) {}\r\nlong c(int d, int *e) {\r\n  switch (d) {\r\n  case 9:\r\n    return b;\r\n  case 8:\r\n    return *e;\r\n  }\r\n}\r\nlong f(int g, long, int h) {\r\n  long i = c(g, &h);\r\n  return i;\r\n}\r\nint32_t r() { int32_t *s[] = {&k, &m}; }\r\nint32_t t(int32_t *aa) {\r\n  uint64_t ab = 2599693332;\r\n  uint8_t ac = 142;\r\n  for (; n <= 4; n++)\r\n    *aa = (safe_mod_func_uint16_t_u_u(\r\n               safe_mod_func_int64_t_s_s(a(0, 0, 0, 0, **l + 20) + **l, **q),\r\n               ***o |= f(**l, 0, ***p)),\r\n           **l + ac + ab - -1695273821 + *aa);\r\n}\r\n```\r\n\r\nThe crash is: clang: error: unable to execute command: Segmentation fault (core dumped)\r\nclang: error: clang frontend command failed due to signal (use -v to see invocation)\r\nCompiler returned: 254\r\n\r\nDetails can be found here: https://godbolt.org/z/3h9j7W6dG",
+    "author": "cardigan1008",
+    "labels": [
+      "regression",
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "shafik",
+        "body": "This looks like a clang trunk regression: https://godbolt.org/z/MoKeds3ev"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "9de327c94d0c995803b6485fb28ac4cad1e53bbe"
+}

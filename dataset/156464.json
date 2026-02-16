@@ -1,0 +1,99 @@
+{
+  "bug_id": "156464",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/156464",
+  "base_commit": "edb80a8d7fb2e1e29a4cb792148b4ffd441eb114",
+  "knowledge_cutoff": "2025-09-02T14:34:17Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "664b227089a2d3a72b15018018c5e8e4e639f944",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlan.h": [
+        [
+          29,
+          34
+        ],
+        [
+          2977,
+          2983
+        ],
+        [
+          3039,
+          3046
+        ]
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        [
+          2755,
+          2764
+        ],
+        [
+          2802,
+          2815
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlan.h": [
+        "~VPExpressionRecipe"
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        "VPExpressionRecipe::VPExpressionRecipe",
+        "VPExpressionRecipe::decompose"
+      ]
+    }
+  },
+  "patch": "commit 664b227089a2d3a72b15018018c5e8e4e639f944\nAuthor: Sam Tebbs <samuel.tebbs@arm.com>\nDate:   Wed Oct 1 16:01:54 2025 +0100\n\n    [LV] Keep duplicate recipes in VPExpressionRecipe (#156976)\n    \n    The VPExpressionRecipe class uses a set to store its bundled recipes. If\n    repeated recipes are bundled then the duplicates will be lost, causing\n    the following recipes to not be at the expected place in the set.\n    \n    When printing a reduce.add(mul(ext, ext)) bundle, for example, if the\n    extends are the same then the 3rd element of the set will be the\n    reduction, rather than the expected mul, causing a cast error. With this\n    change, the recipes are at the expected index in the set.\n    \n    Fixes #156464\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex 10d704df289c..c167dd7f65fa 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -29,6 +29,7 @@\n #include \"llvm/ADT/DenseMap.h\"\n #include \"llvm/ADT/SmallBitVector.h\"\n #include \"llvm/ADT/SmallPtrSet.h\"\n+#include \"llvm/ADT/SmallSet.h\"\n #include \"llvm/ADT/SmallVector.h\"\n #include \"llvm/ADT/Twine.h\"\n #include \"llvm/ADT/ilist.h\"\n@@ -2977,7 +2978,8 @@ public:\n /// the expression is elevated to connect the non-expression recipe with the\n /// VPExpressionRecipe itself.\n class VPExpressionRecipe : public VPSingleDefRecipe {\n-  /// Recipes included in this VPExpressionRecipe.\n+  /// Recipes included in this VPExpressionRecipe. This could contain\n+  /// duplicates.\n   SmallVector<VPSingleDefRecipe *> ExpressionRecipes;\n \n   /// Temporary VPValues used for external operands of the expression, i.e.\n@@ -3039,8 +3041,11 @@ public:\n   }\n \n   ~VPExpressionRecipe() override {\n-    for (auto *R : reverse(ExpressionRecipes))\n-      delete R;\n+    SmallPtrSet<VPSingleDefRecipe *, 4> ExpressionRecipesSeen;\n+    for (auto *R : reverse(ExpressionRecipes)) {\n+      if (ExpressionRecipesSeen.insert(R).second)\n+        delete R;\n+    }\n     for (VPValue *T : LiveInPlaceholders)\n       delete T;\n   }\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 3a55710d59b0..46909a53a954 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -2755,10 +2755,7 @@ VPExpressionRecipe::VPExpressionRecipe(\n     ExpressionTypes ExpressionType,\n     ArrayRef<VPSingleDefRecipe *> ExpressionRecipes)\n     : VPSingleDefRecipe(VPDef::VPExpressionSC, {}, {}),\n-      ExpressionRecipes(SetVector<VPSingleDefRecipe *>(\n-                            ExpressionRecipes.begin(), ExpressionRecipes.end())\n-                            .takeVector()),\n-      ExpressionType(ExpressionType) {\n+      ExpressionRecipes(ExpressionRecipes), ExpressionType(ExpressionType) {\n   assert(!ExpressionRecipes.empty() && \"Nothing to combine?\");\n   assert(\n       none_of(ExpressionRecipes,\n@@ -2802,14 +2799,22 @@ VPExpressionRecipe::VPExpressionRecipe(\n         continue;\n       addOperand(Op);\n       LiveInPlaceholders.push_back(new VPValue());\n-      R->setOperand(Idx, LiveInPlaceholders.back());\n     }\n   }\n+\n+  // Replace each external operand with the first one created for it in\n+  // LiveInPlaceholders.\n+  for (auto *R : ExpressionRecipes)\n+    for (auto const &[LiveIn, Tmp] : zip(operands(), LiveInPlaceholders))\n+      R->replaceUsesOfWith(LiveIn, Tmp);\n }\n \n void VPExpressionRecipe::decompose() {\n   for (auto *R : ExpressionRecipes)\n-    R->insertBefore(this);\n+    // Since the list could contain duplicates, make sure the recipe hasn't\n+    // already been inserted.\n+    if (!R->getParent())\n+      R->insertBefore(this);\n \n   for (const auto &[Idx, Op] : enumerate(operands()))\n     LiveInPlaceholders[Idx]->replaceAllUsesWith(Op);\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/reduction-inloop.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -prefer-inloop-reductions -S",
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=2 -force-vector-width=4 -prefer-inloop-reductions -S"
+      ],
+      "tests": [
+        {
+          "test_name": "reduction_expression_same_operands",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine i64 @reduction_expression_same_operands(ptr readonly captures(none) %x, ptr readonly captures(none) %y, i32 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ %iv.next, %loop ], [ 0, %entry ]\n  %rdx = phi i64 [ %rdx.next, %loop ], [ 0, %entry ]\n  %arrayidx = getelementptr inbounds i16, ptr %x, i32 %iv\n  %load0 = load i16, ptr %arrayidx, align 4\n  %conv0 = sext i16 %load0 to i32\n  %conv1 = sext i16 %load0 to i32\n  %mul = mul nsw i32 %conv0, %conv1\n  %conv = sext i32 %mul to i64\n  %rdx.next = add nsw i64 %rdx, %conv\n  %iv.next = add nuw nsw i32 %iv, 1\n  %exitcond = icmp eq i32 %iv.next, %n\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %r.0.lcssa = phi i64 [ %rdx.next, %loop ]\n  ret i64 %r.0.lcssa\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/vplan-printing-reductions.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -debug-only=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -prefer-inloop-reductions -disable-output %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "print_mulacc_duplicate_extends",
+          "test_body": "define i64 @print_mulacc_duplicate_extends(ptr readonly captures(none) %x, ptr readonly captures(none) %y, i32 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ %iv.next, %loop ], [ 0, %entry ]\n  %rdx = phi i64 [ %rdx.next, %loop ], [ 0, %entry ]\n  %arrayidx = getelementptr inbounds i16, ptr %x, i32 %iv\n  %load0 = load i16, ptr %arrayidx, align 4\n  %conv0 = sext i16 %load0 to i32\n  %mul = mul nsw i32 %conv0, %conv0\n  %conv = sext i32 %mul to i64\n  %rdx.next = sub nsw i64 %rdx, %conv\n  %iv.next = add nuw nsw i32 %iv, 1\n  %exitcond = icmp eq i32 %iv.next, %n\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %r.0.lcssa = phi i64 [ %rdx.next, %loop ]\n  ret i64 %r.0.lcssa\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "VPExpressionRecipe discards duplicate recipes.",
+    "body": "The `VPExpressionRecipe` class takes two extend recipes and a multiply recipe and bundles them into one so that the cost of the extends and multiply are hidden from the cost model. However, it uses a set to store these recipes and so any duplicates are discarded, meaning any attempt to use those recipes for cost computation or printing causes an error.\n\n```\n; opt -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -prefer-inloop-reductions --debug-only=loop-vectorize\ndefine i64 @print_mulacc_extended(ptr nocapture readonly %x, i32 %n) {\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i32 [ %iv.next, %loop ], [ 0, %entry ]\n  %rdx = phi i64 [ %rdx.next, %loop ], [ 0, %entry ]\n  %arrayidx = getelementptr inbounds i16, ptr %x, i32 %iv\n  %load0 = load i16, ptr %arrayidx, align 4\n  %conv0 = sext i16 %load0 to i32\n  %mul = mul nsw i32 %conv0, %conv0\n  %conv = sext i32 %mul to i64\n  %rdx.next = add nsw i64 %rdx, %conv\n  %iv.next = add nuw nsw i32 %iv, 1\n  %exitcond = icmp eq i32 %iv.next, %n\n  br i1 %exitcond, label %exit, label %loop\n\nexit:\n  %r.0.lcssa = phi i64 [ %rdx.next, %loop ]\n  ret i64 %r.0.lcssa\n}\n```\ncauses\n```[...]\n<x1> vector loop: {\n  vector.body:\n    EMIT vp<%4> = CANONICAL-INDUCTION ir<0>, vp<%index.next>\n    WIDEN-REDUCTION-PHI ir<%rdx> = phi vp<%3>, vp<%7>\n    vp<%5> = SCALAR-STEPS vp<%4>, ir<1>, vp<%0>\n    CLONE ir<%arrayidx> = getelementptr inbounds ir<%x>, vp<%5>\n    vp<%6> = vector-pointer ir<%arrayidx>\n    WIDEN ir<%load0> = load vp<%6>\n    EXPRESSION vp<%7> = ir<%rdx> + reduce.add (mulopt: /home/work/llvm-project/llvm/include/llvm/Support/Casting.h:578: decltype(auto) llvm::cast(From*) [with To = VPWidenRecipe; From = VPSingleDefRecipe]: Assertion `isa<To>(Val) && \"cast<Ty>() argument of incompatible type!\"' failed.\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\n```\nThe recipe list should contain the two extends, the mul and the reduction, but since duplicates are discarded, it's only one extend, the mul and reduction. The printing code attempts to access the mul from `ExpressionRecipes[2]`, where it should be, but that is actually the reduction.",
+    "author": "SamTebbs33",
+    "labels": [
+      "vectorizers",
+      "crash-on-valid"
+    ],
+    "comments": [
+      {
+        "author": "SamTebbs33",
+        "body": "@fhahn FYI"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "verified": true,
+  "bisect": "37127f74f4ed7a5c5fef04ef99bea77de4846da4"
+}

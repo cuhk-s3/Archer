@@ -1,0 +1,59 @@
+{
+  "bug_id": "165878",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/165878",
+  "bug_type": "miscompilation",
+  "base_commit": "d310693bde68b49cdb5c5877aadffb41d35c45fb",
+  "knowledge_cutoff": "2025-10-31T15:52:06Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "964c7711f4384b08f051d17da888d35d03a3024a",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          22134,
+          22139
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::collectValuesToDemote"
+      ]
+    }
+  },
+  "patch": "commit 964c7711f4384b08f051d17da888d35d03a3024a\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Fri Oct 31 15:07:26 2025 -0700\n\n    [SLP]Fix the minbitwidth analysis for slternate opcodes\n    \n    If the laternate operation is more stricter than the main operation, we\n    cannot rely on the analysis of the main operation. In such case, better\n    to avoid doing the analysis at all, since it may affect the overall\n    result and lead to incorrect optimization\n    \n    Fixes #165878\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 1b55a3b23522..34b405ced8c0 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -22134,6 +22134,27 @@ bool BoUpSLP::collectValuesToDemote(\n         {VectorizableTree[E.CombinedEntriesWithIndices.front().first].get(),\n          VectorizableTree[E.CombinedEntriesWithIndices.back().first].get()});\n \n+  if (E.isAltShuffle()) {\n+    // Combining these opcodes may lead to incorrect analysis, skip for now.\n+    auto IsDangerousOpcode = [](unsigned Opcode) {\n+      switch (Opcode) {\n+      case Instruction::Shl:\n+      case Instruction::AShr:\n+      case Instruction::LShr:\n+      case Instruction::UDiv:\n+      case Instruction::SDiv:\n+      case Instruction::URem:\n+      case Instruction::SRem:\n+        return true;\n+      default:\n+        break;\n+      }\n+      return false;\n+    };\n+    if (IsDangerousOpcode(E.getAltOpcode()))\n+      return FinalAnalysis();\n+  }\n+\n   switch (E.getOpcode()) {\n \n   // We can always demote truncations and extensions. Since truncations can\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/alternate-opcode-strict-bitwidth-than-main.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -S -slp-threshold=-99999 -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define float @test(i8 %0) {\nentry:\n  %1 = sext i8 0 to i32\n  %2 = lshr i32 %1, 27\n  %3 = sext i8 %0 to i32\n  %reass.add.epil = mul i32 %3, 2\n  %4 = or i32 %reass.add.epil, %2\n  switch i32 %4, label %exit [\n    i32 0, label %exit\n    i32 1, label %exit\n  ]\n\nexit:                                             ; preds = %entry, %entry, %entry\n  ret float 0.000000e+00\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[SLPVectorizer] Miscompile in slp vectorizer (shift produces poison)",
+    "body": "SLPVectorizer (`opt -passes=slp-vectorizer -slp-threshold=-99999`) turns the following IR:\n```llvm\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine float @foo(i8 %0) {\nentry:\n  %1 = sext i8 0 to i32\n  %2 = lshr i32 %1, 27\n  %3 = sext i8 %0 to i32\n  %reass.add.epil = mul i32 %3, 2\n  %4 = or i32 %reass.add.epil, %2\n  switch i32 %4, label %exit [\n    i32 0, label %exit\n    i32 1, label %exit\n  ]\n\nexit:                                      ; preds = %body, %body, %body\n  ret float 0.000000e+00\n}\n```\ninto\n```llvm\ndefine float @foo(i8 %0) {\nentry:\n  %1 = insertelement <2 x i8> <i8 poison, i8 0>, i8 %0, i32 0\n  %2 = sext <2 x i8> %1 to <2 x i16>\n  %3 = mul <2 x i16> %2, <i16 2, i16 27>\n  %4 = lshr <2 x i16> %2, <i16 2, i16 27>\n  %5 = shufflevector <2 x i16> %3, <2 x i16> %4, <2 x i32> <i32 0, i32 3>\n  %6 = extractelement <2 x i16> %5, i32 0\n  %7 = sext i16 %6 to i32\n  %8 = extractelement <2 x i16> %5, i32 1\n  %9 = zext i16 %8 to i32\n  %10 = or i32 %7, %9\n  switch i32 %10, label %exit [\n    i32 0, label %exit\n    i32 1, label %exit\n  ]\n\nexit:\n  ret float 0.000000e+00\n}\n```\n\nNote that it now has `i16` shifts by `27` which later get turned into poison.\n\nGodbolt link: https://godbolt.org/z/shj5GK5nd\nAlive2 link: https://alive2.llvm.org/ce/z/CM7Pmp",
+    "author": "danilaml",
+    "labels": [
+      "miscompilation",
+      "llvm:SLPVectorizer"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

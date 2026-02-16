@@ -1,0 +1,84 @@
+{
+  "bug_id": "141237",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/141237",
+  "base_commit": "af2a957ce30e3d91e17e2194e4be0a6b6481e4ba",
+  "knowledge_cutoff": "2025-05-23T15:00:13Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "a9b2998e315af64b7a68606af9064db425699c39",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          7082,
+          7087
+        ],
+        [
+          7315,
+          7321
+        ],
+        [
+          7352,
+          7357
+        ],
+        [
+          7477,
+          7485
+        ]
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanHelpers.h": [
+        [
+          364,
+          369
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "LoopVectorizationPlanner::computeBestVF",
+        "VPCostContext::getLegacyCost",
+        "VPCostContext::skipCostComputation",
+        "planContainsAdditionalSimplifications"
+      ]
+    }
+  },
+  "patch": "commit a9b2998e315af64b7a68606af9064db425699c39\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Sat May 24 11:09:27 2025 +0100\n\n    [VPlan] Skip cost assert if VPlan converted to single-scalar recipes.\n    \n    Check if a VPlan transform converted recipes to single-scalar\n    VPReplicateRecipes (after 07c085af3efcd67503232f99a1652efc6e54c1a9). If\n    that's the case, the legacy cost model incorrectly overestimates the cost.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/141237.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 275b3d567856..8a35afbb73f3 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -7082,6 +7082,11 @@ InstructionCost VPCostContext::getLegacyCost(Instruction *UI,\n   return CM.getInstructionCost(UI, VF);\n }\n \n+bool VPCostContext::isLegacyUniformAfterVectorization(Instruction *I,\n+                                                      ElementCount VF) const {\n+  return CM.isUniformAfterVectorization(I, VF);\n+}\n+\n bool VPCostContext::skipCostComputation(Instruction *UI, bool IsVector) const {\n   return CM.ValuesToIgnore.contains(UI) ||\n          (IsVector && CM.VecValuesToIgnore.contains(UI)) ||\n@@ -7315,7 +7320,8 @@ InstructionCost LoopVectorizationPlanner::cost(VPlan &Plan,\n /// cost-model did not account for.\n static bool planContainsAdditionalSimplifications(VPlan &Plan,\n                                                   VPCostContext &CostCtx,\n-                                                  Loop *TheLoop) {\n+                                                  Loop *TheLoop,\n+                                                  ElementCount VF) {\n   // First collect all instructions for the recipes in Plan.\n   auto GetInstructionForCost = [](const VPRecipeBase *R) -> Instruction * {\n     if (auto *S = dyn_cast<VPSingleDefRecipe>(R))\n@@ -7352,6 +7358,16 @@ static bool planContainsAdditionalSimplifications(VPlan &Plan,\n       // comparing against the legacy cost isn't desirable.\n       if (isa<VPPartialReductionRecipe>(&R))\n         return true;\n+\n+      /// If a VPlan transform folded a recipe to one producing a single-scalar,\n+      /// but the original instruction wasn't uniform-after-vectorization in the\n+      /// legacy cost model, the legacy cost overestimates the actual cost.\n+      if (auto *RepR = dyn_cast<VPReplicateRecipe>(&R)) {\n+        if (RepR->isSingleScalar() &&\n+            !CostCtx.isLegacyUniformAfterVectorization(\n+                RepR->getUnderlyingInstr(), VF))\n+          return true;\n+      }\n       if (Instruction *UI = GetInstructionForCost(&R)) {\n         // If we adjusted the predicate of the recipe, the cost in the legacy\n         // cost model may be different.\n@@ -7477,9 +7493,10 @@ VectorizationFactor LoopVectorizationPlanner::computeBestVF() {\n   // legacy cost model doesn't properly model costs for such loops.\n   assert((BestFactor.Width == LegacyVF.Width || BestPlan.hasEarlyExit() ||\n           planContainsAdditionalSimplifications(getPlanFor(BestFactor.Width),\n-                                                CostCtx, OrigLoop) ||\n-          planContainsAdditionalSimplifications(getPlanFor(LegacyVF.Width),\n-                                                CostCtx, OrigLoop)) &&\n+                                                CostCtx, OrigLoop,\n+                                                BestFactor.Width) ||\n+          planContainsAdditionalSimplifications(\n+              getPlanFor(LegacyVF.Width), CostCtx, OrigLoop, LegacyVF.Width)) &&\n          \" VPlan cost model and legacy cost model disagreed\");\n   assert((BestFactor.Width.isScalar() || BestFactor.ScalarCost > 0) &&\n          \"when vectorizing, the scalar cost must be computed.\");\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanHelpers.h b/llvm/lib/Transforms/Vectorize/VPlanHelpers.h\nindex 1d42c8f5f373..0446991ebfff 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanHelpers.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanHelpers.h\n@@ -364,6 +364,11 @@ struct VPCostContext {\n \n   /// Returns the OperandInfo for \\p V, if it is a live-in.\n   TargetTransformInfo::OperandValueInfo getOperandInfo(VPValue *V) const;\n+\n+  /// Return true if \\p I is considered uniform-after-vectorization in the\n+  /// legacy cost model for \\p VF. Only used to check for additional VPlan\n+  /// simplifications.\n+  bool isLegacyUniformAfterVectorization(Instruction *I, ElementCount VF) const;\n };\n \n /// This class can be used to assign names to VPValues. For VPValues without\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/uniform_load.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "foo",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n@inc = external global float, align 4\n\ndefine void @foo(ptr noalias captures(none) %A, i64 %N) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %l.inc = load float, ptr @inc, align 4\n  %gep.A = getelementptr inbounds float, ptr %A, i64 %iv\n  %l.A = load float, ptr %gep.A, align 4\n  %add = fadd float %l.inc, %l.A\n  store float %add, ptr %gep.A, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 32\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"core-avx2\" }\n"
+        },
+        {
+          "test_name": "uniform_load_can_fold_users",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @uniform_load_can_fold_users(ptr noalias %src, ptr %dst, i64 %start, double %d) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv.1 = phi i64 [ 0, %entry ], [ %iv.1.next, %loop ]\n  %iv.2 = phi i64 [ %start, %entry ], [ %iv.2.next, %loop ]\n  %l = load double, ptr %src, align 8\n  %m = fmul double %l, 9.000000e+00\n  %div = fdiv double %m, %d\n  %sub = sub i64 %iv.1, 1\n  %gep.1 = getelementptr double, ptr %dst, i64 %iv.1\n  %gep.2 = getelementptr double, ptr %gep.1, i64 %sub\n  store double %div, ptr %gep.2, align 8\n  %iv.1.next = add i64 %iv.1, 1\n  %iv.2.next = add i64 %iv.2, -1\n  %ec = icmp sgt i64 %iv.2, 0\n  br i1 %ec, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Crash in LoopVectorizationPlanner::computeBestVF()",
+    "body": "Reduced reproducer:\n```\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @reduced_test_(ptr %0, i64 %1, ptr %.sroa.067.0.copyload) {\n._crit_edge103:\n  br label %2\n\n2:                                                ; preds = %2, %._crit_edge103\n  %indvars.iv = phi i64 [ 0, %._crit_edge103 ], [ %indvars.iv.next, %2 ]\n  %3 = phi i64 [ %1, %._crit_edge103 ], [ %10, %2 ]\n  %4 = load double, ptr %0, align 8\n  %5 = fmul double %4, 0.000000e+00\n  %6 = fdiv double %5, 0.000000e+00\n  %7 = sub i64 %indvars.iv, %1\n  %8 = getelementptr double, ptr %.sroa.067.0.copyload, i64 %indvars.iv\n  %9 = getelementptr double, ptr %8, i64 %7\n  store double %6, ptr %9, align 8\n  %indvars.iv.next = add i64 %indvars.iv, 1\n  %10 = add i64 %3, -1\n  %11 = icmp sgt i64 %3, 0\n  br i1 %11, label %2, label %._crit_edge106\n\n._crit_edge106:                                   ; preds = %2\n  ret void\n}\n```\nCrash:\n```\n$ opt -O2 reduced.ll \nWARNING: You're attempting to print out a bitcode file.\nThis is inadvisable as it may cause display problems. If\nyou REALLY want to taste LLVM bitcode first-hand, you\ncan force output with the `-f' option.\n\nopt: .../llvm/lib/Transforms/Vectorize/LoopVectorize.cpp:7478: llvm::VectorizationFactor llvm::LoopVectorizationPlanner::computeBestVF(): Assertion `(BestFactor.Width == LegacyVF.Width || BestPlan.hasEarlyExit() || planContainsAdditionalSimplifications(getPlanFor(BestFactor.Width), CostCtx, OrigLoop) || planContainsAdditionalSimplifications(getPlanFor(LegacyVF.Width), CostCtx, OrigLoop)) && \" VPlan cost model and legacy cost model disagreed\"' failed.\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\nStack dump:\n0.      Program arguments: opt -O2 reduced.ll\n1.      Running pass \"function<eager-inv>(float2int,lower-constant-intrinsics,loop(loop-rotate<header-duplication;no-prepare-for-lto>,loop-deletion),loop-distribute,inject-tli-mappings,loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>,infer-alignment,loop-load-elim,instcombine<max-iterations=1;no-verify-fixpoint>,simplifycfg<bonus-inst-threshold=1;forward-switch-cond;switch-range-to-icmp;switch-to-lookup;no-keep-loops;hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>,slp-vectorizer,vector-combine,instcombine<max-iterations=1;no-verify-fixpoint>,loop-unroll<O2>,transform-warning,sroa<preserve-cfg>,infer-alignment,instcombine<max-iterations=1;no-verify-fixpoint>,loop-mssa(licm<allowspeculation>),alignment-from-assumptions,loop-sink,instsimplify,div-rem-pairs,tailcallelim,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-lookup;keep-loops;no-hoist-common-insts;hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;speculate-unpredictables>)\" on module \"reduced.ll\"\n2.      Running pass \"loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>\" on function \"reduced_test_\"\n #0 0x0000000001b16948 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (.../llvm-5162/bin/opt+0x1b16948)\n #1 0x0000000001b13bd4 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\n #2 0x00007ce1f6c45330 (/lib/x86_64-linux-gnu/libc.so.6+0x45330)\n #3 0x00007ce1f6c9eb2c __pthread_kill_implementation ./nptl/pthread_kill.c:44:76\n #4 0x00007ce1f6c9eb2c __pthread_kill_internal ./nptl/pthread_kill.c:78:10\n #5 0x00007ce1f6c9eb2c pthread_kill ./nptl/pthread_kill.c:89:10\n #6 0x00007ce1f6c4527e raise ./signal/../sysdeps/posix/raise.c:27:6\n #7 0x00007ce1f6c288ff abort ./stdlib/abort.c:81:7\n #8 0x00007ce1f6c2881b _nl_load_domain ./intl/loadmsgcat.c:1177:9\n #9 0x00007ce1f6c3b517 (/lib/x86_64-linux-gnu/libc.so.6+0x3b517)\n#10 0x0000000003b73b36 llvm::LoopVectorizationPlanner::computeBestVF() (.../llvm-5162/bin/opt+0x3b73b36)\n#11 0x0000000003b7556a llvm::LoopVectorizePass::processLoop(llvm::Loop*) (.../llvm-5162/bin/opt+0x3b7556a)\n#12 0x0000000003b78140 llvm::LoopVectorizePass::runImpl(llvm::Function&) (.../llvm-5162/bin/opt+0x3b78140)\n#13 0x0000000003b78793 llvm::LoopVectorizePass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (opt+0x3b78793)\n#14 0x00000000036215ae llvm::detail::PassModel<llvm::Function, llvm::LoopVectorizePass, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) PassBuilder.cpp:0:0\n#15 0x0000000001de4030 llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (opt+0x1de4030)\n#16 0x0000000002e4da6e llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) NVPTXTargetMachine.cpp:0:0\n#17 0x0000000001de4543 llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (opt+0x1de4543)\n#18 0x0000000002e4da2e llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) NVPTXTargetMachine.cpp:0:0\n#19 0x0000000001de2160 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (opt+0x1de2160)\n#20 0x00000000034ad61a llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (opt+0x34ad61a)\n...\nAborted\n```",
+    "author": "eugeneepshteyn",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": []
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "07c085af3efcd67503232f99a1652efc6e54c1a9"
+}

@@ -1,0 +1,76 @@
+{
+  "bug_id": "77468",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/77468",
+  "base_commit": "39b2104b4a4e0990eddc763eab99b28e8deab953",
+  "knowledge_cutoff": "2024-01-09T13:19:28Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "59d6f033a25d161e494457e8bb6e30375eb7f40f",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        [
+          895,
+          901
+        ],
+        [
+          948,
+          953
+        ],
+        [
+          979,
+          995
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        "VPlanTransforms::truncateToMinimalBitwidths"
+      ]
+    }
+  },
+  "patch": "commit 59d6f033a25d161e494457e8bb6e30375eb7f40f\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Fri Jan 12 13:14:13 2024 +0000\n\n    [VPlan] Support narrowing widened loads in truncateToMinimimalBitwidths.\n    \n    MinBWs may also contain widened load instructions, handle them by only\n    narrowing their result.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/77468\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 5c430620a2dc..b3694e74a385 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -895,7 +895,10 @@ void VPlanTransforms::truncateToMinimalBitwidths(\n            vp_depth_first_deep(Plan.getVectorLoopRegion()))) {\n     for (VPRecipeBase &R : make_early_inc_range(*VPBB)) {\n       if (!isa<VPWidenRecipe, VPWidenCastRecipe, VPReplicateRecipe,\n-               VPWidenSelectRecipe>(&R))\n+               VPWidenSelectRecipe, VPWidenMemoryInstructionRecipe>(&R))\n+        continue;\n+      if (isa<VPWidenMemoryInstructionRecipe>(&R) &&\n+          cast<VPWidenMemoryInstructionRecipe>(&R)->isStore())\n         continue;\n \n       VPValue *ResultVPV = R.getVPSingleValue();\n@@ -948,6 +951,23 @@ void VPlanTransforms::truncateToMinimalBitwidths(\n \n       auto *NewResTy = IntegerType::get(Ctx, NewResSizeInBits);\n \n+      // Any wrapping introduced by shrinking this operation shouldn't be\n+      // considered undefined behavior. So, we can't unconditionally copy\n+      // arithmetic wrapping flags to VPW.\n+      if (auto *VPW = dyn_cast<VPRecipeWithIRFlags>(&R))\n+        VPW->dropPoisonGeneratingFlags();\n+\n+      // Extend result to original width.\n+      auto *Ext = new VPWidenCastRecipe(Instruction::ZExt, ResultVPV, OldResTy);\n+      Ext->insertAfter(&R);\n+      ResultVPV->replaceAllUsesWith(Ext);\n+      Ext->setOperand(0, ResultVPV);\n+\n+      if (isa<VPWidenMemoryInstructionRecipe>(&R)) {\n+        assert(!cast<VPWidenMemoryInstructionRecipe>(&R)->isStore() && \"stores cannot be narrowed\");\n+        continue;\n+      }\n+\n       // Shrink operands by introducing truncates as needed.\n       unsigned StartIdx = isa<VPWidenSelectRecipe>(&R) ? 1 : 0;\n       for (unsigned Idx = StartIdx; Idx != R.getNumOperands(); ++Idx) {\n@@ -979,17 +999,6 @@ void VPlanTransforms::truncateToMinimalBitwidths(\n         }\n       }\n \n-      // Any wrapping introduced by shrinking this operation shouldn't be\n-      // considered undefined behavior. So, we can't unconditionally copy\n-      // arithmetic wrapping flags to VPW.\n-      if (auto *VPW = dyn_cast<VPRecipeWithIRFlags>(&R))\n-        VPW->dropPoisonGeneratingFlags();\n-\n-      // Extend result to original width.\n-      auto *Ext = new VPWidenCastRecipe(Instruction::ZExt, ResultVPV, OldResTy);\n-      Ext->insertAfter(&R);\n-      ResultVPV->replaceAllUsesWith(Ext);\n-      Ext->setOperand(0, ResultVPV);\n     }\n   }\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/trunc-loads-p16.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pr77468",
+          "test_body": "target datalayout = \"p:16:16\"\n\ndefine void @pr77468(ptr noalias %src, ptr noalias %dst, i1 %x) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i16 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.src = getelementptr i32, ptr %src, i16 %iv\n  %l = load i32, ptr %gep.src, align 1\n  %x.ext = zext i1 %x to i32\n  %and = and i32 %x.ext, %l\n  %gep.dst = getelementptr i16, ptr %dst, i16 %iv\n  %t = trunc i32 %and to i16\n  store i16 %t, ptr %gep.dst, align 2\n  %iv.next = add i16 %iv, 1\n  %exitcond.not = icmp eq i16 %iv.next, 100\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Assertion `MinBWs.size() == NumProcessedRecipes && \"some entries in MinBWs haven't been processed\"' failed. for opt -passes=loop-vectorize",
+    "body": "llvm commit: c1ed45a271145\r\nReproduce with: ```opt -passes=\"loop-vectorize\" bbi-90681_2.ll -S -o /dev/null -mtriple=x86_64```\r\nResult:\r\n```\r\nopt: ../lib/Transforms/Vectorize/VPlanTransforms.cpp:997: static void llvm::VPlanTransforms::truncateToMinimalBitwidths(llvm::VPlan &, const MapVector<llvm::Instruction *, uint64_t> &, llvm::LLVMContext &): Assertion `MinBWs.size() == NumProcessedRecipes && \"some entries in MinBWs haven't been processed\"' failed.\r\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\r\nStack dump:\r\n0.\tProgram arguments: ../../main-github/llvm/build-all/bin/opt -passes=loop-vectorize bbi-90681_2.ll -S -o /dev/null -mtriple=x86_64\r\n #0 0x0000563bdd2b15d7 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (../../main-github/llvm/build-all/bin/opt+0x63c95d7)\r\n #1 0x0000563bdd2af12e llvm::sys::RunSignalHandlers() (../../main-github/llvm/build-all/bin/opt+0x63c712e)\r\n #2 0x0000563bdd2b1c9f SignalHandler(int) (../../main-github/llvm/build-all/bin/opt+0x63c9c9f)\r\n #3 0x00007f87a7de7630 __restore_rt (/lib64/libpthread.so.0+0xf630)\r\n #4 0x00007f87a552e387 raise (/lib64/libc.so.6+0x36387)\r\n #5 0x00007f87a552fa78 abort (/lib64/libc.so.6+0x37a78)\r\n #6 0x00007f87a55271a6 __assert_fail_base (/lib64/libc.so.6+0x2f1a6)\r\n #7 0x00007f87a5527252 (/lib64/libc.so.6+0x2f252)\r\n #8 0x0000563bdd584d86 (../../main-github/llvm/build-all/bin/opt+0x669cd86)\r\n #9 0x0000563bdd50f875 llvm::LoopVectorizationPlanner::buildVPlansWithVPRecipes(llvm::ElementCount, llvm::ElementCount) (../../main-github/llvm/build-all/bin/opt+0x6627875)\r\n#10 0x0000563bdd50eeec llvm::LoopVectorizationPlanner::plan(llvm::ElementCount, unsigned int) (../../main-github/llvm/build-all/bin/opt+0x6626eec)\r\n#11 0x0000563bdd522bc9 llvm::LoopVectorizePass::processLoop(llvm::Loop*) (../../main-github/llvm/build-all/bin/opt+0x663abc9)\r\n#12 0x0000563bdd5289b3 llvm::LoopVectorizePass::runImpl(llvm::Function&, llvm::ScalarEvolution&, llvm::LoopInfo&, llvm::TargetTransformInfo&, llvm::DominatorTree&, llvm::BlockFrequencyInfo*, llvm::TargetLibraryInfo*, llvm::DemandedBits&, llvm::AssumptionCache&, llvm::LoopAccessInfoManager&, llvm::OptimizationRemarkEmitter&, llvm::ProfileSummaryInfo*) (../../main-github/llvm/build-all/bin/opt+0x66409b3)\r\n#13 0x0000563bdd529318 llvm::LoopVectorizePass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (../../main-github/llvm/build-all/bin/opt+0x6641318)\r\n#14 0x0000563bdd4cafad llvm::detail::PassModel<llvm::Function, llvm::LoopVectorizePass, llvm::PreservedAnalyses, llvm::AnalysisManager<llvm::Function> >::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (../../main-github/llvm/build-all/bin/opt+0x65e2fad)\r\n#15 0x0000563bdcce36d4 llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function> >::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (../../main-github/llvm/build-all/bin/opt+0x5dfb6d4)\r\n#16 0x0000563bdb09c87d llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function> >, llvm::PreservedAnalyses, llvm::AnalysisManager<llvm::Function> >::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (../../main-github/llvm/build-all/bin/opt+0x41b487d)\r\n#17 0x0000563bdcce7abe llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (../../main-github/llvm/build-all/bin/opt+0x5dffabe)\r\n#18 0x0000563bdb09c61d llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::PreservedAnalyses, llvm::AnalysisManager<llvm::Module> >::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (../../main-github/llvm/build-all/bin/opt+0x41b461d)\r\n#19 0x0000563bdcce27f6 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module> >::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (../../main-github/llvm/build-all/bin/opt+0x5dfa7f6)\r\n#20 0x0000563bdabb7143 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (../../main-github/llvm/build-all/bin/opt+0x3ccf143)\r\n#21 0x0000563bdabc5844 main (../../main-github/llvm/build-all/bin/opt+0x3cdd844)\r\n#22 0x00007f87a551a555 __libc_start_main (/lib64/libc.so.6+0x22555)\r\n#23 0x0000563bdabb12e9 _start (../../main-github/llvm/build-all/bin/opt+0x3cc92e9)\r\nAbort (core dumped)\r\n```\r\n[bbi-90681_2.ll.gz](https://github.com/llvm/llvm-project/files/13874170/bbi-90681_2.ll.gz)\r\n",
+    "author": "mikaelholmen",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "mikaelholmen",
+        "body": "This starts happening with 70535f5e609f747c28\r\n```\r\n[VPlan] Replace IR based truncateToMinimalBitwidths with VPlan version.\r\n```\r\nPing @fhahn \r\n"
+      },
+      {
+        "author": "mikaelholmen",
+        "body": "Thanks!"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "70535f5e609f747c28cfef699eefb84581b0aac0"
+}

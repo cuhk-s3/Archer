@@ -1,0 +1,76 @@
+{
+  "bug_id": "169334",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/169334",
+  "base_commit": "4d7abe535512e1076ff7e5fea14afde29615a8ed",
+  "knowledge_cutoff": "2025-11-24T14:50:59Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "17677ad7eb2b2391d61c976887bbd2616e7d6c3e",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        [
+          769,
+          775
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        "legalizeAndOptimizeInductions"
+      ]
+    }
+  },
+  "patch": "commit 17677ad7eb2b2391d61c976887bbd2616e7d6c3e\nAuthor: David Sherwood <david.sherwood@arm.com>\nDate:   Mon Dec 1 08:12:41 2025 +0000\n\n    [LV] Don't create WidePtrAdd recipes for scalar VFs (#169344)\n    \n    While attempting to remove the use of undef from more loop vectoriser\n    tests I discovered a bug where this assert was firing:\n    \n    ```\n    llvm::Constant* llvm::Constant::getSplatValue(bool) const: Assertion `this->getType()->isVectorTy() && \"Only valid for vectors!\"' failed.\n    ...\n     #8 0x0000aaaab9e2fba4 llvm::Constant::getSplatValue\n     #9 0x0000aaaab9dfb844 llvm::ConstantFoldBinaryInstruction\n    ```\n    \n    This seems to be happening because we are incorrectly generating\n    WidePtrAdd recipes for scalar VFs. The PR fixes this by checking whether\n    a plan has a scalar VF only in legalizeAndOptimizeInductions.\n    \n    This PR also removes the use of undef from the test `both` in\n    Transforms/LoopVectorize/iv_outside_user.ll, which is what started\n    triggering the assert.\n    \n    Fixes #169334\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex b12f8ccc73c7..f7281283bae8 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -769,7 +769,8 @@ static void legalizeAndOptimizeInductions(VPlan &Plan) {\n     // Replace wide pointer inductions which have only their scalars used by\n     // PtrAdd(IndStart, ScalarIVSteps (0, Step)).\n     if (auto *PtrIV = dyn_cast<VPWidenPointerInductionRecipe>(&Phi)) {\n-      if (!PtrIV->onlyScalarsGenerated(Plan.hasScalableVF()))\n+      if (!Plan.hasScalarVFOnly() &&\n+          !PtrIV->onlyScalarsGenerated(Plan.hasScalableVF()))\n         continue;\n \n       VPValue *PtrAdd = scalarizeVPWidenPointerInduction(PtrIV, Plan, Builder);\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/iv_outside_user.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=2 < %s",
+        "opt -S -passes=loop-vectorize -force-vector-interleave=2 -force-vector-width=1 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "both",
+          "test_body": "define ptr @both(ptr %p, i32 %k) {\nentry:\n  %base = getelementptr inbounds i32, ptr %p, i64 1\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %inc.phi = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %inc.lag1 = phi ptr [ %base, %entry ], [ %tmp, %for.body ]\n  %inc.lag2 = phi ptr [ %base, %entry ], [ %inc.lag1, %for.body ]\n  %tmp = getelementptr inbounds i32, ptr %inc.lag1, i64 1\n  %inc = add nsw i32 %inc.phi, 1\n  %cmp = icmp eq i32 %inc, %k\n  br i1 %cmp, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret ptr %inc.lag1\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LV] Constant::getSplatValue: Assertion `this->getType()->isVectorTy() && \"Only valid for vectors!\"' failed.",
+    "body": "While trying to rewrite the test 'both' in test/Transforms/LoopVectorize/iv_outside_user.ll to look like this:\n\n```\ndefine ptr @both(ptr %p, i32 %k)  {\nentry:\n  %base = getelementptr inbounds i32, ptr %p, i64 1\n  br label %for.body\n\nfor.body:\n  %inc.phi = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %inc.lag1 = phi ptr [ %base, %entry ], [ %tmp, %for.body]\n  %inc.lag2 = phi ptr [ %base, %entry ], [ %inc.lag1, %for.body]\n  %tmp = getelementptr inbounds i32, ptr %inc.lag1, i64 1\n  %inc = add nsw i32 %inc.phi, 1\n  %cmp = icmp eq i32 %inc, %k\n  br i1 %cmp, label %for.end, label %for.body\n\nfor.end:\n  ret ptr %inc.lag1\n}\n```\n\nI encountered this assert and backtrace:\n\n```\nllvm::Constant* llvm::Constant::getSplatValue(bool) const: Assertion `this->getType()->isVectorTy() && \"Only valid for vectors!\"' failed.\n...\n #8 0x0000aaaab9e2fba4 llvm::Constant::getSplatValue(bool) const (./bin/opt+0x4c2fba4)\n #9 0x0000aaaab9dfb844 llvm::ConstantFoldBinaryInstruction(unsigned int, llvm::Constant*, llvm::Constant*) (./bin/opt+0x4bfb844)\n#10 0x0000aaaab8235dd0 llvm::IRBuilderBase::CreateBinOpFMF(llvm::Instruction::BinaryOps, llvm::Value*, llvm::Value*, llvm::FMFSource, llvm::Twine const&, llvm::MDNode*) (.constprop.0) VPlanRecipes.cpp:0:0\n#11 0x0000aaaab8248338 llvm::VPInstruction::generate(llvm::VPTransformState&) (./bin/opt+0x3048338)\n#12 0x0000aaaab824a5c0 llvm::VPInstruction::execute(llvm::VPTransformState&) (./bin/opt+0x304a5c0)\n#13 0x0000aaaab81f7988 llvm::VPBasicBlock::executeRecipes(llvm::VPTransformState*, llvm::BasicBlock*) (./bin/opt+0x2ff7988)\n#14 0x0000aaaab820422c llvm::VPBasicBlock::execute(llvm::VPTransformState*) (./bin/opt+0x300422c)\n```\n\nwhen using the command:\n\n```\nopt -S -passes=loop-vectorize -force-vector-interleave=2 -force-vector-width=1 < iv_outside_user.ll\n```\n\nThe vplan for VF=1 looks like this:\n\n```\nvector.body:\n  EMIT-SCALAR vp<%index> = phi [ ir<0>, vector.ph ], [ vp<%index.next>, vector.body ]\n  EMIT-SCALAR vp<%pointer.phi> = phi [ ir<%base>, vector.ph ], [ vp<%ptr.ind>, vector.body ]\n  EMIT vp<%7> = step-vector i64\n  EMIT vp<%8> = mul vp<%7>, ir<4>\n  EMIT vp<%vector.gep> = wide-ptradd vp<%pointer.phi>, vp<%8>\n  EMIT vp<%step.add> = wide-ptradd vp<%vector.gep>, vp<%6>\n  EMIT vp<%index.next> = add nuw vp<%index>, ir<2>\n  EMIT vp<%ptr.ind> = ptradd vp<%pointer.phi>, ir<8>\n  EMIT branch-on-count vp<%index.next>, vp<%n.vec>\nSuccessor(s): middle.block, vector.body\n```\n\nThe problem happens when generating code for the mul VPInstruction, since we are attempting to multiply `<1 x i64> zeroinitializer` by `i64 4`. It looks like this is the problematic code:\n\n```\n  if (Instruction::isBinaryOp(getOpcode())) {\n    bool OnlyFirstLaneUsed = vputils::onlyFirstLaneUsed(this);\n    Value *A = State.get(getOperand(0), OnlyFirstLaneUsed);\n    Value *B = State.get(getOperand(1), OnlyFirstLaneUsed);\n```\n\nPresumably OnlyFirstLaneUsed should be true here?\n",
+    "author": "david-arm",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "david-arm",
+        "body": "cc @fhahn @lukel97"
+      },
+      {
+        "author": "lukel97",
+        "body": "I guess this must have snuck in recently, I can't seem to reproduce it on 86a82f27ee8cb7477c25561bc5697a6a6a8ff21d but I can on ad0acf4af001a3781b41b572788adcd7d652d18a"
+      },
+      {
+        "author": "david-arm",
+        "body": "I think I may have a fix for this, but be good to verify this first:\n\n```\n@@ -1360,7 +1360,7 @@ bool VPInstruction::usesFirstLaneOnly(const VPValue *Op) const {\n     return Op == getOperand(0) || vputils::onlyFirstLaneUsed(this);\n   case VPInstruction::WidePtrAdd:\n     // WidePtrAdd supports scalar and vector base addresses.\n-    return false;\n+    return vputils::onlyFirstLaneUsed(this);;\n   case VPInstruction::ComputeAnyOfResult:\n   case VPInstruction::ComputeFindIVResult:\n     return Op == getOperand(1);\n```"
+      },
+      {
+        "author": "david-arm",
+        "body": "I created this issue in case there is already a fix upstream that I don't know about!"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

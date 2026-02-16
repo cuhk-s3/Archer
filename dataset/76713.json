@@ -1,0 +1,99 @@
+{
+  "bug_id": "76713",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/76713",
+  "bug_type": "miscompilation",
+  "base_commit": "71bcef0b0bf55a96f85b2f323b0beb13ad8e2caa",
+  "knowledge_cutoff": "2024-01-02T12:49:15Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/ConstraintElimination"
+  ],
+  "hints": {
+    "fix_commit": "3c127e83c07c3791e86413c22a414a030d4302e3",
+    "components": [
+      "ConstraintElimination"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+        [
+          366,
+          371
+        ],
+        [
+          569,
+          578
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+        "add",
+        "decompose",
+        "mul"
+      ]
+    }
+  },
+  "patch": "commit 3c127e83c07c3791e86413c22a414a030d4302e3\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Tue Jan 2 22:05:57 2024 +0000\n\n    [ConstraintElim] Replace NUWSub decomp with recursive decomp of ops.\n    \n    The current patterns for NUWSub decompositions do not handle negative\n    constants correctly at the moment (causing #76713).\n    \n    Replace the incorrect pattern by more general code that recursively\n    decomposes the operands and then combines the results. This is already\n    done in most other places that handle operators like add/mul.\n    \n    This means we fall back to the general constant handling code (fixes the\n    mis-compile) while also being able to support reasoning about\n    decomposable expressions in the SUB operands.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/76713.\n\ndiff --git a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\nindex 49ac1e96e255..06c87bd6dc37 100644\n--- a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n@@ -366,6 +366,13 @@ struct Decomposition {\n     append_range(Vars, Other.Vars);\n   }\n \n+  void sub(const Decomposition &Other) {\n+    Decomposition Tmp = Other;\n+    Tmp.mul(-1);\n+    add(Tmp.Offset);\n+    append_range(Vars, Tmp.Vars);\n+  }\n+\n   void mul(int64_t Factor) {\n     Offset = multiplyWithOverflow(Offset, Factor);\n     for (auto &Var : Vars)\n@@ -569,10 +576,12 @@ static Decomposition decompose(Value *V,\n     return Result;\n   }\n \n-  if (match(V, m_NUWSub(m_Value(Op0), m_ConstantInt(CI))) && canUseSExt(CI))\n-    return {-1 * CI->getSExtValue(), {{1, Op0}}};\n-  if (match(V, m_NUWSub(m_Value(Op0), m_Value(Op1))))\n-    return {0, {{1, Op0}, {-1, Op1}}};\n+  if (match(V, m_NUWSub(m_Value(Op0), m_Value(Op1)))) {\n+    auto ResA = decompose(Op0, Preconditions, IsSigned, DL);\n+    auto ResB = decompose(Op1, Preconditions, IsSigned, DL);\n+    ResA.sub(ResB);\n+    return ResA;\n+  }\n \n   return {V, IsKnownNonNegative};\n }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/sub-nuw.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pr76713",
+          "test_body": "define i1 @pr76713(i16 %i1, i16 %i3) {\nentry:\n  %c1 = icmp ult i16 %i1, -1\n  %c2 = icmp uge i16 %i1, -3\n  %c3 = icmp ult i16 %i3, 2\n  %and = and i1 %c1, %c2\n  %and.2 = and i1 %and, %c3\n  br i1 %and, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %sub = sub nuw nsw i16 %i1, -3\n  %arrayidx.idx = mul nuw nsw i16 %i3, 4\n  %i6 = add nuw nsw i16 %arrayidx.idx, %sub\n  %c4 = icmp ult i16 12, %i6\n  ret i1 %c4\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "sub_nuw_chained_negative_constants",
+          "test_body": "declare void @use(i1)\n\ndefine void @sub_nuw_chained_negative_constants(i8 %a) {\nentry:\n  %sub1 = sub nuw i8 %a, 10\n  %sub2 = sub nuw i8 %sub1, -126\n  %c.1 = icmp ugt i8 %sub2, 20\n  br i1 %c.1, label %exit.1, label %exit.2\n\nexit.1:                                           ; preds = %entry\n  %c.2 = icmp ugt i8 %a, -96\n  call void @use(i1 %c.2)\n  %c.3 = icmp ugt i8 %a, -95\n  call void @use(i1 %c.3)\n  ret void\n\nexit.2:                                           ; preds = %entry\n  %c.4 = icmp ugt i8 %a, -96\n  call void @use(i1 %c.4)\n  %c.5 = icmp ugt i8 %a, -95\n  call void @use(i1 %c.5)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "sub_nuw_neg_i16",
+          "test_body": "define i1 @sub_nuw_neg_i16(i16 %a) {\nentry:\n  %neg2 = sub nuw i16 %a, -305\n  %c.1 = icmp ugt i16 0, %neg2\n  br i1 %c.1, label %exit.1, label %exit.2\n\nexit.1:                                           ; preds = %entry\n  %c.2 = icmp ugt i16 %a, 0\n  ret i1 %c.2\n\nexit.2:                                           ; preds = %entry\n  %c.3 = icmp ugt i16 %a, 0\n  ret i1 %c.3\n}\n"
+        },
+        {
+          "test_name": "sub_nuw_chained_positive_constants",
+          "test_body": "declare void @use(i1)\n\ndefine void @sub_nuw_chained_positive_constants(i16 %a) {\nentry:\n  %sub1 = sub nuw i16 %a, 10\n  %sub2 = sub nuw i16 %sub1, 20\n  %c.1 = icmp ugt i16 %sub2, 90\n  br i1 %c.1, label %exit.1, label %exit.2\n\nexit.1:                                           ; preds = %entry\n  %c.2 = icmp ugt i16 %a, 120\n  call void @use(i1 %c.2)\n  %c.3 = icmp ugt i16 %a, 121\n  call void @use(i1 %c.3)\n  ret void\n\nexit.2:                                           ; preds = %entry\n  %c.4 = icmp ugt i16 %a, 120\n  call void @use(i1 %c.4)\n  %c.5 = icmp ugt i16 %a, 121\n  call void @use(i1 %c.5)\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Miscompile with opt -passes=\"constraint-elimination\"",
+    "body": "llvm commit: 5842dfe34d89\r\nReproduce with: ```opt -passes=\"constraint-elimination\" bbi-90501.ll -S -o -```\r\n[bbi-90501.ll.gz](https://github.com/llvm/llvm-project/files/13810077/bbi-90501.ll.gz)\r\n\r\nThere are two nested loops in the input that should finish and then we should end up at\r\n```\r\nbb.2:                                             ; preds = %bb.1\r\n  ret i16 0\r\n```\r\nbut with constraint-elimination the condition in bb.5 is changed to\r\n```\r\n  %i10 = or i1 true, %i9\r\n  br i1 %i10, label %bb.7, label %bb.6\r\n```\r\nso we will go to\r\n```\r\nbb.7:                                             ; preds = %bb.5\r\n  ret i16 1\r\n```\r\ninstead.",
+    "author": "mikaelholmen",
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "mikaelholmen",
+        "body": "This starts happening with e6a1657fa30c747f4412fc47f567660ebe861a9e\r\n```\r\n[ConstraintElim] Add A < B if A is an increasing phi for A != B.\r\n```\r\n@fhahn : any idea what's up?"
+      },
+      {
+        "author": "fhahn",
+        "body": "Looks like an issue with `sub` decomposition with negative constants, preparing a fix."
+      },
+      {
+        "author": "mikaelholmen",
+        "body": "Thanks for the quick fix! I've verified it solves the problem I saw."
+      },
+      {
+        "author": "fhahn",
+        "body": "@mikaelholmen thanks for the reproducer!"
+      },
+      {
+        "author": "fhahn",
+        "body": "(appreciated as always, thanks for your extensive testing)"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "fbcf8a8cbb2461730bfd0603b396842925a88ef2"
+}

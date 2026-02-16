@@ -1,0 +1,72 @@
+{
+  "bug_id": "77118",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/77118",
+  "base_commit": "40fae67a50e08e6b5b5300210021218e404d63a7",
+  "knowledge_cutoff": "2024-01-05T16:53:32Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopUnroll"
+  ],
+  "hints": {
+    "fix_commit": "e209178d6402348414b69941c77d621919b3b7ab",
+    "components": [
+      "SimplifyIndVar"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/SimplifyIndVar.cpp": [
+        [
+          25,
+          30
+        ],
+        [
+          643,
+          652
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/SimplifyIndVar.cpp": [
+        "SimplifyIndvar::replaceIVUserWithLoopInvariant"
+      ]
+    }
+  },
+  "patch": "commit e209178d6402348414b69941c77d621919b3b7ab\nAuthor: Vedant Paranjape <vedant.paranjape@amd.com>\nDate:   Wed Feb 21 17:51:56 2024 +0530\n\n    [SimplifyIndVar] LCSSA form is destroyed by simplifyLoopIVs, preserve it (#78696)\n    \n    In LoopUnroll, peelLoop is called on the loop. After the loop is peeled\n    it calls simplifyLoopAfterUnroll on the loop. This call to\n    simplifyLoopAfterUnroll doesn't preserve the LCSSA form of the parent\n    loop and thus during the next call to peelLoop the LCSSA form is already\n    broken.\n    \n    LoopPeel util takes in the PreserveLCSSA argument and it passes\n    on the same argument to simplifyLoop which checks if the loop is in a\n    valid LCSSA form, when (PreserveLCSSA = true).\n    \n    This causes an assert in simplifyLoop when (PreserveLCSSA = true), as\n    during the last call LCSSA for the loop wasn't preserved, and thus\n    crashes at the following assert.\n    \n    assert(L->isRecursivelyLCSSAForm(*DT, *LI) &&\n                \"Requested to preserve LCSSA, but it's already broken.\");\n    \n    Upon debugging, it is evident that simplifyLoopIVs call inside\n    simplifyLoopAfterUnroll breaks the LCSSA form. This patch fixes\n    llvm#77118, it checks if the replacement of IV Users with Loop Invariant\n    preserves the LCSSA form. If it does not, it emits the required LCSSA\n    Phi instructions.\n\ndiff --git a/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp b/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp\nindex 66bba1ca2f1d..297cfe5124d8 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp\n@@ -25,6 +25,7 @@\n #include \"llvm/Support/Debug.h\"\n #include \"llvm/Support/raw_ostream.h\"\n #include \"llvm/Transforms/Utils/Local.h\"\n+#include \"llvm/Transforms/Utils/LoopUtils.h\"\n #include \"llvm/Transforms/Utils/ScalarEvolutionExpander.h\"\n \n using namespace llvm;\n@@ -643,10 +644,21 @@ bool SimplifyIndvar::replaceIVUserWithLoopInvariant(Instruction *I) {\n   }\n \n   auto *Invariant = Rewriter.expandCodeFor(S, I->getType(), IP);\n+  bool NeedToEmitLCSSAPhis = false;\n+  if (!LI->replacementPreservesLCSSAForm(I, Invariant))\n+    NeedToEmitLCSSAPhis = true;\n \n   I->replaceAllUsesWith(Invariant);\n   LLVM_DEBUG(dbgs() << \"INDVARS: Replace IV user: \" << *I\n                     << \" with loop invariant: \" << *S << '\\n');\n+\n+  if (NeedToEmitLCSSAPhis) {\n+    SmallVector<Instruction *, 1> NeedsLCSSAPhis;\n+    NeedsLCSSAPhis.push_back(cast<Instruction>(Invariant));\n+    formLCSSAForInstructions(NeedsLCSSAPhis, *DT, *LI, SE);\n+    LLVM_DEBUG(dbgs() << \" INDVARS: Replacement breaks LCSSA form\"\n+                      << \" inserting LCSSA Phis\" << '\\n');\n+  }\n   ++NumFoldedUser;\n   Changed = true;\n   DeadInsts.emplace_back(I);\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/gh-issue77118-broken-lcssa-form.ll",
+      "commands": [
+        "opt -passes=loop-unroll -unroll-peel-count=2 -S -disable-output -debug-only=loop-unroll < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "; REQUIRES: asserts\n\ndefine void @test() {\nentry:\n  br label %loop1\n\nloop1:\n  %phi = phi i32 [ 1, %entry ], [ 0, %loop1.latch ]\n  br label %loop2\n\nloop2:\n  %phi3 = phi i64 [ 0, %loop1 ], [ %sext, %loop2.latch ]\n  br label %loop3\n\nloop3:\n  %phi5 = phi i64 [ %phi3, %loop2 ], [ %sext, %loop3.latch ]\n  %phi6 = phi i32 [ 1, %loop2 ], [ %add10, %loop3.latch ]\n  %trunc = trunc i64 %phi5 to i32\n  br i1 true, label %loop3.latch, label %exit\n\nloop3.latch:\n  %add = add i32 1, %phi\n  %sext = sext i32 %add to i64\n  %add10 = add i32 %phi6, 1\n  %icmp = icmp ugt i32 %add10, 2\n  br i1 %icmp, label %loop2.latch, label %loop3\n\nloop2.latch:\n  br i1 false, label %loop4.preheader, label %loop2\n\nloop4.preheader:\n  br label %loop4\n\nloop4:\n  br i1 false, label %loop1.latch, label %loop4\n\nloop1.latch:\n  br label %loop1\n\nexit:\n  %phi8 = phi i32 [ %trunc, %loop3 ]\n  ret void\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Assertion `L->isRecursivelyLCSSAForm(*DT, *LI) && \"Requested to preserve LCSSA, but it's already broken.\"' failed.",
+    "body": "Run opt with -passes=loop-unroll\r\n\r\nhttps://godbolt.org/z/GcEW4dhMh\r\n\r\nTest.ll\r\n```\r\n; ModuleID = './reduced.ll'\r\nsource_filename = \"./reduced.ll\"\r\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\r\ntarget triple = \"x86_64-unknown-linux-gnu\"\r\n\r\ndefine void @wombat() gc \"statepoint-example\" !prof !0 {\r\nbb:\r\n  br label %bb1\r\n\r\nbb1:                                              ; preds = %bb12, %bb\r\n  %phi = phi i32 [ 1, %bb ], [ 0, %bb12 ]\r\n  br label %bb2\r\n\r\nbb2:                                              ; preds = %bb11, %bb1\r\n  %phi3 = phi i64 [ 0, %bb1 ], [ %sext, %bb11 ]\r\n  br label %bb4\r\n\r\nbb4:                                              ; preds = %bb9, %bb2\r\n  %phi5 = phi i64 [ %phi3, %bb2 ], [ %sext, %bb9 ]\r\n  %phi6 = phi i32 [ 1, %bb2 ], [ %add10, %bb9 ]\r\n  %trunc = trunc i64 %phi5 to i32\r\n  br i1 true, label %bb9, label %bb7\r\n\r\nbb7:                                              ; preds = %bb4\r\n  %phi8 = phi i32 [ %trunc, %bb4 ]\r\n  ret void\r\n\r\nbb9:                                              ; preds = %bb4\r\n  %add = add i32 1, %phi\r\n  %sext = sext i32 %add to i64\r\n  %add10 = add i32 %phi6, 1\r\n  %icmp = icmp ugt i32 %add10, 2\r\n  br i1 %icmp, label %bb11, label %bb4\r\n\r\nbb11:                                             ; preds = %bb9\r\n  br i1 false, label %bb12, label %bb2\r\n\r\nbb12:                                             ; preds = %bb12, %bb11\r\n  br i1 false, label %bb1, label %bb12, !prof !1\r\n}\r\n\r\n!0 = !{!\"function_entry_count\", i64 32768}\r\n!1 = !{!\"branch_weights\", i32 11, i32 1}\r\n```\r\nStack dump:\r\n```\r\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -S -passes=loop-unroll <source>\r\n #0 0x000000000359f928 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x359f928)\r\n #1 0x000000000359d07c SignalHandler(int) Signals.cpp:0:0\r\n #2 0x00007fe5f8e42520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\r\n #3 0x00007fe5f8e969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\r\n #4 0x00007fe5f8e42476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\r\n #5 0x00007fe5f8e287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\r\n #6 0x00007fe5f8e2871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\r\n #7 0x00007fe5f8e39e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\r\n #8 0x00000000036a9544 llvm::simplifyLoop(llvm::Loop*, llvm::DominatorTree*, llvm::LoopInfo*, llvm::ScalarEvolution*, llvm::AssumptionCache*, llvm::MemorySSAUpdater*, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x36a9544)\r\n #9 0x000000000369b9d6 llvm::peelLoop(llvm::Loop*, unsigned int, llvm::LoopInfo*, llvm::ScalarEvolution*, llvm::DominatorTree&, llvm::AssumptionCache*, bool, llvm::ValueMap<llvm::Value const*, llvm::WeakTrackingVH, llvm::ValueMapConfig<llvm::Value const*, llvm::sys::SmartMutex<false>>>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x369b9d6)\r\n#10 0x00000000033f771b tryToUnrollLoop(llvm::Loop*, llvm::DominatorTree&, llvm::LoopInfo*, llvm::ScalarEvolution&, llvm::TargetTransformInfo const&, llvm::AssumptionCache&, llvm::OptimizationRemarkEmitter&, llvm::BlockFrequencyInfo*, llvm::ProfileSummaryInfo*, bool, int, bool, bool, bool, std::optional<unsigned int>, std::optional<unsigned int>, std::optional<bool>, std::optional<bool>, std::optional<bool>, std::optional<bool>, std::optional<bool>, std::optional<unsigned int>) LoopUnrollPass.cpp:0:0\r\n#11 0x00000000033fa420 llvm::LoopUnrollPass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x33fa420)\r\n#12 0x00000000037a6b8e llvm::detail::PassModel<llvm::Function, llvm::LoopUnrollPass, llvm::PreservedAnalyses, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x37a6b8e)\r\n#13 0x0000000000d8693d llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::PreservedAnalyses, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xd8693d)\r\n#14 0x0000000002f3dfee llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x2f3dfee)\r\n#15 0x0000000000d6ac7e llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::PreservedAnalyses, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xd6ac7e)\r\n#16 0x0000000002f3bf9c llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x2f3bf9c)\r\n#17 0x0000000000895e8a llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x895e8a)\r\n#18 0x000000000079c6d3 main (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x79c6d3)\r\n#19 0x00007fe5f8e29d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\r\n#20 0x00007fe5f8e29e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\r\n#21 0x000000000088b0de _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x88b0de)\r\nProgram terminated with signal: SIGSEGV\r\nCompiler returned: 139\r\n```",
+    "author": "TatyanaDoubts",
+    "labels": [
+      "loopoptim",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "vedantparanjape-amd",
+        "body": "I looked at this, it seems peelLoop call destroys the LCSSA form, and after that calls simplifyLoop with PreserveLCSSA = true. I did the following change to confirm it.\r\n\r\n```c\r\ndiff --git a/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp b/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\r\nindex 7cfeb019af97..be73d58796be 100644\r\n--- a/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\r\n+++ b/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\r\n@@ -1270,6 +1270,7 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,\r\n     });\r\n\r\n     ValueToValueMapTy VMap;\r\n+    dbgs() << \"is lcssa form (before peel): \" << L->isRecursivelyLCSSAForm(DT, *LI) << \"\\n\";\r\n     if (peelLoop(L, PP.PeelCount, LI, &SE, DT, &AC, PreserveLCSSA, VMap)) {\r\n       simplifyLoopAfterUnroll(L, true, LI, &SE, &DT, &AC, &TTI);\r\n       // If the loop was peeled, we already \"used up\" the profile information\r\ndiff --git a/llvm/lib/Transforms/Utils/LoopPeel.cpp b/llvm/lib/Transforms/Utils/LoopPeel.cpp\r\nindex f76fa3bb6c61..47775ef70dc0 100644\r\n--- a/llvm/lib/Transforms/Utils/LoopPeel.cpp\r\n+++ b/llvm/lib/Transforms/Utils/LoopPeel.cpp\r\n@@ -1054,6 +1054,7 @@ bool llvm::peelLoop(Loop *L, unsigned PeelCount, LoopInfo *LI,\r\n   assert(DT.verify(DominatorTree::VerificationLevel::Fast));\r\n #endif\r\n\r\n+  dbgs() << \"is lcssa form (after peel): \" << L->isRecursivelyLCSSAForm(DT, *LI) << \"\\n\";\r\n   // FIXME: Incrementally update loop-simplify\r\n   simplifyLoop(L, &DT, LI, SE, AC, nullptr, PreserveLCSSA);\r\n```\r\nThe output from it was as follows:\r\n```bash\r\nis lcssa form (before peel): 1\r\nis lcssa form (after peel): 0\r\n```\r\nAs for the fix, adding a simple check for LCSSA and if it's not in form, forming it helped solve this bug. Does this look like a correct fix ?\r\n\r\n```c\r\ndiff --git a/llvm/lib/Transforms/Utils/LoopPeel.cpp b/llvm/lib/Transforms/Utils/LoopPeel.cpp\r\nindex f76fa3bb6c61..3e0545656d49 100644\r\n--- a/llvm/lib/Transforms/Utils/LoopPeel.cpp\r\n+++ b/llvm/lib/Transforms/Utils/LoopPeel.cpp\r\n@@ -1054,6 +1054,8 @@ bool llvm::peelLoop(Loop *L, unsigned PeelCount, LoopInfo *LI,\r\n   assert(DT.verify(DominatorTree::VerificationLevel::Fast));\r\n #endif\r\n\r\n+  if (PreserveLCSSA && !L->isRecursivelyLCSSAForm(DT, *LI))\r\n+    formLCSSARecursively(*L, DT, LI, SE);\r\n   // FIXME: Incrementally update loop-simplify\r\n   simplifyLoop(L, &DT, LI, SE, AC, nullptr, PreserveLCSSA);\r\n```\r\nCC: @fhahn / @nikic "
+      },
+      {
+        "author": "vedantparanjape-amd",
+        "body": "@TatyanaDoubts thanks for the report, it is now fixed."
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "9d2903c8e50944224eb294afe7bef13138e1ea7b"
+}

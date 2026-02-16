@@ -1,0 +1,66 @@
+{
+  "bug_id": "169921",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/169921",
+  "bug_type": "miscompilation",
+  "base_commit": "97e0573f9e16fb6b7970130ff24e5c9eba98e164",
+  "knowledge_cutoff": "2025-11-28T14:11:34Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/AggressiveInstCombine"
+  ],
+  "hints": {
+    "fix_commit": "c7c6c0a45c1d840d05b414d73f7bab5136dcb8c2",
+    "components": [
+      "AggressiveInstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp": [
+        [
+          710,
+          718
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp": [
+        "foldLoadsRecursive"
+      ]
+    }
+  },
+  "patch": "commit c7c6c0a45c1d840d05b414d73f7bab5136dcb8c2\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Mon Dec 1 22:46:16 2025 +0800\n\n    [AggressiveInstCombine] Fix memory location for alias analysis (#169953)\n    \n    When LOps.RootInsert comes after LI2, since we use LI2 as the new insert\n    point, we should make sure the memory region accessed by LOps isn't\n    modified. However, the original implementation passes the bit width\n    `LOps.LoadSize` as the number of bytes to be accessed, causing BasicAA\n    to return NoAlias:\n    \n    https://github.com/llvm/llvm-project/blob/a941e150749650e6a75e948f10d46b0bedcc128b/llvm/lib/Analysis/BasicAliasAnalysis.cpp#L1658-L1667\n    With `-aa-trace`, we get:\n    ```\n    End ptr getelementptr inbounds nuw (i8, ptr @g, i64 4) @ LocationSize::precise(1),   %gep1 = getelementptr i8, ptr %p, i64 4 @ LocationSize::precise(32) = NoAlias\n    ```\n    This patch uses `getTypeStoreSize` to compute the correct access size\n    for LOps. Instead of modifying the MemoryLocation for End (i.e.,\n    `LOps.RootInsert`), it also uses the computed base and AATag for\n    correctness.\n    \n    Closes https://github.com/llvm/llvm-project/issues/169921.\n\ndiff --git a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\nindex 7ed8fb68f107..2397133fa61e 100644\n--- a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n+++ b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n@@ -710,9 +710,17 @@ static bool foldLoadsRecursive(Value *V, LoadOps &LOps, const DataLayout &DL,\n   MemoryLocation Loc;\n   if (!Start->comesBefore(End)) {\n     std::swap(Start, End);\n-    Loc = MemoryLocation::get(End);\n+    // If LOps.RootInsert comes after LI2, since we use LI2 as the new insert\n+    // point, we should make sure whether the memory region accessed by LOps\n+    // isn't modified.\n     if (LOps.FoundRoot)\n-      Loc = Loc.getWithNewSize(LOps.LoadSize);\n+      Loc = MemoryLocation(\n+          LOps.Root->getPointerOperand(),\n+          LocationSize::precise(DL.getTypeStoreSize(\n+              IntegerType::get(LI1->getContext(), LOps.LoadSize))),\n+          LOps.AATags);\n+    else\n+      Loc = MemoryLocation::get(End);\n   } else\n     Loc = MemoryLocation::get(End);\n   unsigned NumScanned = 0;\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/AggressiveInstCombine/X86/or-load.ll",
+      "commands": [
+        "opt < %s -passes=aggressive-instcombine -mtriple x86_64-none-eabi -mattr=avx2 -data-layout=\"e-n64\" -S",
+        "opt < %s -passes=aggressive-instcombine -mtriple x86_64-none-eabi -mattr=avx2 -data-layout=\"E-n64\" -S"
+      ],
+      "tests": [
+        {
+          "test_name": "loadcombine_consecutive_mayalias",
+          "test_body": "@g = global i64 1060856922120\n\ndefine i64 @loadcombine_consecutive_mayalias(ptr %p) {\nentry:\n  %load1 = load i32, ptr %p, align 4\n  %gep1 = getelementptr i8, ptr %p, i64 4\n  %gep2 = getelementptr i8, ptr %p, i64 5\n  store i8 0, ptr getelementptr inbounds nuw (i8, ptr @g, i64 4), align 4\n  %load2 = load i8, ptr %gep1, align 4\n  %load3 = load i24, ptr %gep2, align 1\n  %zext1 = zext i24 %load3 to i64\n  %shl1 = shl i64 %zext1, 40\n  %zext2 = zext i8 %load2 to i64\n  %shl2 = shl i64 %zext2, 32\n  %or1 = or i64 %shl1, %shl2\n  %zext3 = zext i32 %load1 to i64\n  %or2 = or i64 %or1, %zext3\n  %res = lshr i64 %or2, 32\n  ret i64 %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[AggressiveInstCombine] Miscompilation at O3",
+    "body": "Reproducer: https://alive2.llvm.org/ce/z/msNmWC\n```\n; bin/opt -passes=aggressive-instcombine test.ll -S\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n@g_374 = global ptr @g_375\n@g_375 = global { i32, i8, [3 x i8] } { i32 8, i8 -9, [3 x i8] zeroinitializer }\n\ndefine i32 @main() {\nentry:\n  %0 = load ptr, ptr @g_374, align 8\n  %l_1162.sroa.3.8.copyload.i.i = load i32, ptr %0, align 4\n  %l_1162.sroa.6.8..sroa_idx.i.i = getelementptr i8, ptr %0, i64 4\n  %l_1162.sroa.8.8..sroa_idx.i.i = getelementptr i8, ptr %0, i64 5\n  store i8 0, ptr getelementptr inbounds nuw (i8, ptr @g_375, i64 4), align 4\n  %l_1162.sroa.6.8.copyload.i.i = load i8, ptr %l_1162.sroa.6.8..sroa_idx.i.i, align 4\n  %l_1162.sroa.8.8.copyload.i.i = load i24, ptr %l_1162.sroa.8.8..sroa_idx.i.i, align 1\n  %1 = zext i24 %l_1162.sroa.8.8.copyload.i.i to i64\n  %2 = shl i64 %1, 40\n  %3 = zext i8 %l_1162.sroa.6.8.copyload.i.i to i64\n  %4 = shl i64 %3, 32\n  %5 = or i64 %2, %4\n  %6 = zext i32 %l_1162.sroa.3.8.copyload.i.i to i64\n  %7 = or i64 %5, %6\n  store i64 %7, ptr %0, align 4\n  %8 = load i32, ptr getelementptr inbounds nuw (i8, ptr @g_375, i64 4), align 4\n  ret i32 %8\n}\n```\n```\n; ModuleID = 'reduced.ll'\nsource_filename = \"reduced.ll\"\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n@g_374 = global ptr @g_375\n@g_375 = global { i32, i8, [3 x i8] } { i32 8, i8 -9, [3 x i8] zeroinitializer }\n\ndefine i32 @main() {\nentry:\n  %0 = load ptr, ptr @g_374, align 8\n  %l_1162.sroa.3.8.copyload.i.i = load i64, ptr %0, align 4\n  store i8 0, ptr getelementptr inbounds nuw (i8, ptr @g_375, i64 4), align 4\n  store i64 %l_1162.sroa.3.8.copyload.i.i, ptr %0, align 4\n  %1 = load i32, ptr getelementptr inbounds nuw (i8, ptr @g_375, i64 4), align 4\n  ret i32 %1\n}\n```\nllubi output:\nsrc:\n```\nEntering function main\n  %0 = load ptr, ptr @g_374, align 8 -> Ptr 2056[@g_375] captures(address, provenance) RW\n  %l_1162.sroa.3.8.copyload.i.i = load i32, ptr %0, align 4 -> i32 8\n  %l_1162.sroa.6.8..sroa_idx.i.i = getelementptr i8, ptr %0, i64 4 -> Ptr 2060[@g_375 + 4] captures(address, provenance) RW\n  %l_1162.sroa.8.8..sroa_idx.i.i = getelementptr i8, ptr %0, i64 5 -> Ptr 2061[@g_375 + 5] captures(address, provenance) RW\n  %1 = getelementptr inbounds nuw i8, ptr @g_375, i64 4 -> Ptr 2060[@g_375 + 4] captures(address, provenance) RW\n  store i8 0, ptr %1, align 4\n  %l_1162.sroa.6.8.copyload.i.i = load i8, ptr %l_1162.sroa.6.8..sroa_idx.i.i, align 4 -> i8 0\n  %l_1162.sroa.8.8.copyload.i.i = load i24, ptr %l_1162.sroa.8.8..sroa_idx.i.i, align 1 -> i24 0\n  %2 = zext i24 %l_1162.sroa.8.8.copyload.i.i to i64 -> i64 0\n  %3 = shl i64 %2, 40 -> i64 0\n  %4 = zext i8 %l_1162.sroa.6.8.copyload.i.i to i64 -> i64 0\n  %5 = shl i64 %4, 32 -> i64 0\n  %6 = or i64 %3, %5 -> i64 0\n  %7 = zext i32 %l_1162.sroa.3.8.copyload.i.i to i64 -> i64 8\n  %8 = or i64 %6, %7 -> i64 8\n  store i64 %8, ptr %0, align 4\n  %9 = getelementptr inbounds nuw i8, ptr @g_375, i64 4 -> Ptr 2060[@g_375 + 4] captures(address, provenance) RW\n  %10 = load i32, ptr %9, align 4 -> i32 0\n  ret i32 %10\nExiting function main\n```\ntgt:\n```\nEntering function main\n  %0 = load ptr, ptr @g_374, align 8 -> Ptr 2056[@g_375] captures(address, provenance) RW\n  %l_1162.sroa.3.8.copyload.i.i = load i64, ptr %0, align 4 -> i64 1060856922120\n  %1 = getelementptr inbounds nuw i8, ptr @g_375, i64 4 -> Ptr 2060[@g_375 + 4] captures(address, provenance) RW\n  store i8 0, ptr %1, align 4\n  store i64 %l_1162.sroa.3.8.copyload.i.i, ptr %0, align 4\n  %2 = getelementptr inbounds nuw i8, ptr @g_375, i64 4 -> Ptr 2060[@g_375 + 4] captures(address, provenance) RW\n  %3 = load i32, ptr %2, align 4 -> i32 247\n  ret i32 %3\nExiting function main\n```",
+    "author": "dtcxzyw",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine",
+      "generated by fuzzer"
+    ],
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "Reduced:\n```\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n@g = global i64 1060856922120, align 8\n@g_ref = global ptr @g, align 8\n\ndefine i64 @test() {\nentry:\n  %p = load ptr, ptr @g_ref, align 8\n  %load1 = load i32, ptr %p, align 4\n  %gep1 = getelementptr i8, ptr %p, i64 4\n  %gep2 = getelementptr i8, ptr %p, i64 5\n  store i8 0, ptr getelementptr inbounds nuw (i8, ptr @g, i64 4), align 4\n  %load2 = load i8, ptr %gep1, align 4\n  %load3 = load i24, ptr %gep2, align 1\n  %zext1 = zext i24 %load3 to i64\n  %shl1 = shl i64 %zext1, 40\n  %zext2 = zext i8 %load2 to i64\n  %shl2 = shl i64 %zext2, 32\n  %or1 = or i64 %shl1, %shl2\n  %zext3 = zext i32 %load1 to i64\n  %or2 = or i64 %or1, %zext3\n  %res = lshr i64 %or2, 32\n  ret i64 %res\n}\n\n```"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

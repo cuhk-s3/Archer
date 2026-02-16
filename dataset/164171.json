@@ -1,0 +1,68 @@
+{
+  "bug_id": "164171",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/164171",
+  "base_commit": "94647eea7fc0fcdf1c953b8ff6bd6ef9981d7890",
+  "knowledge_cutoff": "2025-10-19T18:02:40Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "9fe1f29541109ac10e1399deb85da0507135f836",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+        [
+          325,
+          330
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+        "createWidenCast"
+      ]
+    }
+  },
+  "patch": "commit 9fe1f29541109ac10e1399deb85da0507135f836\nAuthor: Luke Lau <luke@igalia.com>\nDate:   Mon Oct 20 18:39:16 2025 +0800\n\n    [VPlan] Set flags when constructing zexts using VPWidenCastRecipe (#164198)\n    \n    createWidenCast doesn't set the flag type, so when we simplify trunc\n    (zext nneg x) -> zext x we would hit an assertion in CSE that the flag\n    types don't match with other VPWidenCastRecipes that weren't simplified.\n    \n    This fixes it the same way trunc flags are handled too.\n    \n    As an aside I think it should be correct to preserve the nneg flag in\n    this case since the input operand is still non-negative after the\n    transform. But that's left to another PR.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/164171\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\nindex 7651ba16b35c..3fed003282f2 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n@@ -325,6 +325,8 @@ public:\n     VPIRFlags Flags;\n     if (Opcode == Instruction::Trunc)\n       Flags = VPIRFlags::TruncFlagsTy(false, false);\n+    else if (Opcode == Instruction::ZExt)\n+      Flags = VPIRFlags::NonNegFlagsTy(false);\n     return tryInsertInstruction(\n         new VPWidenCastRecipe(Opcode, Op, ResultTy, Flags));\n   }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/cse-casts.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=2 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "preserve_flags_narrowing_extends_and_truncs",
+          "test_body": "define void @preserve_flags_narrowing_extends_and_truncs(ptr noalias %A, ptr noalias %B, ptr noalias %C) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %l = load i8, ptr %gep.A, align 1\n  %l.ext = zext i8 %l to i64\n  %gep.C = getelementptr inbounds i8, ptr %C, i64 %iv\n  store i64 %l.ext, ptr %gep.C, align 4\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %l.1 = load i8, ptr %gep.B, align 1\n  %masked = and i8 %l.1, 1\n  %l.1.trunc = trunc i8 %l.1 to i1\n  %sel.0 = select i1 %l.1.trunc, float 1.000000e+00, float 0.000000e+00\n  %masked.trunc = trunc i8 %masked to i1\n  %sel.1 = select i1 %masked.trunc, float 3.000000e+00, float %sel.0\n  %bc = bitcast float %sel.1 to i32\n  %bc.trunc = trunc i32 %bc to i8\n  store i8 %bc.trunc, ptr %gep.B, align 1\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 1\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "simplified_cast_preserves_irflag_type",
+          "test_body": "define void @simplified_cast_preserves_irflag_type(ptr noalias %p, ptr noalias %q, ptr noalias %r) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %x = load i8, ptr %p, align 1\n  %x.i32 = zext i8 %x to i32\n  %trunc = trunc i32 %x.i32 to i16\n  store i16 %trunc, ptr %q, align 2\n  %x.i16 = zext i8 %x to i16\n  store i16 %x.i16, ptr %r, align 2\n  %iv.next = add i64 %iv, 2\n  %ec = icmp eq i64 %iv.next, 100\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LV] Assert \"OpType must match\" in VPIRFlags::intersectFlags",
+    "body": "This IR:\n\n```\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\"\ntarget triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @_Z1hiPA2_bPA2_c(ptr %arrayidx6, ptr %arrayidx20) {\nentry:\n  br label %for.body\n\nfor.cond.cleanup.loopexit:                        ; preds = %for.body\n  ret void\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv1 = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %0 = load i8, ptr %arrayidx6, align 1\n  %loadedv = zext i8 %0 to i32\n  %conv9 = trunc i32 %loadedv to i16\n  store i16 %conv9, ptr null, align 2\n  %1 = zext i8 %0 to i16\n  store i16 %1, ptr %arrayidx20, align 2\n  %indvars.iv.next = add i64 %indvars.iv1, 2\n  %tobool.not = icmp eq i64 %indvars.iv.next, 0\n  br i1 %tobool.not, label %for.cond.cleanup.loopexit, label %for.body\n}\n```\n\nCompiled with `opt --passes=loop-vectorize -S `will triggers this assert:\n\n```\nopt: /root/llvm-project/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp:404: void llvm::VPIRFlags::intersectFlags(const llvm::VPIRFlags&): Assertion `OpType == Other.OpType && \"OpType must match\"' failed.\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.\nStack dump:\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S --passes=loop-vectorize <source>\n1.\tRunning pass \"function(loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>)\" on module \"<source>\"\n2.\tRunning pass \"loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>\" on function \"_Z1hiPA2_bPA2_c\"\n #0 0x0000000005944c48 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x5944c48)\n #1 0x0000000005941af4 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\n #2 0x0000718d16242520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\n #3 0x0000718d162969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\n #4 0x0000718d16242476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\n #5 0x0000718d162287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\n #6 0x0000718d1622871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\n #7 0x0000718d16239e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\n #8 0x00000000038376c4 (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x38376c4)\n #9 0x0000000003888c73 llvm::VPlanTransforms::cse(llvm::VPlan&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3888c73)\n#10 0x000000000367d30e llvm::LoopVectorizationPlanner::executePlan(llvm::ElementCount, unsigned int, llvm::VPlan&, llvm::InnerLoopVectorizer&, llvm::DominatorTree*, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x367d30e)\n```\n\nSee also:  https://godbolt.org/z/nxzGcccff\n\nCan be triggered from source-code:\n\n```\n#include <algorithm>\nshort a;\nextern short b[];\nint c;\nvoid h(int d, bool e[][2], char f[][2]) {\n#pragma clang loop vectorize_predicate(enable)\n  for (int g(d); g; g += 2) {\n    a = f[g][g] - e[g][g] - c;\n    b[g] = std::max(d ? (unsigned long long)e[g][g] : 0, (unsigned long long)0);\n  }\n}\n```",
+    "author": "sjoerdmeijer",
+    "labels": [
+      "vectorizers",
+      "crash-on-valid"
+    ],
+    "comments": [
+      {
+        "author": "sjoerdmeijer",
+        "body": "CC: @fhahn "
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true,
+  "bisect": "c3e76b27709f93c9e945caa29dae596b581289e2"
+}

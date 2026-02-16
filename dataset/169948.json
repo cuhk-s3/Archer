@@ -1,0 +1,59 @@
+{
+  "bug_id": "169948",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/169948",
+  "base_commit": "9ffd2e40c1c469e3ccb0798fa15fc38d6df42652",
+  "knowledge_cutoff": "2025-11-28T18:07:02Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "24b87b8d4891d90afd8c4033a4997dedecbdd107",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          7187,
+          7203
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "LoopVectorizationPlanner::computeBestVF"
+      ]
+    }
+  },
+  "patch": "commit 24b87b8d4891d90afd8c4033a4997dedecbdd107\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Sat Nov 29 22:00:30 2025 +0000\n\n    [VPlan] Skip cost verification for loops with EVL gather/scatter.\n    \n    The VPlan-based cost model use vp_gather/vp_scatter for gather/scatter\n    costs, which is different to the legacy cost model and cannot be matched\n    there. Don't verify the costs match for plans containing gather/scatters\n    with EVL.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/169948.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex c8495f1f32bd..4a89f7dd8672 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -7187,17 +7187,29 @@ VectorizationFactor LoopVectorizationPlanner::computeBestVF() {\n   VPCostContext CostCtx(CM.TTI, *CM.TLI, BestPlan, CM, CM.CostKind,\n                         *CM.PSE.getSE(), OrigLoop);\n   precomputeCosts(BestPlan, BestFactor.Width, CostCtx);\n-  // Verify that the VPlan-based and legacy cost models agree, except for VPlans\n-  // with early exits and plans with additional VPlan simplifications. The\n-  // legacy cost model doesn't properly model costs for such loops.\n-  assert((BestFactor.Width == LegacyVF.Width || BestPlan.hasEarlyExit() ||\n-          !Legal->getLAI()->getSymbolicStrides().empty() ||\n-          planContainsAdditionalSimplifications(getPlanFor(BestFactor.Width),\n-                                                CostCtx, OrigLoop,\n-                                                BestFactor.Width) ||\n-          planContainsAdditionalSimplifications(\n-              getPlanFor(LegacyVF.Width), CostCtx, OrigLoop, LegacyVF.Width)) &&\n-         \" VPlan cost model and legacy cost model disagreed\");\n+  // Verify that the VPlan-based and legacy cost models agree, except for\n+  // * VPlans with early exits,\n+  // * VPlans with additional VPlan simplifications,\n+  // * EVL-based VPlans with gather/scatters (the VPlan-based cost model uses\n+  //   vp_scatter/vp_gather).\n+  // The legacy cost model doesn't properly model costs for such loops.\n+  bool UsesEVLGatherScatter =\n+      any_of(VPBlockUtils::blocksOnly<VPBasicBlock>(vp_depth_first_shallow(\n+                 BestPlan.getVectorLoopRegion()->getEntry())),\n+             [](VPBasicBlock *VPBB) {\n+               return any_of(*VPBB, [](VPRecipeBase &R) {\n+                 return isa<VPWidenLoadEVLRecipe, VPWidenStoreEVLRecipe>(&R) &&\n+                        !cast<VPWidenMemoryRecipe>(&R)->isConsecutive();\n+               });\n+             });\n+  assert(\n+      (BestFactor.Width == LegacyVF.Width || BestPlan.hasEarlyExit() ||\n+       !Legal->getLAI()->getSymbolicStrides().empty() || UsesEVLGatherScatter ||\n+       planContainsAdditionalSimplifications(\n+           getPlanFor(BestFactor.Width), CostCtx, OrigLoop, BestFactor.Width) ||\n+       planContainsAdditionalSimplifications(\n+           getPlanFor(LegacyVF.Width), CostCtx, OrigLoop, LegacyVF.Width)) &&\n+      \" VPlan cost model and legacy cost model disagreed\");\n   assert((BestFactor.Width.isScalar() || BestFactor.ScalarCost > 0) &&\n          \"when vectorizing, the scalar cost must be computed.\");\n #endif\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/RISCV/gather-scatter-cost.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -mtriple riscv64 -mattr=+rva23u64 -S",
+        "opt < %s -passes=loop-vectorize -mtriple riscv64 -mattr=+rva23u64,+zvl1024b -S"
+      ],
+      "tests": [
+        {
+          "test_name": "mixed_gather_scatters",
+          "test_body": "define i8 @mixed_gather_scatters(ptr %A, ptr %B, ptr %C) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %accum = phi i8 [ 0, %entry ], [ %or.4, %loop ]\n  %ptr.0 = load ptr, ptr %A, align 8\n  %val.0 = load i64, ptr %ptr.0, align 8\n  %cmp.0 = icmp sgt i64 %val.0, 0\n  %ext.0 = zext i1 %cmp.0 to i8\n  %or.0 = or i8 %accum, %ext.0\n  %ptr.1 = load ptr, ptr %B, align 8\n  %val.1 = load i64, ptr %ptr.1, align 8\n  %cmp.1 = icmp sgt i64 %val.1, 0\n  %ext.1 = zext i1 %cmp.1 to i8\n  %or.1 = or i8 %or.0, %ext.1\n  %or.2 = or i8 %or.1, 1\n  %ptr.4 = load ptr, ptr %C, align 8\n  %val.4 = load i64, ptr %ptr.4, align 8\n  %cmp.4 = icmp sgt i64 %val.4, 0\n  %ext.4 = zext i1 %cmp.4 to i8\n  %or.4 = or i8 %or.2, %ext.4\n  %iv.next = add i32 %iv, 1\n  %exitcond = icmp eq i32 %iv, 9\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i8 %or.4\n}\n\nattributes #0 = { \"target-features\"=\"+zve64x,+zvl256b\" }\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LLVM][RISCV][ICE] LoopVectorize Assertion Failure in computeBestVF()",
+    "body": "llvm::LoopVectorizationPlanner::computeBestVF(): Assertion `(BestFactor.Width == LegacyVF.Width || BestPlan.hasEarlyExit() || !Legal->getLAI()->getSymbolicStrides().empty() || planContainsAdditionalSimplifications(getPlanFor(BestFactor.Width), CostCtx, OrigLoop, BestFactor.Width) || planContainsAdditionalSimplifications( getPlanFor(LegacyVF.Width), CostCtx, OrigLoop, LegacyVF.Width)) && \" VPlan cost model and legacy cost model disagreed\"' failed.\n\n \nRUN script red-e0c444.sh to reproduce the issue.\n[red-e0c444.sh](https://github.com/user-attachments/files/23827986/red-e0c444.sh)\n[red-e0c444.c](https://github.com/user-attachments/files/23827993/red-e0c444.c)\n\nAttached backtrace.\n[verbose-log.txt](https://github.com/user-attachments/files/23828005/verbose-log.txt)\n\nReduced testcase.\n[red.c](https://github.com/user-attachments/files/23828018/red.c)\n\n\nFound via Fuzzer.",
+    "author": "whileone-sk",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

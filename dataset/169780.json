@@ -1,0 +1,81 @@
+{
+  "bug_id": "169780",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/169780",
+  "base_commit": "07d14cb6d3e0319b4f95bfaca1502c4a8dc02910",
+  "knowledge_cutoff": "2025-11-27T09:36:56Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "8459508227dd30ce32f870fbc9109fe95d51f4db",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        [
+          703,
+          708
+        ],
+        [
+          755,
+          770
+        ],
+        [
+          3575,
+          3580
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        "VPlanTransforms::convertToConcreteRecipes",
+        "collectUsersRecursively",
+        "legalizeAndOptimizeInductions"
+      ]
+    }
+  },
+  "patch": "commit 8459508227dd30ce32f870fbc9109fe95d51f4db\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Thu Nov 27 21:52:15 2025 +0000\n\n    [VPlan] Handle scalar VPWidenPointerInd in convertToConcreteRecipes. (#169338)\n    \n    In some case, VPWidenPointerInductions become only used by scalars after\n    legalizeAndOptimizationInducftions was already run, for example due to\n    some VPlan optimizations.\n    \n    Move the code to scalarize VPWidenPointerInductions to a helper and use\n    it if needed.\n    \n    This fixes a crash after #148274 in the added test case.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/169780\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 4b7f90118374..67aca48bcaf8 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -703,6 +703,23 @@ static SmallVector<VPUser *> collectUsersRecursively(VPValue *V) {\n   return Users.takeVector();\n }\n \n+/// Scalarize a VPWidenPointerInductionRecipe by replacing it with a PtrAdd\n+/// (IndStart, ScalarIVSteps (0, Step)). This is used when the recipe only\n+/// generates scalar values.\n+static VPValue *\n+scalarizeVPWidenPointerInduction(VPWidenPointerInductionRecipe *PtrIV,\n+                                 VPlan &Plan, VPBuilder &Builder) {\n+  const InductionDescriptor &ID = PtrIV->getInductionDescriptor();\n+  VPValue *StartV = Plan.getConstantInt(ID.getStep()->getType(), 0);\n+  VPValue *StepV = PtrIV->getOperand(1);\n+  VPScalarIVStepsRecipe *Steps = createScalarIVSteps(\n+      Plan, InductionDescriptor::IK_IntInduction, Instruction::Add, nullptr,\n+      nullptr, StartV, StepV, PtrIV->getDebugLoc(), Builder);\n+\n+  return Builder.createPtrAdd(PtrIV->getStartValue(), Steps,\n+                              PtrIV->getDebugLoc(), \"next.gep\");\n+}\n+\n /// Legalize VPWidenPointerInductionRecipe, by replacing it with a PtrAdd\n /// (IndStart, ScalarIVSteps (0, Step)) if only its scalar values are used, as\n /// VPWidenPointerInductionRecipe will generate vectors only. If some users\n@@ -755,16 +772,7 @@ static void legalizeAndOptimizeInductions(VPlan &Plan) {\n       if (!PtrIV->onlyScalarsGenerated(Plan.hasScalableVF()))\n         continue;\n \n-      const InductionDescriptor &ID = PtrIV->getInductionDescriptor();\n-      VPValue *StartV = Plan.getConstantInt(ID.getStep()->getType(), 0);\n-      VPValue *StepV = PtrIV->getOperand(1);\n-      VPScalarIVStepsRecipe *Steps = createScalarIVSteps(\n-          Plan, InductionDescriptor::IK_IntInduction, Instruction::Add, nullptr,\n-          nullptr, StartV, StepV, PtrIV->getDebugLoc(), Builder);\n-\n-      VPValue *PtrAdd = Builder.createPtrAdd(PtrIV->getStartValue(), Steps,\n-                                             PtrIV->getDebugLoc(), \"next.gep\");\n-\n+      VPValue *PtrAdd = scalarizeVPWidenPointerInduction(PtrIV, Plan, Builder);\n       PtrIV->replaceAllUsesWith(PtrAdd);\n       continue;\n     }\n@@ -3575,6 +3583,16 @@ void VPlanTransforms::convertToConcreteRecipes(VPlan &Plan) {\n       }\n \n       if (auto *WidenIVR = dyn_cast<VPWidenPointerInductionRecipe>(&R)) {\n+        // If the recipe only generates scalars, scalarize it instead of\n+        // expanding it.\n+        if (WidenIVR->onlyScalarsGenerated(Plan.hasScalableVF())) {\n+          VPBuilder Builder(WidenIVR);\n+          VPValue *PtrAdd =\n+              scalarizeVPWidenPointerInduction(WidenIVR, Plan, Builder);\n+          WidenIVR->replaceAllUsesWith(PtrAdd);\n+          ToRemove.push_back(WidenIVR);\n+          continue;\n+        }\n         expandVPWidenPointerInduction(WidenIVR, TypeInfo);\n         ToRemove.push_back(WidenIVR);\n         continue;\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/RISCV/pointer-induction.ll",
+      "commands": [
+        "opt -mtriple riscv64 -mcpu=sifive-p670 -p loop-vectorize -vectorize-scev-check-threshold=3000 %s"
+      ],
+      "tests": [
+        {
+          "test_name": "scalarize_ptr_induction",
+          "test_body": "define void @blam(ptr %arg, ptr %arg1) {\nbb:\n  br label %bb400\n\nbb400:                                            ; preds = %bb437, %bb\n  %phi401 = phi ptr [ %getelementptr440, %bb437 ], [ %arg, %bb ]\n  %phi402 = phi ptr [ %getelementptr439, %bb437 ], [ %arg1, %bb ]\n  %load403 = load i64, ptr %phi402, align 4\n  store i64 %load403, ptr %phi401, align 4\n  %getelementptr404 = getelementptr i8, ptr %phi402, i64 8\n  %getelementptr405 = getelementptr i8, ptr %phi401, i64 8\n  %load408 = load i64, ptr %getelementptr404, align 4\n  store i64 %load408, ptr %getelementptr405, align 4\n  %getelementptr409 = getelementptr i8, ptr %phi402, i64 16\n  %getelementptr410 = getelementptr i8, ptr %phi401, i64 16\n  %load413 = load i64, ptr %getelementptr409, align 4\n  store i64 %load413, ptr %getelementptr410, align 4\n  %getelementptr414 = getelementptr i8, ptr %phi402, i64 24\n  %getelementptr415 = getelementptr i8, ptr %phi401, i64 24\n  %load418 = load i64, ptr %getelementptr414, align 4\n  store i64 %load418, ptr %getelementptr415, align 4\n  %getelementptr419 = getelementptr i8, ptr %phi402, i64 32\n  %getelementptr420 = getelementptr i8, ptr %phi401, i64 32\n  %load423 = load i64, ptr %getelementptr419, align 4\n  store i64 %load423, ptr %getelementptr420, align 4\n  %getelementptr424 = getelementptr i8, ptr %phi402, i64 40\n  %getelementptr425 = getelementptr i8, ptr %phi401, i64 40\n  %load428 = load i64, ptr %getelementptr424, align 4\n  store i64 %load428, ptr %getelementptr425, align 4\n  %getelementptr429 = getelementptr i8, ptr %phi402, i64 48\n  %getelementptr430 = getelementptr i8, ptr %phi401, i64 48\n  %load433 = load i64, ptr %getelementptr429, align 4\n  store i64 %load433, ptr %getelementptr430, align 4\n  %getelementptr434 = getelementptr i8, ptr %phi402, i64 56\n  %getelementptr435 = getelementptr i8, ptr %phi401, i64 56\n  %icmp436 = icmp eq ptr %getelementptr434, null\n  br i1 %icmp436, label %bb442, label %bb437\n\nbb437:                                            ; preds = %bb400\n  %load438 = load i64, ptr %getelementptr434, align 4\n  store i64 %load438, ptr %getelementptr435, align 4\n  %getelementptr439 = getelementptr i8, ptr %phi402, i64 64\n  %getelementptr440 = getelementptr i8, ptr %phi401, i64 64\n  br i1 false, label %bb442, label %bb400\n\nbb442:                                            ; preds = %bb437, %bb400\n  %phi443 = phi ptr [ %getelementptr440, %bb437 ], [ %getelementptr435, %bb400 ]\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LV] Assertion `!R->onlyScalarsGenerated(Plan->hasScalableVF()) && \"Recipe should have been replaced\"'",
+    "body": "```\ndefine void @blam(ptr %arg, ptr %arg1) {\nbb:\n  br label %bb400\n\nbb400:                                            ; preds = %bb437, %bb\n  %phi401 = phi ptr [ %getelementptr440, %bb437 ], [ %arg, %bb ]\n  %phi402 = phi ptr [ %getelementptr439, %bb437 ], [ %arg1, %bb ]\n  %load403 = load i64, ptr %phi402, align 4\n  store i64 %load403, ptr %phi401, align 4\n  %getelementptr404 = getelementptr i8, ptr %phi402, i64 8\n  %getelementptr405 = getelementptr i8, ptr %phi401, i64 8\n  %load408 = load i64, ptr %getelementptr404, align 4\n  store i64 %load408, ptr %getelementptr405, align 4\n  %getelementptr409 = getelementptr i8, ptr %phi402, i64 16\n  %getelementptr410 = getelementptr i8, ptr %phi401, i64 16\n  %load413 = load i64, ptr %getelementptr409, align 4\n  store i64 %load413, ptr %getelementptr410, align 4\n  %getelementptr414 = getelementptr i8, ptr %phi402, i64 24\n  %getelementptr415 = getelementptr i8, ptr %phi401, i64 24\n  %load418 = load i64, ptr %getelementptr414, align 4\n  store i64 %load418, ptr %getelementptr415, align 4\n  %getelementptr419 = getelementptr i8, ptr %phi402, i64 32\n  %getelementptr420 = getelementptr i8, ptr %phi401, i64 32\n  %load423 = load i64, ptr %getelementptr419, align 4\n  store i64 %load423, ptr %getelementptr420, align 4\n  %getelementptr424 = getelementptr i8, ptr %phi402, i64 40\n  %getelementptr425 = getelementptr i8, ptr %phi401, i64 40\n  %load428 = load i64, ptr %getelementptr424, align 4\n  store i64 %load428, ptr %getelementptr425, align 4\n  %getelementptr429 = getelementptr i8, ptr %phi402, i64 48\n  %getelementptr430 = getelementptr i8, ptr %phi401, i64 48\n  %load433 = load i64, ptr %getelementptr429, align 4\n  store i64 %load433, ptr %getelementptr430, align 4\n  %getelementptr434 = getelementptr i8, ptr %phi402, i64 56\n  %getelementptr435 = getelementptr i8, ptr %phi401, i64 56\n  %icmp436 = icmp eq ptr %getelementptr434, null\n  br i1 %icmp436, label %bb442, label %bb437\n\nbb437:                                            ; preds = %bb400\n  %load438 = load i64, ptr %getelementptr434, align 4\n  store i64 %load438, ptr %getelementptr435, align 4\n  %getelementptr439 = getelementptr i8, ptr %phi402, i64 64\n  %getelementptr440 = getelementptr i8, ptr %phi401, i64 64\n  br i1 false, label %bb442, label %bb400\n\nbb442:                                            ; preds = %bb437, %bb400\n  %phi443 = phi ptr [ %getelementptr440, %bb437 ], [ %getelementptr435, %bb400 ]\n  ret void\n}\n```\nThis IR triggers the assertion\n```\nopt: /root/llvm-project/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp:3513: void expandVPWidenPointerInduction(llvm::VPWidenPointerInductionRecipe*, llvm::VPTypeAnalysis&): Assertion `!R->onlyScalarsGenerated(Plan->hasScalableVF()) && \"Recipe should have been replaced\"' failed.\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.\nStack dump:\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -mtriple riscv64 -mcpu=sifive-p670 -p loop-vectorize -vectorize-scev-check-threshold=3000 <source>\n1.\tRunning pass \"function(loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>)\" on module \"<source>\"\n2.\tRunning pass \"loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>\" on function \"blam\"\n #0 0x00000000059a86a8 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x59a86a8)\n #1 0x00000000059a5554 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\n #2 0x00007f0308042520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\n #3 0x00007f03080969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\n #4 0x00007f0308042476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\n #5 0x00007f03080287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\n #6 0x00007f030802871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\n #7 0x00007f0308039e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\n #8 0x00000000038d5422 llvm::VPlanTransforms::convertToConcreteRecipes(llvm::VPlan&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x38d5422)\n #9 0x00000000036dc59a llvm::LoopVectorizationPlanner::executePlan(llvm::ElementCount, unsigned int, llvm::VPlan&, llvm::InnerLoopVectorizer&, llvm::DominatorTree*, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x36dc59a)\n```\nSee also: https://godbolt.org/z/6Yzf35ffG",
+    "author": "arcbbb",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "arcbbb",
+        "body": "My investigation shows that wide-ptr-iv `EMIT ir<%phi401> = WIDEN-POINTER-INDUCTION` is used by `WIDEN-GEP Var[Inv] ir<%getelementptr440>`, so legalizeAndOptimizeInductions skips this ptr-iv.\nWhen removeBranchOnConst deletes the exit block,  %getelementptr440 becomes dead.\nAfter dead recipe removal,  wide-ptr-iv has a remaining scalar use.\n\nWe may want to revisit the pass ordering in VPlanTransforms::optimize(). consider moving removeBranchOnConst earlier in the pipeline?\n"
+      },
+      {
+        "author": "arcbbb",
+        "body": "CC: @fhahn "
+      },
+      {
+        "author": "fhahn",
+        "body": "This should be fixed by https://github.com/llvm/llvm-project/pull/169338"
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true
+}

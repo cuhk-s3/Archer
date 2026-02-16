@@ -1,0 +1,59 @@
+{
+  "bug_id": "173796",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/173796",
+  "bug_type": "miscompilation",
+  "base_commit": "3c5f206b67ad4894874d5ec29d80e22adfec4b94",
+  "knowledge_cutoff": "2025-12-28T19:37:03Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "ab450597dad2bc8f92376da2c230d9604fc8afc1",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          25028,
+          25037
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "tryToReduce"
+      ]
+    }
+  },
+  "patch": "commit ab450597dad2bc8f92376da2c230d9604fc8afc1\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Sun Dec 28 13:31:04 2025 -0800\n\n    [SLP]Do not swap RHS, if it is used in bool op, used as a second operand in a reduction\n    \n    If the RHS operand is used as a first operand in the bool reduction op,\n    used as a second operand in the reduction ops, still need to use this\n    RHS as RHS, not as LHS\n    \n    https://alive2.llvm.org/ce/z/pmc2YJ\n    \n    Fixes #173796\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex a7b41631594d..0bf90209df9c 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -25028,10 +25028,18 @@ public:\n           if (isBoolLogicOp(RedOp2) && ((!InitStep && RHS == VectorizedTree) ||\n                                         getRdxOperand(RedOp2, 0) == RHS ||\n                                         isGuaranteedNotToBePoison(RHS, AC))) {\n+            // If RedOp2 was used as a second operand - do not swap.\n             if ((InitStep || RHS != VectorizedTree) &&\n                 getRdxOperand(RedOp2, 0) == RHS &&\n-                (!isBoolLogicOp(RedOp1) ||\n-                 getRdxOperand(RedOp1, 1) == RedOp2)) {\n+                ((isBoolLogicOp(RedOp1) &&\n+                  getRdxOperand(RedOp1, 1) == RedOp2) ||\n+                 any_of(ReductionOps, [&](ArrayRef<Value *> Ops) {\n+                   return any_of(Ops, [&](Value *Op) {\n+                     auto *OpI = dyn_cast<Instruction>(Op);\n+                     return OpI && isBoolLogicOp(OpI) &&\n+                            getRdxOperand(OpI, 1) == RedOp2;\n+                   });\n+                 }))) {\n               NeedFreeze = false;\n             } else {\n               std::swap(LHS, RHS);\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/test_intermediate_dual_use.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_intermediate_dual_use",
+          "test_body": "define i1 @test_intermediate_dual_use(<4 x i32> %x) {\n  %x0 = extractelement <4 x i32> %x, i32 0\n  %p_val = extractelement <4 x i32> %x, i32 -1\n  %leaf_p = icmp eq i32 %p_val, 0\n  %leaf_f = icmp ugt i32 %x0, -1\n  %i1 = select i1 %leaf_p, i1 true, i1 false\n  %safe = select i1 %leaf_f, i1 %i1, i1 false\n  %unsafe = select i1 %i1, i1 true, i1 false\n  %res = select i1 %safe, i1 %unsafe, i1 false\n  ret i1 %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[SLP] Incorrect poison propagation when vectorizing boolean select chains",
+    "body": "In https://github.com/llvm/llvm-project/commit/889215a30ed60474e573f9632d1fa362dfa1b04e, there is still an uncovered correctness issue in SLP vectorization of boolean select chains involving poison, specifically when an intermediate reduction node is used in mixed positions within the same reduction tree.\n\nConsider the following IR:\n\n```llvm\n%i1 = select i1 %p, i1 true, i1 false\n%safe   = select i1 %f, i1 %i1, i1 false\n%unsafe = select i1 %i1, i1 true, i1 false\n%res    = select i1 %safe, i1 %unsafe, i1 false\nret i1 %res\n```\n\nIf `%f` is false, `%safe` evaluates to false, and `%res` immediately becomes false. \nIn this case, `%unsafe` is never observed, and the poison carried by `%i1` is correctly suppressed by the scalar semantics. \n\nHowever, after the current SLP transformation, `%safe` and `%unsafe` are combined into a single boolean reduction tree.\nThe intermediate value `%i1` is treated as a reduction operand and participates directly in the vectorized reduction logic. \n\nBecause `%i1` is used as a condition operand in `%unsafe`, the current logic assumes that `%i1` is poison-propagating and therefore skips inserting a freeze.\nThis classification ignores the fact that `%i1` is also used as a value operand in `%safe`, where poison is semantically suppressed by a dominating constant false.\n\nAlive2 proof: https://alive2.llvm.org/ce/z/qPCjs6\n\nExposed from https://github.com/llvm/llvm-project/commit/889215a30ed60474e573f9632d1fa362dfa1b04e, cc @alexey-bataev ",
+    "author": "cardigan1008",
+    "labels": [
+      "miscompilation",
+      "llvm:SLPVectorizer"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true
+}

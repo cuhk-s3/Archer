@@ -1,0 +1,80 @@
+{
+  "bug_id": "97452",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/97452",
+  "base_commit": "5c204b1d2619cbad7b7ad228b62feae08781a6db",
+  "knowledge_cutoff": "2024-07-02T17:49:01Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "2b3b405b09a0d965a4aff1f92958418ddbf1e7f6",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          6813,
+          6818
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "LoopVectorizationCostModel::getInstructionCost"
+      ]
+    }
+  },
+  "patch": "commit 2b3b405b09a0d965a4aff1f92958418ddbf1e7f6\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Thu Jul 4 11:44:50 2024 +0100\n\n    [LV] Don't vectorize first-order recurrence with VF <vscale x 1 x ..>\n    \n    The assertion added as part of https://github.com/llvm/llvm-project/pull/93395\n    surfaced cases where first-order recurrences are vectorized with\n    <vscale x 1 x ..>. If vscale is 1, then we are unable to extract the\n    penultimate value (second to last lane). Previously this case got\n    mis-compiled, trying to extract from an invalid lane (-1)\n    https://llvm.godbolt.org/z/3adzYYcf9.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/97452.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex f9c0c66e6e0a..d7b0240fd8a8 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -6813,6 +6813,11 @@ LoopVectorizationCostModel::getInstructionCost(Instruction *I, ElementCount VF,\n \n     // First-order recurrences are replaced by vector shuffles inside the loop.\n     if (VF.isVector() && Legal->isFixedOrderRecurrence(Phi)) {\n+      // For <vscale x 1 x i64>, if vscale = 1 we are unable to extract the\n+      // penultimate value of the recurrence.\n+      // TODO: Consider vscale_range info.\n+      if (VF.isScalable() && VF.getKnownMinValue() == 1)\n+        return InstructionCost::getInvalid();\n       SmallVector<int> Mask(VF.getKnownMinValue());\n       std::iota(Mask.begin(), Mask.end(), VF.getKnownMinValue() - 1);\n       return TTI.getShuffleCost(TargetTransformInfo::SK_Splice,\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/RISCV/first-order-recurrence-scalable-vf1.ll",
+      "commands": [
+        "opt -p loop-vectorize -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ntarget datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"riscv64-unknown-linux-gnu\"\n\n; Make sure we do not pick <vscale x 1 x i64> as VF for a loop with a\n; first-order recurrence.\ndefine i64 @pr97452_scalable_vf1_for(ptr %src) #0 {\n;\nentry:\n  br label %loop\n\nloop:\n  %for = phi i64 [ 0, %entry ], [ %l, %loop ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %gep = getelementptr inbounds i64, ptr %src, i64 %iv\n  %l = load i64, ptr %gep, align 8\n  %ec = icmp eq i64 %iv, 22\n  br i1 %ec, label %exit, label %loop\n\nexit:\n  %res = phi i64 [ %for, %loop ]\n  ret i64 %res\n}\n\nattributes #0 = { \"target-features\"=\"+64bit,+v,+zvl128b,+zvl256b\" }\n;.\n;."
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/first-order-recurrence-scalable-vf1.ll",
+      "commands": [
+        "opt -p loop-vectorize -scalable-vectorization=on -force-vector-width=1 -force-target-supports-scalable-vectors=true -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ntarget datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\n\n\ndefine i64 @pr97452_scalable_vf1_for_live_out(ptr %src) {\n;\nentry:\n  br label %loop\n\nloop:\n  %for = phi i64 [ 0, %entry ], [ %l, %loop ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %gep = getelementptr inbounds i64, ptr %src, i64 %iv\n  %l = load i64, ptr %gep, align 8\n  %ec = icmp eq i64 %iv, 22\n  br i1 %ec, label %exit, label %loop\n\nexit:\n  %res = phi i64 [ %for, %loop ]\n  ret i64 %res\n}\n\n\ndefine void @pr97452_scalable_vf1_for_no_live_out(ptr %src, ptr noalias %dst) {\n;\nentry:\n  br label %loop\n\nloop:\n  %for = phi i64 [ 0, %entry ], [ %l, %loop ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %gep = getelementptr inbounds i64, ptr %src, i64 %iv\n  %l = load i64, ptr %gep, align 8\n  %gep.dst = getelementptr inbounds i64, ptr %dst, i64 %iv\n  store i64 %l, ptr %gep.dst\n  %ec = icmp eq i64 %iv, 22\n  br i1 %ec, label %exit, label %loop\n\nexit:\n  ret void\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LoopVectorize] Assertion `Offset <= State.VF.getKnownMinValue() && \"invalid offset to extract from\"' failed.",
+    "body": "Reduced testcase:\r\n```llvm ir\r\ntarget datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\r\ntarget triple = \"riscv64-unknown-linux-gnu\"\r\n\r\ndefine i32 @main() #0 {\r\nentry:\r\n  br label %for.body\r\n\r\nfor.cond.cleanup:                                 ; preds = %for.body\r\n  %.lcssa17 = phi i64 [ %0, %for.body ]\r\n  ret i32 0\r\n\r\nfor.body:                                         ; preds = %for.body, %entry\r\n  %0 = phi i64 [ 0, %entry ], [ %1, %for.body ]\r\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\r\n  %indvars.iv.next = add i64 %indvars.iv, 1\r\n  %1 = load i64, ptr null, align 8\r\n  %exitcond.not = icmp eq i64 %indvars.iv, 22\r\n  br i1 %exitcond.not, label %for.cond.cleanup, label %for.body\r\n}\r\n\r\nattributes #0 = { \"target-features\"=\"+64bit,+v,+zvl128b,+zvl256b\" }\r\n```\r\n\r\nCommand/backtrace:\r\n```bash\r\n> /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt -passes=loop-vectorize reduced.ll\r\nWARNING: You're attempting to print out a bitcode file.\r\nThis is inadvisable as it may cause display problems. If\r\nyou REALLY want to taste LLVM bitcode first-hand, you\r\ncan force output with the `-f' option.\r\n\r\nopt: /scratch/tc-testing/tc-compiler-fuzz-trunk/llvm/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp:569: llvm::Value* llvm::VPInstruction::generatePerPart(llvm::VPTransformState&, unsigned int): Assertion `Offset <= State.VF.getKnownMinValue() && \"invalid offset to extract from\"' failed.\r\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\r\nStack dump:\r\n0.      Program arguments: /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt -passes=loop-vectorize reduced.ll\r\n1.      Running pass \"function(loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>)\" on module \"reduced.ll\"\r\n2.      Running pass \"loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>\" on function \"main\"\r\n #0 0x000055972ae01800 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2ed2800)\r\n #1 0x000055972adfec0f llvm::sys::RunSignalHandlers() (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2ecfc0f)\r\n #2 0x000055972adfed65 SignalHandler(int) Signals.cpp:0:0\r\n #3 0x0000728161442520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\r\n #4 0x00007281614969fc __pthread_kill_implementation ./nptl/pthread_kill.c:44:76\r\n #5 0x00007281614969fc __pthread_kill_internal ./nptl/pthread_kill.c:78:10\r\n #6 0x00007281614969fc pthread_kill ./nptl/pthread_kill.c:89:10\r\n #7 0x0000728161442476 gsignal ./signal/../sysdeps/posix/raise.c:27:6\r\n #8 0x00007281614287f3 abort ./stdlib/abort.c:81:7\r\n #9 0x000072816142871b _nl_load_domain ./intl/loadmsgcat.c:1177:9\r\n#10 0x0000728161439e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\r\n#11 0x0000559729f62d80 llvm::VPInstruction::generatePerPart(llvm::VPTransformState&, unsigned int) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2033d80)\r\n#12 0x0000559729f63155 llvm::VPInstruction::execute(llvm::VPTransformState&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2034155)\r\n#13 0x0000559729f2de47 llvm::VPBasicBlock::executeRecipes(llvm::VPTransformState*, llvm::BasicBlock*) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x1ffee47)\r\n#14 0x0000559729f2e141 llvm::VPIRBasicBlock::execute(llvm::VPTransformState*) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x1fff141)\r\n#15 0x0000559729f30286 llvm::VPlan::execute(llvm::VPTransformState*) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2001286)\r\n#16 0x0000559729e2380a llvm::LoopVectorizationPlanner::executePlan(llvm::ElementCount, unsigned int, llvm::VPlan&, llvm::InnerLoopVectorizer&, llvm::DominatorTree*, bool, llvm::DenseMap<llvm::SCEV const*, llvm::Value*, llvm::DenseMapInfo<llvm::SCEV const*, void>, llvm::detail::DenseMapPair<llvm::SCEV const*, llvm::Value*>> const*) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x1ef480a)\r\n#17 0x0000559729e34a7c llvm::LoopVectorizePass::processLoop(llvm::Loop*) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x1f05a7c)\r\n#18 0x0000559729e36f7e llvm::LoopVectorizePass::runImpl(llvm::Function&, llvm::ScalarEvolution&, llvm::LoopInfo&, llvm::TargetTransformInfo&, llvm::DominatorTree&, llvm::BlockFrequencyInfo*, llvm::TargetLibraryInfo*, llvm::DemandedBits&, llvm::AssumptionCache&, llvm::LoopAccessInfoManager&, llvm::OptimizationRemarkEmitter&, llvm::ProfileSummaryInfo*) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x1f07f7e)\r\n#19 0x0000559729e380a0 llvm::LoopVectorizePass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x1f090a0)\r\n#20 0x0000559728cc6dc6 llvm::detail::PassModel<llvm::Function, llvm::LoopVectorizePass, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0xd97dc6)\r\n#21 0x000055972ac1ce46 llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2cede46)\r\n#22 0x0000559728cc9f56 llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0xd9af56)\r\n#23 0x000055972ac1bbcb llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2cecbcb)\r\n#24 0x0000559728cc6526 llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0xd97526)\r\n#25 0x000055972ac19d02 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x2cead02)\r\n#26 0x0000559728520136 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x5f1136)\r\n#27 0x0000559728511d51 optMain (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x5e2d51)\r\n#28 0x0000728161429d90 __libc_start_call_main ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16\r\n#29 0x0000728161429e40 call_init ./csu/../csu/libc-start.c:128:20\r\n#30 0x0000728161429e40 __libc_start_main ./csu/../csu/libc-start.c:379:5\r\n#31 0x0000559728507b85 _start (/scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt+0x5d8b85)\r\nzsh: IOT instruction (core dumped)  /scratch/tc-testing/tc-compiler-fuzz-trunk/build-gcv/build-llvm-linux/bin/opt\r\n```\r\nGodbolt: https://godbolt.org/z/ojz8sMa1r\r\n\r\nFound via fuzzer",
+    "author": "patrick-rivos",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "svs-quic",
+        "body": "Bisected to #93395 \r\ncc: @fhahn "
+      },
+      {
+        "author": "fhahn",
+        "body": "Thanks for the test case. Should be fixed now. The assertion highlighted a case where we previously miscompiled for the case where VF is <vscale x 1 x ..>; in that case we are unable to extract the penultimate value (second-to-last) if vscale = 1"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "07b330132c0b7fd5b3ada1890840d0dbbd8cdb8e"
+}

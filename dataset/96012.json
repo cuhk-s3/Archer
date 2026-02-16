@@ -1,0 +1,76 @@
+{
+  "bug_id": "96012",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/96012",
+  "base_commit": "aad27bf534b59645f47a92f072af798687b1dd0d",
+  "knowledge_cutoff": "2024-06-19T02:31:53Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "48ae61470104e9d7a8be5beb8739c24f52cc33c0",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          780,
+          790
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp": [
+        [
+          90,
+          102
+        ],
+        [
+          309,
+          314
+        ],
+        [
+          537,
+          543
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp": [
+        "Negator::Negate",
+        "Negator::Negator",
+        "Negator::visitImpl",
+        "Negator::~Negator"
+      ]
+    }
+  },
+  "patch": "commit 48ae61470104e9d7a8be5beb8739c24f52cc33c0\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sat Aug 17 16:48:29 2024 +0800\n\n    [InstCombine] Avoid infinite loop when negating phi nodes (#104581)\n    \n    Closes https://github.com/llvm/llvm-project/issues/96012\n    \n    ---------\n    \n    Co-authored-by: Nikita Popov <github@npopov.com>\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 16f1c3ba15eb..a0f2399972b5 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -780,11 +780,14 @@ class Negator final {\n   using BuilderTy = IRBuilder<TargetFolder, IRBuilderCallbackInserter>;\n   BuilderTy Builder;\n \n+  const DominatorTree &DT;\n+\n   const bool IsTrulyNegation;\n \n   SmallDenseMap<Value *, Value *> NegationsCache;\n \n-  Negator(LLVMContext &C, const DataLayout &DL, bool IsTrulyNegation);\n+  Negator(LLVMContext &C, const DataLayout &DL, const DominatorTree &DT,\n+          bool IsTrulyNegation);\n \n #if LLVM_ENABLE_STATS\n   unsigned NumValuesVisitedInThisNegator = 0;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp b/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\nindex 2dd1db6a4a75..92293ef40146 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\n@@ -90,13 +90,14 @@ static cl::opt<unsigned>\n                     cl::desc(\"What is the maximal lookup depth when trying to \"\n                              \"check for viability of negation sinking.\"));\n \n-Negator::Negator(LLVMContext &C, const DataLayout &DL, bool IsTrulyNegation_)\n+Negator::Negator(LLVMContext &C, const DataLayout &DL, const DominatorTree &DT_,\n+                 bool IsTrulyNegation_)\n     : Builder(C, TargetFolder(DL),\n               IRBuilderCallbackInserter([&](Instruction *I) {\n                 ++NegatorNumInstructionsCreatedTotal;\n                 NewInstructions.push_back(I);\n               })),\n-      IsTrulyNegation(IsTrulyNegation_) {}\n+      DT(DT_), IsTrulyNegation(IsTrulyNegation_) {}\n \n #if LLVM_ENABLE_STATS\n Negator::~Negator() {\n@@ -309,6 +310,9 @@ std::array<Value *, 2> Negator::getSortedOperandsOfBinOp(Instruction *I) {\n     auto *PHI = cast<PHINode>(I);\n     SmallVector<Value *, 4> NegatedIncomingValues(PHI->getNumOperands());\n     for (auto I : zip(PHI->incoming_values(), NegatedIncomingValues)) {\n+      // Don't negate indvars to avoid infinite loops.\n+      if (DT.dominates(PHI->getParent(), std::get<0>(I)))\n+        return nullptr;\n       if (!(std::get<1>(I) =\n                 negate(std::get<0>(I), IsNSW, Depth + 1))) // Early return.\n         return nullptr;\n@@ -537,7 +541,8 @@ std::array<Value *, 2> Negator::getSortedOperandsOfBinOp(Instruction *I) {\n   if (!NegatorEnabled || !DebugCounter::shouldExecute(NegatorCounter))\n     return nullptr;\n \n-  Negator N(Root->getContext(), IC.getDataLayout(), LHSIsZero);\n+  Negator N(Root->getContext(), IC.getDataLayout(), IC.getDominatorTree(),\n+            LHSIsZero);\n   std::optional<Result> Res = N.run(Root, IsNSW);\n   if (!Res) { // Negation failed.\n     LLVM_DEBUG(dbgs() << \"Negator: failed to sink negation into \" << *Root\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/pr96012.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ntarget datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\n\n; Make sure we don't hang here.\ndefine i32 @pr96012() {\n;\nentry:\n  br label %for.cond\n\nfor.cond:\n  %indvar = phi i32 [ 1, %entry ], [ %shl, %for.cond ]\n  %conv1 = trunc i32 %indvar to i8\n  %neg = sub i8 0, %conv1\n  %conv2 = zext i8 %neg to i32\n  %shl = shl nuw i32 %conv2, 24\n  br label %for.cond\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "InstCombine gets stuck when sinking negation",
+    "body": "Minimal reproducer (It looks over-reduced): https://godbolt.org/z/9zj5K8seP\r\n```\r\n; opt -passes=instcombine test.ll -S -debug\r\ntarget datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\r\ntarget triple = \"riscv64-unknown-linux-gnu\"\r\n\r\ndefine i32 @func_112() {\r\nentry:\r\n  br label %for.cond\r\n\r\nfor.cond:                                         ; preds = %for.cond, %entry\r\n  %l_139.0 = phi i32 [ 1, %entry ], [ %0, %for.cond ]\r\n  %conv5 = trunc i32 %l_139.0 to i8\r\n  %call6 = sub i8 0, %conv5\r\n  %conv7 = zext i8 %call6 to i32\r\n  %0 = shl nuw i32 %conv7, 24\r\n  br label %for.cond\r\n}\r\n```\r\n\r\n```\r\nINSTCOMBINE ITERATION #1 on func_112\r\nADD:   br label %for.cond\r\nADD:   %0 = shl nuw i32 %conv7, 24\r\nADD:   %conv7 = zext i8 %call6 to i32\r\nADD:   %call6 = sub i8 0, %conv5\r\nADD:   %conv5 = trunc i32 %l_139.0 to i8\r\nADD:   %l_139.0 = phi i32 [ 1, %entry ], [ %0, %for.cond ]\r\nADD:   br label %for.cond\r\nIC: Visiting:   br label %for.cond\r\nIC: Visiting:   %l_139.0 = phi i32 [ 1, %entry ], [ %0, %for.cond ]\r\nIC: Visiting:   %conv5 = trunc i32 %l_139.0 to i8\r\nIC: Visiting:   %call6 = sub i8 0, %conv5\r\nNegator: attempting to sink negation into   %conv5 = trunc i32 %l_139.0 to i8\r\nNegator: successfully sunk negation into   %conv5 = trunc i32 %l_139.0 to i8\r\n         NEW:   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\nNegator: Propagating 3 instrs to InstCombine\r\nADD DEFERRED:   %.neg = mul i32 %conv7, -16777216\r\nADD DEFERRED:   %l_139.0.neg = phi i32 [ -1, %entry ], [ %.neg, %for.cond ]\r\nADD DEFERRED:   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\nIC: Old =   %call6 = sub i8 0, %conv5\r\n    New =   <badref> = add i8 %conv5.neg, 0\r\nADD:   %call6 = add i8 %conv5.neg, 0\r\nIC: ERASE   %0 = sub i8 0, %conv5\r\nADD DEFERRED:   %conv5 = trunc i32 %l_139.0 to i8\r\nIC: ERASE   %conv5 = trunc i32 %l_139.0 to i8\r\nADD DEFERRED:   %l_139.0 = phi i32 [ 1, %entry ], [ %0, %for.cond ]\r\nIC: ERASE   %l_139.0 = phi i32 [ 1, %entry ], [ %0, %for.cond ]\r\nADD DEFERRED:   %0 = shl nuw i32 %conv7, 24\r\nIC: ERASE   %0 = shl nuw i32 %conv7, 24\r\nADD DEFERRED:   %conv7 = zext i8 %call6 to i32\r\nADD:   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\nADD:   %l_139.0.neg = phi i32 [ -1, %entry ], [ %.neg, %for.cond ]\r\nADD:   %.neg = mul i32 %conv7, -16777216\r\nIC: Visiting:   %.neg = mul i32 %conv7, -16777216\r\nNegator: attempting to sink negation into   %conv7 = zext i8 %call6 to i32\r\nNegator: failed to sink negation into   %conv7 = zext i8 %call6 to i32\r\nADD DEFERRED:   %call6.neg = sub i8 0, %call6\r\nADD DEFERRED:   %call6.neg.z = zext i8 %call6.neg to i32\r\nIC: Old =   %.neg = mul i32 %conv7, -16777216\r\n    New =   <badref> = shl i32 %call6.neg.z, 24\r\nADD:   %.neg = shl i32 %call6.neg.z, 24\r\nIC: ERASE   %0 = mul i32 %conv7, -16777216\r\nADD DEFERRED:   %conv7 = zext i8 %call6 to i32\r\nIC: ERASE   %conv7 = zext i8 %call6 to i32\r\nADD DEFERRED:   %call6 = add i8 %conv5.neg, 0\r\nADD:   %call6.neg.z = zext i8 %call6.neg to i32\r\nADD:   %call6.neg = sub i8 0, %call6\r\nIC: Visiting:   %call6.neg = sub i8 0, %call6\r\nIC: Old =   %call6.neg = sub i8 0, %call6\r\n    New =   <badref> = sub i8 0, %conv5.neg\r\nADD:   %call6.neg = sub i8 0, %conv5.neg\r\nIC: ERASE   %0 = sub i8 0, %call6\r\nADD DEFERRED:   %call6 = add i8 %conv5.neg, 0\r\nIC: ERASE   %call6 = add i8 %conv5.neg, 0\r\nADD DEFERRED:   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\nADD DEFERRED:   %call6.neg = sub i8 0, %conv5.neg\r\nIC: Visiting:   %call6.neg = sub i8 0, %conv5.neg\r\nNegator: attempting to sink negation into   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\nNegator: successfully sunk negation into   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\n         NEW:   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\nNegator: Propagating 3 instrs to InstCombine\r\nADD DEFERRED:   %.neg.neg = mul i32 %call6.neg.z, -16777216\r\nADD DEFERRED:   %l_139.0.neg.neg = phi i32 [ 1, %entry ], [ %.neg.neg, %for.cond ]\r\nADD DEFERRED:   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\nIC: Old =   %call6.neg = sub i8 0, %conv5.neg\r\n    New =   <badref> = add i8 %conv5.neg.neg, 0\r\nADD:   %call6.neg = add i8 %conv5.neg.neg, 0\r\nIC: ERASE   %0 = sub i8 0, %conv5.neg\r\nADD DEFERRED:   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\nIC: ERASE   %conv5.neg = trunc i32 %l_139.0.neg to i8\r\nADD DEFERRED:   %l_139.0.neg = phi i32 [ -1, %entry ], [ %.neg, %for.cond ]\r\nIC: ERASE   %l_139.0.neg = phi i32 [ -1, %entry ], [ %.neg, %for.cond ]\r\nADD DEFERRED:   %.neg = shl i32 %call6.neg.z, 24\r\nIC: ERASE   %.neg = shl i32 %call6.neg.z, 24\r\nADD DEFERRED:   %call6.neg.z = zext i8 %call6.neg to i32\r\nADD:   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\nADD:   %l_139.0.neg.neg = phi i32 [ 1, %entry ], [ %.neg.neg, %for.cond ]\r\nADD:   %.neg.neg = mul i32 %call6.neg.z, -16777216\r\nIC: Visiting:   %.neg.neg = mul i32 %call6.neg.z, -16777216\r\nNegator: attempting to sink negation into   %call6.neg.z = zext i8 %call6.neg to i32\r\nNegator: failed to sink negation into   %call6.neg.z = zext i8 %call6.neg to i32\r\nADD DEFERRED:   %call6.neg.neg = sub i8 0, %call6.neg\r\nADD DEFERRED:   %call6.neg.neg.z = zext i8 %call6.neg.neg to i32\r\nIC: Old =   %.neg.neg = mul i32 %call6.neg.z, -16777216\r\n    New =   <badref> = shl i32 %call6.neg.neg.z, 24\r\nADD:   %.neg.neg = shl i32 %call6.neg.neg.z, 24\r\nIC: ERASE   %0 = mul i32 %call6.neg.z, -16777216\r\nADD DEFERRED:   %call6.neg.z = zext i8 %call6.neg to i32\r\nIC: ERASE   %call6.neg.z = zext i8 %call6.neg to i32\r\nADD DEFERRED:   %call6.neg = add i8 %conv5.neg.neg, 0\r\nADD:   %call6.neg.neg.z = zext i8 %call6.neg.neg to i32\r\nADD:   %call6.neg.neg = sub i8 0, %call6.neg\r\nIC: Visiting:   %call6.neg.neg = sub i8 0, %call6.neg\r\nIC: Old =   %call6.neg.neg = sub i8 0, %call6.neg\r\n    New =   <badref> = sub i8 0, %conv5.neg.neg\r\nADD:   %call6.neg.neg = sub i8 0, %conv5.neg.neg\r\nIC: ERASE   %0 = sub i8 0, %call6.neg\r\nADD DEFERRED:   %call6.neg = add i8 %conv5.neg.neg, 0\r\nIC: ERASE   %call6.neg = add i8 %conv5.neg.neg, 0\r\nADD DEFERRED:   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\nADD DEFERRED:   %call6.neg.neg = sub i8 0, %conv5.neg.neg\r\nIC: Visiting:   %call6.neg.neg = sub i8 0, %conv5.neg.neg\r\nNegator: attempting to sink negation into   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\nNegator: successfully sunk negation into   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\n         NEW:   %conv5.neg.neg.neg = trunc i32 %l_139.0.neg.neg.neg to i8\r\nNegator: Propagating 3 instrs to InstCombine\r\nADD DEFERRED:   %.neg.neg.neg = mul i32 %call6.neg.neg.z, -16777216\r\nADD DEFERRED:   %l_139.0.neg.neg.neg = phi i32 [ -1, %entry ], [ %.neg.neg.neg, %for.cond ]\r\nADD DEFERRED:   %conv5.neg.neg.neg = trunc i32 %l_139.0.neg.neg.neg to i8\r\nIC: Old =   %call6.neg.neg = sub i8 0, %conv5.neg.neg\r\n    New =   <badref> = add i8 %conv5.neg.neg.neg, 0\r\nADD:   %call6.neg.neg = add i8 %conv5.neg.neg.neg, 0\r\nIC: ERASE   %0 = sub i8 0, %conv5.neg.neg\r\nADD DEFERRED:   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\nIC: ERASE   %conv5.neg.neg = trunc i32 %l_139.0.neg.neg to i8\r\nADD DEFERRED:   %l_139.0.neg.neg = phi i32 [ 1, %entry ], [ %.neg.neg, %for.cond ]\r\nIC: ERASE   %l_139.0.neg.neg = phi i32 [ 1, %entry ], [ %.neg.neg, %for.cond ]\r\nADD DEFERRED:   %.neg.neg = shl i32 %call6.neg.neg.z, 24\r\nIC: ERASE   %.neg.neg = shl i32 %call6.neg.neg.z, 24\r\nADD DEFERRED:   %call6.neg.neg.z = zext i8 %call6.neg.neg to i32\r\nADD:   %conv5.neg.neg.neg = trunc i32 %l_139.0.neg.neg.neg to i8\r\nADD:   %l_139.0.neg.neg.neg = phi i32 [ -1, %entry ], [ %.neg.neg.neg, %for.cond ]\r\nADD:   %.neg.neg.neg = mul i32 %call6.neg.neg.z, -16777216\r\nIC: Visiting:   %.neg.neg.neg = mul i32 %call6.neg.neg.z, -16777216\r\nNegator: attempting to sink negation into   %call6.neg.neg.z = zext i8 %call6.neg.neg to i32\r\nNegator: failed to sink negation into   %call6.neg.neg.z = zext i8 %call6.neg.neg to i32\r\nADD DEFERRED:   %call6.neg.neg.neg = sub i8 0, %call6.neg.neg\r\nADD DEFERRED:   %call6.neg.neg.neg.z = zext i8 %call6.neg.neg.neg to i32\r\nIC: Old =   %.neg.neg.neg = mul i32 %call6.neg.neg.z, -16777216\r\n    New =   <badref> = shl i32 %call6.neg.neg.neg.z, 24\r\nADD:   %.neg.neg.neg = shl i32 %call6.neg.neg.neg.z, 24\r\nIC: ERASE   %0 = mul i32 %call6.neg.neg.z, -16777216\r\nADD DEFERRED:   %call6.neg.neg.z = zext i8 %call6.neg.neg to i32\r\nIC: ERASE   %call6.neg.neg.z = zext i8 %call6.neg.neg to i32\r\nADD DEFERRED:   %call6.neg.neg = add i8 %conv5.neg.neg.neg, 0\r\nADD:   %call6.neg.neg.neg.z = zext i8 %call6.neg.neg.neg to i32\r\nADD:   %call6.neg.neg.neg = sub i8 0, %call6.neg.neg\r\nIC: Visiting:   %call6.neg.neg.neg = sub i8 0, %call6.neg.neg\r\nIC: Old =   %call6.neg.neg.neg = sub i8 0, %call6.neg.neg\r\n    New =   <badref> = sub i8 0, %conv5.neg.neg.neg\r\nADD:   %call6.neg.neg.neg = sub i8 0, %conv5.neg.neg.neg\r\nIC: ERASE   %0 = sub i8 0, %call6.neg.neg\r\nADD DEFERRED:   %call6.neg.neg = add i8 %conv5.neg.neg.neg, 0\r\nIC: ERASE   %call6.neg.neg = add i8 %conv5.neg.neg.neg, 0\r\nADD DEFERRED:   %conv5.neg.neg.neg = trunc i32 %l_139.0.neg.neg.neg to i8\r\nADD DEFERRED:   %call6.neg.neg.neg = sub i8 0, %conv5.neg.neg.neg\r\nIC: Visiting:   %call6.neg.neg.neg = sub i8 0, %conv5.neg.neg.neg\r\nNegator: attempting to sink negation into   %conv5.neg.neg.neg = trunc i32 %l_139.0.neg.neg.neg to i8\r\nNegator: successfully sunk negation into   %conv5.neg.neg.neg = trunc i32 %l_139.0.neg.neg.neg to i8\r\n         NEW:   %conv5.neg.neg.neg.neg = trunc i32 %l_139.0.neg.neg.neg.neg to i8\r\n...\r\n```",
+    "author": "dtcxzyw",
+    "labels": [
+      "llvm:instcombine",
+      "llvm:hang"
+    ],
+    "comments": []
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "N/A"
+}

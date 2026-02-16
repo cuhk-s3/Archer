@@ -1,0 +1,104 @@
+{
+  "bug_id": "101337",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/101337",
+  "base_commit": "1b936e4812ab395328203f65cacd4ffe02bb318e",
+  "knowledge_cutoff": "2024-07-31T14:11:24Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "cd08fadd03904806fa26a1f117879ddae34fbf67",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          7080,
+          7086
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "LoopVectorizationPlanner::cost"
+      ]
+    }
+  },
+  "patch": "commit cd08fadd03904806fa26a1f117879ddae34fbf67\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Mon Aug 12 14:45:43 2024 +0100\n\n    [LV] Include chains feeding inductions in cost precomputation.\n    \n    Include chain of ops feeding inductions in cost precomputation for\n    inductions, not just the induction increment. In VPlan, those\n    instructions will be cleaned up, as both phi and increment are generated\n    by VPWidenIntOrFpInductionRecipe independently.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/101337.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 542d74ef0e1e..41e4b0fcd9b0 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -7080,7 +7080,16 @@ InstructionCost LoopVectorizationPlanner::cost(VPlan &Plan,\n   for (const auto &[IV, IndDesc] : Legal->getInductionVars()) {\n     Instruction *IVInc = cast<Instruction>(\n         IV->getIncomingValueForBlock(OrigLoop->getLoopLatch()));\n-    SmallVector<Instruction *> IVInsts = {IV, IVInc};\n+    SmallVector<Instruction *> IVInsts = {IVInc};\n+    for (unsigned I = 0; I != IVInsts.size(); I++) {\n+      for (Value *Op : IVInsts[I]->operands()) {\n+        auto *OpI = dyn_cast<Instruction>(Op);\n+        if (Op == IV || !OpI || !OrigLoop->contains(OpI) || !Op->hasOneUse())\n+          continue;\n+        IVInsts.push_back(OpI);\n+      }\n+    }\n+    IVInsts.push_back(IV);\n     for (User *U : IV->users()) {\n       auto *CI = cast<Instruction>(U);\n       if (!CostCtx.CM.isOptimizableIVTruncate(CI, VF))\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/induction-costs.ll",
+      "commands": [
+        "opt -p loop-vectorize -mtriple=x86_64-apple-macosx -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "iv_and_step_trunc",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine i16 @iv_and_step_trunc() {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rec = phi i16 [ 0, %entry ], [ %rec.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %0 = trunc i64 %iv to i16\n  %1 = trunc i64 %iv.next to i16\n  %rec.next = mul i16 %0, %1\n  %ec = icmp eq i64 %iv, 1\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i16 %rec\n}\n"
+        },
+        {
+          "test_name": "wombat2",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @wombat2(i32 %arg, ptr %dst) #0 {\nentry:\n  %mul = mul i32 %arg, 3\n  %zext = zext i32 %arg to i64\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %phi = phi i64 [ 4, %entry ], [ %add, %loop ]\n  %phi2 = phi i32 [ %mul, %entry ], [ %trunc.1, %loop ]\n  %getelementptr = getelementptr i32, ptr %dst, i64 %phi\n  %and = and i32 %phi2, 12\n  store i32 %and, ptr %getelementptr, align 4\n  %mul3 = mul i64 %phi, %zext\n  %add = add i64 %phi, 1\n  %icmp = icmp ugt i64 %phi, 65\n  %trunc.0 = trunc i64 %mul3 to i60\n  %trunc.1 = trunc i60 %trunc.0 to i32\n  br i1 %icmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"skylake-avx512\" \"target-features\"=\"-avx512f\" }\n"
+        },
+        {
+          "test_name": "with_dead_use",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @with_dead_use(i32 %arg, ptr %dst) #0 {\nentry:\n  %mul = mul i32 %arg, 3\n  %zext = zext i32 %arg to i64\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %phi = phi i64 [ 4, %entry ], [ %add, %loop ]\n  %phi2 = phi i32 [ %mul, %entry ], [ %trunc, %loop ]\n  %getelementptr = getelementptr i32, ptr %dst, i64 %phi\n  %and = and i32 %phi2, 12\n  store i32 %and, ptr %getelementptr, align 4\n  %mul3 = mul i64 %phi, %zext\n  %add = add i64 %phi, 1\n  %icmp = icmp ugt i64 %phi, 65\n  %trunc = trunc i64 %mul3 to i32\n  %dead.and = and i32 %trunc, 123\n  br i1 %icmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"skylake-avx512\" \"target-features\"=\"-avx512f\" }\n"
+        },
+        {
+          "test_name": "test_scalar_predicated_cost",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine i32 @test_scalar_predicated_cost(i64 %x, i64 %y, ptr %A) #0 {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %cmp9.not = icmp ule i64 %iv, %y\n  br i1 %cmp9.not, label %loop.latch, label %if.then\n\nif.then:                                          ; preds = %loop.header\n  %or = or i64 %x, %iv\n  %gep = getelementptr i32, ptr %A, i64 %iv\n  %t = trunc i64 %or to i32\n  store i32 %t, ptr %gep, align 4\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %if.then, %loop.header\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 100\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret i32 0\n}\n\nattributes #0 = { \"min-legal-vector-width\"=\"0\" \"target-cpu\"=\"skylake-avx512\" }\n"
+        },
+        {
+          "test_name": "truncated_ivs_with_wide_and_scalar_uses",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @truncated_ivs_with_wide_and_scalar_uses(i1 %c, ptr %dst) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.16 = trunc i64 %iv to i16\n  %iv.32 = trunc i64 %iv to i32\n  %gep = getelementptr i16, ptr %dst, i32 %iv.32\n  %sel = select i1 %c, i16 %iv.16, i16 10\n  store i16 %sel, ptr %gep, align 2\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 64\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "multiple_truncated_ivs_with_wide_uses",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @multiple_truncated_ivs_with_wide_uses(i1 %c, ptr %A, ptr %B) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.16 = trunc i64 %iv to i16\n  %iv.32 = trunc i64 %iv to i32\n  %sel = select i1 %c, i16 %iv.16, i16 10\n  %gep.A = getelementptr i16, ptr %A, i64 %iv\n  store i16 %sel, ptr %gep.A, align 2\n  %gep.B = getelementptr i32, ptr %B, i64 %iv\n  store i32 %iv.32, ptr %gep.B, align 4\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 64\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "wide_iv_trunc_reuse",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @wide_iv_trunc_reuse(ptr %dst) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 1, %entry ], [ %iv.next, %loop ]\n  %iv.2 = phi i32 [ 0, %entry ], [ %iv.trunc, %loop ]\n  store i32 %iv.2, ptr %dst, align 4\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 0\n  %iv.trunc = trunc i64 %iv to i32\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "iv_used_widened_and_truncated",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine i32 @iv_used_widened_and_truncated(ptr %dst, i64 %N) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep = getelementptr { i32, [8 x i32] }, ptr %dst, i64 %iv\n  %t = trunc i64 %iv to i32\n  store i32 %t, ptr %gep, align 8\n  %iv.next = add i64 %iv, 1\n  %c = icmp eq i64 %iv, %N\n  br i1 %c, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 0\n}\n\nattributes #0 = { \"min-legal-vector-width\"=\"0\" \"target-cpu\"=\"skylake-avx512\" }\n"
+        },
+        {
+          "test_name": "wombat",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @wombat(i32 %arg, ptr %dst) #0 {\nentry:\n  %mul = mul i32 %arg, 3\n  %zext = zext i32 %arg to i64\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %phi = phi i64 [ 4, %entry ], [ %add, %loop ]\n  %phi2 = phi i32 [ %mul, %entry ], [ %trunc, %loop ]\n  %getelementptr = getelementptr i32, ptr %dst, i64 %phi\n  %and = and i32 %phi2, 12\n  store i32 %and, ptr %getelementptr, align 4\n  %mul3 = mul i64 %phi, %zext\n  %add = add i64 %phi, 1\n  %icmp = icmp ugt i64 %phi, 65\n  %trunc = trunc i64 %mul3 to i32\n  br i1 %icmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"skylake-avx512\" \"target-features\"=\"-avx512f\" }\n"
+        },
+        {
+          "test_name": "wide_iv_trunc",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @wide_iv_trunc(ptr %dst, i64 %N) {\nentry:\n  %cmp = icmp ult i64 %N, 8\n  br i1 %cmp, label %loop, label %exit\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.trunc = trunc i64 %iv to i32\n  store i32 %iv.trunc, ptr %dst, align 4\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, %N\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "multiple_pointer_ivs_with_scalar_uses_only",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @multiple_pointer_ivs_with_scalar_uses_only(ptr %A, ptr %B) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv.1 = phi i32 [ 100, %entry ], [ %dec, %loop ]\n  %iv.2 = phi i32 [ 2048, %entry ], [ %add38, %loop ]\n  %ptr.iv.1 = phi ptr [ %A, %entry ], [ %outptr.0, %loop ]\n  %ptr.iv.2 = phi ptr [ %B, %entry ], [ %incdec.ptr36, %loop ]\n  %ptr.iv.3 = phi ptr [ %B, %entry ], [ %incdec.ptr33, %loop ]\n  %incdec.ptr33 = getelementptr i8, ptr %ptr.iv.3, i64 1\n  %0 = load i8, ptr %ptr.iv.3, align 1\n  %conv34 = zext i8 %0 to i32\n  %incdec.ptr36 = getelementptr i8, ptr %ptr.iv.2, i64 1\n  %1 = load i8, ptr %ptr.iv.2, align 1\n  %conv37 = zext i8 %1 to i32\n  %add38 = add i32 %conv34, %conv37\n  %shr42 = lshr i32 %iv.2, 1\n  %conv43 = trunc i32 %shr42 to i8\n  store i8 %conv43, ptr %ptr.iv.1, align 1\n  %dec = add i32 %iv.1, 1\n  %outptr.0 = getelementptr i8, ptr %ptr.iv.1, i64 2\n  %cmp30.not = icmp eq i32 %dec, 0\n  br i1 %cmp30.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"min-legal-vector-width\"=\"0\" \"target-cpu\"=\"skylake-avx512\" }\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Assertion `VF.Width == BestVF && \"VPlan cost model and legacy cost model disagreed\"' failed.",
+    "body": "To reproduce run opt with \r\n```\r\n-passes=loop-vectorize --mcpu=skylake-avx512 --mattr=+prfchw,-cldemote,+avx,+aes,+sahf,+pclmul,-xop,+crc32,+xsaves,-avx512fp16,-usermsr,-sm4,-egpr,+sse4.1,-avx512ifma,+xsave,+sse4.2,-tsxldtrk,-sm3,-ptwrite,-widekl,+invpcid,+64bit,+xsavec,-avx10.1-512,-avx512vpopcntdq,+cmov,-avx512vp2intersect,+avx512cd,+movbe,-avxvnniint8,-ccmp,-amx-int8,-kl,-avx10.1-256,+evex512,-avxvnni,+rtm,+adx,+avx2,-hreset,-movdiri,-serialize,-sha512,-vpclmulqdq,+avx512vl,-uintr,-cf,+clflushopt,-raoint,-cmpccxadd,+bmi,-amx-tile,+sse,-gfni,-avxvnniint16,-amx-fp16,-zu,-ndd,+xsaveopt,+rdrnd,+avx512f,-amx-bf16,-avx512bf16,-avx512vnni,-push2pop2,+cx8,+avx512bw,+sse3,+pku,-nf,+fsgsbase,-clzero,-mwaitx,-lwp,+lzcnt,-sha,-movdir64b,-ppx,-wbnoinvd,-enqcmd,-avxneconvert,-tbm,-pconfig,-amx-complex,+ssse3,+cx16,+bmi2,+fma,+popcnt,-avxifma,+f16c,-avx512bitalg,-rdpru,+clwb,+mmx,+sse2,+rdseed,-avx512vbmi2,-prefetchi,-rdpid,-fma4,-avx512vbmi,-shstk,-vaes,-waitpkg,-sgx,+fxsr,+avx512dq,-sse4a,-avx512f\r\n```\r\nwith the following test:\r\n```\r\n; ModuleID = './reduced.ll'\r\nsource_filename = \"./reduced.ll\"\r\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\r\ntarget triple = \"x86_64-unknown-linux-gnu\"\r\n\r\ndefine void @wombat(i32 %arg) #0 gc \"statepoint-example\" {\r\nbb:\r\n  %mul = mul i32 %arg, 3\r\n  %zext = zext i32 %arg to i64\r\n  br label %bb1\r\n\r\nbb1:                                              ; preds = %bb1, %bb\r\n  %phi = phi i64 [ %add, %bb1 ], [ 4, %bb ]\r\n  %phi2 = phi i32 [ %trunc, %bb1 ], [ %mul, %bb ]\r\n  %getelementptr = getelementptr i32, ptr addrspace(1) null, i64 %phi\r\n  %and = and i32 %phi2, 0\r\n  store i32 0, ptr addrspace(1) %getelementptr, align 4\r\n  %mul3 = mul i64 %phi, %zext\r\n  %add = add i64 %phi, 1\r\n  %icmp = icmp ugt i64 %phi, 65\r\n  %trunc = trunc i64 %mul3 to i32\r\n  br i1 %icmp, label %bb4, label %bb1\r\n\r\nbb4:                                              ; preds = %bb1\r\n  ret void\r\n}\r\n```\r\nReproducer:  https://godbolt.org/z/nPsP7h51n\r\n\r\nStack dump:\r\n```\r\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -passes=loop-vectorize --mcpu=skylake-avx512 --mattr=+prfchw,-cldemote,+avx,+aes,+sahf,+pclmul,-xop,+crc32,+xsaves,-avx512fp16,-usermsr,-sm4,-egpr,+sse4.1,-avx512ifma,+xsave,+sse4.2,-tsxldtrk,-sm3,-ptwrite,-widekl,+invpcid,+64bit,+xsavec,-avx10.1-512,-avx512vpopcntdq,+cmov,-avx512vp2intersect,+avx512cd,+movbe,-avxvnniint8,-ccmp,-amx-int8,-kl,-avx10.1-256,+evex512,-avxvnni,+rtm,+adx,+avx2,-hreset,-movdiri,-serialize,-sha512,-vpclmulqdq,+avx512vl,-uintr,-cf,+clflushopt,-raoint,-cmpccxadd,+bmi,-amx-tile,+sse,-gfni,-avxvnniint16,-amx-fp16,-zu,-ndd,+xsaveopt,+rdrnd,+avx512f,-amx-bf16,-avx512bf16,-avx512vnni,-push2pop2,+cx8,+avx512bw,+sse3,+pku,-nf,+fsgsbase,-clzero,-mwaitx,-lwp,+lzcnt,-sha,-movdir64b,-ppx,-wbnoinvd,-enqcmd,-avxneconvert,-tbm,-pconfig,-amx-complex,+ssse3,+cx16,+bmi2,+fma,+popcnt,-avxifma,+f16c,-avx512bitalg,-rdpru,+clwb,+mmx,+sse2,+rdseed,-avx512vbmi2,-prefetchi,-rdpid,-fma4,-avx512vbmi,-shstk,-vaes,-waitpkg,-sgx,+fxsr,+avx512dq,-sse4a,-avx512f <source>\r\n1.\tRunning pass \"function(loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>)\" on module \"<source>\"\r\n2.\tRunning pass \"loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>\" on function \"wombat\"\r\n #0 0x0000000004f053c8 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4f053c8)\r\n #1 0x0000000004f02b3c SignalHandler(int) Signals.cpp:0:0\r\n #2 0x00007458cc042520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\r\n #3 0x00007458cc0969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\r\n #4 0x00007458cc042476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\r\n #5 0x00007458cc0287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\r\n #6 0x00007458cc02871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\r\n #7 0x00007458cc039e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\r\n #8 0x0000000003f83f37 llvm::LoopVectorizePass::processLoop(llvm::Loop*) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3f83f37)\r\n #9 0x0000000003f86659 llvm::LoopVectorizePass::runImpl(llvm::Function&, llvm::ScalarEvolution&, llvm::LoopInfo&, llvm::TargetTransformInfo&, llvm::DominatorTree&, llvm::BlockFrequencyInfo*, llvm::TargetLibraryInfo*, llvm::DemandedBits&, llvm::AssumptionCache&, llvm::LoopAccessInfoManager&, llvm::OptimizationRemarkEmitter&, llvm::ProfileSummaryInfo*) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3f86659)\r\n#10 0x0000000003f86cd2 llvm::LoopVectorizePass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3f86cd2)\r\n#11 0x0000000002e596ce llvm::detail::PassModel<llvm::Function, llvm::LoopVectorizePass, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x2e596ce)\r\n#12 0x0000000004d02758 llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4d02758)\r\n#13 0x0000000000de089e llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xde089e)\r\n#14 0x0000000004d0114e llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4d0114e)\r\n#15 0x0000000000de0eee llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xde0eee)\r\n#16 0x0000000004cff2b0 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4cff2b0)\r\n#17 0x00000000008e3752 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8e3752)\r\n#18 0x00000000008d667c optMain (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8d667c)\r\n#19 0x00007458cc029d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\r\n#20 0x00007458cc029e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\r\n#21 0x00000000008cdade _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8cdade)\r\nProgram terminated with signal: SIGSEGV\r\nCompiler returned: 139\r\n```",
+    "author": "TatyanaDoubts",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "patrick-rivos",
+        "body": "Potentially related: https://github.com/llvm/llvm-project/issues/100591"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "7d0a5848f2c72854d7d5a795fcc265b8ba787782"
+}

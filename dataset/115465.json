@@ -1,0 +1,64 @@
+{
+  "bug_id": "115465",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/115465",
+  "bug_type": "miscompilation",
+  "base_commit": "d822c099eeacc69f6bf834a6373a41d0c9f84a3e",
+  "knowledge_cutoff": "2024-11-08T11:25:34Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "27bf45aa36386136db179c494358670a994a98a5",
+    "components": [
+      "InstCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp": [
+        [
+          2904,
+          2910
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp": [
+        "InstCombinerImpl::visitShuffleVectorInst"
+      ]
+    }
+  },
+  "patch": "commit 27bf45aa36386136db179c494358670a994a98a5\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sun Nov 10 17:07:25 2024 +0800\n\n    [InstCombine] Fix poison safety of folding shufflevector into select (#115483)\n    \n    We are allowed to fold shufflevector into select iff the condition is\n    guaranteed not to be poison or the RHS is a poison.\n    Alive2: https://alive2.llvm.org/ce/z/28zEWR\n    \n    Closes https://github.com/llvm/llvm-project/issues/115465.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\nindex 454fe5a91d37..ede89b099e8d 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n@@ -2904,7 +2904,9 @@ Instruction *InstCombinerImpl::visitShuffleVectorInst(ShuffleVectorInst &SVI) {\n     if (auto *SI = dyn_cast<SelectInst>(LHS)) {\n       // We cannot do this fold for elementwise select since ShuffleVector is\n       // not elementwise.\n-      if (SI->getCondition()->getType()->isIntegerTy()) {\n+      if (SI->getCondition()->getType()->isIntegerTy() &&\n+          (isa<PoisonValue>(RHS) ||\n+           isGuaranteedNotToBePoison(SI->getCondition()))) {\n         if (Instruction *I = FoldOpIntoSelect(SVI, SI))\n           return I;\n       }\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/vec_shuffle.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "shuf_cmp_may_be_poison",
+          "test_body": "define <4 x i8> @shuf_cmp_may_be_poison(<4 x i8> %x, <4 x i8> %y, i1 %cmp) {\n  %sel = select i1 %cmp, <4 x i8> %y, <4 x i8> <i8 0, i8 poison, i8 0, i8 poison>\n  %shuf = shufflevector <4 x i8> %sel, <4 x i8> <i8 poison, i8 1, i8 poison, i8 3>, <4 x i32> <i32 0, i32 5, i32 2, i32 7>\n  ret <4 x i8> %shuf\n}\n"
+        },
+        {
+          "test_name": "shuf_same_length_vec_select",
+          "test_body": "define <4 x i32> @shuf_same_length_vec_select(<4 x i1> %cond) {\n  %sel = select <4 x i1> %cond, <4 x i32> <i32 0, i32 1, i32 2, i32 3>, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %shuf = shufflevector <4 x i32> %sel, <4 x i32> <i32 8, i32 9, i32 10, i32 11>, <4 x i32> <i32 2, i32 1, i32 3, i32 5>\n  ret <4 x i32> %shuf\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[InstCombine] folded select produces different result on a blended vector",
+    "body": "Alive2 report: https://alive2.llvm.org/ce/z/73v-ug\r\n\r\n```llvm\r\n----------------------------------------\r\ndefine <4 x i8> @sel_shuf_commute3.2(<4 x i8> %x, <4 x i8> %y, i1 %cmp) {\r\n#0:\r\n  %blend = shufflevector <4 x i8> { 0, 0, 0, 0 }, <4 x i8> %y, 0, 5, 2, 3\r\n  %r = select i1 %cmp, <4 x i8> %y, <4 x i8> %blend\r\n  %#1 = select <4 x i1> { 0, 1, 0, 1 }, <4 x i8> { 0, 1, 2, 3 }, <4 x i8> %r\r\n  ret <4 x i8> %#1\r\n}\r\n=>\r\ndefine <4 x i8> @sel_shuf_commute3.2(<4 x i8> %x, <4 x i8> %y, i1 %cmp) {\r\n#0:\r\n  %#1 = shufflevector <4 x i8> %y, <4 x i8> { poison, 1, poison, 3 }, 0, 5, 2, 7\r\n  %#2 = select i1 %cmp, <4 x i8> %#1, <4 x i8> { 0, 1, 0, 3 }\r\n  ret <4 x i8> %#2\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nExample:\r\n<4 x i8> %x = < poison, poison, poison, poison >\r\n<4 x i8> %y = < poison, poison, poison, poison >\r\ni1 %cmp = poison\r\n\r\nSource:\r\n<4 x i8> %blend = < #x00 (0), poison, #x00 (0), #x00 (0) >\r\n<4 x i8> %r = < poison, poison, poison, poison >\r\n<4 x i8> %#1 = < poison, #x01 (1), poison, #x03 (3) >\r\n\r\nTarget:\r\n<4 x i8> %#1 = < poison, #x01 (1), poison, #x03 (3) >\r\n<4 x i8> %#2 = < poison, poison, poison, poison >\r\nSource value: < poison, #x01 (1), poison, #x03 (3) >\r\nTarget value: < poison, poison, poison, poison >\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```\r\n",
+    "author": "bongjunj",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "comments": []
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "5903c6af44256e0bba77b7a69d608aa3ccc6a0dd"
+}

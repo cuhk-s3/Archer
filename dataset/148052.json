@@ -1,0 +1,100 @@
+{
+  "bug_id": "148052",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/148052",
+  "base_commit": "65787728b72a2b1f1bfdefd15d32ec0a69f2b941",
+  "knowledge_cutoff": "2025-07-10T20:24:08Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SimplifyCFG"
+  ],
+  "hints": {
+    "fix_commit": "43561ad204329667954d5ce1e632e09335f0ab12",
+    "components": [
+      "BasicBlockUtils"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/BasicBlockUtils.cpp": [
+        [
+          58,
+          63
+        ],
+        [
+          75,
+          81
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/BasicBlockUtils.cpp": [
+        "llvm::detachDeadBlocks"
+      ]
+    }
+  },
+  "patch": "commit 43561ad204329667954d5ce1e632e09335f0ab12\nAuthor: Gábor Spaits <gaborspaits1@gmail.com>\nDate:   Thu Sep 11 22:52:16 2025 +0200\n\n    [BasicBlockUtils] Handle funclets when detaching EH pad blocks (#157363)\n    \n    Fixes #148052 .\n    \n    When removing EH Pad blocks, the value defined by them becomes poison. These poison values are then used by `catchret` and `cleanupret`, which is invalid. This commit replaces those unreachable `catchret` and `cleanupret` instructions with `unreachable`.\n\ndiff --git a/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp b/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp\nindex cad0b4c12b54..d2391e166f94 100644\n--- a/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp\n+++ b/llvm/lib/Transforms/Utils/BasicBlockUtils.cpp\n@@ -58,6 +58,19 @@ static cl::opt<unsigned> MaxDeoptOrUnreachableSuccessorCheckDepth(\n              \"is followed by a block that either has a terminating \"\n              \"deoptimizing call or is terminated with an unreachable\"));\n \n+static void replaceFuncletPadsRetWithUnreachable(Instruction &I) {\n+  assert(isa<FuncletPadInst>(I) && \"Instruction must be a funclet pad!\");\n+  for (User *User : make_early_inc_range(I.users())) {\n+    Instruction *ReturnInstr = dyn_cast<Instruction>(User);\n+    if (isa<CatchReturnInst>(ReturnInstr) ||\n+        isa<CleanupReturnInst>(ReturnInstr)) {\n+      BasicBlock *ReturnInstrBB = ReturnInstr->getParent();\n+      ReturnInstr->eraseFromParent();\n+      new UnreachableInst(ReturnInstrBB->getContext(), ReturnInstrBB);\n+    }\n+  }\n+}\n+\n void llvm::detachDeadBlocks(\n     ArrayRef<BasicBlock *> BBs,\n     SmallVectorImpl<DominatorTree::UpdateType> *Updates,\n@@ -75,7 +88,36 @@ void llvm::detachDeadBlocks(\n     // Zap all the instructions in the block.\n     while (!BB->empty()) {\n       Instruction &I = BB->back();\n-      // If this instruction is used, replace uses with an arbitrary value.\n+      // Exception handling funclets need to be explicitly addressed.\n+      // These funclets must begin with cleanuppad or catchpad and end with\n+      // cleanupred or catchret. The return instructions can be in different\n+      // basic blocks than the pad instruction. If we would only delete the\n+      // first block, the we would have possible cleanupret and catchret\n+      // instructions with poison arguments, which wouldn't be valid.\n+      if (isa<FuncletPadInst>(I))\n+        replaceFuncletPadsRetWithUnreachable(I);\n+\n+      // Catchswitch instructions have handlers, that must be catchpads and\n+      // an unwind label, that is either a catchpad or catchswitch.\n+      if (CatchSwitchInst *CSI = dyn_cast<CatchSwitchInst>(&I)) {\n+        // Iterating over the handlers and the unwind basic block and processing\n+        // catchpads. If the unwind label is a catchswitch, we just replace the\n+        // label with poison later on.\n+        for (unsigned I = 0; I < CSI->getNumSuccessors(); I++) {\n+          BasicBlock *SucBlock = CSI->getSuccessor(I);\n+          Instruction &SucFstInst = *(SucBlock->getFirstNonPHIIt());\n+          if (isa<FuncletPadInst>(SucFstInst)) {\n+            replaceFuncletPadsRetWithUnreachable(SucFstInst);\n+            // There may be catchswitch instructions using the catchpad.\n+            // Just replace those with poison.\n+            if (!SucFstInst.use_empty())\n+              SucFstInst.replaceAllUsesWith(\n+                  PoisonValue::get(SucFstInst.getType()));\n+            SucFstInst.eraseFromParent();\n+          }\n+        }\n+      }\n+\n       // Because control flow can't get here, we don't care what we replace the\n       // value with.  Note that since this block is unreachable, and all values\n       // contained within it must dominate their uses, that all uses will\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SimplifyCFG/unreachable-multi-basic-block-funclet.ll",
+      "commands": [
+        "opt -passes=simplifycfg -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\n; cleanuppad/cleanupret\n\ndefine void @unreachable_cleanuppad_linear(i64 %shapes.1) personality ptr null {\n;\nstart:\n  %_7 = icmp ult i64 0, %shapes.1\n  ret void\n\nfunclet:\n  %cleanuppad = cleanuppad within none []\n  br label %funclet_end\n\nfunclet_end:\n  cleanupret from %cleanuppad unwind to caller\n}\n\ndefine void @unreachable_cleanuppad_multiple_predecessors(i64 %shapes.1) personality ptr null {\n;\nstart:\n  %_7 = icmp ult i64 0, %shapes.1\n  ret void\n\nfunclet:\n  %cleanuppad = cleanuppad within none []\n  switch i64 %shapes.1, label %otherwise [ i64 0, label %one\n  i64 1, label %two\n  i64 42, label %three ]\none:\n  br label %funclet_end\n\ntwo:\n  br label %funclet_end\n\nthree:\n  br label %funclet_end\n\notherwise:\n  br label %funclet_end\n\nfunclet_end:\n  cleanupret from %cleanuppad unwind to caller\n}\n\n; catchpad/catchret\n\ndefine void @unreachable_catchpad_linear(i64 %shapes.1) personality ptr null {\n;\nstart:\n  %_7 = icmp ult i64 0, %shapes.1\n  ret void\n\ndispatch:\n  %cs = catchswitch within none [label %funclet] unwind to caller\n\nfunclet:\n  %cleanuppad = catchpad within %cs []\n  br label %funclet_end\n\n\nfunclet_end:\n  catchret from %cleanuppad to label %unreachable\n\nunreachable:\n  unreachable\n}\n\ndefine void @unreachable_catchpad_multiple_predecessors(i64 %shapes.1) personality ptr null {\n;\nstart:\n  %_7 = icmp ult i64 0, %shapes.1\n  ret void\n\ndispatch:\n  %cs = catchswitch within none [label %funclet] unwind to caller\n\nfunclet:\n  %cleanuppad = catchpad within %cs []\n  switch i64 %shapes.1, label %otherwise [ i64 0, label %one\n  i64 1, label %two\n  i64 42, label %three ]\none:\n  br label %funclet_end\n\ntwo:\n  br label %funclet_end\n\nthree:\n  br label %funclet_end\n\notherwise:\n  br label %funclet_end\n\nfunclet_end:\n  catchret from %cleanuppad to label %unreachable\n\nunreachable:\n  unreachable\n}\n\n; Issue reproducer\n\ndefine void @gh148052(i64 %shapes.1) personality ptr null {\n;\nstart:\n  %_7 = icmp ult i64 0, %shapes.1\n  br i1 %_7, label %bb1, label %panic\n\nbb1:\n  %_11 = icmp ult i64 0, %shapes.1\n  br i1 %_11, label %bb3, label %panic1\n\npanic:\n  unreachable\n\nbb3:\n  ret void\n\npanic1:\n  invoke void @func(i64 0, i64 0, ptr null)\n  to label %unreachable unwind label %funclet_bb14\n\nfunclet_bb14:\n  %cleanuppad = cleanuppad within none []\n  br label %bb13\n\nunreachable:\n  unreachable\n\nbb10:\n  cleanupret from %cleanuppad5 unwind to caller\n\nfunclet_bb10:\n  %cleanuppad5 = cleanuppad within none []\n  br label %bb10\n\nbb13:\n  cleanupret from %cleanuppad unwind label %funclet_bb10\n}\n\ndeclare void @func(i64, i64, ptr)"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Bug in SimplifyCFG causes ICE",
+    "body": "This minimal Rust code causes a failure when the `simplifycfg` pass is enabled:\n\n```rust\npub fn repro_func(shapes: &mut [ShapeInfo<ReproShape>]) {\n    repro_generic::<ReproShape>(shapes);\n}\n\n#[derive(Clone)]\npub struct ShapeInfo<S> {\n    pub shape: S,\n}\n\n#[derive(Default, Copy, Clone)]\npub enum ReproShape {\n    #[default]\n    A = 0,\n    B = 1,\n}\n\npub(crate) fn repro_generic<S: Default + Clone>(shapes: &mut [ShapeInfo<S>]) {\n    shapes[0] = shapes[1].clone();\n    shapes[1].shape = Default::default();\n}\n```\n\nWhen this is compiled with these Rust args:\n\n```\nrustc \\\n--emit=llvm-ir \\\n--crate-name=repro \\\n--edition=2021 \\\nrepro.rs \\\n--crate-type=lib \\\n--out-dir=out \\\n--target=x86_64-pc-windows-msvc \\\n-Cno-prepopulate-passes\n```\n\nit produces `repro.ll`.  Rust normally enables `simplifycfg` by default, so I've disabled all passes in this repro.  You can manually reproduce the problem by running `opt --passes=simplifycfg repro.ll`.\n\nI tried to attach `repro.ll`, but GitHub rejects `*.ll` files.  I'll create a repro PR.\n",
+    "author": "sivadeilra",
+    "labels": [
+      "crash",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "sivadeilra",
+        "body": "I've created #148053 with an integration test that shows the bug.\n\nTagging @spaits, @andjo403 for help, since I see recent commits to this code.\n\n"
+      },
+      {
+        "author": "spaits",
+        "body": "Hi. Could you please tell what rustc version you use?"
+      },
+      {
+        "author": "sivadeilra",
+        "body": "I used 1.88.0 to generate the LLVM IR.  I haven't tested earlier versions, but I'm guessing it repros with earlier versions, as long as you're generating IR and then optimizing with with LLVM at HEAD."
+      },
+      {
+        "author": "sivadeilra",
+        "body": "I just checked with Rust 1.82.0, and the same problem occurs."
+      },
+      {
+        "author": "efriedma-quic",
+        "body": "Reduced using `llvm-reduce -skip-delta-passes=simplify-cfg,ir-passes`:\n\n```\ndefine void @_RINvCs3LQYlzOoal9_5repro13repro_genericNtB2_10ReproShapeEB2_(i64 %shapes.1) personality ptr null {\nstart:\n  %_7 = icmp ult i64 0, %shapes.1\n  br i1 %_7, label %bb1, label %panic\n\nbb1:                                              ; preds = %start\n  %_11 = icmp ult i64 0, %shapes.1\n  br i1 %_11, label %bb3, label %panic1\n\npanic:                                            ; preds = %start\n  unreachable\n\nbb3:                                              ; preds = %bb1\n  ret void\n\npanic1:                                           ; preds = %bb1\n  invoke void @_RNvNtCshEuXqvZjEXJ_4core9panicking18panic_bounds_check(i64 0, i64 0, ptr null)\n          to label %unreachable unwind label %funclet_bb14\n\nfunclet_bb14:                                     ; preds = %panic1\n  %cleanuppad = cleanuppad within none []\n  br label %bb13\n\nunreachable:                                      ; preds = %panic1\n  unreachable\n\nbb10:                                             ; preds = %funclet_bb10\n  cleanupret from %cleanuppad5 unwind to caller\n\nfunclet_bb10:                                     ; preds = %bb13\n  %cleanuppad5 = cleanuppad within none []\n  br label %bb10\n\nbb13:                                             ; preds = %funclet_bb14\n  cleanupret from %cleanuppad unwind label %funclet_bb10\n}\n\ndeclare void @_RNvNtCshEuXqvZjEXJ_4core9panicking18panic_bounds_check(i64, i64, ptr)\n```"
+      },
+      {
+        "author": "sivadeilra",
+        "body": "Call stack:\n\n```text\n0:000> knL 20\n # Call Site\n00 opt!HandleAbort+0xc\n01 opt!raise+0x221\n02 opt!abort+0x18\n03 opt!common_assert_to_stderr_direct+0xd3\n04 opt!common_assert_to_stderr<wchar_t>+0x18\n05 opt!common_assert+0x56\n06 opt!_wassert+0x72\n07 opt!llvm::cast<llvm::CleanupPadInst,llvm::Use>+0x40\n08 opt!llvm::CleanupReturnInst::getCleanupPad+0x1c\n09 opt!llvm::removeUnwindEdge+0x118\n0a opt!removeEmptyCleanup+0x6ac\n0b opt!`anonymous namespace'::SimplifyCFGOpt::simplifyCleanupReturn+0x5d\n0c opt!`anonymous namespace'::SimplifyCFGOpt::simplifyOnce+0x57d\n0d opt!`anonymous namespace'::SimplifyCFGOpt::run+0x35\n0e opt!llvm::simplifyCFG+0xbc\n0f opt!iterativelySimplifyCFG+0x3a9\n10 opt!simplifyFunctionCFGImpl+0x16a\n11 opt!simplifyFunctionCFG+0x91\n12 opt!llvm::SimplifyCFGPass::run+0xcf\n13 opt!llvm::detail::PassModel<llvm::Function,llvm::SimplifyCFGPass,llvm::AnalysisManager<llvm::Function> >::run+0x40\n14 opt!llvm::PassManager<llvm::Function,llvm::AnalysisManager<llvm::Function> >::run+0x1e2\n15 opt!llvm::detail::PassModel<llvm::Function,llvm::PassManager<llvm::Function,llvm::AnalysisManager<llvm::Function> >,llvm::AnalysisManager<llvm::Function> >::run+0x40\n16 opt!llvm::ModuleToFunctionPassAdaptor::run+0x1ae\n17 opt!llvm::detail::PassModel<llvm::Module,llvm::ModuleToFunctionPassAdaptor,llvm::AnalysisManager<llvm::Module> >::run+0x40\n18 opt!llvm::PassManager<llvm::Module,llvm::AnalysisManager<llvm::Module> >::run+0x1e2\n19 opt!llvm::runPassPipeline+0x1ef5\n```\n\nAssertion failure:\n\n```text\nAssertion failed: isa<To>(Val) && \"cast<Ty>() argument of incompatible type!\", file D:\\rust\\src\\llvm-project\\llvm\\include\\llvm/Support/Casting.h, line 566\n```\n"
+      },
+      {
+        "author": "spaits",
+        "body": "Here is the reproducer in godbolt:\nhttps://godbolt.org/z/njT5ET3dj"
+      },
+      {
+        "author": "hstk30-hw",
+        "body": "the `%cleanuppad` is optimize to `posion`\n\n```\ncleanupret from posion unwind label %funclet_bb10`\n```\n\nCast from `posion` to `CleanupPadInst` failed"
+      },
+      {
+        "author": "spaits",
+        "body": "It seems that the seond attempt causes crashes on the buildbot builds: https://lab.llvm.org/buildbot/#/builders/55/builds/17295\n\nI have reverted the fix again. I will give it another go later this week."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true,
+  "bisect": "Cannot find a good commit"
+}

@@ -1,0 +1,98 @@
+{
+  "bug_id": "89669",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/89669",
+  "bug_type": "miscompilation",
+  "base_commit": "d97cdd7d088b11b45038112a5f7fe5cbf60a6461",
+  "knowledge_cutoff": "2024-04-22T21:27:36Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "hints": {
+    "fix_commit": "a1b1c4a6d1d52916c5d885170a5f54632d579cdc",
+    "components": [
+      "InstCombine",
+      "ValueTracking"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        [
+          131,
+          137
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          8042,
+          8058
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp": [
+        [
+          320,
+          326
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "llvm::isKnownNegation",
+        "matchMinMax"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp": [
+        "Negator::visitImpl"
+      ]
+    }
+  },
+  "patch": "commit a1b1c4a6d1d52916c5d885170a5f54632d579cdc\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Wed Apr 24 10:56:26 2024 +0900\n\n    [InstCombine] Fix miscompile in negation of select (#89698)\n    \n    Swapping the operands of a select is not valid if one hand is more\n    poisonous that the other, because the negation zero contains poison\n    elements.\n    \n    Fix this by adding an extra parameter to isKnownNegation() to forbid\n    poison elements.\n    \n    I've implemented this using manual checks to avoid needing four variants\n    for the NeedsNSW/AllowPoison combinations. Maybe there is a better way\n    to do this...\n    \n    Fixes https://github.com/llvm/llvm-project/issues/89669.\n\ndiff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex a2fa8f6064e1..571e44cdac26 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -131,7 +131,8 @@ bool isKnownNonZero(const Value *V, const SimplifyQuery &Q, unsigned Depth = 0);\n /// Currently can recoginze Value pair:\n /// 1: <X, Y> if X = sub (0, Y) or Y = sub (0, X)\n /// 2: <X, Y> if X = sub (A, B) and Y = sub (B, A)\n-bool isKnownNegation(const Value *X, const Value *Y, bool NeedNSW = false);\n+bool isKnownNegation(const Value *X, const Value *Y, bool NeedNSW = false,\n+                     bool AllowPoison = true);\n \n /// Returns true if the give value is known to be non-negative.\n bool isKnownNonNegative(const Value *V, const SimplifyQuery &SQ,\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 21e3f8a4cc52..7501f78ca23b 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -8042,17 +8042,27 @@ static SelectPatternResult matchMinMax(CmpInst::Predicate Pred,\n   return {SPF_UNKNOWN, SPNB_NA, false};\n }\n \n-bool llvm::isKnownNegation(const Value *X, const Value *Y, bool NeedNSW) {\n+bool llvm::isKnownNegation(const Value *X, const Value *Y, bool NeedNSW,\n+                           bool AllowPoison) {\n   assert(X && Y && \"Invalid operand\");\n \n-  // X = sub (0, Y) || X = sub nsw (0, Y)\n-  if ((!NeedNSW && match(X, m_Sub(m_ZeroInt(), m_Specific(Y)))) ||\n-      (NeedNSW && match(X, m_NSWNeg(m_Specific(Y)))))\n+  auto IsNegationOf = [&](const Value *X, const Value *Y) {\n+    if (!match(X, m_Neg(m_Specific(Y))))\n+      return false;\n+\n+    auto *BO = cast<BinaryOperator>(X);\n+    if (NeedNSW && !BO->hasNoSignedWrap())\n+      return false;\n+\n+    auto *Zero = cast<Constant>(BO->getOperand(0));\n+    if (!AllowPoison && !Zero->isNullValue())\n+      return false;\n+\n     return true;\n+  };\n \n-  // Y = sub (0, X) || Y = sub nsw (0, X)\n-  if ((!NeedNSW && match(Y, m_Sub(m_ZeroInt(), m_Specific(X)))) ||\n-      (NeedNSW && match(Y, m_NSWNeg(m_Specific(X)))))\n+  // X = -Y or Y = -X\n+  if (IsNegationOf(X, Y) || IsNegationOf(Y, X))\n     return true;\n \n   // X = sub (A, B), Y = sub (B, A) || X = sub nsw (A, B), Y = sub nsw (B, A)\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp b/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\nindex d697f361dec0..ed2a98ba4ae4 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineNegator.cpp\n@@ -320,7 +320,8 @@ std::array<Value *, 2> Negator::getSortedOperandsOfBinOp(Instruction *I) {\n     return NegatedPHI;\n   }\n   case Instruction::Select: {\n-    if (isKnownNegation(I->getOperand(1), I->getOperand(2))) {\n+    if (isKnownNegation(I->getOperand(1), I->getOperand(2), /*NeedNSW=*/false,\n+                        /*AllowPoison=*/false)) {\n       // Of one hand of select is known to be negation of another hand,\n       // just swap the hands around.\n       auto *NewSelect = cast<SelectInst>(I->clone());\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/sub-of-negatible.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "negate_select_of_negation_poison",
+          "test_body": "define <2 x i32> @negate_select_of_negation_poison(<2 x i1> %c, <2 x i32> %x) {\n  %neg = sub <2 x i32> <i32 0, i32 poison>, %x\n  %sel = select <2 x i1> %c, <2 x i32> %neg, <2 x i32> %x\n  %neg2 = sub <2 x i32> zeroinitializer, %sel\n  ret <2 x i32> %neg2\n}\n"
+        },
+        {
+          "test_name": "dont_negate_ordinary_select",
+          "test_body": "define i8 @dont_negate_ordinary_select(i8 %x, i8 %y, i8 %z, i1 %c) {\n  %t0 = select i1 %c, i8 %x, i8 %y\n  %t1 = sub i8 %z, %t0\n  ret i8 %t1\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "miscompile of vector double-negation + select by InstCombine",
+    "body": "https://alive2.llvm.org/ce/z/N1RVAr\r\n\r\nthis:\r\n```llvm\r\ndefine <4 x i32> @f(<4 x i32> %0) {\r\n  %2 = sub <4 x i32> zeroinitializer, %0\r\n  %3 = select <4 x i1> <i1 false, i1 true, i1 poison, i1 poison>, <4 x i32> %2, <4 x i32> %0\r\n  %4 = sub <4 x i32> zeroinitializer, %3\r\n  ret <4 x i32> %4\r\n}\r\n```\r\nis being optimized to:\r\n```llvm\r\ndefine <4 x i32> @f(<4 x i32> %0) {\r\n  ret <4 x i32> %0\r\n}\r\n```\r\nhere's Alive's work explaining why this is wrong:\r\n```\r\nERROR: Value mismatch\r\n\r\nExample:\r\n<4 x i32> %#0 = < #x00000001 (1), poison, poison, poison >\r\n\r\nSource:\r\n<4 x i32> %#2 = < #xffffffff (4294967295, -1), poison, poison, poison >\r\n<4 x i32> %#3 = < #x00000001 (1), poison, poison, poison >\r\n<4 x i32> %#4 = < #xffffffff (4294967295, -1), poison, poison, poison >\r\n\r\nTarget:\r\nSource value: < #xffffffff (4294967295, -1), poison, poison, poison >\r\nTarget value: < #x00000001 (1), poison, poison, poison >\r\n```\r\n\r\ncc @nunoplopes @hatsunespica\r\n\r\n",
+    "author": "regehr",
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "comments": [
+      {
+        "author": "topperc",
+        "body": "I think the problem is this code in Negator::visitImpl.\r\n\r\n```\r\n  case Instruction::Select: {\r\n    if (isKnownNegation(I->getOperand(1), I->getOperand(2))) {                   \r\n      // Of one hand of select is known to be negation of another hand,          \r\n      // just swap the hands around.                                             \r\n      auto *NewSelect = cast<SelectInst>(I->clone());                            \r\n      // Just swap the operands of the select.                                   \r\n      NewSelect->swapValues();                                                   \r\n      // Don't swap prof metadata, we didn't change the branch behavior.         \r\n      NewSelect->setName(I->getName() + \".neg\");                                 \r\n      Builder.Insert(NewSelect);                                                 \r\n      return NewSelect;                                                          \r\n    }   \r\n```\r\n\r\nThe IR at the time of that code running was\r\n```\r\n%2 = sub <4 x i32> <i32 poison, i32 0, i32 0, i32 0>, %0\r\n%3 = select <4 x i1> <i1 false, i1 true, i1 poison, i1 poison>, <4 x i32> %2, <4 x i32> %0\r\n%4 = sub <4 x i32> zeroinitializer, %3\r\n```\r\n\r\nSo operand element 0 of %2 is poison. This occurred because element 0 isn't selected so SimplifiedDemandedVectorElts replaced with poison.\r\n\r\nOnce Negator swaps the operands, now element 1 of %2 is never selected so we end up with `sub <4 x i32> poison, %0`\r\n\r\nIt doesn't look like swapping the operands of the select is poison safe.\r\n\r\nCC @nikic "
+      },
+      {
+        "author": "nikic",
+        "body": "Yeah, that analysis sounds right to me. With that in mind, a more direct test case would be:\r\n```llvm\r\ndefine <2 x i32> @f(<2 x i1> %c, <2 x i32> %x) {\r\n  %neg = sub <2 x i32> <i32 0, i32 poison>, %x\r\n  %sel = select <2 x i1> %c, <2 x i32> %neg, <2 x i32> %x\r\n  %neg2 = sub <2 x i32> zeroinitializer, %sel\r\n  ret <2 x i32> %neg2\r\n}\r\n```"
+      },
+      {
+        "author": "regehr",
+        "body": "off topic but do we want an llvm-reduce pass that shrinks vectors? and maybe also shrinks lane sizes? if so I could work on that sort of thing this summer"
+      },
+      {
+        "author": "XChy",
+        "body": "> off topic but do we want an llvm-reduce pass that shrinks vectors? and maybe also shrinks lane sizes? if so I could work on that sort of thing this summer\r\n\r\nSounds great to me. I think some SLPVectorizer testcases that involve 16 or even 32 lanes should be further reduced."
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "bisect": "Cannot find a good commit"
+}

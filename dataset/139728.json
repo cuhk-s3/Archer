@@ -1,0 +1,173 @@
+{
+  "bug_id": "139728",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/139728",
+  "base_commit": "be6c1684c058ff40b5cb29e7eb88f06f72dd50df",
+  "knowledge_cutoff": "2025-05-13T13:36:11Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "d79d9b8fbfc7e8411aeaf2f5e1be9d4247594fee",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          16142,
+          16157
+        ],
+        [
+          16210,
+          16216
+        ],
+        [
+          17799,
+          17815
+        ],
+        [
+          18696,
+          18701
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::getLastInstructionInBundle",
+        "BoUpSLP::setInsertPointAfterBundle",
+        "BoUpSLP::vectorizeTree"
+      ]
+    }
+  },
+  "patch": "commit d79d9b8fbfc7e8411aeaf2f5e1be9d4247594fee\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Fri May 16 12:52:27 2025 -0400\n\n    [SLP]Change the insertion point for outside-block-used nodes and prevec phi operand gathers\n    \n    Need to set the insertion point for (non-schedulable) vector node after\n    the last instruction in the node to avoid def-use breakage. But it also\n    causes miscompilation with gather/buildvector operands of the phi nodes,\n    used in the same phi only in the block.\n    These nodes supposed to be inserted at the end of the block and after\n    changing the insertion point for the non-schedulable vec block, it also\n    may break def-use dependencies. Need to prevector such nodes, to emit\n    them as early as possible, so the vectorized nodes are inserted before\n    these nodes.\n    \n    Fixes #139728\n    \n    Reviewers: hiraditya, HanKuanChen, RKSimon\n    \n    Reviewed By: RKSimon\n    \n    Pull Request: https://github.com/llvm/llvm-project/pull/139917\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex eb339282fdae..19d19946ea23 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -16142,16 +16142,10 @@ Instruction &BoUpSLP::getLastInstructionInBundle(const TreeEntry *E) {\n                 [](Value *V) {\n                   return !isa<GetElementPtrInst>(V) && isa<Instruction>(V);\n                 })) ||\n-        all_of(E->Scalars,\n-               [](Value *V) {\n-                 return isa<PoisonValue>(V) ||\n-                        (!isVectorLikeInstWithConstOps(V) &&\n-                         isUsedOutsideBlock(V));\n-               }) ||\n-        (E->isGather() && E->Idx == 0 && all_of(E->Scalars, [](Value *V) {\n-           return isa<ExtractElementInst, UndefValue>(V) ||\n-                  areAllOperandsNonInsts(V);\n-         })))\n+        all_of(E->Scalars, [](Value *V) {\n+          return isa<PoisonValue>(V) ||\n+                 (!isVectorLikeInstWithConstOps(V) && isUsedOutsideBlock(V));\n+        }))\n       Res = FindLastInst();\n     else\n       Res = FindFirstInst();\n@@ -16210,7 +16204,7 @@ void BoUpSLP::setInsertPointAfterBundle(const TreeEntry *E) {\n   }\n   if (IsPHI ||\n       (!E->isGather() && E->State != TreeEntry::SplitVectorize &&\n-       doesNotNeedToSchedule(E->Scalars)) ||\n+       all_of(E->Scalars, areAllOperandsNonInsts)) ||\n       (GatheredLoadsEntriesFirst.has_value() &&\n        E->Idx >= *GatheredLoadsEntriesFirst && !E->isGather() &&\n        E->getOpcode() == Instruction::Load)) {\n@@ -17799,17 +17793,27 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {\n           Value *VecOp = NewPhi->getIncomingValueForBlock(IBB);\n           NewPhi->addIncoming(VecOp, IBB);\n           TreeEntry *OpTE = getOperandEntry(E, I);\n+          assert(!OpTE->VectorizedValue && \"Expected no vectorized value.\");\n           OpTE->VectorizedValue = VecOp;\n           continue;\n         }\n \n         Builder.SetInsertPoint(IBB->getTerminator());\n         Builder.SetCurrentDebugLocation(PH->getDebugLoc());\n-        Value *Vec = vectorizeOperand(E, I);\n+        const TreeEntry *OpE = getOperandEntry(E, I);\n+        Value *Vec;\n+        if (OpE->isGather()) {\n+          assert(OpE->VectorizedValue && \"Expected vectorized value.\");\n+          Vec = OpE->VectorizedValue;\n+          if (auto *IVec = dyn_cast<Instruction>(Vec))\n+            Builder.SetInsertPoint(IVec->getNextNonDebugInstruction());\n+        } else {\n+          Vec = vectorizeOperand(E, I);\n+        }\n         if (VecTy != Vec->getType()) {\n-          assert((It != MinBWs.end() || getOperandEntry(E, I)->isGather() ||\n-                  MinBWs.contains(getOperandEntry(E, I))) &&\n-                 \"Expected item in MinBWs.\");\n+          assert(\n+              (It != MinBWs.end() || OpE->isGather() || MinBWs.contains(OpE)) &&\n+              \"Expected item in MinBWs.\");\n           Vec = Builder.CreateIntCast(Vec, VecTy, GetOperandSignedness(I));\n         }\n         NewPhi->addIncoming(Vec, IBB);\n@@ -18696,6 +18700,28 @@ Value *BoUpSLP::vectorizeTree(\n   else\n     Builder.SetInsertPoint(&F->getEntryBlock(), F->getEntryBlock().begin());\n \n+  // Vectorize gather operands of the PHI nodes.\n+  for (const std::unique_ptr<TreeEntry> &TE : reverse(VectorizableTree)) {\n+    if (TE->isGather() && TE->UserTreeIndex.UserTE &&\n+        TE->UserTreeIndex.UserTE->hasState() &&\n+        !TE->UserTreeIndex.UserTE->isAltShuffle() &&\n+        TE->UserTreeIndex.UserTE->State == TreeEntry::Vectorize &&\n+        TE->UserTreeIndex.UserTE->getOpcode() == Instruction::PHI &&\n+        !TE->VectorizedValue) {\n+      auto *PH = cast<PHINode>(TE->UserTreeIndex.UserTE->getMainOp());\n+      BasicBlock *IBB = PH->getIncomingBlock(TE->UserTreeIndex.EdgeIdx);\n+      // If there is the same incoming block earlier - skip, it will be handled\n+      // in PHI node.\n+      if (TE->UserTreeIndex.EdgeIdx > 0 &&\n+          any_of(seq<unsigned>(TE->UserTreeIndex.EdgeIdx), [&](unsigned Idx) {\n+            return PH->getIncomingBlock(Idx) == IBB;\n+          }))\n+        continue;\n+      Builder.SetInsertPoint(IBB->getTerminator());\n+      Builder.SetCurrentDebugLocation(PH->getDebugLoc());\n+      (void)vectorizeTree(TE.get());\n+    }\n+  }\n   // Emit gathered loads first to emit better code for the users of those\n   // gathered loads.\n   for (const std::unique_ptr<TreeEntry> &TE : VectorizableTree) {\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/AArch64/reused-scalar-repeated-in-node.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=aarch64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test() {\nentry:\n  br label %bb61\n\nbb61:                                             ; preds = %entry\n  br label %bb64\n\nbb62:                                             ; No predecessors!\n  br i1 poison, label %bb63, label %bb64\n\nbb63:                                             ; preds = %bb62\n  br label %bb64\n\nbb64:                                             ; preds = %bb63, %bb62, %bb61\n  %i = phi nsz float [ poison, %bb61 ], [ poison, %bb63 ], [ poison, %bb62 ]\n  %i65 = phi nsz float [ poison, %bb61 ], [ poison, %bb63 ], [ poison, %bb62 ]\n  %i66 = load float, ptr poison, align 16\n  %i67 = load float, ptr poison, align 4\n  %i68 = load float, ptr poison, align 8\n  %i69 = load float, ptr poison, align 4\n  %i70 = load float, ptr poison, align 4\n  %i71 = load float, ptr poison, align 16\n  %i72 = load float, ptr poison, align 4\n  %i73 = load float, ptr poison, align 8\n  %i74 = load float, ptr poison, align 4\n  %i75 = load float, ptr poison, align 16\n  %i76 = load float, ptr poison, align 4\n  br i1 poison, label %bb167, label %bb77\n\nbb77:                                             ; preds = %bb64\n  br label %bb78\n\nbb78:                                             ; preds = %bb78, %bb77\n  %i79 = phi nsz float [ %i66, %bb77 ], [ %i103, %bb78 ]\n  %i80 = phi nsz float [ %i67, %bb77 ], [ %i104, %bb78 ]\n  %i81 = phi nsz float [ %i68, %bb77 ], [ %i105, %bb78 ]\n  %i82 = phi nsz float [ poison, %bb77 ], [ %i106, %bb78 ]\n  %i83 = phi nsz float [ poison, %bb77 ], [ %i123, %bb78 ]\n  %i84 = phi nsz float [ %i69, %bb77 ], [ %i124, %bb78 ]\n  %i85 = phi nsz float [ poison, %bb77 ], [ %i125, %bb78 ]\n  %i86 = phi nsz float [ %i70, %bb77 ], [ %i126, %bb78 ]\n  %i87 = fmul fast float %i79, poison\n  %i88 = fmul fast float %i80, poison\n  %i89 = fmul fast float %i81, poison\n  %i90 = fmul fast float %i82, poison\n  %i91 = fmul fast float %i83, poison\n  %i92 = fadd fast float %i91, %i87\n  %i93 = fmul fast float %i84, poison\n  %i94 = fadd fast float %i93, %i88\n  %i95 = fmul fast float %i85, poison\n  %i96 = fadd fast float %i95, %i89\n  %i97 = fmul fast float %i86, poison\n  %i98 = fadd fast float %i97, %i90\n  %i99 = fadd fast float %i92, poison\n  %i100 = fadd fast float %i94, poison\n  %i101 = fadd fast float %i96, poison\n  %i102 = fadd fast float %i98, poison\n  %i103 = fadd fast float %i99, poison\n  %i104 = fadd fast float %i100, poison\n  %i105 = fadd fast float %i101, poison\n  %i106 = fadd fast float %i102, poison\n  %i107 = fmul fast float %i79, poison\n  %i108 = fmul fast float %i80, poison\n  %i109 = fmul fast float %i81, poison\n  %i110 = fmul fast float %i82, poison\n  %i111 = fmul fast float %i83, poison\n  %i112 = fadd fast float %i111, %i107\n  %i113 = fmul fast float %i84, poison\n  %i114 = fadd fast float %i113, %i108\n  %i115 = fmul fast float %i85, poison\n  %i116 = fadd fast float %i115, %i109\n  %i117 = fmul fast float %i86, poison\n  %i118 = fadd fast float %i117, %i110\n  %i119 = fadd fast float %i112, poison\n  %i120 = fadd fast float %i114, poison\n  %i121 = fadd fast float %i116, poison\n  %i122 = fadd fast float %i118, poison\n  %i123 = fadd fast float %i119, poison\n  %i124 = fadd fast float %i120, poison\n  %i125 = fadd fast float %i121, poison\n  %i126 = fadd fast float %i122, poison\n  %i127 = fmul fast float %i79, %i\n  %i128 = fmul fast float %i80, %i\n  %i129 = fmul fast float %i81, %i\n  %i130 = fmul fast float %i82, %i\n  %i131 = fmul fast float %i83, %i65\n  %i132 = fadd fast float %i131, %i127\n  %i133 = fmul fast float %i84, %i65\n  %i134 = fadd fast float %i133, %i128\n  %i135 = fmul fast float %i85, %i65\n  %i136 = fadd fast float %i135, %i129\n  %i137 = fmul fast float %i86, %i65\n  %i138 = fadd fast float %i137, %i130\n  %i139 = fadd fast float %i132, poison\n  %i140 = fadd fast float %i134, poison\n  %i141 = fadd fast float %i136, poison\n  %i142 = fadd fast float %i138, poison\n  %i143 = fadd fast float %i139, poison\n  %i144 = fadd fast float %i140, poison\n  %i145 = fadd fast float %i141, poison\n  %i146 = fadd fast float %i142, poison\n  %i147 = fmul fast float %i79, poison\n  %i148 = fmul fast float %i80, poison\n  %i149 = fmul fast float %i81, poison\n  %i150 = fmul fast float %i82, poison\n  %i151 = fmul fast float %i83, poison\n  %i152 = fadd fast float %i151, %i147\n  %i153 = fmul fast float %i84, poison\n  %i154 = fadd fast float %i153, %i148\n  %i155 = fmul fast float %i85, poison\n  %i156 = fadd fast float %i155, %i149\n  %i157 = fmul fast float %i86, poison\n  %i158 = fadd fast float %i157, %i150\n  %i159 = fadd fast float %i152, poison\n  %i160 = fadd fast float %i154, poison\n  %i161 = fadd fast float %i156, poison\n  %i162 = fadd fast float %i158, poison\n  %i163 = fadd fast float %i159, poison\n  %i164 = fadd fast float %i160, poison\n  %i165 = fadd fast float %i161, poison\n  %i166 = fadd fast float %i162, poison\n  br i1 poison, label %bb78, label %bb167\n\nbb167:                                            ; preds = %bb78, %bb64\n  %i168 = phi nsz float [ %i76, %bb64 ], [ %i166, %bb78 ]\n  %i169 = phi nsz float [ poison, %bb64 ], [ %i165, %bb78 ]\n  %i170 = phi nsz float [ poison, %bb64 ], [ %i164, %bb78 ]\n  %i171 = phi nsz float [ %i75, %bb64 ], [ %i163, %bb78 ]\n  %i172 = phi nsz float [ %i74, %bb64 ], [ %i146, %bb78 ]\n  %i173 = phi nsz float [ %i73, %bb64 ], [ %i145, %bb78 ]\n  %i174 = phi nsz float [ %i72, %bb64 ], [ %i144, %bb78 ]\n  %i175 = phi nsz float [ %i71, %bb64 ], [ %i143, %bb78 ]\n  %i176 = phi nsz float [ %i70, %bb64 ], [ %i126, %bb78 ]\n  %i177 = phi nsz float [ poison, %bb64 ], [ %i125, %bb78 ]\n  %i178 = phi nsz float [ %i69, %bb64 ], [ %i124, %bb78 ]\n  %i179 = phi nsz float [ poison, %bb64 ], [ %i123, %bb78 ]\n  %i180 = phi nsz float [ poison, %bb64 ], [ %i106, %bb78 ]\n  %i181 = phi nsz float [ %i68, %bb64 ], [ %i105, %bb78 ]\n  %i182 = phi nsz float [ %i67, %bb64 ], [ %i104, %bb78 ]\n  %i183 = phi nsz float [ %i66, %bb64 ], [ %i103, %bb78 ]\n  store float %i182, ptr poison, align 1\n  store float %i174, ptr poison, align 1\n  br i1 poison, label %bb186, label %bb184\n\nbb184:                                            ; preds = %bb167\n  br label %bb185\n\nbb185:                                            ; preds = %bb185, %bb184\n  br i1 poison, label %bb185, label %bb186\n\nbb186:                                            ; preds = %bb185, %bb167\n  %i187 = phi nsz float [ %i178, %bb167 ], [ poison, %bb185 ]\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/buildvectors-parent-phi-nodes.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-generic-linux-gnu -mattr=+avx < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(ptr %0, float %1) {\n  %3 = load float, ptr %0, align 4\n  br label %4\n\n4:                                                ; preds = %4, %2\n  %5 = phi float [ %1, %4 ], [ %3, %2 ]\n  %6 = phi float [ %1, %4 ], [ 0.000000e+00, %2 ]\n  %7 = phi float [ %28, %4 ], [ 0.000000e+00, %2 ]\n  %8 = phi float [ %26, %4 ], [ 0.000000e+00, %2 ]\n  %9 = phi float [ %26, %4 ], [ %3, %2 ]\n  %10 = phi float [ %24, %4 ], [ 0.000000e+00, %2 ]\n  %11 = fmul float %9, 0.000000e+00\n  %12 = fadd float %11, 0.000000e+00\n  %13 = fmul float %7, 0.000000e+00\n  %14 = fadd float %13, 0.000000e+00\n  %15 = fmul float %10, 0.000000e+00\n  %16 = fadd float %15, 0.000000e+00\n  %17 = fmul float %8, 0.000000e+00\n  %18 = fadd float %17, 0.000000e+00\n  %19 = insertelement <4 x float> zeroinitializer, float %12, i64 0\n  %20 = insertelement <4 x float> %19, float %14, i64 1\n  %21 = insertelement <4 x float> %20, float %16, i64 2\n  %22 = insertelement <4 x float> %21, float %18, i64 3\n  store <4 x float> %22, ptr %0, align 16\n  %23 = fmul float %6, 0.000000e+00\n  %24 = fadd float %23, 0.000000e+00\n  %25 = fmul float %6, 0.000000e+00\n  %26 = fadd float %25, 0.000000e+00\n  %27 = fmul float %5, 0.000000e+00\n  %28 = fadd float %27, 0.000000e+00\n  br label %4\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/full-matched-bv-with-subvectors.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -slp-threshold=-9999 -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i32 @test(i64 %l.549) {\nentry:\n  %conv3 = sext i32 0 to i64\n  br label %if.then19\n\np:                                                ; preds = %if.end29, %if.end25\n  %l.0 = phi i64 [ %xor, %if.end29 ], [ %l.5493, %if.end25 ]\n  %m.0 = phi i64 [ %not21, %if.end29 ], [ %m.550, %if.end25 ]\n  br i1 false, label %s, label %q\n\nq:                                                ; preds = %land.lhs.true, %p\n  %xor39 = phi i64 [ 0, %p ], [ 0, %land.lhs.true ]\n  %l.1 = phi i64 [ 0, %p ], [ 0, %land.lhs.true ]\n  %m.1 = phi i64 [ 0, %p ], [ 0, %land.lhs.true ]\n  br i1 false, label %lor.lhs.false, label %r\n\nlor.lhs.false:                                    ; preds = %q\n  br i1 false, label %land.lhs.true, label %s\n\nr:                                                ; preds = %if.then19, %q\n  %xor38 = phi i64 [ %xor39, %q ], [ %xor, %if.then19 ]\n  %j.0 = phi i64 [ %conv3, %q ], [ %not21, %if.then19 ]\n  %l.2 = phi i64 [ %l.1, %q ], [ %l.549, %if.then19 ]\n  %m.2 = phi i64 [ %m.1, %q ], [ %m.550, %if.then19 ]\n  br i1 false, label %s, label %land.lhs.true\n\nland.lhs.true:                                    ; preds = %r, %lor.lhs.false\n  %xor37 = phi i64 [ %xor38, %r ], [ 0, %lor.lhs.false ]\n  %j.1 = phi i64 [ %j.0, %r ], [ 0, %lor.lhs.false ]\n  %l.3 = phi i64 [ %l.2, %r ], [ 0, %lor.lhs.false ]\n  %m.3 = phi i64 [ %m.2, %r ], [ 0, %lor.lhs.false ]\n  br i1 false, label %q, label %s\n\ns:                                                ; preds = %land.lhs.true, %r, %lor.lhs.false, %p\n  %xor36 = phi i64 [ %xor37, %land.lhs.true ], [ %xor38, %r ], [ %xor39, %lor.lhs.false ], [ %l.0, %p ]\n  %j.2 = phi i64 [ %j.1, %land.lhs.true ], [ %j.0, %r ], [ %conv3, %lor.lhs.false ], [ %m.0, %p ]\n  %l.4 = phi i64 [ %l.3, %land.lhs.true ], [ %l.2, %r ], [ %l.1, %lor.lhs.false ], [ %l.0, %p ]\n  %m.4 = phi i64 [ %m.3, %land.lhs.true ], [ %m.2, %r ], [ %m.1, %lor.lhs.false ], [ %m.0, %p ]\n  br label %if.then19\n\nif.then19:                                        ; preds = %s, %entry\n  %m.550 = phi i64 [ 0, %entry ], [ %m.4, %s ]\n  %l.5493 = phi i64 [ 0, %entry ], [ %l.4, %s ]\n  %xor = xor i64 0, 0\n  %not21 = xor i64 0, 0\n  br i1 false, label %r, label %if.end25\n\nif.end25:                                         ; preds = %if.then19\n  br i1 false, label %if.end29, label %p\n\nif.end29:                                         ; preds = %if.end25\n  br label %p\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/matched-bv-schedulable.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu < %s -slp-threshold=-99999"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test() {\nbb:\n  br i1 false, label %bb1, label %bb5\n\nbb1:                                              ; preds = %bb1, %bb\n  %phi = phi i32 [ %or4, %bb1 ], [ 0, %bb ]\n  %phi2 = phi i32 [ %add, %bb1 ], [ 0, %bb ]\n  %add = add i32 1, 0\n  %or = or i32 0, %phi2\n  %or3 = or i32 %or, 0\n  %mul = mul i32 0, 0\n  %or4 = or i32 %phi, %mul\n  br i1 false, label %bb1, label %bb5\n\nbb5:                                              ; preds = %bb1, %bb\n  %phi6 = phi i32 [ 0, %bb ], [ %or4, %bb1 ]\n  %phi7 = phi i32 [ 0, %bb ], [ %or, %bb1 ]\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/matched-nodes-updated.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -slp-threshold=-9999 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i32 @test(i32 %s.0) {\nentry:\n  br label %k\n\nk:                                                ; preds = %t, %entry\n  %.pre = phi i32 [ 0, %entry ], [ %.pre4053, %t ]\n  br label %o\n\nif.end3:                                          ; No predecessors!\n  br label %if.end6\n\nif.end6:                                          ; preds = %o, %if.end3\n  %.pre43 = phi i32 [ 0, %if.end3 ], [ 0, %o ]\n  %0 = phi i32 [ 0, %if.end3 ], [ 0, %o ]\n  %1 = phi i32 [ 0, %if.end3 ], [ 0, %o ]\n  %h.4 = phi i32 [ 0, %if.end3 ], [ %h.6, %o ]\n  %i.4 = phi i32 [ 0, %if.end3 ], [ %i.7, %o ]\n  %j.4 = phi i32 [ 0, %if.end3 ], [ %j.5, %o ]\n  %l.4 = phi i32 [ 0, %if.end3 ], [ 0, %o ]\n  %not8 = xor i32 %i.4, 0\n  %not9 = xor i32 %h.4, 0\n  br i1 false, label %if.end24, label %if.then11\n\nif.then11:                                        ; preds = %if.end6\n  br label %if.end24\n\nif.then18:                                        ; No predecessors!\n  br label %t\n\nt:                                                ; preds = %o, %if.then18\n  %.pre40 = phi i32 [ %.pre4053, %o ], [ 0, %if.then18 ]\n  %i.5 = phi i32 [ 0, %o ], [ 0, %if.then18 ]\n  %l.5 = phi i32 [ %l.7, %o ], [ 0, %if.then18 ]\n  %r.2 = phi i32 [ %r.4, %o ], [ 0, %if.then18 ]\n  %s.2 = phi i32 [ %s.4, %o ], [ 0, %if.then18 ]\n  br i1 false, label %if.end24, label %k\n\nif.end24:                                         ; preds = %t, %if.then11, %if.end6\n  %.pre4050 = phi i32 [ 0, %if.then11 ], [ 0, %if.end6 ], [ %.pre40, %t ]\n  %.pre42 = phi i32 [ 0, %if.then11 ], [ %.pre43, %if.end6 ], [ %.pre40, %t ]\n  %2 = phi i32 [ 0, %if.then11 ], [ %0, %if.end6 ], [ %.pre40, %t ]\n  %3 = phi i32 [ 0, %if.then11 ], [ %1, %if.end6 ], [ %.pre40, %t ]\n  %i.6 = phi i32 [ %i.4, %if.then11 ], [ %i.7, %if.end6 ], [ %i.5, %t ]\n  %l.6 = phi i32 [ 0, %if.then11 ], [ %l.4, %if.end6 ], [ %l.5, %t ]\n  %r.3 = phi i32 [ %j.4, %if.then11 ], [ %not8, %if.end6 ], [ %r.2, %t ]\n  %s.3 = phi i32 [ 0, %if.then11 ], [ %not9, %if.end6 ], [ %s.2, %t ]\n  br label %o\n\no:                                                ; preds = %if.end24, %k\n  %.pre4053 = phi i32 [ 0, %k ], [ %.pre4050, %if.end24 ]\n  %.pre46 = phi i32 [ 0, %k ], [ %.pre42, %if.end24 ]\n  %4 = phi i32 [ 0, %k ], [ %2, %if.end24 ]\n  %5 = phi i32 [ 0, %k ], [ %3, %if.end24 ]\n  %h.6 = phi i32 [ 0, %k ], [ %r.3, %if.end24 ]\n  %i.7 = phi i32 [ 0, %k ], [ %i.6, %if.end24 ]\n  %j.5 = phi i32 [ 0, %k ], [ %s.3, %if.end24 ]\n  %l.7 = phi i32 [ %.pre, %k ], [ %l.6, %if.end24 ]\n  %r.4 = phi i32 [ 0, %k ], [ %r.3, %if.end24 ]\n  %s.4 = phi i32 [ %s.0, %k ], [ %s.3, %if.end24 ]\n  br i1 false, label %t, label %if.end6\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/node-outside-used-only.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -slp-threshold=-99999 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ndefine i64 @test() {\n;\nbb:\n  br label %bb1\n\nbb1:\n  %phi = phi i32 [ 0, %bb ], [ %or, %bb5 ]\n  %phi2 = phi i32 [ 0, %bb ], [ %or4, %bb5 ]\n  %or = or i32 %phi, 0\n  %add = add i32 0, 0\n  %or3 = or i32 %add, %phi2\n  %or4 = or i32 %or3, 0\n  br label %bb5\n\nbb5:\n  br i1 false, label %bb6, label %bb1\n\nbb6:\n  %phi7 = phi i32 [ %or, %bb5 ]\n  %phi8 = phi i32 [ %or3, %bb5 ]\n  ret i64 0\n}"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/reduced-val-vectorized-in-transform.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -slp-threshold=-10 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i32 @test(i1 %cond) {\nentry:\n  br label %bb\n\nbb:                                               ; preds = %bb, %entry\n  %p1 = phi i32 [ %or92, %bb ], [ 0, %entry ]\n  %p2 = phi i32 [ %0, %bb ], [ 0, %entry ]\n  %p3 = phi i32 [ %4, %bb ], [ 0, %entry ]\n  %0 = or i32 1, 0\n  %or8.i = or i32 0, 0\n  %or9.i = or i32 0, 0\n  %or91 = or i32 %p1, 0\n  %or12.i = or i32 %p2, 0\n  %or92 = or i32 1, 0\n  %1 = xor i32 %or91, %or12.i\n  %2 = xor i32 %1, %or9.i\n  %3 = xor i32 %2, %or8.i\n  %4 = xor i32 %3, %or92\n  br i1 %cond, label %exit, label %bb\n\nexit:                                             ; preds = %bb\n  ret i32 %4\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/split-node-num-operands.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mattr=+avx -slp-threshold=-1000 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "Foo",
+          "test_body": "define i64 @Foo(ptr align 8 dereferenceable(344) %0, i64 %1) {\n  %3 = getelementptr i8, ptr %0, i64 104\n  %4 = getelementptr i8, ptr %0, i64 112\n  %5 = getelementptr i8, ptr %0, i64 24\n  %6 = load i64, ptr %3, align 8\n  %7 = load i64, ptr %4, align 8\n  %8 = load i64, ptr %5, align 8\n  %9 = load i64, ptr %0, align 8\n  br label %10\n\n10:                                               ; preds = %18, %2\n  %11 = phi i64 [ %9, %2 ], [ 0, %18 ]\n  %12 = phi i64 [ %8, %2 ], [ %12, %18 ]\n  %13 = phi i64 [ %7, %2 ], [ 0, %18 ]\n  %14 = phi i64 [ %6, %2 ], [ 0, %18 ]\n  switch i32 0, label %15 [\n    i32 0, label %18\n  ]\n\n15:                                               ; preds = %10\n  %16 = tail call i64 @llvm.umin.i64(i64 0, i64 0)\n  %17 = tail call i64 @llvm.umax.i64(i64 0, i64 0)\n  br label %18\n\n18:                                               ; preds = %15, %10\n  %19 = phi i64 [ %17, %15 ], [ 0, %10 ]\n  %20 = phi i64 [ %16, %15 ], [ 0, %10 ]\n  %21 = phi i64 [ %11, %15 ], [ 0, %10 ]\n  %22 = phi i64 [ %12, %15 ], [ 0, %10 ]\n  %23 = phi i64 [ %13, %15 ], [ %1, %10 ]\n  %24 = phi i64 [ %14, %15 ], [ 0, %10 ]\n  br i1 false, label %.loopexit206, label %10\n\n.loopexit206:                                     ; preds = %18\n  switch i32 0, label %26 [\n    i32 0, label %.cont174\n    i32 1, label %25\n  ]\n\n25:                                               ; preds = %.loopexit206\n  br label %.cont174\n\n26:                                               ; preds = %.loopexit206\n  %27 = tail call i64 @llvm.umin.i64(i64 0, i64 0)\n  %28 = tail call i64 @llvm.umax.i64(i64 0, i64 0)\n  br label %.cont174\n\n.cont174:                                         ; preds = %26, %25, %.loopexit206\n  %.sroa.139.1 = phi i64 [ %28, %26 ], [ %19, %25 ], [ %19, %.loopexit206 ]\n  %.sroa.133.1 = phi i64 [ %27, %26 ], [ 0, %25 ], [ %20, %.loopexit206 ]\n  %.sroa.81.1 = phi i64 [ %23, %26 ], [ 0, %25 ], [ %23, %.loopexit206 ]\n  %.sroa.75.1 = phi i64 [ %24, %26 ], [ 0, %25 ], [ %24, %.loopexit206 ]\n  %.sroa.21.1 = phi i64 [ %21, %26 ], [ 0, %25 ], [ %21, %.loopexit206 ]\n  %.sroa.15.1 = phi i64 [ %22, %26 ], [ 0, %25 ], [ %22, %.loopexit206 ]\n  %29 = phi i64 [ %28, %26 ], [ 0, %25 ], [ %19, %.loopexit206 ]\n  %30 = phi i64 [ %27, %26 ], [ 0, %25 ], [ %20, %.loopexit206 ]\n  ret i64 0\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umin.i64(i64, i64) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/revec.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -S -slp-revec -slp-max-reg-size=1024 -slp-threshold=-100 %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test8",
+          "test_body": "define void @test8() {\nentry:\n  br i1 false, label %for0, label %for.body\n\nfor0:                                             ; preds = %for.body, %entry\n  %0 = phi <2 x float> [ zeroinitializer, %entry ], [ %4, %for.body ]\n  %1 = phi <2 x float> [ zeroinitializer, %entry ], [ %5, %for.body ]\n  %2 = phi <2 x float> [ zeroinitializer, %entry ], [ %4, %for.body ]\n  %3 = phi <2 x float> [ zeroinitializer, %entry ], [ %5, %for.body ]\n  ret void\n\nfor.body:                                         ; preds = %for.body, %entry\n  %4 = phi <2 x float> [ %4, %for.body ], [ zeroinitializer, %entry ]\n  %5 = phi <2 x float> [ %5, %for.body ], [ zeroinitializer, %entry ]\n  br i1 false, label %for0, label %for.body\n}\n"
+        },
+        {
+          "test_name": "test7",
+          "test_body": "define void @test7() {\n  %1 = getelementptr i8, ptr null, i64 16\n  %2 = trunc <8 x i64> zeroinitializer to <8 x i16>\n  store <8 x i16> %2, ptr %1, align 2\n  %3 = trunc <8 x i64> zeroinitializer to <8 x i16>\n  store <8 x i16> %3, ptr null, align 2\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Instruction does not dominate all uses! LLVM ERROR: Broken module found, compilation aborted! Yet another case.",
+    "body": "To reproduce run opt with the test below using -passes=slp-vectorizer -slp-threshold=-99999:\n\n```\n; ModuleID = './reduced.ll'\nsource_filename = \"./reduced.ll\"\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @wombat() #0 gc \"statepoint-example\" {\nbb:\n  br label %bb1\n\nbb1:                                              ; preds = %bb5, %bb\n  %phi = phi i32 [ 0, %bb ], [ %or, %bb5 ]\n  %phi2 = phi i32 [ 0, %bb ], [ %or4, %bb5 ]\n  %or = or i32 %phi, 0\n  %add = add i32 0, 0\n  %or3 = or i32 %add, %phi2\n  %or4 = or i32 %or3, 0\n  br label %bb5\n\nbb5:                                              ; preds = %bb1\n  br i1 false, label %bb6, label %bb1\n\nbb6:                                              ; preds = %bb5\n  %phi7 = phi i32 [ %or, %bb5 ]\n  %phi8 = phi i32 [ %or3, %bb5 ]\n  ret i64 0\n}\n\nattributes #0 = { \"target-features\"=\"+prfchw,-cldemote,+avx,+aes,+sahf,+pclmul,-xop,+crc32,-amx-fp8,+xsaves,-avx512fp16,-usermsr,-sm4,-egpr,+sse4.1,-avx512ifma,+xsave,+sse4.2,-tsxldtrk,-sm3,-ptwrite,-widekl,-movrs,+invpcid,+64bit,+xsavec,-avx10.1-512,-avx512vpopcntdq,+cmov,-avx512vp2intersect,+avx512cd,+movbe,-avxvnniint8,-ccmp,-amx-int8,-kl,-avx10.1-256,+evex512,-avxvnni,+rtm,+adx,+avx2,-hreset,-movdiri,-serialize,-sha512,-vpclmulqdq,+avx512vl,-uintr,-cf,+clflushopt,-raoint,-cmpccxadd,+bmi,-amx-tile,+sse,-avx10.2-256,-gfni,-avxvnniint16,-amx-fp16,-zu,-ndd,+xsaveopt,+rdrnd,+avx512f,-amx-bf16,-avx512bf16,-avx512vnni,-push2pop2,+cx8,+avx512bw,+sse3,+pku,-nf,-amx-tf32,-amx-avx512,+fsgsbase,-clzero,-mwaitx,-lwp,+lzcnt,-sha,-movdir64b,-ppx,-wbnoinvd,-enqcmd,-amx-transpose,-avx10.2-512,-avxneconvert,-tbm,-pconfig,-amx-complex,+ssse3,+cx16,+bmi2,+fma,+popcnt,-avxifma,+f16c,-avx512bitalg,-rdpru,+clwb,+mmx,+sse2,+rdseed,-avx512vbmi2,-prefetchi,-amx-movrs,-rdpid,-fma4,-avx512vbmi,-shstk,-vaes,-waitpkg,-sgx,+fxsr,+avx512dq,-sse4a,-avx512f\" }\n```\n\nReproducer: https://godbolt.org/z/xh9xjfEKc\n\nStack dump:\n```\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -passes=slp-vectorizer -slp-threshold=-99999 <source>\n1.\tRunning pass \"verify\" on module \"<source>\"\n #0 0x00000000055a8748 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x55a8748)\n #1 0x00000000055a60d4 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\n #2 0x00007479c4242520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\n #3 0x00007479c42969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\n #4 0x00007479c4242476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\n #5 0x00007479c42287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\n #6 0x000000000080bfcd llvm::json::operator==(llvm::json::Value const&, llvm::json::Value const&) (.cold) JSON.cpp:0:0\n #7 0x00000000054e4741 (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x54e4741)\n #8 0x00000000053e0e38 (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x53e0e38)\n #9 0x0000000000940c0e llvm::detail::PassModel<llvm::Module, llvm::VerifierPass, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x940c0e)\n#10 0x000000000539ff70 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x539ff70)\n#11 0x000000000094b05a llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x94b05a)\n#12 0x000000000093e82c optMain (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x93e82c)\n#13 0x00007479c4229d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\n#14 0x00007479c4229e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\n#15 0x0000000000936465 _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x936465)\nProgram terminated with signal: SIGSEGV\nCompiler returned: 139\n```",
+    "author": "TatyanaDoubts",
+    "labels": [
+      "llvm:SLPVectorizer",
+      "crash-on-valid"
+    ],
+    "comments": []
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "894935cb5146fd2ac6334cc8b11e6d6e0e264fe6"
+}

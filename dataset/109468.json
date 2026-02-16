@@ -1,0 +1,89 @@
+{
+  "bug_id": "109468",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/109468",
+  "base_commit": "51039101cf32591782ef564a108db71150a3b7c3",
+  "knowledge_cutoff": "2024-09-20T20:22:11Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "a068b974b199b0e7350da2d9506adc7df3995ce3",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlan.h": [
+        [
+          2709,
+          2714
+        ],
+        [
+          2787,
+          2792
+        ]
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        [
+          2267,
+          2272
+        ],
+        [
+          2363,
+          2368
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        "VPWidenLoadEVLRecipe::execute",
+        "VPWidenLoadEVLRecipe::print",
+        "VPWidenStoreEVLRecipe::execute",
+        "VPWidenStoreEVLRecipe::print"
+      ]
+    }
+  },
+  "patch": "commit a068b974b199b0e7350da2d9506adc7df3995ce3\nAuthor: Elvis Wang <elvis.wang@sifive.com>\nDate:   Thu Sep 26 07:10:25 2024 +0800\n\n    [VPlan] Implement VPWidenLoad/StoreEVLRecipe::computeCost().  (#109644)\n    \n    Currently the EVL recipes transfer the tail masking to the EVL.\n    But in the legacy cost model, the mask exist and will calculate the\n    instruction cost of the mask.\n    To fix the difference between the VPlan-based cost model and the legacy\n    cost model, we always calculate the instruction cost for the mask in the\n    EVL recipes.\n    \n    Note that we should remove the mask cost in the EVL recipes when we\n    don't need to compare to the legacy cost model.\n    \n    This patch also fixes #109468.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex bbcfaf9e19cd..23a24ce293ef 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -2709,6 +2709,10 @@ struct VPWidenLoadEVLRecipe final : public VPWidenMemoryRecipe, public VPValue {\n   /// Generate the wide load or gather.\n   void execute(VPTransformState &State) override;\n \n+  /// Return the cost of this VPWidenLoadEVLRecipe.\n+  InstructionCost computeCost(ElementCount VF,\n+                              VPCostContext &Ctx) const override;\n+\n #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)\n   /// Print the recipe.\n   void print(raw_ostream &O, const Twine &Indent,\n@@ -2787,6 +2791,10 @@ struct VPWidenStoreEVLRecipe final : public VPWidenMemoryRecipe {\n   /// Generate the wide store or scatter.\n   void execute(VPTransformState &State) override;\n \n+  /// Return the cost of this VPWidenStoreEVLRecipe.\n+  InstructionCost computeCost(ElementCount VF,\n+                              VPCostContext &Ctx) const override;\n+\n #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)\n   /// Print the recipe.\n   void print(raw_ostream &O, const Twine &Indent,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex dacba152611c..9a0aefb898e5 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -2267,6 +2267,31 @@ void VPWidenLoadEVLRecipe::execute(VPTransformState &State) {\n   State.set(this, Res);\n }\n \n+InstructionCost VPWidenLoadEVLRecipe::computeCost(ElementCount VF,\n+                                                  VPCostContext &Ctx) const {\n+  if (!Consecutive || IsMasked)\n+    return VPWidenMemoryRecipe::computeCost(VF, Ctx);\n+\n+  // We need to use the getMaskedMemoryOpCost() instead of getMemoryOpCost()\n+  // here because the EVL recipes using EVL to replace the tail mask. But in the\n+  // legacy model, it will always calculate the cost of mask.\n+  // TODO: Using getMemoryOpCost() instead of getMaskedMemoryOpCost when we\n+  // don't need to compare to the legacy cost model.\n+  Type *Ty = ToVectorTy(getLoadStoreType(&Ingredient), VF);\n+  const Align Alignment =\n+      getLoadStoreAlignment(const_cast<Instruction *>(&Ingredient));\n+  unsigned AS =\n+      getLoadStoreAddressSpace(const_cast<Instruction *>(&Ingredient));\n+  TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n+  InstructionCost Cost = Ctx.TTI.getMaskedMemoryOpCost(\n+      Ingredient.getOpcode(), Ty, Alignment, AS, CostKind);\n+  if (!Reverse)\n+    return Cost;\n+\n+  return Cost + Ctx.TTI.getShuffleCost(TargetTransformInfo::SK_Reverse,\n+                                       cast<VectorType>(Ty), {}, CostKind, 0);\n+}\n+\n #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)\n void VPWidenLoadEVLRecipe::print(raw_ostream &O, const Twine &Indent,\n                                  VPSlotTracker &SlotTracker) const {\n@@ -2363,6 +2388,31 @@ void VPWidenStoreEVLRecipe::execute(VPTransformState &State) {\n   State.addMetadata(NewSI, SI);\n }\n \n+InstructionCost VPWidenStoreEVLRecipe::computeCost(ElementCount VF,\n+                                                   VPCostContext &Ctx) const {\n+  if (!Consecutive || IsMasked)\n+    return VPWidenMemoryRecipe::computeCost(VF, Ctx);\n+\n+  // We need to use the getMaskedMemoryOpCost() instead of getMemoryOpCost()\n+  // here because the EVL recipes using EVL to replace the tail mask. But in the\n+  // legacy model, it will always calculate the cost of mask.\n+  // TODO: Using getMemoryOpCost() instead of getMaskedMemoryOpCost when we\n+  // don't need to compare to the legacy cost model.\n+  Type *Ty = ToVectorTy(getLoadStoreType(&Ingredient), VF);\n+  const Align Alignment =\n+      getLoadStoreAlignment(const_cast<Instruction *>(&Ingredient));\n+  unsigned AS =\n+      getLoadStoreAddressSpace(const_cast<Instruction *>(&Ingredient));\n+  TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n+  InstructionCost Cost = Ctx.TTI.getMaskedMemoryOpCost(\n+      Ingredient.getOpcode(), Ty, Alignment, AS, CostKind);\n+  if (!Reverse)\n+    return Cost;\n+\n+  return Cost + Ctx.TTI.getShuffleCost(TargetTransformInfo::SK_Reverse,\n+                                       cast<VectorType>(Ty), {}, CostKind, 0);\n+}\n+\n #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)\n void VPWidenStoreEVLRecipe::print(raw_ostream &O, const Twine &Indent,\n                                   VPSlotTracker &SlotTracker) const {\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/RISCV/vectorize-force-tail-with-evl-uniform-store.ll",
+      "commands": [
+        "opt < %s --prefer-predicate-over-epilogue=predicate-dont-vectorize --passes=loop-vectorize -mcpu=sifive-p470 -mattr=+v,+f -force-tail-folding-style=data-with-evl -S"
+      ],
+      "tests": [
+        {
+          "test_name": "lshift_significand",
+          "test_body": "target datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"riscv64-unknown-linux-gnu\"\n\ndefine void @lshift_significand(i32 %n, ptr nocapture writeonly %dst) {\nentry:\n  %cmp1.peel = icmp eq i32 %n, 0\n  %spec.select = select i1 %cmp1.peel, i64 2, i64 0\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %spec.select, %entry ], [ %iv.next, %loop ]\n  %0 = sub nuw nsw i64 1, %iv\n  %arrayidx13 = getelementptr i64, ptr %dst, i64 %0\n  store i64 0, ptr %arrayidx13, align 8\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 3\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LV][VPlan] Crash due to disagreements on the VPlan cost v.s. legacy cost model",
+    "body": "Given this input:\r\n``` llvm\r\ntarget datalayout = \"e-m:e-p:64:64-i64:64-i128:128-n32:64-S128\"\r\ntarget triple = \"riscv64-unknown-linux-gnu\"\r\n\r\ndefine void @lshift_significand(i32 %n, ptr %0) {\r\nentry:\r\n  br label %for.cond\r\n\r\nfor.cond:                                         ; preds = %for.cond, %entry\r\n  %i.0 = phi i32 [ 0, %entry ], [ 2, %for.cond ]\r\n  %add = or i32 %n, %i.0\r\n  %cmp1 = icmp eq i32 %add, 0\r\n  br i1 %cmp1, label %for.cond, label %for.cond7\r\n\r\nfor.cond7:                                        ; preds = %for.body9, %for.cond\r\n  %i.1 = phi i32 [ %i.0, %for.cond ], [ %inc15, %for.body9 ]\r\n  %cmp8 = icmp ult i32 %i.1, 3\r\n  br i1 %cmp8, label %for.body9, label %for.end16\r\n\r\nfor.body9:                                        ; preds = %for.cond7\r\n  %sub11 = sub nuw i32 1, %i.1\r\n  %idxprom12 = zext i32 %sub11 to i64\r\n  %arrayidx13 = getelementptr [3 x i64], ptr %0, i64 0, i64 %idxprom12\r\n  store i64 0, ptr %arrayidx13, align 8\r\n  %inc15 = add i32 %i.1, 1\r\n  br label %for.cond7\r\n\r\nfor.end16:                                        ; preds = %for.cond7\r\n  ret void\r\n}\r\n```\r\nAnd this command:\r\n``` bash\r\nopt -mcpu=sifive-p470 -O3 -prefer-predicate-over-epilogue=predicate-dont-vectorize -force-tail-folding-style=data-with-evl input.ll -disable-output\r\n```\r\nWe'll get the following assertion:\r\n```\r\nllvm/lib/Transforms/Vectorize/LoopVectorize.cpp:7386: VectorizationFactor llvm::LoopVectorizationPlanner::computeBestVF(): Assertion `(BestFactor.Width == LegacyVF.Width || planContainsAdditionalSimplifications(getPlanFor(BestFactor.Width), CostCtx, OrigLoop)) && \" VPlan cost model and legacy cost model disagreed\"' failed.\r\n```\r\n\r\n\r\nPreliminary investigation shows that this is caused by the disagreement on (reverse) widen store's cost. First, this is the trace for VPlan's cost model:\r\n```\r\nLV: Scalar loop costs: 4.\r\nCost of 1 for VF vscale x 1: induction instruction   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\r\nCost of 0 for VF vscale x 1: induction instruction   %indvars.iv = phi i64 [ %spec.select, %entry ], [ %indvars.iv.next, %for.body9 ]\r\nCost of 1 for VF vscale x 1: exit condition instruction   %exitcond.not = icmp eq i64 %indvars.iv.next, 3\r\nCost of 0 for VF vscale x 1: EMIT vp<%4> = CANONICAL-INDUCTION ir<0>, vp<%12>\r\nCost of 0 for VF vscale x 1: EXPLICIT-VECTOR-LENGTH-BASED-IV-PHI vp<%5> = phi ir<0>, vp<%11>\r\nCost of 0 for VF vscale x 1: EMIT vp<%6> = EXPLICIT-VECTOR-LENGTH vp<%5>, vp<%3>\r\nCost of 0 for VF vscale x 1: vp<%7> = DERIVED-IV ir<%spec.select> + vp<%5> * ir<1>\r\nCost of 0 for VF vscale x 1: vp<%8> = SCALAR-STEPS vp<%7>, ir<1>\r\nCost of 1 for VF vscale x 1: CLONE ir<%1> = sub nuw nsw ir<1>, vp<%8>\r\nCost of 0 for VF vscale x 1: CLONE ir<%arrayidx13> = getelementptr ir<%0>, ir<0>, ir<%1>\r\nCost of 0 for VF vscale x 1: vp<%9> = vector-pointer (reverse) ir<%arrayidx13>\r\nCost of 8 for VF vscale x 1: WIDEN vp.store vp<%9>, ir<0>, vp<%6>\r\nCost of 0 for VF vscale x 1: SCALAR-CAST vp<%10> = zext vp<%6> to i64\r\nCost of 0 for VF vscale x 1: EMIT vp<%11> = add vp<%10>, vp<%5>\r\nCost of 0 for VF vscale x 1: EMIT vp<%12> = add vp<%4>, vp<%0>\r\nCost of 0 for VF vscale x 1: EMIT branch-on-count vp<%12>, vp<%1>\r\nCost of 0 for VF vscale x 1: vector loop backedge\r\nCost for VF vscale x 1: 11\r\nCost of 1 for VF vscale x 2: induction instruction   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\r\nCost of 0 for VF vscale x 2: induction instruction   %indvars.iv = phi i64 [ %spec.select, %entry ], [ %indvars.iv.next, %for.body9 ]\r\nCost of 1 for VF vscale x 2: exit condition instruction   %exitcond.not = icmp eq i64 %indvars.iv.next, 3\r\nCost of 0 for VF vscale x 2: EMIT vp<%4> = CANONICAL-INDUCTION ir<0>, vp<%12>\r\nCost of 0 for VF vscale x 2: EXPLICIT-VECTOR-LENGTH-BASED-IV-PHI vp<%5> = phi ir<0>, vp<%11>\r\nCost of 0 for VF vscale x 2: EMIT vp<%6> = EXPLICIT-VECTOR-LENGTH vp<%5>, vp<%3>\r\nCost of 0 for VF vscale x 2: vp<%7> = DERIVED-IV ir<%spec.select> + vp<%5> * ir<1>\r\nCost of 0 for VF vscale x 2: vp<%8> = SCALAR-STEPS vp<%7>, ir<1>\r\nCost of 1 for VF vscale x 2: CLONE ir<%1> = sub nuw nsw ir<1>, vp<%8>\r\nCost of 0 for VF vscale x 2: CLONE ir<%arrayidx13> = getelementptr ir<%0>, ir<0>, ir<%1>\r\nCost of 0 for VF vscale x 2: vp<%9> = vector-pointer (reverse) ir<%arrayidx13>\r\nCost of 14 for VF vscale x 2: WIDEN vp.store vp<%9>, ir<0>, vp<%6>\r\nCost of 0 for VF vscale x 2: SCALAR-CAST vp<%10> = zext vp<%6> to i64\r\nCost of 0 for VF vscale x 2: EMIT vp<%11> = add vp<%10>, vp<%5>\r\nCost of 0 for VF vscale x 2: EMIT vp<%12> = add vp<%4>, vp<%0>\r\nCost of 0 for VF vscale x 2: EMIT branch-on-count vp<%12>, vp<%1>\r\nCost of 0 for VF vscale x 2: vector loop backedge\r\nCost for VF vscale x 2: 17\r\n```\r\nWith VPlan's cost model, we will eventually choose scalar loop, because when VF=vscale x 1, the final cost is `ceil(11 / 2) = 6`; when VF=vscale x 2, the final cost is `ceil(17 / 4) = 5`. Both of them are larger than the scalar cost, 4.\r\n\r\nWhile with the legacy cost model:\r\n```\r\nLV: Found an estimated cost of 0 for VF 1 For instruction:   %indvars.iv = phi i64 [ %spec.select, %entry ], [ %indvars.iv.next, %for.body9 ]\r\nLV: Found an estimated cost of 1 for VF 1 For instruction:   %1 = sub nuw nsw i64 1, %indvars.iv\r\nLV: Found an estimated cost of 0 for VF 1 For instruction:   %arrayidx13 = getelementptr [3 x i64], ptr %0, i64 0, i64 %1\r\nLV: Found an estimated cost of 1 for VF 1 For instruction:   store i64 0, ptr %arrayidx13, align 8\r\nLV: Found an estimated cost of 1 for VF 1 For instruction:   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\r\nLV: Found an estimated cost of 1 for VF 1 For instruction:   %exitcond.not = icmp eq i64 %indvars.iv.next, 3\r\nLV: Found an estimated cost of 0 for VF 1 For instruction:   br i1 %exitcond.not, label %for.end16, label %for.body9\r\nLV: Scalar loop costs: 4.\r\nLV: Found an estimated cost of 0 for VF vscale x 1 For instruction:   %indvars.iv = phi i64 [ %spec.select, %entry ], [ %indvars.iv.next, %for.body9 ]\r\nLV: Found an estimated cost of 1 for VF vscale x 1 For instruction:   %1 = sub nuw nsw i64 1, %indvars.iv\r\nLV: Found an estimated cost of 0 for VF vscale x 1 For instruction:   %arrayidx13 = getelementptr [3 x i64], ptr %0, i64 0, i64 %1\r\nLV: Found an estimated cost of 7 for VF vscale x 1 For instruction:   store i64 0, ptr %arrayidx13, align 8\r\nLV: Found an estimated cost of 1 for VF vscale x 1 For instruction:   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\r\nLV: Found an estimated cost of 1 for VF vscale x 1 For instruction:   %exitcond.not = icmp eq i64 %indvars.iv.next, 3\r\nLV: Found an estimated cost of 0 for VF vscale x 1 For instruction:   br i1 %exitcond.not, label %for.end16, label %for.body9\r\nLV: Vector loop of width vscale x 1 costs: 5 (assuming a minimum vscale of 2).\r\nLV: Found an estimated cost of 0 for VF vscale x 2 For instruction:   %indvars.iv = phi i64 [ %spec.select, %entry ], [ %indvars.iv.next, %for.body9 ]\r\nLV: Found an estimated cost of 1 for VF vscale x 2 For instruction:   %1 = sub nuw nsw i64 1, %indvars.iv\r\nLV: Found an estimated cost of 0 for VF vscale x 2 For instruction:   %arrayidx13 = getelementptr [3 x i64], ptr %0, i64 0, i64 %1\r\nLV: Found an estimated cost of 13 for VF vscale x 2 For instruction:   store i64 0, ptr %arrayidx13, align 8\r\nLV: Found an estimated cost of 1 for VF vscale x 2 For instruction:   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\r\nLV: Found an estimated cost of 1 for VF vscale x 2 For instruction:   %exitcond.not = icmp eq i64 %indvars.iv.next, 3\r\nLV: Found an estimated cost of 0 for VF vscale x 2 For instruction:   br i1 %exitcond.not, label %for.end16, label %for.body9\r\nLV: Vector loop of width vscale x 2 costs: 4 (assuming a minimum vscale of 2).\r\nLV: Selecting VF: vscale x 2.\r\n```\r\nWe will eventually choose VF=vscale x 2.\r\n\r\nThe key difference is the cost of `store i64 0, ptr %arrayidx13, align 8` v.s. cost of `WIDEN vp.store vp<%9>, ir<0>, vp<%6>`, where the latter is larger than the former by 1.\r\n\r\nIn both cases (the store instruction in VPlan cost model v.s. legacy cost model) their costs are computed by the base cost of store + the cost of shuffle due to being reverse store. I used debugger to confirm that they used the same shuffle cost, which means that for some reason, VPlan's cost model yield a slightly higher cost for store than that in the legacy cost model.\r\n",
+    "author": "mshockwave",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": [
+      {
+        "author": "ElvisWang123",
+        "body": "It seems that  the legacy cost model using `getMaskedMemoryOpCost` to query the instruction cost. But in the VPlan-based cost model using `getMemoryOpCost`. \r\n\r\nIn this case, the mask in the  `VPWidenStoreEVLRecipe` is false since it is using the EVL recipe.\r\nThe legacy cost model will not check the tail folding type so it will using `getMaskedMemoryOpCost` instead of `getMemoryOpCost` . And the `MaskedMemoryCost` is slightly smaller than non-mask version."
+      },
+      {
+        "author": "ElvisWang123",
+        "body": "Open a PR to fix this issue. #109644 \r\n\r\nWe remove the shuffle cost when the value stored by reversed vector  is loop invariant."
+      },
+      {
+        "author": "mshockwave",
+        "body": "CC @fhahn "
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "ed220e15718498d0f854f1044ddcbfee00739aa7"
+}

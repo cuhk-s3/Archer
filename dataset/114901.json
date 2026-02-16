@@ -1,0 +1,69 @@
+{
+  "bug_id": "114901",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/114901",
+  "bug_type": "miscompilation",
+  "base_commit": "a88be11eef59b1722030e1219109ea0b76eebbe5",
+  "knowledge_cutoff": "2024-11-05T00:44:52Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/VectorCombine"
+  ],
+  "hints": {
+    "fix_commit": "05e838f428555bcc4507bd37912da60ea9110ef6",
+    "components": [
+      "VectorCombine"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+        [
+          1032,
+          1040
+        ],
+        [
+          1113,
+          1120
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+        "VectorCombine::foldExtractedCmps"
+      ]
+    }
+  },
+  "patch": "commit 05e838f428555bcc4507bd37912da60ea9110ef6\nAuthor: Simon Pilgrim <llvm-dev@redking.me.uk>\nDate:   Tue Nov 5 11:42:20 2024 +0000\n\n    [VectorCombine] foldExtractedCmps - disable fold on non-commutative binops\n    \n    The fold needs to be adjusted to correctly track the LHS/RHS operands, which will take some refactoring, for now just disable the fold in this case.\n    \n    Fixes #114901\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 025234c54956..332c52040e21 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -1032,9 +1032,15 @@ bool VectorCombine::scalarizeBinopOrCmp(Instruction &I) {\n /// a vector into vector operations followed by extract. Note: The SLP pass\n /// may miss this pattern because of implementation problems.\n bool VectorCombine::foldExtractedCmps(Instruction &I) {\n+  auto *BI = dyn_cast<BinaryOperator>(&I);\n+\n   // We are looking for a scalar binop of booleans.\n   // binop i1 (cmp Pred I0, C0), (cmp Pred I1, C1)\n-  if (!I.isBinaryOp() || !I.getType()->isIntegerTy(1))\n+  if (!BI || !I.getType()->isIntegerTy(1))\n+    return false;\n+\n+  // TODO: Support non-commutative binary ops.\n+  if (!BI->isCommutative())\n     return false;\n \n   // The compare predicates should match, and each compare should have a\n@@ -1113,8 +1119,7 @@ bool VectorCombine::foldExtractedCmps(Instruction &I) {\n   Value *VCmp = Builder.CreateCmp(Pred, X, ConstantVector::get(CmpC));\n \n   Value *Shuf = createShiftShuffle(VCmp, ExpensiveIndex, CheapIndex, Builder);\n-  Value *VecLogic = Builder.CreateBinOp(cast<BinaryOperator>(I).getOpcode(),\n-                                        VCmp, Shuf);\n+  Value *VecLogic = Builder.CreateBinOp(BI->getOpcode(), VCmp, Shuf);\n   Value *NewExt = Builder.CreateExtractElement(VecLogic, CheapIndex);\n   replaceValue(I, *NewExt);\n   ++NumVecCmpBO;\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/pr114901.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=sse2",
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=avx2"
+      ],
+      "tests": [
+        {
+          "test_name": "PR114901",
+          "test_body": "define i1 @PR114901(<4 x i32> %a) {\n  %e1 = extractelement <4 x i32> %a, i32 1\n  %e3 = extractelement <4 x i32> %a, i32 3\n  %cmp1 = icmp sgt i32 %e1, -8\n  %cmp3 = icmp sgt i32 %e3, 42\n  %r = ashr i1 %cmp3, %cmp1\n  ret i1 %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[VectorCombine] miscompilation",
+    "body": "Alive2 report: https://alive2.llvm.org/ce/z/YwSTI4\r\n\r\n```llvm\r\n----------------------------------------\r\ndefine i1 @icmp_xor_v4i32.2(<4 x i32> %a) {\r\n#0:\r\n  %e1 = extractelement <4 x i32> %a, i32 3\r\n  %e2 = extractelement <4 x i32> %a, i32 1\r\n  %cmp1 = icmp sgt i32 %e1, 42\r\n  %cmp2 = icmp sgt i32 %e2, 4294967288\r\n  %#1 = ashr i1 %cmp1, %cmp2\r\n  ret i1 %#1\r\n}\r\n=>\r\ndefine i1 @icmp_xor_v4i32.2(<4 x i32> %a) {\r\n#0:\r\n  %#1 = icmp sgt <4 x i32> %a, { poison, 4294967288, poison, 42 }\r\n  %shift = shufflevector <4 x i1> %#1, <4 x i1> poison, 4294967295, 3, 4294967295, 4294967295\r\n  %#2 = ashr <4 x i1> %#1, %shift\r\n  %#3 = extractelement <4 x i1> %#2, i64 1\r\n  ret i1 %#3\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nExample:\r\n<4 x i32> %a = < #x00000000 (0), #xfffffff8 (4294967288, -8), #x00000000 (0), #x0000002b (43) >\r\n\r\nSource:\r\ni32 %e1 = #x0000002b (43)\r\ni32 %e2 = #xfffffff8 (4294967288, -8)\r\ni1 %cmp1 = #x1 (1)\r\ni1 %cmp2 = #x0 (0)\r\ni1 %#1 = #x1 (1)\r\n\r\nTarget:\r\n<4 x i1> %#1 = < poison, #x0 (0), poison, #x1 (1) >\r\n<4 x i1> %shift = < poison, #x1 (1), poison, poison >\r\n<4 x i1> %#2 = < poison, poison, poison, poison >\r\ni1 %#3 = poison\r\nSource value: #x1 (1)\r\nTarget value: poison\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```",
+    "author": "bongjunj",
+    "labels": [
+      "miscompilation"
+    ],
+    "comments": [
+      {
+        "author": "RKSimon",
+        "body": "It looks like the ashr operands have been commuted in the fold - will take a look later today"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "Cannot find a good commit"
+}

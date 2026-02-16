@@ -1,0 +1,120 @@
+{
+  "bug_id": "118725",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/118725",
+  "base_commit": "e3352904309a539eddcf3ddd9fb11ca2aef29d65",
+  "knowledge_cutoff": "2024-12-05T01:14:53Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/GlobalOpt"
+  ],
+  "hints": {
+    "fix_commit": "5013c81b781eb95af8e429956d63c8f9c16a4647",
+    "components": [
+      "Evaluator"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Transforms/Utils/Evaluator.h": [
+        [
+          125,
+          133
+        ]
+      ],
+      "llvm/lib/Transforms/Utils/Evaluator.cpp": [
+        [
+          253,
+          292
+        ],
+        [
+          520,
+          528
+        ],
+        [
+          544,
+          553
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/include/llvm/Transforms/Utils/Evaluator.h": [
+        "setVal"
+      ],
+      "llvm/lib/Transforms/Utils/Evaluator.cpp": [
+        "Evaluator::EvaluateBlock",
+        "Evaluator::castCallResultIfNeeded",
+        "Evaluator::getFormalParams"
+      ]
+    }
+  },
+  "patch": "commit 5013c81b781eb95af8e429956d63c8f9c16a4647\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Thu Dec 12 10:44:52 2024 +0100\n\n    [GlobalOpt][Evaluator] Don't evaluate calls with signature mismatch (#119548)\n    \n    The global ctor evaluator tries to evalute function calls where the call\n    function type and function type do not match, by performing bitcasts.\n    This currently causes a crash when calling a void function with non-void\n    return type.\n    \n    I've opted to remove this functionality entirely rather than fixing this\n    specific case. With opaque pointers, there shouldn't be a legitimate use\n    case for this anymore, as we don't need to look through pointer type\n    casts. Doing other bitcasts is very iffy because it ignores ABI\n    considerations. We should at least leave adjusting the signatures to\n    make them line up to InstCombine (which also does some iffy things, but\n    is at least somewhat more constrained).\n    \n    Fixes https://github.com/llvm/llvm-project/issues/118725.\n\ndiff --git a/llvm/include/llvm/Transforms/Utils/Evaluator.h b/llvm/include/llvm/Transforms/Utils/Evaluator.h\nindex 5d53773b5d6b..118037625421 100644\n--- a/llvm/include/llvm/Transforms/Utils/Evaluator.h\n+++ b/llvm/include/llvm/Transforms/Utils/Evaluator.h\n@@ -125,9 +125,6 @@ private:\n     ValueStack.back()[V] = C;\n   }\n \n-  /// Casts call result to a type of bitcast call expression\n-  Constant *castCallResultIfNeeded(Type *ReturnType, Constant *RV);\n-\n   /// Given call site return callee and list of its formal arguments\n   Function *getCalleeWithFormalArgs(CallBase &CB,\n                                     SmallVectorImpl<Constant *> &Formals);\ndiff --git a/llvm/lib/Transforms/Utils/Evaluator.cpp b/llvm/lib/Transforms/Utils/Evaluator.cpp\nindex cf1a8b4af112..2af447aadce2 100644\n--- a/llvm/lib/Transforms/Utils/Evaluator.cpp\n+++ b/llvm/lib/Transforms/Utils/Evaluator.cpp\n@@ -253,40 +253,17 @@ Evaluator::getCalleeWithFormalArgs(CallBase &CB,\n \n bool Evaluator::getFormalParams(CallBase &CB, Function *F,\n                                 SmallVectorImpl<Constant *> &Formals) {\n-  if (!F)\n-    return false;\n-\n   auto *FTy = F->getFunctionType();\n-  if (FTy->getNumParams() > CB.arg_size()) {\n-    LLVM_DEBUG(dbgs() << \"Too few arguments for function.\\n\");\n+  if (FTy != CB.getFunctionType()) {\n+    LLVM_DEBUG(dbgs() << \"Signature mismatch.\\n\");\n     return false;\n   }\n \n-  auto ArgI = CB.arg_begin();\n-  for (Type *PTy : FTy->params()) {\n-    auto *ArgC = ConstantFoldLoadThroughBitcast(getVal(*ArgI), PTy, DL);\n-    if (!ArgC) {\n-      LLVM_DEBUG(dbgs() << \"Can not convert function argument.\\n\");\n-      return false;\n-    }\n-    Formals.push_back(ArgC);\n-    ++ArgI;\n-  }\n+  for (Value *Arg : CB.args())\n+    Formals.push_back(getVal(Arg));\n   return true;\n }\n \n-/// If call expression contains bitcast then we may need to cast\n-/// evaluated return value to a type of the call expression.\n-Constant *Evaluator::castCallResultIfNeeded(Type *ReturnType, Constant *RV) {\n-  if (!RV || RV->getType() == ReturnType)\n-    return RV;\n-\n-  RV = ConstantFoldLoadThroughBitcast(RV, ReturnType, DL);\n-  if (!RV)\n-    LLVM_DEBUG(dbgs() << \"Failed to fold bitcast call expr\\n\");\n-  return RV;\n-}\n-\n /// Evaluate all instructions in block BB, returning true if successful, false\n /// if we can't evaluate it.  NewBB returns the next BB that control flows into,\n /// or null upon return. StrippedPointerCastsForAliasAnalysis is set to true if\n@@ -520,9 +497,7 @@ bool Evaluator::EvaluateBlock(BasicBlock::iterator CurInst, BasicBlock *&NextBB,\n         if (Callee->isDeclaration()) {\n           // If this is a function we can constant fold, do it.\n           if (Constant *C = ConstantFoldCall(&CB, Callee, Formals, TLI)) {\n-            InstResult = castCallResultIfNeeded(CB.getType(), C);\n-            if (!InstResult)\n-              return false;\n+            InstResult = C;\n             LLVM_DEBUG(dbgs() << \"Constant folded function call. Result: \"\n                               << *InstResult << \"\\n\");\n           } else {\n@@ -544,10 +519,7 @@ bool Evaluator::EvaluateBlock(BasicBlock::iterator CurInst, BasicBlock *&NextBB,\n             return false;\n           }\n           ValueStack.pop_back();\n-          InstResult = castCallResultIfNeeded(CB.getType(), RetVal);\n-          if (RetVal && !InstResult)\n-            return false;\n-\n+          InstResult = RetVal;\n           if (InstResult) {\n             LLVM_DEBUG(dbgs() << \"Successfully evaluated function. Result: \"\n                               << *InstResult << \"\\n\\n\");\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/GlobalOpt/evaluate-ret-void-mismatch.ll",
+      "commands": [
+        "opt -S -passes=globalopt < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\n; Don't evaluate call with return value type mismatch.\n\n@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @__cxx_global_var_init, ptr null }]\n\ndefine void @__cxa_guard_acquire() {\n;\nentry:\n  ret void\n}\n\ndefine void @__cxx_global_var_init() {\n;\n  %res = call i32 @__cxa_guard_acquire()\n  %tobool.not = icmp eq i32 %res, 0\n  ret void\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "SIGSEGV with -flto",
+    "body": "Static linking with -flto on Arch linux with clang 18.1.8\n\nNot able to get a minimal repro at the moment. Other possibly less common options\n\n      \"-std=c++20\",\n      \"-nostdlib\",\n      \"-nostartfiles\",\n      \"-fno-exceptions\",\n      \"-fno-rtti\",\n\nProgram terminated with signal SIGSEGV, Segmentation fault.\n#0  0x00007ee06170e69c in llvm::ConstantFoldConstant(llvm::Constant const*, llvm::DataLayout const&, llvm::TargetLibraryInfo const*) () from /usr/lib/libLLVM.so.18.1\n#0  0x00007ee06170e69c in llvm::ConstantFoldConstant(llvm::Constant const*, llvm::DataLayout const&, llvm::TargetLibraryInfo const*) () from /usr/lib/libLLVM.so.18.1\n#1  0x00007ee060abea1a in llvm::Evaluator::EvaluateBlock(llvm::ilist_iterator_w_bits<llvm::ilist_detail::node_options<llvm::Instruction, false, false, void, true>, false, false>, llvm::BasicBlock*&, bool&) () from /usr/lib/libLLVM.so.18.1\n#2  0x00007ee060ac14e4 in llvm::Evaluator::EvaluateFunction(llvm::Function*, llvm::Constant*&, llvm::SmallVectorImpl<llvm::Constant*> const&) () from /usr/lib/libLLVM.so.18.1\n#3  0x00007ee061307930 in ?? () from /usr/lib/libLLVM.so.18.1\n#4  0x00007ee061308634 in ?? () from /usr/lib/libLLVM.so.18.1\n#5  0x00007ee060aa7649 in llvm::optimizeGlobalCtorsList(llvm::Module&, llvm::function_ref<bool (unsigned int, llvm::Function*)>) () from /usr/lib/libLLVM.so.18.1\n#6  0x00007ee0613135f9 in llvm::GlobalOptPass::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) () from /usr/lib/libLLVM.so.18.1\n#7  0x00007ee06411d177 in ?? () from /usr/lib/libLLVM.so.18.1\n#8  0x00007ee05fbd767e in llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) () from /usr/lib/libLLVM.so.18.1\n#9  0x00007ee061a57995 in ?? () from /usr/lib/libLLVM.so.18.1\n#10 0x00007ee061a591ff in llvm::lto::opt(llvm::lto::Config const&, llvm::TargetMachine*, unsigned int, llvm::Module&, bool, llvm::ModuleSummaryIndex*, llvm::ModuleSummaryIndex const*, std::vector<unsigned char, std::allocator<unsigned char> > const&) () from /usr/lib/libLLVM.so.18.1\n#11 0x00007ee061a5a582 in llvm::lto::backend(llvm::lto::Config const&, std::function<llvm::Expected<std::unique_ptr<llvm::CachedFileStream, std::default_delete<llvm::CachedFileStream> > > (unsigned int, llvm::Twine const&)>, unsigned int, llvm::Module&, llvm::ModuleSummaryIndex&) () from /usr/lib/libLLVM.so.18.1\n#12 0x00007ee061a4ed49 in llvm::lto::LTO::runRegularLTO(std::function<llvm::Expected<std::unique_ptr<llvm::CachedFileStream, std::default_delete<llvm::CachedFileStream> > > (unsigned int, llvm::Twine const&)>) () from /usr/lib/libLLVM.so.18.1\n#13 0x00007ee061a4f241 in llvm::lto::LTO::run(std::function<llvm::Expected<std::unique_ptr<llvm::CachedFileStream, std::default_delete<llvm::CachedFileStream> > > (unsigned int, llvm::Twine const&)>, std::function<llvm::Expected<std::function<llvm::Expected<std::unique_ptr<llvm::CachedFileStream, std::default_delete<llvm::CachedFileStream> > > (unsigned int, llvm::Twine const&)> > (unsigned int, llvm::StringRef, llvm::Twine const&)>) () from /usr/lib/libLLVM.so.18.1\n#14 0x00007ee0678ce067 in ?? () from /usr/bin/../lib/LLVMgold.so\n#15 0x00007ee0678cfd12 in ?? () from /usr/bin/../lib/LLVMgold.so\n#16 0x000056f827567837 in ?? ()\n#17 0x000056f82756f75f in ?? ()\n#18 0x00007ee067a00e08 in ?? () from /usr/lib/libc.so.6\n#19 0x00007ee067a00ecc in __libc_start_main () from /usr/lib/libc.so.6\n#20 0x000056f82756ea65 in ?? ()\n",
+    "author": "illiminable",
+    "labels": [
+      "incomplete",
+      "crash",
+      "LTO"
+    ],
+    "comments": [
+      {
+        "author": "EugeneZelenko",
+        "body": "Could you please try 19 or `main` branch?"
+      },
+      {
+        "author": "illiminable",
+        "body": "I don't think 19 is packaged for arch yet. I'll see if I can build trunk later in the week.\n\nIs it possible to just to disable this optimizeGlobalCtorsList or all of globalopt. I looked through --hidden-help and could not see an option like this."
+      },
+      {
+        "author": "ms178",
+        "body": "@illiminable While it is not packaged by Arch yet, you could try the linked toolchain instead and use it via an environment variable which points llvm to the new path: https://mirrors.edge.kernel.org/pub/tools/llvm/"
+      },
+      {
+        "author": "illiminable",
+        "body": "OK thanks I'll try. FWIW this is the approximate code pattern. And presumably its trying to optimize the fact that there are N unique symbols that \"register\" assigns true to but then never get used.\n\n```\n// Header File\nclass Functor {\n   virtual void execImpl() = 0;\n   void exec() { execImpl(); }\n };\n \n class Info {\n   Functor* fn = nullptr;\n };\n \n class Registry {\n   array<Info, 1024> fns;\n   int count = 0;\n   \n   void register(Info&& f) {\n     fns[count++] = f;\n   }\n   \n   void exec() {\n      for i in 0..count { fns[i].fn->exec(); }\n   }\n };\n \n inline Registry reg;\n \n inline bool register(Functor* fn) {\n   reg.register({.fn = fn});\n   return true;\n }\n \n \n // REPEAT approx 10 each copies of the below in 10 different .cpp TU's\n class _uniquesymbol_ : public Functor {\n   void execImpl() override;\n };\n \n // Instance of the derived functor class\n _uniquesymbol_ _uniquesymbol__instance;\n \n // _uniquesymbol__flag is always true and never used. Theres probably a better\n // way to do this?\n const bool _uniquesymbol__flag = register(&_uniquesymbol__instance);\n \n void _uniquesymbol_::execImpl() {\n   // do stuff\n }\n \n // END REPEAT\n \n \n // Usage...\n reg.exec();\n``` \n"
+      },
+      {
+        "author": "illiminable",
+        "body": "@ms178 The toolchain didn't work because it doesn't contain LLVMgold.so\n\nI was able to build from the 19.1.5 branch in debug and can repro. It's only on one target. This is the assert output\n\nld.gold: /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/Support/Casting.h:109: static bool llvm::isa_impl_cl<To, const From*>::doit(const From*) [with To = llvm::ConstantVector; From = llvm::Constant]: Assertion `Val && \"isa<> used on a null pointer\"' failed.\n\nAnd a better symbolized stack\n\n#0  0x00007c11cae473f4 in ?? () from /usr/lib/libc.so.6\n#0  0x00007c11cae473f4 in ?? () from /usr/lib/libc.so.6\n#1  0x00007c11cadee120 in raise () from /usr/lib/libc.so.6\n#2  0x00007c11cadd54c3 in abort () from /usr/lib/libc.so.6\n#3  0x00007c11cadd53df in ?? () from /usr/lib/libc.so.6\n#4  0x00007c11cade6177 in __assert_fail () from /usr/lib/libc.so.6\n#5  0x00007c11c329c245 in llvm::isa_impl_cl<llvm::ConstantVector, llvm::Constant const*>::doit (Val=0x0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/Support/Casting.h:109\n#6  0x00007c11c329bd99 in llvm::isa_impl_wrap<llvm::ConstantVector, llvm::Constant const*, llvm::Constant const*>::doit (Val=@0x7ffd009f71a0: 0x0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/Support/Casting.h:137\n#7  0x00007c11c329b45b in llvm::isa_impl_wrap<llvm::ConstantVector, llvm::Constant const* const, llvm::Constant const*>::doit (Val=@0x7ffd009f71f0: 0x0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/Support/Casting.h:129\n#8  0x00007c11c329a6b6 in llvm::CastIsPossible<llvm::ConstantVector, llvm::Constant const*, void>::isPossible (f=@0x7ffd009f71f0: 0x0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/Support/Casting.h:257\n#9  0x00007c11c5ccd903 in llvm::CastInfo<llvm::ConstantVector, llvm::Constant const* const, void>::isPossible (f=@0x7ffd009f7248: 0x0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/Support/Casting.h:509\n#10 0x00007c11c5ccd3d8 in llvm::isa<llvm::ConstantVector, llvm::Constant const*> (Val=@0x7ffd009f7248: 0x0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/Support/Casting.h:549\n#11 0x00007c11c5f8be6e in (anonymous namespace)::ConstantFoldConstantImpl (C=0x0, DL=..., TLI=0x5d4a86076c38, FoldedOps=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Analysis/ConstantFolding.cpp:1078\n#12 0x00007c11c5f8c5d3 in llvm::ConstantFoldConstant (C=0x0, DL=..., TLI=0x5d4a86076c38) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Analysis/ConstantFolding.cpp:1163\n#13 0x00007c11c5cb7bdc in llvm::Evaluator::EvaluateBlock (this=0x7ffd009f7930, CurInst=..., NextBB=@0x7ffd009f76e0: 0x0, StrippedPointerCastsForAliasAnalysis=@0x7ffd009f76d0: false) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Transforms/Utils/Evaluator.cpp:610\n#14 0x00007c11c5cb7fd8 in llvm::Evaluator::EvaluateFunction (this=0x7ffd009f7930, F=0x5d4a85ccc618, RetVal=@0x7ffd009f78a8: 0x7ffd009f7ae0, ActualArgs=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Transforms/Utils/Evaluator.cpp:660\n#15 0x00007c11c4f410a8 in EvaluateStaticConstructor (F=0x5d4a85ccc618, DL=..., TLI=0x5d4a86076c38) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Transforms/IPO/GlobalOpt.cpp:2080\n#16 0x00007c11c4f42bf7 in operator() (__closure=0x7ffd009f7e90, Priority=65535, F=0x5d4a85ccc618) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Transforms/IPO/GlobalOpt.cpp:2524\n#17 0x00007c11c4f43f3b in llvm::function_ref<bool(unsigned int, llvm::Function*)>::callback_fn<optimizeGlobalsInModule(llvm::Module&, const llvm::DataLayout&, llvm::function_ref<llvm::TargetLibraryInfo&(llvm::Function&)>, llvm::function_ref<llvm::TargetTransformInfo&(llvm::Function&)>, llvm::function_ref<llvm::BlockFrequencyInfo&(llvm::Function&)>, llvm::function_ref<llvm::DominatorTree&(llvm::Function&)>, llvm::function_ref<void(llvm::Function&)>, llvm::function_ref<void(llvm::Function&)>)::<lambda(uint32_t, llvm::Function*)> >(intptr_t, unsigned int, llvm::Function *) (callable=140724613906064, params#0=65535, params#1=0x5d4a85ccc618) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/ADT/STLFunctionalExtras.h:45\n#18 0x00007c11c5c95103 in llvm::function_ref<bool(unsigned int, llvm::Function*)>::operator() (this=0x7ffd009f7cc0, params#0=65535, params#1=0x5d4a85ccc618) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/ADT/STLFunctionalExtras.h:68\n#19 0x00007c11c5c92754 in llvm::optimizeGlobalCtorsList (M=..., ShouldRemove=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Transforms/Utils/CtorUtils.cpp:138\n#20 0x00007c11c4f4309c in optimizeGlobalsInModule(llvm::Module &, const llvm::DataLayout &, llvm::function_ref<llvm::TargetLibraryInfo&(llvm::Function&)>, llvm::function_ref<llvm::TargetTransformInfo&(llvm::Function&)>, llvm::function_ref<llvm::BlockFrequencyInfo&(llvm::Function&)>, llvm::function_ref<llvm::DominatorTree&(llvm::Function&)>, llvm::function_ref<void(llvm::Function&)>, llvm::function_ref<void(llvm::Function&)>) (M=..., DL=..., GetTLI=..., GetTTI=..., GetBFI=..., LookupDomTree=..., ChangedCFGCallback=..., DeleteFnCallback=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Transforms/IPO/GlobalOpt.cpp:2520\n#21 0x00007c11c4f435e0 in llvm::GlobalOptPass::run (this=0x5d4a85c13138, M=..., AM=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/Transforms/IPO/GlobalOpt.cpp:2583\n#22 0x00007c11c4366477 in llvm::detail::PassModel<llvm::Module, llvm::GlobalOptPass, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (this=0x5d4a85c13130, IR=..., AM=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/IR/PassManagerInternal.h:90\n#23 0x00007c11c6e2f349 in llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (this=0x7ffd009f8300, IR=..., AM=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/include/llvm/IR/PassManagerImpl.h:81\n#24 0x00007c11c3934968 in runNewPMPasses (Conf=..., Mod=..., TM=0x5d4a85edf0b0, OptLevel=3, IsThinLTO=false, ExportSummary=0x5d4a85bc6d18, ImportSummary=0x0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/LTO/LTOBackend.cpp:338\n#25 0x00007c11c3934b94 in llvm::lto::opt (Conf=..., TM=0x5d4a85edf0b0, Task=0, Mod=..., IsThinLTO=false, ExportSummary=0x5d4a85bc6d18, ImportSummary=0x0, CmdArgs=std::vector of length 0, capacity 0) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/LTO/LTOBackend.cpp:363\n#26 0x00007c11c3936054 in llvm::lto::backend (C=..., AddStream=..., ParallelCodeGenParallelismLevel=1, Mod=..., CombinedIndex=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/LTO/LTOBackend.cpp:517\n#27 0x00007c11c38e855d in llvm::lto::LTO::runRegularLTO (this=0x5d4a85bc6710, AddStream=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/LTO/LTO.cpp:1354\n#28 0x00007c11c38e746b in llvm::lto::LTO::run (this=0x5d4a85bc6710, AddStream=..., Cache=...) at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/lib/LTO/LTO.cpp:1186\n#29 0x00007c11c3255536 in runLTO () at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/tools/gold/gold-plugin.cpp:1111\n#30 0x00007c11c3255a0d in allSymbolsReadHook () at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/tools/gold/gold-plugin.cpp:1148\n#31 0x00007c11c3255c19 in all_symbols_read_hook () at /mnt/local/src/third_party/github/llvm/llvm-project/llvm/tools/gold/gold-plugin.cpp:1173\n#32 0x00005d4a6c4d9154 in ?? ()\n#33 0x00005d4a6c5138d0 in ?? ()\n#34 0x00005d4a6c3fc49a in ?? ()\n#35 0x00007c11cadd6e08 in ?? () from /usr/lib/libc.so.6\n#36 0x00007c11cadd6ecc in __libc_start_main () from /usr/lib/libc.so.6\n#37 0x00005d4a6c3ff985 in ?? ()"
+      },
+      {
+        "author": "ms178",
+        "body": "@illiminable Thanks for letting me know. Unfortunately I am not a developer and cannot help you to debug this problem further."
+      },
+      {
+        "author": "illiminable",
+        "body": "I debugged a little bit, but I don't fully understand this code.\n\nIn EvaluateBlock the issue is that after the various branches the code falls out to this block at 609 with InstResult still null. All the other branches usually check InstResult and return false. ConstantFoldConstant will assert or crash if the  first parameter is null in the call from 610. I also tried just guarding this conditino with !InstResult but that doesn't seem right since it triggers another assert later \"Assertion `R && \"Reference to an uncomputed value!\"'.\n\nhttps://github.com/llvm/llvm-project/blob/llvmorg-19.1.5/llvm/lib/Transforms/Utils/Evaluator.cpp#L610\n\nThe bug only only occurs when the code hits the branch on 556. Strangely the debug log here says both branches of the if are success. I don't know if it's a copy paste error or if maybe the code should just return true after 558, but given the rest of the code this doesn't seem right.\n\nBut returning false in the line 556 branch seems to fix the crash and the resulting program seems to work fine.\n\nhttps://github.com/llvm/llvm-project/blob/llvmorg-19.1.5/llvm/lib/Transforms/Utils/Evaluator.cpp#L556\n\nSomeone who understands the code better should evaluate though.\n"
+      },
+      {
+        "author": "illiminable",
+        "body": "I used llvm-reduce to reduce the bitcode and when i looked at what was left it was basically __cxa_guard_acquire and I realized that while bootstrapping i defined it with the wrong return type. So since I violated the ABI I guess my fault.\n\nNot sure if there is still an underlying issue here someone wants to fix. ie. would be better to error or ignore than crash. But it seems pretty unlikely someone else will hit at least this specific cause of the problem.\n\nCan probably close if this corner case is not important."
+      },
+      {
+        "author": "nikic",
+        "body": "Could you please share the reduced bitcode? (Or IR after running it through llvm-dis.)"
+      },
+      {
+        "author": "illiminable",
+        "body": "[reduced.zip](https://github.com/user-attachments/files/18043521/reduced.zip)\n\nThis is the reduced.bc\n\n"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "bisect": "Cannot find a good commit"
+}

@@ -1,0 +1,84 @@
+{
+  "bug_id": "159979",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/159979",
+  "base_commit": "fa57074d146925a303263905af415cc78f58f353",
+  "knowledge_cutoff": "2025-09-21T11:07:53Z",
+  "lit_test_dir": [
+    "llvm/test/Analysis/DependenceAnalysis"
+  ],
+  "hints": {
+    "fix_commit": "a8057ff12956b7dd6dec44f9610c446c828c4af8",
+    "components": [
+      "DependenceAnalysis"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/DependenceAnalysis.cpp": [
+        [
+          1180,
+          1211
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/DependenceAnalysis.cpp": [
+        "DependenceInfo::isKnownLessThan"
+      ]
+    }
+  },
+  "patch": "commit a8057ff12956b7dd6dec44f9610c446c828c4af8\nAuthor: Sjoerd Meijer <smeijer@nvidia.com>\nDate:   Tue Oct 14 09:16:28 2025 +0100\n\n    [DA] getBackedgeTakenCount in isKnownLessThan can return CouldNotCompute (#162495)\n    \n    Bail out when the backedge taken count is a CouldNotCompute SCEV in\n    function isKnownLessThan; we cannot and do not want to query things like\n    its Type.\n    \n    Fixes #159979\n\ndiff --git a/llvm/lib/Analysis/DependenceAnalysis.cpp b/llvm/lib/Analysis/DependenceAnalysis.cpp\nindex 8d20b0e10305..805b6820e1e1 100644\n--- a/llvm/lib/Analysis/DependenceAnalysis.cpp\n+++ b/llvm/lib/Analysis/DependenceAnalysis.cpp\n@@ -1180,32 +1180,41 @@ bool DependenceInfo::isKnownLessThan(const SCEV *S, const SCEV *Size) const {\n   S = SE->getTruncateOrZeroExtend(S, MaxType);\n   Size = SE->getTruncateOrZeroExtend(Size, MaxType);\n \n-  // Special check for addrecs using BE taken count\n-  if (const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(S))\n-    if (AddRec->isAffine() && AddRec->hasNoSignedWrap()) {\n-      const SCEV *BECount = SE->getBackedgeTakenCount(AddRec->getLoop());\n-      const SCEV *Start = AddRec->getStart();\n-      const SCEV *Step = AddRec->getStepRecurrence(*SE);\n-      const SCEV *End = AddRec->evaluateAtIteration(BECount, *SE);\n-      const SCEV *Diff0 = SE->getMinusSCEV(Start, Size);\n-      const SCEV *Diff1 = SE->getMinusSCEV(End, Size);\n-\n-      // If the value of Step is non-negative and the AddRec is non-wrap, it\n-      // reaches its maximum at the last iteration. So it's enouth to check\n-      // whether End - Size is negative.\n-      if (SE->isKnownNonNegative(Step) && SE->isKnownNegative(Diff1))\n-        return true;\n+  auto CheckAddRecBECount = [&]() {\n+    const SCEVAddRecExpr *AddRec = dyn_cast<SCEVAddRecExpr>(S);\n+    if (!AddRec || !AddRec->isAffine() || !AddRec->hasNoSignedWrap())\n+      return false;\n+    const SCEV *BECount = collectUpperBound(AddRec->getLoop(), MaxType);\n+    // If the BTC cannot be computed, check the base case for S.\n+    if (!BECount || isa<SCEVCouldNotCompute>(BECount))\n+      return false;\n+    const SCEV *Start = AddRec->getStart();\n+    const SCEV *Step = AddRec->getStepRecurrence(*SE);\n+    const SCEV *End = AddRec->evaluateAtIteration(BECount, *SE);\n+    const SCEV *Diff0 = SE->getMinusSCEV(Start, Size);\n+    const SCEV *Diff1 = SE->getMinusSCEV(End, Size);\n+\n+    // If the value of Step is non-negative and the AddRec is non-wrap, it\n+    // reaches its maximum at the last iteration. So it's enouth to check\n+    // whether End - Size is negative.\n+    if (SE->isKnownNonNegative(Step) && SE->isKnownNegative(Diff1))\n+      return true;\n \n-      // If the value of Step is non-positive and the AddRec is non-wrap, the\n-      // initial value is its maximum.\n-      if (SE->isKnownNonPositive(Step) && SE->isKnownNegative(Diff0))\n-        return true;\n+    // If the value of Step is non-positive and the AddRec is non-wrap, the\n+    // initial value is its maximum.\n+    if (SE->isKnownNonPositive(Step) && SE->isKnownNegative(Diff0))\n+      return true;\n \n-      // Even if we don't know the sign of Step, either Start or End must be\n-      // the maximum value of the AddRec since it is non-wrap.\n-      if (SE->isKnownNegative(Diff0) && SE->isKnownNegative(Diff1))\n-        return true;\n-    }\n+    // Even if we don't know the sign of Step, either Start or End must be\n+    // the maximum value of the AddRec since it is non-wrap.\n+    if (SE->isKnownNegative(Diff0) && SE->isKnownNegative(Diff1))\n+      return true;\n+\n+    return false;\n+  };\n+\n+  if (CheckAddRecBECount())\n+    return true;\n \n   // Check using normal isKnownNegative\n   const SCEV *LimitedBound = SE->getMinusSCEV(S, Size);\n",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/DependenceAnalysis/becount-couldnotcompute.ll",
+      "commands": [
+        "opt < %s -disable-output \"-passes=print<da>\" -aa-pipeline=basic-aa 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\n; Test for function isKnownLessThan that calculates a back-edge taken count,\n; which can return a CouldNotCompute SCEV.\n\ndefine void @test(i64 %conv, ptr %a) {\n;\nentry:\n  %sub = add i64 %conv, 1\n  br label %loop\n\nloop:\n  %i = phi i64 [ %add26, %loop ], [ 0, %entry ]\n  %arrayidx12 = getelementptr i32, ptr %a, i64 %i\n  %ld = load i32, ptr %arrayidx12, align 4\n  %add26 = add nsw i64 %sub, %i\n  br label %loop\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[DA] Crash in ScalarEvolution::getTruncateOrZeroExtend",
+    "body": "This input:\n\n```\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\"\ntarget triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @_Z1dbibPA2_i(i64 %conv, ptr %a) {\nentry:\n  %sub = add i64 %conv, 1\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.cond, %entry\n  %i.0 = phi i64 [ %add26, %for.cond ], [ 0, %entry ]\n  %arrayidx12 = getelementptr i32, ptr %a, i64 %i.0\n  %.pre.pre.pre = load i32, ptr %arrayidx12, align 4\n  %add26 = add nsw i64 %sub, %i.0\n  br label %for.cond\n}\n```\n\nCompiled with: \n\n```\nopt -disable-output \"-passes=print<da>\" -aa-pipeline=basic-aa\n```\n\nResults in\n\n```\n UNREACHABLE executed at llvm-project/llvm/lib/Analysis/ScalarEvolution.cpp:412!\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.\nStack dump:\n0.      Program arguments: bin/opt -disable-output -passes=print<da> -aa-pipeline=basic-aa reduced.ll\n1.      Running pass \"function(print<da>)\" on module \"reduced.ll\"\n2.      Running pass \"print<da>\" on function \"_Z1dbibPA2_i\"\n #0 0x0000aaaaaecdcf4c llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) llvm-project/llvm/lib/Support/Unix/Signals.inc:834:11\n #1 0x0000aaaaaecdd46c PrintStackTraceSignalHandler(void*) llvm-project/llvm/lib/Support/Unix/Signals.inc:917:1\n #2 0x0000aaaaaecdb504 llvm::sys::RunSignalHandlers() llvm-project/llvm/lib/Support/Signals.cpp:104:5\n #3 0x0000aaaaaecddc34 SignalHandler(int, siginfo_t*, void*) llvm-project/llvm/lib/Support/Unix/Signals.inc:426:38\n #4 0x0000fffff7fb09d0 (linux-vdso.so.1+0x9d0)\n #5 0x0000fffff7a1f200 __pthread_kill_implementation ./nptl/pthread_kill.c:44:76\n #6 0x0000fffff79da67c gsignal ./signal/../sysdeps/posix/raise.c:27:6\n #7 0x0000fffff79c7130 abort ./stdlib/abort.c:81:7\n #8 0x0000aaaaaecd8f84 llvm::install_out_of_memory_new_handler() llvm-project/llvm/lib/Support/ErrorHandling.cpp:225:0\n #9 0x0000aaaaaf627654 llvm::SCEV::getType() const llvm-project/llvm/lib/Analysis/ScalarEvolution.cpp:414:3\n#10 0x0000aaaaaf62904c llvm::ScalarEvolution::getTruncateOrZeroExtend(llvm::SCEV const*, llvm::Type*, unsigned int) llvm-project/llvm/lib/Analysis/ScalarEvolution.cpp:4756:9\n#11 0x0000aaaaaf628794 BinomialCoefficient(llvm::SCEV const*, unsigned int, llvm::ScalarEvolution&, llvm::Type*) llvm-project/llvm/lib/Analysis/ScalarEvolution.cpp:872:5\n#12 0x0000aaaaaf628698 llvm::SCEVAddRecExpr::evaluateAtIteration(llvm::ArrayRef<llvm::SCEV const*>, llvm::SCEV const*, llvm::ScalarEvolution&) llvm-project/llvm/lib/Analysis/ScalarEvolution.cpp:994:25\n#13 0x0000aaaaaf6285b4 llvm::SCEVAddRecExpr::evaluateAtIteration(llvm::SCEV const*, llvm::ScalarEvolution&) const llvm-project/llvm/lib/Analysis/ScalarEvolution.cpp:982:3\n#14 0x0000aaaab039b164 llvm::DependenceInfo::isKnownLessThan(llvm::SCEV const*, llvm::SCEV const*) const llvm-project/llvm/lib/Analysis/DependenceAnalysis.cpp:1189:33\n#15 0x0000aaaab03a7ce0 llvm::DependenceInfo::tryDelinearizeParametricSize(llvm::Instruction*, llvm::Instruction*, llvm::SCEV const*, llvm::SCEV const*, llvm::SmallVectorImpl<llvm::SCEV const*>&, llvm::SmallVectorImpl<llvm::SCEV const*>&) llvm-project/llvm/lib/Analysis/DependenceAnalysis.cpp:3639:18\n#16 0x0000aaaab03a7050 llvm::DependenceInfo::tryDelinearize(llvm::Instruction*, llvm::Instruction*, llvm::SmallVectorImpl<llvm::DependenceInfo::Subscript>&) llvm-project/llvm/lib/Analysis/DependenceAnalysis.cpp:3457:7\n#17 0x0000aaaab03a8dac llvm::DependenceInfo::depends(llvm::Instruction*, llvm::Instruction*, bool) llvm-project/llvm/lib/Analysis/DependenceAnalysis.cpp:3819:9\n#18 0x0000aaaab039773c dumpExampleDependence(llvm::raw_ostream&, llvm::DependenceInfo*, llvm::ScalarEvolution&, bool) llvm-project/llvm/lib/Analysis/DependenceAnalysis.cpp:195:28\n```\n",
+    "author": "sjoerdmeijer",
+    "labels": [
+      "crash",
+      "llvm:analysis"
+    ],
+    "comments": [
+      {
+        "author": "sjoerdmeijer",
+        "body": "CC: @nikic , @kasuga-fj "
+      },
+      {
+        "author": "kasuga-fj",
+        "body": "Seems the issue in DA. I think removing the following part and insert appropriate early exit could fix the problem. \n\nhttps://github.com/llvm/llvm-project/blob/094d313fe4f949351670449172a43a345694ede0/llvm/lib/Analysis/DependenceAnalysis.cpp#L1174-L1181\n\n(Calling `getTruncateOrZeroExtend` here seems incorrect to begin with, as it may alter the value...)"
+      },
+      {
+        "author": "sjoerdmeijer",
+        "body": "Thanks for the analysis. I was going to ask if you would like to pick this up, or if I shall do that. But given your RFC about NewDA, my guess is that I can have a look, is that right? :-) "
+      },
+      {
+        "author": "kasuga-fj",
+        "body": "Yes, at least for a while, I'm planning to step back from DA development. Feel free to send me review requests, though."
+      },
+      {
+        "author": "sjoerdmeijer",
+        "body": "Ok, thanks, will do."
+      },
+      {
+        "author": "sjoerdmeijer",
+        "body": "The C reproducer in the original description, isn't triggering the issue anymore, something is behaving differently, but this IR reproducer is triggering the same issue: https://godbolt.org/z/4abqrW1Wz\n\nI will fix the description."
+      }
+    ]
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "verified": true,
+  "bisect": "05dd957cda663273ae0e5739656ffe701404f37c"
+}

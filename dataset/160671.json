@@ -1,0 +1,64 @@
+{
+  "bug_id": "160671",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/160671",
+  "base_commit": "d77d3a78472410128f6d0b9f71bd36fb26b72feb",
+  "knowledge_cutoff": "2025-09-25T09:27:43Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "57947ace14ebfadba46a99aa80589e021c757037",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          17519,
+          17525
+        ],
+        [
+          19119,
+          19125
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::getLastInstructionInBundle",
+        "BoUpSLP::vectorizeTree"
+      ]
+    }
+  },
+  "patch": "commit 57947ace14ebfadba46a99aa80589e021c757037\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Thu Sep 25 13:38:27 2025 -0700\n\n    [SLP]Correctly set the insert point for insertlements with copyable arguments\n    \n    Need to find the last insertelement instruction in the list for the\n    copyable arguments, otherwise wrong def-use chain may be built\n    \n    Fixes #160671\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 1814d9a6811c..065622efc7ec 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -17519,7 +17519,9 @@ Instruction &BoUpSLP::getLastInstructionInBundle(const TreeEntry *E) {\n                   return !isa<GetElementPtrInst>(V) && isa<Instruction>(V);\n                 })) ||\n         all_of(E->Scalars, [&](Value *V) {\n-          return isa<PoisonValue>(V) || E->isCopyableElement(V) ||\n+          return isa<PoisonValue>(V) ||\n+                 (E->Idx == 0 && isa<InsertElementInst>(V)) ||\n+                 E->isCopyableElement(V) ||\n                  (!isVectorLikeInstWithConstOps(V) && isUsedOutsideBlock(V));\n         }))\n       Res = FindLastInst();\n@@ -19119,7 +19121,12 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {\n     }\n     case Instruction::InsertElement: {\n       assert(E->ReuseShuffleIndices.empty() && \"All inserts should be unique\");\n-      Builder.SetInsertPoint(cast<Instruction>(E->Scalars.back()));\n+      if (const TreeEntry *OpE = getOperandEntry(E, 1);\n+          OpE && !OpE->isGather() && OpE->hasState() &&\n+          !OpE->hasCopyableElements())\n+        Builder.SetInsertPoint(cast<Instruction>(E->Scalars.back()));\n+      else\n+        setInsertPointAfterBundle(E);\n       Value *V = vectorizeOperand(E, 1);\n       ArrayRef<Value *> Op = E->getOperand(1);\n       Type *ScalarTy = Op.front()->getType();\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/insertelement-with-copyable-args.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -slp-threshold=-99999 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ndefine i64 @test(i32 %arg) {\n;\nbb:\n  %freeze = freeze i32 0\n  br i1 false, label %bb1, label %bb1\n\nbb1:\n  %load = load i32, ptr addrspace(1) null, align 4\n  %0 = insertelement <4 x i32> <i32 0, i32 poison, i32 poison, i32 0>, i32 %freeze, i32 2\n  %1 = insertelement <4 x i32> <i32 0, i32 0, i32 0, i32 poison>, i32 %arg, i32 3\n  %add = add i32 %freeze, 0\n  %2 = insertelement <2 x i32> poison, i32 %freeze, i32 0\n  %3 = shufflevector <2 x i32> %2, <2 x i32> poison, <2 x i32> zeroinitializer\n  %4 = add <2 x i32> %3, zeroinitializer\n  %5 = insertelement <2 x i32> poison, i32 %arg, i32 0\n  %6 = insertelement <2 x i32> %5, i32 %load, i32 1\n  %7 = icmp ult <2 x i32> %4, %6\n  %8 = extractelement <2 x i1> %7, i32 0\n  %and = and i1 %8, false\n  %9 = insertelement <4 x i32> %0, i32 %add, i32 1\n  %10 = icmp eq <4 x i32> %9, %1\n  %11 = icmp ult <4 x i32> %9, %1\n  %12 = shufflevector <4 x i1> %10, <4 x i1> %11, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  br i1 false, label %bb11, label %bb12\n\nbb11:\n  %zext = zext i32 %add to i64\n  ret i64 0\n\nbb12:\n  %zext13 = zext i32 %add to i64\n  ret i64 0\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Instruction does not dominate all uses! LLVM ERROR: Broken module found, compilation aborted!",
+    "body": "To reproduce run opt with the test below, using `-passes=slp-vectorizer -slp-threshold=-99999 `\n```\n; ModuleID = './reduced.ll'\nsource_filename = \"./reduced.ll\"\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @wombat(i32 %arg) #0 gc \"statepoint-example\" {\nbb:\n  %freeze = freeze i32 0\n  br i1 false, label %bb1, label %bb1\n\nbb1:                                              ; preds = %bb, %bb\n  %load = load i32, ptr addrspace(1) null, align 4\n  %icmp = icmp eq i32 0, 0\n  %icmp2 = icmp ult i32 0, 0\n  %add = add i32 %freeze, 0\n  %icmp3 = icmp ult i32 %add, 0\n  %icmp4 = icmp ugt i32 0, 0\n  %icmp5 = icmp ult i32 %freeze, 0\n  %icmp6 = icmp ult i32 0, 0\n  %icmp7 = icmp ult i32 %add, %arg\n  %and = and i1 %icmp7, false\n  %icmp8 = icmp ugt i32 0, 0\n  %icmp9 = icmp ugt i32 %arg, 0\n  %icmp10 = icmp ult i32 %freeze, %load\n  br i1 false, label %bb11, label %bb12\n\nbb11:                                             ; preds = %bb1\n  %zext = zext i32 %add to i64\n  ret i64 0\n\nbb12:                                             ; preds = %bb1\n  %zext13 = zext i32 %add to i64\n  ret i64 0\n}\n\nattributes #0 = { \"target-features\"=\"+prfchw,-cldemote,+avx,+aes,+sahf,+pclmul,-xop,+crc32,-amx-fp8,+xsaves,-avx512fp16,-usermsr,-sm4,-egpr,+sse4.1,-avx10.1,-avx512ifma,+xsave,+sse4.2,-tsxldtrk,-sm3,-ptwrite,-widekl,-movrs,-invpcid,+64bit,+xsavec,-avx512vpopcntdq,+cmov,-avx512vp2intersect,-avx512cd,+movbe,-avxvnniint8,-ccmp,-amx-int8,-kl,-sha512,-avxvnni,-rtm,+adx,+avx2,-hreset,-movdiri,-serialize,-vpclmulqdq,-avx512vl,-uintr,-cf,+clflushopt,-raoint,-cmpccxadd,+bmi,-amx-tile,+sse,-gfni,-avxvnniint16,-amx-fp16,-zu,-ndd,+xsaveopt,+rdrnd,-avx512f,-amx-bf16,-avx512bf16,-avx512vnni,-push2pop2,+cx8,-avx512bw,+sse3,-pku,-nf,-amx-tf32,-amx-avx512,+fsgsbase,+clzero,-mwaitx,-lwp,+lzcnt,+sha,-movdir64b,-ppx,+wbnoinvd,-enqcmd,-amx-transpose,-avxneconvert,-tbm,-pconfig,-amx-complex,+ssse3,+cx16,-avx10.2,+bmi2,+fma,+popcnt,-avxifma,+f16c,-avx512bitalg,-rdpru,+clwb,+mmx,+sse2,+rdseed,-avx512vbmi2,-prefetchi,-amx-movrs,+rdpid,-fma4,-avx512vbmi,-shstk,-vaes,-waitpkg,-sgx,+fxsr,-avx512dq,+sse4a\" }\n```\nReproducer: https://godbolt.org/z/nY8fvjv8f\n\nStack dump:\n```\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -passes=slp-vectorizer -slp-threshold=-99999 <source>\n1.\tRunning pass \"verify\" on module \"<source>\"\n #0 0x00000000058da2e8 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x58da2e8)\n #1 0x00000000058d7194 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\n #2 0x00007cfd67242520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\n #3 0x00007cfd672969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\n #4 0x00007cfd67242476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\n #5 0x00007cfd672287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\n #6 0x000000000082fa8d llvm::json::operator==(llvm::json::Value const&, llvm::json::Value const&) (.cold) JSON.cpp:0:0\n #7 0x00000000058112c1 (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x58112c1)\n #8 0x0000000005701d78 (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x5701d78)\n #9 0x000000000097292e llvm::detail::PassModel<llvm::Module, llvm::VerifierPass, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x97292e)\n#10 0x00000000056bf8e1 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x56bf8e1)\n#11 0x000000000097cb18 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x97cb18)\n#12 0x0000000000970cb7 optMain (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x970cb7)\n#13 0x00007cfd67229d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\n#14 0x00007cfd67229e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\n#15 0x0000000000967dc5 _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x967dc5)\nProgram terminated with signal: SIGSEGV\nCompiler returned: 139\n```",
+    "author": "TatyanaDoubts",
+    "labels": [
+      "llvm:SLPVectorizer",
+      "crash"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true,
+  "bisect": "898bba311f180ed54de33dc09e7071c279a4942a"
+}

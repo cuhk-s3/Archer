@@ -1,0 +1,76 @@
+{
+  "bug_id": "156091",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/156091",
+  "base_commit": "86c4ef506d96468d3f4c196a61767c40ce180d2e",
+  "knowledge_cutoff": "2025-08-29T19:55:36Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "hints": {
+    "fix_commit": "0aac22758a81a98d9612ed1ad4853d9e434e8451",
+    "components": [
+      "LoopVectorize"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          1134,
+          1140
+        ],
+        [
+          1657,
+          1663
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "getCallWideningDecision",
+        "needsExtract"
+      ]
+    }
+  },
+  "patch": "commit 0aac22758a81a98d9612ed1ad4853d9e434e8451\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Sun Aug 31 15:12:41 2025 +0100\n\n    [LV] Correctly cost chains of replicating calls in legacy CM.\n    \n    Check for scalarized calls in needsExtract to fix a divergence between\n    legacy and VPlan-based cost model.\n    \n    The legacy cost model was missing a check for scalarized calls in\n    needsExtract, which meant if incorrectly assumed the result of a\n    scalarized call needs extracting.\n    \n    Exposed by https://github.com/llvm/llvm-project/pull/154617.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/156091.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 56403dba92df..1f4610ad191c 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -1134,7 +1134,10 @@ public:\n   CallWideningDecision getCallWideningDecision(CallInst *CI,\n                                                ElementCount VF) const {\n     assert(!VF.isScalar() && \"Expected vector VF\");\n-    return CallWideningDecisions.at({CI, VF});\n+    auto I = CallWideningDecisions.find({CI, VF});\n+    if (I == CallWideningDecisions.end())\n+      return {CM_Unknown, nullptr, Intrinsic::not_intrinsic, std::nullopt, 0};\n+    return I->second;\n   }\n \n   /// Return True if instruction \\p I is an optimizable truncate whose operand\n@@ -1657,7 +1660,9 @@ private:\n     Instruction *I = dyn_cast<Instruction>(V);\n     if (VF.isScalar() || !I || !TheLoop->contains(I) ||\n         TheLoop->isLoopInvariant(I) ||\n-        getWideningDecision(I, VF) == CM_Scalarize)\n+        getWideningDecision(I, VF) == CM_Scalarize ||\n+        (isa<CallInst>(I) &&\n+         getCallWideningDecision(cast<CallInst>(I), VF).Kind == CM_Scalarize))\n       return false;\n \n     // Assume we can vectorize V (and hence we need extraction) if the\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/cost-conditional-branches.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -mtriple=x86_64-apple-macosx10.8.0 -mcpu=corei7-avx -S"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\n; Test case for https://github.com/llvm/llvm-project/issues/156091.\ndefine void @test_replicate_call_chain(float %x, ptr noalias %A, ptr noalias %B, ptr align 4 noalias %C, ptr align 4 noalias %D, ptr noalias %E) #0 {\n;\nentry:\n  br label %loop.header\n\nloop.header:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %dec.iv = phi i64 [ 100, %entry ], [ %dec.iv.next, %loop.latch ]\n  %iv.inc = add i64 %iv, 1\n  %gep.A = getelementptr inbounds float, ptr %A, i64 %iv\n  %l.A = load float, ptr %gep.A, align 4\n  %c.A = fcmp ogt float %l.A, 0.0\n  %gep.B = getelementptr inbounds float, ptr %B, i64 %iv\n  %l.B = load float, ptr %gep.B, align 4\n  %c.B = fcmp ogt float %l.B, 0.0\n  %gep.C = getelementptr float, ptr %C, i64 %iv.inc\n  %and = and i1 %c.A, %c.B\n  br i1 %and, label %then, label %else\n\nthen:\n  store float 0.0, ptr %gep.C, align 4\n  br label %loop.latch\n\nelse:\n  %iv.mul.2 = shl i64 %iv, 2\n  %gep.D = getelementptr i8, ptr %D, i64 %iv.mul.2\n  %l.D = load float, ptr %gep.D, align 4\n  %mul = fmul float %l.D, 2.0\n  %pow.1 = tail call float @llvm.pow.f32(float %mul, float %x)\n  %pow.2 = tail call float @llvm.pow.f32(float %pow.1, float %x)\n  store float %pow.2, ptr %gep.C, align 4\n  br label %loop.latch\n\nloop.latch:\n  store float 0.000000e+00, ptr %E, align 4\n  %iv.next = add i64 %iv, 1\n  %dec.iv.next = add i64 %dec.iv, -1\n  %ec = icmp ne i64 %dec.iv.next, 0\n  br i1 %ec, label %loop.header, label %exit\n\nexit:\n  ret void\n}\n\ndefine i64 @avx512_cond_load_cost(ptr %src, i32 %a, i64 %b, i32 %c, i32 %d) #1 {\n;\nentry:\n  br label %loop.header\n\nloop.header:\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %c.1 = icmp slt i32 %iv, 0\n  br i1 %c.1, label %if.then, label %loop.latch\n\nif.then:\n  %1 = urem i32 %a, %c\n  %mul = sub i32 0, %1\n  %div = udiv i32 %c, %d\n  %or = or i32 %div, %mul\n  %ext = sext i32 %or to i64\n  %gep = getelementptr { i64, i64, i64 }, ptr %src, i64 %ext, i32 2\n  %l = load i64, ptr %gep, align 8\n  %or.2 = or i64 %l, %b\n  br label %loop.latch\n\nloop.latch:\n  %res = phi i64 [ 0, %loop.header ], [ %or.2, %if.then ]\n  %iv.next = add i32 %iv, 1\n  %ec = icmp ult i32 %iv, %c\n  br i1 %ec, label %loop.header, label %exit\n\nexit:\n  ret i64 %res\n}\n\ndefine void @cost_duplicate_recipe_for_sinking(ptr %A, i64 %N) #2 {\n;\nentry:\n  br label %loop.header\n\nloop.header:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %iv.shl = shl nsw i64 %iv, 2\n  %gep.0 = getelementptr nusw double, ptr %A, i64 %iv.shl\n  %l = load double, ptr %gep.0, align 8\n  %c = fcmp oeq double %l, 0.000000e+00\n  br i1 %c, label %if.then, label %loop.latch\n\nif.then:\n  %gep.1 = getelementptr double, ptr %A, i64 %iv.shl\n  store double 0.000000e+00, ptr %gep.1, align 8\n  br label %loop.latch\n\nloop.latch:\n  %iv.next = add nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv, %N\n  br i1 %ec, label %exit, label %loop.header\n\nexit:\n  ret void\n}\n\n; Test for https://github.com/llvm/llvm-project/issues/129236.\ndefine i32 @cost_ashr_with_op_known_invariant_via_scev(i8 %a) {\n;\nentry:\n  %cmp.i = icmp eq i16 0, 0\n  %conv.i = sext i16 0 to i32\n  %conv5.i = sext i8 %a to i32\n  br label %loop.header\n\nloop.header:\n  %iv = phi i8 [ 100, %entry ], [ %iv.next, %loop.latch ]\n  br i1 %cmp.i, label %then, label %else\n\nthen:\n  %p.1 = phi i32 [ %rem.i, %else ], [ 0, %loop.header ]\n  %shr.i = ashr i32 %conv5.i, %p.1\n  %tobool6.not.i = icmp eq i32 %shr.i, 0\n  %sext.i = shl i32 %p.1, 24\n  %2 = ashr exact i32 %sext.i, 24\n  %3 = select i1 %tobool6.not.i, i32 %2, i32 0\n  br label %loop.latch\n\nelse:\n  %rem.i = urem i32 -1, %conv.i\n  %cmp3.i = icmp sgt i32 %rem.i, 1\n  br i1 %cmp3.i, label %loop.latch, label %then\n\nloop.latch:\n  %p.2 = phi i32 [ 0, %else ], [ %3, %then ]\n  %iv.next = add i8 %iv, -1\n  %ec = icmp eq i8 %iv.next, 0\n  br i1 %ec, label %exit, label %loop.header\n\nexit:\n  ret i32 %p.2\n}\n\nattributes #0 = { \"target-cpu\"=\"znver4\" }\nattributes #1 = { \"target-features\"=\"+avx512bw,+avx512cd,+avx512dq,+avx512f,+avx512vl\" }\nattributes #2 = { \"target-cpu\"=\"znver3\" }"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/cost-model.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -mtriple=x86_64-apple-macosx10.8.0 -mcpu=corei7-avx -S"
+      ],
+      "tests": [
+        {
+          "test_name": "cost_assume",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i64 @cost_assume(ptr %end, i64 %N) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %0 = phi i64 [ 0, %entry ], [ %1, %loop ]\n  %1 = add i64 %0, 1\n  %iv.next = add nsw i64 %iv, 1\n  %c = icmp ne i64 %N, 0\n  tail call void @llvm.assume(i1 %c)\n  %gep = getelementptr nusw [9 x i8], ptr null, i64 %iv.next\n  %ec = icmp eq ptr %gep, %end\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i64 %1\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[VPlan] VPlan cost model and legacy cost model disagreed assertion hit",
+    "body": "[reduced.ll.gz](https://github.com/user-attachments/files/22052471/reduced.ll.gz)\n\nReproducer: `opt --passes=loop-vectorize reduced.ll`:\n```\nopt: .../llvm/lib/Transforms/Vectorize/LoopVectorize.cpp:7066: llvm::VectorizationFactor llvm::LoopVectorizationPlanner::computeBestVF(): Assertion `(BestFactor.Width == LegacyVF.Width || BestPlan.hasEarlyExit() || planContainsAdditionalSimplifications(getPlanFor(BestFactor.Width), CostCtx, OrigLoop, BestFactor.Width) || planContainsAdditionalSimplifications( getPlanFor(LegacyVF.Width), CostCtx, OrigLoop, LegacyVF.Width)) && \" VPlan cost model and legacy cost model disagreed\"' failed.\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\n```\n\nThe issue appeared between 3addfd0186c1 and 988ab5aca06e.  It affects `CPU2017/621.wrf_s`.\n\nThe only suspect (by just looking through the commits) is #154617. @fhahn can you please take a look?",
+    "author": "vzakhari",
+    "labels": [
+      "vectorizers",
+      "crash"
+    ],
+    "comments": []
+  },
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "verified": true,
+  "bisect": "df098796ec188b80ee3816aadc97590c11fed307"
+}

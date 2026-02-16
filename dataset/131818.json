@@ -1,0 +1,59 @@
+{
+  "bug_id": "131818",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/131818",
+  "base_commit": "84909d797782a0dcf240f79a8e5e863d8165c03f",
+  "knowledge_cutoff": "2025-03-18T15:06:59Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "45090b3059562b32723cd25679db75d1574ab04e",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          14086,
+          14096
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::isGatherShuffledSingleRegisterEntry"
+      ]
+    }
+  },
+  "patch": "commit 45090b3059562b32723cd25679db75d1574ab04e\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Tue Mar 18 09:32:23 2025 -0700\n\n    [SLP]Check the whole def-use chain in the tree to find proper dominance, if the last instruction is the same\n    \n    If the insertion point (last instruction) of the user nodes is the same,\n    need to check the whole def-use chain in the tree to find proper\n    dominance to prevent a compiler crash.\n    \n    Fixes #131818\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 24171f1d9a06..4a835bc797ab 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -14086,11 +14086,18 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(\n   auto CheckParentNodes = [&](const TreeEntry *User1, const TreeEntry *User2,\n                               unsigned EdgeIdx) {\n     const TreeEntry *Ptr1 = User1;\n+    const TreeEntry *Ptr2 = User2;\n+    SmallDenseMap<const TreeEntry *, unsigned> PtrToIdx;\n+    while (Ptr2) {\n+      PtrToIdx.try_emplace(Ptr2, EdgeIdx);\n+      EdgeIdx = Ptr2->UserTreeIndex.EdgeIdx;\n+      Ptr2 = Ptr2->UserTreeIndex.UserTE;\n+    }\n     while (Ptr1) {\n       unsigned Idx = Ptr1->UserTreeIndex.EdgeIdx;\n       Ptr1 = Ptr1->UserTreeIndex.UserTE;\n-      if (Ptr1 == User2)\n-        return Idx < EdgeIdx;\n+      if (auto It = PtrToIdx.find(Ptr1); It != PtrToIdx.end())\n+        return Idx < It->second;\n     }\n     return false;\n   };\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/same-last-instruction-different-parents.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ndefine i32 @test(i32 %0, i1 %1) {\n;\n  %3 = sitofp i32 %0 to double\n  %4 = sitofp i32 %0 to double\n  %5 = sitofp i32 %0 to double\n  br i1 %1, label %6, label %9\n\n6:\n  %7 = tail call double @llvm.fmuladd.f64(double %4, double 0.000000e+00, double 0.000000e+00)\n  %8 = tail call double @llvm.fmuladd.f64(double %5, double 0.000000e+00, double 0.000000e+00)\n  br label %18\n\n9:\n  br i1 false, label %15, label %10\n\n10:\n  %11 = call double @llvm.copysign.f64(double 0.000000e+00, double %3)\n  %12 = tail call double @llvm.fmuladd.f64(double %11, double %4, double 0.000000e+00)\n  %13 = call double @llvm.copysign.f64(double 0.000000e+00, double %5)\n  %14 = tail call double @llvm.fmuladd.f64(double %13, double 0.000000e+00, double 0.000000e+00)\n  br label %15\n\n15:\n  %16 = phi double [ %12, %10 ], [ 0.000000e+00, %9 ]\n  %17 = phi double [ %14, %10 ], [ 0.000000e+00, %9 ]\n  br label %18\n\n18:\n  %19 = phi double [ %17, %15 ], [ %8, %6 ]\n  %20 = phi double [ %16, %15 ], [ %7, %6 ]\n  %21 = fmul double %20, %19\n  %22 = fptosi double %21 to i32\n  ret i32 %22\n}"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[clang] Crash at -O3: Instruction does not dominate all uses!",
+    "body": "This code crashes at `-O3`:\n\n```c\nint a;\ndouble b;\nlong c;\nint d(long f, long g) {\n  if (f + g)\n    return 1;\n  for (long e = 0; e < g; e++)\n    *(char *)e = 5;\n  return 0;\n}\nint h(int f) {\n  double i = 0.270112271089232341485679099e4;\n  b = 0.1e1;\n  for (; c; c--) {\n    i = i * (80 + f) * (9 + f) + a;\n    a = 0;\n    b = b * f * (d(-42, f) + f) + 0.11623987080032122878585294e22;\n  }\n  return i / b;\n}\nvoid main() {}\n```\n\nCompiler Explorer: https://godbolt.org/z/b4YEsPMrq\n\nBisected to https://github.com/llvm/llvm-project/commit/d57884011e8c57b118b831614b692ba4bc8b5aca, which was committed by @alexey-bataev \n\nCrash:\n\n```console\nInstruction does not dominate all uses!\n  %3 = insertelement <2 x i32> %2, i32 %f, i64 1\n  %0 = insertelement <2 x i32> %3, i32 %add1, i64 0\nin function h\nfatal error: error in backend: Broken function found, compilation aborted!\n```\n\nBacktrace:\n\n```console\nStack dump:\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/clang -gdwarf-4 -g -o /app/output.s -mllvm --x86-asm-syntax=intel -fno-verbose-asm -S --gcc-toolchain=/opt/compiler-explorer/gcc-snapshot -fcolor-diagnostics -fno-crash-diagnostics -O3 -Wall -Wextra <source>\n1.\t<eof> parser at end of file\n2.\tCode generation\n3.\tRunning pass 'Function Pass Manager' on module '<source>'.\n4.\tRunning pass 'Module Verifier' on function '@h'\n #0 0x0000000003e87c38 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x3e87c38)\n #1 0x0000000003e858c4 llvm::sys::CleanupOnSignal(unsigned long) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x3e858c4)\n #2 0x0000000003dcacb6 llvm::CrashRecoveryContext::HandleExit(int) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x3dcacb6)\n #3 0x0000000003e7cfee llvm::sys::Process::Exit(int, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x3e7cfee)\n #4 0x0000000000d4e5a0 LLVMErrorHandler(void*, char const*, bool) cc1_main.cpp:0:0\n #5 0x0000000003dd5443 llvm::report_fatal_error(llvm::Twine const&, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x3dd5443)\n #6 0x0000000003dd55a8 (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x3dd55a8)\n #7 0x0000000003887952 (anonymous namespace)::VerifierLegacyPass::runOnFunction(llvm::Function&) Verifier.cpp:0:0\n #8 0x00000000037d28df llvm::FPPassManager::runOnFunction(llvm::Function&) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x37d28df)\n #9 0x00000000037d2c91 llvm::FPPassManager::runOnModule(llvm::Module&) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x37d2c91)\n#10 0x00000000037d3531 llvm::legacy::PassManagerImpl::run(llvm::Module&) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x37d3531)\n#11 0x000000000413d67e clang::emitBackendOutput(clang::CompilerInstance&, clang::CodeGenOptions&, llvm::StringRef, llvm::Module*, clang::BackendAction, llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>, std::unique_ptr<llvm::raw_pwrite_stream, std::default_delete<llvm::raw_pwrite_stream>>, clang::BackendConsumer*) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x413d67e)\n#12 0x00000000048429a0 clang::BackendConsumer::HandleTranslationUnit(clang::ASTContext&) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x48429a0)\n#13 0x00000000064aecac clang::ParseAST(clang::Sema&, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x64aecac)\n#14 0x0000000004842da8 clang::CodeGenAction::ExecuteAction() (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x4842da8)\n#15 0x0000000004b127f5 clang::FrontendAction::Execute() (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x4b127f5)\n#16 0x0000000004a94a2e clang::CompilerInstance::ExecuteAction(clang::FrontendAction&) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x4a94a2e)\n#17 0x0000000004c024fe clang::ExecuteCompilerInvocation(clang::CompilerInstance*) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x4c024fe)\n#18 0x0000000000d50baf cc1_main(llvm::ArrayRef<char const*>, char const*, void*) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0xd50baf)\n#19 0x0000000000d4836a ExecuteCC1Tool(llvm::SmallVectorImpl<char const*>&, llvm::ToolContext const&) driver.cpp:0:0\n#20 0x000000000488b309 void llvm::function_ref<void ()>::callback_fn<clang::driver::CC1Command::Execute(llvm::ArrayRef<std::optional<llvm::StringRef>>, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>*, bool*) const::'lambda'()>(long) Job.cpp:0:0\n#21 0x0000000003dcabf4 llvm::CrashRecoveryContext::RunSafely(llvm::function_ref<void ()>) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x3dcabf4)\n#22 0x000000000488b91f clang::driver::CC1Command::Execute(llvm::ArrayRef<std::optional<llvm::StringRef>>, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>*, bool*) const (.part.0) Job.cpp:0:0\n#23 0x000000000484e38d clang::driver::Compilation::ExecuteCommand(clang::driver::Command const&, clang::driver::Command const*&, bool) const (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x484e38d)\n#24 0x000000000484f41e clang::driver::Compilation::ExecuteJobs(clang::driver::JobList const&, llvm::SmallVectorImpl<std::pair<int, clang::driver::Command const*>>&, bool) const (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x484f41e)\n#25 0x0000000004856af5 clang::driver::Driver::ExecuteCompilation(clang::driver::Compilation&, llvm::SmallVectorImpl<std::pair<int, clang::driver::Command const*>>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0x4856af5)\n#26 0x0000000000d4d9a8 clang_main(int, char**, llvm::ToolContext const&) (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0xd4d9a8)\n#27 0x0000000000c146c4 main (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0xc146c4)\n#28 0x00007acc03029d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\n#29 0x00007acc03029e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\n#30 0x0000000000d47e15 _start (/opt/compiler-explorer/clang-assertions-trunk/bin/clang+0xd47e15)\n```",
+    "author": "cardigan1008",
+    "labels": [
+      "llvm:SLPVectorizer",
+      "crash-on-valid"
+    ],
+    "comments": []
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "894935cb5146fd2ac6334cc8b11e6d6e0e264fe6"
+}

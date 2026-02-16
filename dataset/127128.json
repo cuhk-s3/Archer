@@ -1,0 +1,76 @@
+{
+  "bug_id": "127128",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/127128",
+  "base_commit": "1ff5f328d9824694cc356ebf78adad8816a6de86",
+  "knowledge_cutoff": "2025-02-13T20:59:01Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "ac217ee389d63124432e5e6890851a678f7a676b",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          13206,
+          13213
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::isGatherShuffledSingleRegisterEntry"
+      ]
+    }
+  },
+  "patch": "commit ac217ee389d63124432e5e6890851a678f7a676b\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Thu Feb 13 14:19:51 2025 -0800\n\n    [SLP] Check for PHI nodes (potentially cycles!) when checking dependencies\n    \n    When checking for dependecies for gather nodes with users with the same\n    last instruction, cannot rely on the index order, if there is (even\n    potential!) cycle in the graph, which may cause order not work correctly\n    and cause compiler crash.\n    \n    Fixes #127128\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex fb72a112b9ac..780cafe91d6b 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -13206,8 +13206,16 @@ BoUpSLP::isGatherShuffledSingleRegisterEntry(\n           continue;\n         // If the user instruction is used for some reason in different\n         // vectorized nodes - make it depend on index.\n+        // If any vector node is PHI node, this dependency might not work\n+        // because of cycle dependencies, so disable it.\n         if (TEUseEI.UserTE != UseEI.UserTE &&\n-            TEUseEI.UserTE->Idx < UseEI.UserTE->Idx)\n+            (TEUseEI.UserTE->Idx < UseEI.UserTE->Idx ||\n+             any_of(\n+                 VectorizableTree,\n+                 [](const std::unique_ptr<TreeEntry> &TE) {\n+                   return TE->State == TreeEntry::Vectorize &&\n+                          TE->getOpcode() == Instruction::PHI;\n+                 })))\n           continue;\n       }\n \n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/delayed-gather-emission.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -mtriple=x86_64 -mattr=+avx2 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test() {\nentry:\n  %.pre.pre = load float, ptr poison, align 4\n  br label %bb1\n\nbb1:                                              ; preds = %bb2, %entry\n  %.pre = phi float [ %.pre.pre, %entry ], [ %i2, %bb2 ]\n  %foxtrot.0 = phi float [ undef, %entry ], [ %gulf.0, %bb2 ]\n  br label %bb2\n\nbb2:                                              ; preds = %bb2, %bb1\n  %i = phi float [ %.pre, %bb1 ], [ %i2, %bb2 ]\n  %gulf.0 = phi float [ %foxtrot.0, %bb1 ], [ %div, %bb2 ]\n  %div = fdiv float %i, %gulf.0\n  %i1 = load float, ptr poison, align 4\n  %div1 = fdiv float %gulf.0, %i1\n  %mul = fmul float %div, %div1\n  tail call void @foo(float %mul)\n  %i2 = load float, ptr poison, align 4\n  %tobool = fcmp une float %i2, 0.000000e+00\n  br i1 %tobool, label %bb1, label %bb2\n}\n\ndeclare void @foo(float)\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/phi-node-with-cycle.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=haswell < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ndefine void @test(float %0) {\n;\n  %2 = fdiv float 0.000000e+00, 0.000000e+00\n  %3 = fdiv float 0.000000e+00, 0.000000e+00\n  %4 = fdiv float %0, 0.000000e+00\n  br label %5\n\n5:\n  %6 = fmul float %4, 0.000000e+00\n  %7 = fsub float 0.000000e+00, %6\n  %8 = fmul float %3, 0.000000e+00\n  %9 = fsub float 0.000000e+00, %8\n  br label %11\n\n10:\n  br label %11\n\n11:\n  %12 = phi float [ %7, %5 ], [ 0.000000e+00, %10 ]\n  %13 = phi float [ %9, %5 ], [ 0.000000e+00, %10 ]\n  br label %14\n\n14:\n  %15 = fmul float %2, 0.000000e+00\n  %16 = fsub float %12, %15\n  %17 = fmul float %4, 0.000000e+00\n  %18 = fsub float %13, %17\n  %19 = fadd float %16, %18\n  %20 = call float @llvm.fabs.f32(float %19)\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "SLPVectorizer miscompilation",
+    "body": "```llvm\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128-ni:10:11:12:13\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine swiftcc { ptr addrspace(10), i8 } @julia__dir2ori_404(float %0) {\n  %2 = fdiv float 0.000000e+00, 0.000000e+00\n  %3 = fdiv float 0.000000e+00, 0.000000e+00\n  %4 = fdiv float %0, 0.000000e+00\n  br label %5\n\n5:                                                ; preds = %1\n  %6 = fmul float %4, 0.000000e+00\n  %7 = fsub float 0.000000e+00, %6\n  %8 = fmul float %3, 0.000000e+00\n  %9 = fsub float 0.000000e+00, %8\n  br label %11\n\n10:                                               ; No predecessors!\n  br label %11\n\n11:                                               ; preds = %10, %5\n  %12 = phi float [ %7, %5 ], [ 0.000000e+00, %10 ]\n  %13 = phi float [ %9, %5 ], [ 0.000000e+00, %10 ]\n  br label %14\n\n14:                                               ; preds = %11\n  %15 = fmul float %2, 0.000000e+00\n  %16 = fsub float %12, %15\n  %17 = fmul float %4, 0.000000e+00\n  %18 = fsub float %13, %17\n  %19 = fadd float %16, %18\n  %20 = call float @llvm.fabs.f32(float %19)\n  ret { ptr addrspace(10), i8 } zeroinitializer\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n```\nproduces \n```\nInstruction does not dominate all uses!\n  %4 = insertelement <2 x float> <float poison, float 0.000000e+00>, float %0, i32 0\n  %2 = shufflevector <2 x float> %4, <2 x float> <float 0.000000e+00, float poison>, <2 x i32> <i32 2, i32 0>\nLLVM ERROR: Broken module found, compilation aborted!\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\nStack dump:\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -passes=slp-vectorizer -mcpu=haswell <source>\n1.\tRunning pass \"verify\" on module \"<source>\"\n #0 0x00000000054edec8 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x54edec8)\n #1 0x00000000054eb884 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\n #2 0x00007faaea842520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\n #3 0x00007faaea8969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\n #4 0x00007faaea842476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\n #5 0x00007faaea8287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\n #6 0x000000000082790d llvm::json::operator==(llvm::json::Value const&, llvm::json::Value const&) (.cold) JSON.cpp:0:0\n #7 0x000000000542b6e8 (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x542b6e8)\n #8 0x0000000005329278 (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x5329278)\n #9 0x000000000095605e llvm::detail::PassModel<llvm::Module, llvm::VerifierPass, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x95605e)\n#10 0x00000000052e7b50 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x52e7b50)\n#11 0x000000000096174a llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x96174a)\n#12 0x0000000000953c7c optMain (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x953c7c)\n#13 0x00007faaea829d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\n#14 0x00007faaea829e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\n#15 0x000000000094b555 _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x94b555)\nProgram terminated with signal: SIGSEGV\nCompiler returned: 139\n```\non 19 and trunk.\nGodbolt: https://godbolt.org/z/qxKP6198T",
+    "author": "Zentrik",
+    "labels": [
+      "llvm:SLPVectorizer",
+      "crash-on-valid"
+    ],
+    "comments": [
+      {
+        "author": "Zentrik",
+        "body": "Bisected thanks to manyclangs to 66775f8ccdcc8264ef349518e1c59d96d4227823 (8e2b2c4181506efc5b9321c203dd107bbd63392b seemed to be good) @alexey-bataev"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "Cannot find a good commit"
+}

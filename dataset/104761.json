@@ -1,0 +1,96 @@
+{
+  "bug_id": "104761",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/104761",
+  "base_commit": "5cfa8baef33636827e5aa8dd76888c724433b53e",
+  "knowledge_cutoff": "2024-08-19T11:00:31Z",
+  "lit_test_dir": [
+    "llvm/test/Analysis/LoopCacheAnalysis"
+  ],
+  "hints": {
+    "fix_commit": "2e6deb1dd3a4422807633ba08773e8d786e43d4c",
+    "components": [
+      "LoopCacheAnalysis"
+    ],
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/LoopCacheAnalysis.h": [
+        [
+          16,
+          21
+        ],
+        [
+          31,
+          37
+        ],
+        [
+          192,
+          199
+        ]
+      ],
+      "llvm/lib/Analysis/LoopCacheAnalysis.cpp": [
+        [
+          328,
+          333
+        ],
+        [
+          338,
+          351
+        ],
+        [
+          696,
+          702
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/LoopCacheAnalysis.cpp": [
+        "CacheCost::computeLoopCacheCost",
+        "IndexedReference::computeRefCost",
+        "IndexedReference::tryDelinearizeFixedSize"
+      ]
+    }
+  },
+  "patch": "commit 2e6deb1dd3a4422807633ba08773e8d786e43d4c\nAuthor: Sjoerd Meijer <smeijer@nvidia.com>\nDate:   Thu Nov 14 08:40:45 2024 +0000\n\n    [LoopInterchange] Fix overflow in cost calculation (#111807)\n    \n    If the iteration count is really large, e.g. UINT_MAX, then the cost\n    calculation can overflows and trigger an assert. So saturate the cost to\n    INT_MAX if this is the case by using InstructionCost as a type which\n    already supports this kind of overflow handling.\n    \n    This fixes #104761\n\ndiff --git a/llvm/include/llvm/Analysis/LoopCacheAnalysis.h b/llvm/include/llvm/Analysis/LoopCacheAnalysis.h\nindex 4fd2485e39d6..3e22487e5e34 100644\n--- a/llvm/include/llvm/Analysis/LoopCacheAnalysis.h\n+++ b/llvm/include/llvm/Analysis/LoopCacheAnalysis.h\n@@ -16,6 +16,7 @@\n \n #include \"llvm/Analysis/LoopAnalysisManager.h\"\n #include \"llvm/IR/PassManager.h\"\n+#include \"llvm/Support/InstructionCost.h\"\n #include <optional>\n \n namespace llvm {\n@@ -31,7 +32,7 @@ class ScalarEvolution;\n class SCEV;\n class TargetTransformInfo;\n \n-using CacheCostTy = int64_t;\n+using CacheCostTy = InstructionCost;\n using LoopVectorTy = SmallVector<Loop *, 8>;\n \n /// Represents a memory reference as a base pointer and a set of indexing\n@@ -192,8 +193,6 @@ class CacheCost {\n   using LoopCacheCostTy = std::pair<const Loop *, CacheCostTy>;\n \n public:\n-  static CacheCostTy constexpr InvalidCost = -1;\n-\n   /// Construct a CacheCost object for the loop nest described by \\p Loops.\n   /// The optional parameter \\p TRT can be used to specify the max. distance\n   /// between array elements accessed in a loop so that the elements are\ndiff --git a/llvm/lib/Analysis/LoopCacheAnalysis.cpp b/llvm/lib/Analysis/LoopCacheAnalysis.cpp\nindex 7ca9f15ad5fc..2897b922f61e 100644\n--- a/llvm/lib/Analysis/LoopCacheAnalysis.cpp\n+++ b/llvm/lib/Analysis/LoopCacheAnalysis.cpp\n@@ -328,6 +328,8 @@ CacheCostTy IndexedReference::computeRefCost(const Loop &L,\n       const SCEV *TripCount =\n           computeTripCount(*AR->getLoop(), *Sizes.back(), SE);\n       Type *WiderType = SE.getWiderType(RefCost->getType(), TripCount->getType());\n+      // For the multiplication result to fit, request a type twice as wide.\n+      WiderType = WiderType->getExtendedType();\n       RefCost = SE.getMulExpr(SE.getNoopOrZeroExtend(RefCost, WiderType),\n                               SE.getNoopOrZeroExtend(TripCount, WiderType));\n     }\n@@ -338,14 +340,18 @@ CacheCostTy IndexedReference::computeRefCost(const Loop &L,\n   assert(RefCost && \"Expecting a valid RefCost\");\n \n   // Attempt to fold RefCost into a constant.\n+  // CacheCostTy is a signed integer, but the tripcount value can be large\n+  // and may not fit, so saturate/limit the value to the maximum signed\n+  // integer value.\n   if (auto ConstantCost = dyn_cast<SCEVConstant>(RefCost))\n-    return ConstantCost->getValue()->getZExtValue();\n+    return ConstantCost->getValue()->getLimitedValue(\n+        std::numeric_limits<int64_t>::max());\n \n   LLVM_DEBUG(dbgs().indent(4)\n              << \"RefCost is not a constant! Setting to RefCost=InvalidCost \"\n                 \"(invalid value).\\n\");\n \n-  return CacheCost::InvalidCost;\n+  return CacheCostTy::getInvalid();\n }\n \n bool IndexedReference::tryDelinearizeFixedSize(\n@@ -696,7 +702,7 @@ CacheCostTy\n CacheCost::computeLoopCacheCost(const Loop &L,\n                                 const ReferenceGroupsTy &RefGroups) const {\n   if (!L.isLoopSimplifyForm())\n-    return InvalidCost;\n+    return CacheCostTy::getInvalid();\n \n   LLVM_DEBUG(dbgs() << \"Considering loop '\" << L.getName()\n                     << \"' as innermost loop.\\n\");\n",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/LoopCacheAnalysis/interchange-refcost-overflow.ll",
+      "commands": [
+        "opt <  %s  -passes='print<loop-cache-cost>' -disable-output 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "foo",
+          "test_body": "@A = external local_unnamed_addr global [11 x [11 x [11 x i32]]], align 16\n\ndefine void @foo(i32 noundef %b) {\nentry:\n  %0 = sext i32 %b to i64\n  br label %outer.loop\n\nouter.loop:                                       ; preds = %outer.loop.cleanup, %entry\n  %indvars.iv = phi i64 [ %indvars.iv.next, %outer.loop.cleanup ], [ 0, %entry ]\n  br label %inner.loop\n\nouter.loop.cleanup:                               ; preds = %inner.loop\n  %indvars.iv.next = add nsw i64 %indvars.iv, %0\n  br label %outer.loop\n\ninner.loop:                                       ; preds = %inner.loop, %outer.loop\n  %inner.iv = phi i64 [ 0, %outer.loop ], [ %add, %inner.loop ]\n  %arrayidx3 = getelementptr inbounds [11 x [11 x [11 x i32]]], ptr @A, i64 0, i64 %indvars.iv, i64 %inner.iv, i64 %inner.iv\n  store i32 0, ptr %arrayidx3, align 4\n  %add = add nuw i64 %inner.iv, 2\n  %cmp = icmp ult i64 %inner.iv, -5\n  br i1 %cmp, label %inner.loop, label %outer.loop.cleanup\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "[LoopInterchange]  Assertion `getActiveBits() <= 64 && \"Too many bits for uint64_t\"",
+    "body": "With options \"-O3 --target=aarch64 func.cpp -mllvm -enable-loopinterchange\" and this input:\r\n```\r\nunsigned int A[11][11][11] __attribute__((aligned(16)));\r\nvoid a(int b) {\r\n  for (int c;; c += b)\r\n    for (long d = 0; d < -3ULL; d += 2ULL)\r\n      A[c][d][d] = 0;\r\n}\r\n```\r\n\r\nLoop-interchange runs in an assert:\r\n\r\n```\r\nllvm-project/llvm/include/llvm/ADT/APInt.h:1501: uint64_t llvm::APInt::getZExtValue() const: Assertion `getActiveBits() <= 64 && \"Too many bits for uint64_t\"' failed.\r\n```\r\n\r\nIR reproducer, compile this with \"opt -passes=loop-interchange -S\":\r\n\r\n```\r\ntarget datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\"\r\ntarget triple = \"aarch64-unknown-linux-gnu\"\r\n\r\n@A = local_unnamed_addr global [11 x [11 x [11 x i32]]] zeroinitializer, align 16\r\n\r\ndefine void @_Z1ai(i32 noundef %b) local_unnamed_addr #0 {\r\nentry:\r\n  %0 = sext i32 %b to i64\r\n  br label %for.cond\r\n\r\n; Loop:\r\nfor.cond:                                         ; preds = %for.cond.cleanup, %entry\r\n  %indvars.iv = phi i64 [ %indvars.iv.next, %for.cond.cleanup ], [ 0, %entry ]\r\n  br label %for.body\r\n\r\nfor.cond.cleanup:                                 ; preds = %for.body\r\n  %indvars.iv.next = add nsw i64 %indvars.iv, %0\r\n  br label %for.cond\r\n\r\nfor.body:                                         ; preds = %for.cond, %for.body\r\n  %d.010 = phi i64 [ 0, %for.cond ], [ %add, %for.body ]\r\n  %arrayidx3 = getelementptr inbounds [11 x [11 x [11 x i32]]], ptr @A, i64 0, i64 %indvars.iv, i64 %d.010, i64 %d.010\r\n  store i32 0, ptr %arrayidx3, align 4\r\n  %add = add nuw i64 %d.010, 2\r\n  %cmp = icmp ult i64 %d.010, -5\r\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\r\n}\r\n```",
+    "author": "sjoerdmeijer",
+    "labels": [
+      "crash-on-valid",
+      "llvm:analysis"
+    ],
+    "comments": [
+      {
+        "author": "RKSimon",
+        "body": "```\r\nopt: /root/llvm-project/llvm/include/llvm/ADT/APInt.h:1501: uint64_t llvm::APInt::getZExtValue() const: Assertion `getActiveBits() <= 64 && \"Too many bits for uint64_t\"' failed.\r\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\r\nStack dump:\r\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -passes=loop-interchange -debug <source>\r\n1.\tRunning pass \"function(loop(loop-interchange))\" on module \"<source>\"\r\n2.\tRunning pass \"loop(loop-interchange)\" on function \"_Z1ai\"\r\n #0 0x0000000004f7f528 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4f7f528)\r\n #1 0x0000000004f7cc9c SignalHandler(int) Signals.cpp:0:0\r\n #2 0x00007f497b842520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\r\n #3 0x00007f497b8969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\r\n #4 0x00007f497b842476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\r\n #5 0x00007f497b8287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\r\n #6 0x00007f497b82871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\r\n #7 0x00007f497b839e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\r\n #8 0x00000000045677cc llvm::IndexedReference::computeRefCost(llvm::Loop const&, unsigned int) const (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x45677cc)\r\n #9 0x000000000456995f llvm::CacheCost::computeLoopCacheCost(llvm::Loop const&, llvm::SmallVector<llvm::SmallVector<std::unique_ptr<llvm::IndexedReference, std::default_delete<llvm::IndexedReference>>, 8u>, 8u> const&) const (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x456995f)\r\n#10 0x000000000456c137 llvm::CacheCost::calculateCacheFootprint() (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x456c137)\r\n#11 0x0000000004573d5c llvm::CacheCost::getCacheCost(llvm::Loop&, llvm::LoopStandardAnalysisResults&, llvm::DependenceInfo&, std::optional<unsigned int>) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4573d5c)\r\n#12 0x0000000003c71d66 llvm::LoopInterchangePass::run(llvm::LoopNest&, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>&, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3c71d66)\r\n#13 0x0000000002eb0a6e llvm::detail::PassModel<llvm::LoopNest, llvm::LoopInterchangePass, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&>::run(llvm::LoopNest&, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>&, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x2eb0a6e)\r\n#14 0x0000000003c85255 llvm::PassManager<llvm::Loop, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&>::runWithLoopNestPasses(llvm::Loop&, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>&, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3c85255)\r\n#15 0x0000000003c85ce3 llvm::PassManager<llvm::Loop, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&>::run(llvm::Loop&, llvm::AnalysisManager<llvm::Loop, llvm::LoopStandardAnalysisResults&>&, llvm::LoopStandardAnalysisResults&, llvm::LPMUpdater&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3c85ce3)\r\n#16 0x0000000003c868b8 llvm::FunctionToLoopPassAdaptor::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3c868b8)\r\n#17 0x0000000000df128e llvm::detail::PassModel<llvm::Function, llvm::FunctionToLoopPassAdaptor, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xdf128e)\r\n#18 0x0000000004d7c368 llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4d7c368)\r\n#19 0x0000000000df14be llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xdf14be)\r\n#20 0x0000000004d7ad5e llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4d7ad5e)\r\n#21 0x0000000000df0f8e llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xdf0f8e)\r\n#22 0x0000000004d78ec0 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4d78ec0)\r\n#23 0x00000000008e7582 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8e7582)\r\n#24 0x00000000008da45c optMain (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8da45c)\r\n#25 0x00007f497b829d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\r\n#26 0x00007f497b829e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\r\n#27 0x00000000008d1eee _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8d1eee)\r\n```\r\nWhich seems to be due to the getZExtValue() call inside IndexedReference::computeRefCost\r\nhttps://github.com/llvm/llvm-project/blob/b05c55472bf7cadcd0e4cb1a669b3474695b0524/llvm/lib/Analysis/LoopCacheAnalysis.cpp#L340:L343"
+      },
+      {
+        "author": "svs-quic",
+        "body": "cc: @caojoshua "
+      },
+      {
+        "author": "sjoerdmeijer",
+        "body": "I have a fix, will put it up for review tomorrow. "
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "09d879d060ed31b22a6e72f7f5e44fe9b5660aa3"
+}
