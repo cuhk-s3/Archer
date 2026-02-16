@@ -188,7 +188,7 @@ def analyze_bug(agent: SimpleOpenAIClient, data: dict, issue_id: str, passes_dir
 
   analysis_result = response_content
 
-  # Save to file
+  # Prepare paths but do not write yet
   md_paths = []
   if not components:
     components = ["unknown"]
@@ -197,20 +197,6 @@ def analyze_bug(agent: SimpleOpenAIClient, data: dict, issue_id: str, passes_dir
     # Sanitize it
     safe_pass_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", comp)
     output_path = Path(passes_dir) / f"{safe_pass_name}.md"
-
-    # Ensure directory exists
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Check if file exists to add a separator if needed
-    file_exists = output_path.exists()
-
-    with open(output_path, "a") as f:
-      if file_exists:
-        f.write("\n\n---\n\n")
-      f.write(f"# Issue {issue_id}\n\n")
-      f.write(analysis_result)
-
-    logger.info(f"Analysis appended to {output_path}")
     md_paths.append(output_path)
 
   return md_paths, analysis_result
@@ -396,19 +382,28 @@ def main():
           Bug(original_ir=src_ir, transformed_ir=tgt_ir, log="Reproduced")
         )
 
-      if verification_success and md_paths:
-        for md_path in md_paths:
-          with open(md_path, "a") as f:
-            f.write("\n\n## Example\n\n")
-            f.write("### Original IR\n")
-            f.write("```llvm\n")
-            f.write(src_ir)
-            f.write("\n```\n")
-            f.write("### Optimized IR\n")
-            f.write("```llvm\n")
-            f.write(tgt_ir)
-            f.write("\n```\n")
-          logger.info(f"Verified example appended to {md_path}")
+        if md_paths:
+          for md_path in md_paths:
+            # Ensure directory exists
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            file_exists = md_path.exists()
+            
+            with open(md_path, "a") as f:
+              if file_exists:
+                f.write("\n\n---\n\n")
+              f.write(f"# Issue {args.issue}\n\n")
+              f.write(strategy)
+              f.write("\n\n## Example\n\n")
+              f.write("### Original IR\n")
+              f.write("```llvm\n")
+              f.write(src_ir)
+              f.write("\n```\n")
+              f.write("### Optimized IR\n")
+              f.write("```llvm\n")
+              f.write(tgt_ir)
+              f.write("\n```\n")
+            logger.info(f"Verified example appended to {md_path}")
 
     except Exception as e:
       logger.error(f"Generation/Verification failed: {e}")
