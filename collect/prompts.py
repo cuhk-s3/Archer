@@ -115,4 +115,6 @@ The output should be in Markdown format and follow this structure:
 It should start with ## Elements Frequently Missed and be followed by a bullet point list of the elements.
 - **High-Level Patterns Not Well Handled**: A description of high-level patterns that are not well handled in the optimization pass, along with an explanation of the issues they cause \
 and why they are not well handled. It should start with ## Patterns Not Well Handled and be followed by a detailed description of the patterns titled with ### Pattern 1, ### Pattern 2, etc.
+
+No other explanation is needed. The output should only have two sections: Elements Frequently Missed and High-Level Patterns Not Well Handled, as described above.
 """
