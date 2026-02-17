@@ -109,6 +109,7 @@ def main():
     output_file = output_dir / f"{args.component}.md"
 
     with open(output_file, "w") as f:
+      f.write(f"# Subsystem Knowledge for {args.component}\n")
       f.write(response)
 
     logger.info(f"Summary saved to {output_file}")
@@ -144,5 +145,5 @@ def main():
       sys.exit(1)
 
 
-if __name__ == "__main__":
+if __nfame__ == "__main__":
   main()

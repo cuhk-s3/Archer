@@ -1,3 +1,5 @@
+# Subsystem Knowledge for ValueTracking
+
 ## Elements Frequently Missed
 
 *   **Optimization Flags (`nsw`, `samesign`)**: The analysis frequently overlooks that flags like `nsw` (No Signed Wrap) or `samesign` alter the domain of defined values. Ignoring these leads to treating instructions as equivalent or safe to hoist when they actually produce `poison` on specific inputs where the unoptimized code was well-defined.

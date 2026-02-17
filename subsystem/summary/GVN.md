@@ -1,3 +1,5 @@
+# Subsystem Knowledge for GVN
+
 ## Elements Frequently Missed
 
 *   **Instruction Metadata and Attributes**: The optimization pass frequently overlooks metadata attached to specific call sites or instructions, such as `!range`, `nonnull`, or `noundef`. While the operands and opcodes may be identical, these attributes define strict conditions under which the result is well-defined versus `poison`. GVN often treats instructions as equivalent based solely on value computation, missing that one instruction may be "poison-prone" while the other is not.

@@ -1,3 +1,5 @@
+# Subsystem Knowledge for SROA
+
 ## Elements Frequently Missed
 
 *   **Non-Standard Integer Types with Padding**: Types such as `i6`, `i9`, or `i24` where the logical bit-width is smaller than the physical storage size (store size). The optimization pass frequently overlooks that the "padding" bits between the logical width and the storage width are not guaranteed to be preserved by typed instructions.

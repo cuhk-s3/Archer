@@ -1,3 +1,5 @@
+# Subsystem Knowledge for DivRemPairs
+
 ## Elements Frequently Missed
 
 *   **Poison-Generating Flags (`exact`):** The optimization pass frequently overlooks the implications of flags like `exact` on division instructions (`sdiv`, `udiv`). It fails to recognize that these flags narrow the domain of defined inputs, causing the instruction to yield `poison` when conditions (like the dividend being a multiple of the divisor) are not met.

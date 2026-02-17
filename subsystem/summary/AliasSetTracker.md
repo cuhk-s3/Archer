@@ -1,3 +1,5 @@
+# Subsystem Knowledge for AliasSetTracker
+
 ## Elements Frequently Missed
 
 *   **Dynamic Size Updates for Representative Pointers**: The optimization pass frequently misses updating the memory access size associated with the "representative" pointer of a `MustAlias` set. When a subsequent instruction accesses the same memory location with a larger size than the representative, this size expansion is ignored.

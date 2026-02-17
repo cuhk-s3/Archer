@@ -1,3 +1,5 @@
+# Subsystem Knowledge for SimplifyCFG
+
 ## Elements Frequently Missed
 
 *   **Alignment Constraints during Speculation**: The optimization pass frequently misses the verification of alignment attributes (`align N`) when hoisting memory access instructions (like `store`). It correctly identifies that the pointer is dereferenceable based on prior accesses but fails to check if the prior access guarantees the *same or stricter* alignment required by the instruction being hoisted.

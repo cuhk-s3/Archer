@@ -1,3 +1,5 @@
+# Subsystem Knowledge for Local
+
 ## Elements Frequently Missed
 
 *   **Instruction-Level Metadata and Attributes**: The optimizer frequently overlooks metadata attached to specific call sites (e.g., `!range`, `!nonnull`, `!noundef`) when identifying equivalent instructions. It assumes that calls to the same function with the same operands are interchangeable, ignoring that one call site may have stricter constraints that produce `poison` where the other does not.

@@ -1,3 +1,5 @@
+# Subsystem Knowledge for LazyValueInfo
+
 ## Elements Frequently Missed
 
 *   **`noundef` Attributes on Call Instructions**: The analysis frequently overlooks the `noundef` attribute on return values or parameters when determining if a call is safe to speculatively execute. While checking for `readnone` and `nounwind` ensures no side effects, missing `noundef` allows the hoisting of instructions that trigger immediate Undefined Behavior (UB) when processing `poison` values.

@@ -1,3 +1,5 @@
+# Subsystem Knowledge for Reassociate
+
 ## Elements Frequently Missed
 
 *   **Poison and Undef Elements in Vector Constants**: The optimization pass frequently overlooks the presence of `poison` or `undef` values within constant vector operands. It tends to treat vectors containing a mix of identity values (like 0) and `poison` as if they were purely identity vectors, leading to unsafe canonicalizations.

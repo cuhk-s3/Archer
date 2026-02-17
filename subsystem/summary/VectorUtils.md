@@ -1,3 +1,5 @@
+# Subsystem Knowledge for VectorUtils
+
 Based on the provided bug-triggering strategy and example, here is the subsystem knowledge base for the VectorUtils optimization pass.
 
 ## Elements Frequently Missed

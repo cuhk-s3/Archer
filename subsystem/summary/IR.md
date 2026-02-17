@@ -1,3 +1,5 @@
+# Subsystem Knowledge for IR
+
 ## Elements Frequently Missed
 
 *   **Poison-Generating Attributes on Instructions**: The analysis logic frequently overlooks specific flags and attributes that imply poison generation or undefined behavior (UB) upon execution. Specifically, the `samesign` flag on `icmp` instructions and the `noundef` attribute on function calls are often missed. While the optimizer checks for general side effects (like memory writes), it fails to account for these attributes, leading to incorrect assumptions that the instructions are unconditionally safe to speculate or hoist.

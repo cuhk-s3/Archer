@@ -1,3 +1,5 @@
+# Subsystem Knowledge for SeparateConstOffsetFromGEP
+
 ## Elements Frequently Missed
 
 *   **Poison-Generating Flags (`nuw`/`nsw`) Context Sensitivity**: The optimization pass frequently misses that flags asserting "no wrap" behavior are dependent on the specific bit-width of the operation. It fails to recognize that a guarantee holding for a wide integer type (e.g., `i32`) does not automatically transfer to a narrower type (e.g., `i8`) after truncation.

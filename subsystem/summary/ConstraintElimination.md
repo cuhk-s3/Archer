@@ -1,3 +1,5 @@
+# Subsystem Knowledge for ConstraintElimination
+
 ## Elements Frequently Missed
 
 *   **Internal Integer Bit-Width Limits**: The optimization pass frequently misses checks for arithmetic overflows when mapping LLVM IR values to its internal constraint representation. Specifically, it often attempts to represent coefficients and offsets for wide integer types (e.g., `i128`) using fixed-width 64-bit integers (`int64_t`), leading to truncation or wrap-around errors that invalidate the constraint system.

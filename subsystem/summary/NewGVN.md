@@ -1,3 +1,5 @@
+# Subsystem Knowledge for NewGVN
+
 ## Elements Frequently Missed
 
 *   **Call Site Attributes and Metadata**: The optimization pass frequently overlooks specific attributes (e.g., `nonnull`, `noundef`) and metadata (e.g., `!range`) attached to function calls. While it correctly identifies that the function and operands are identical, it fails to verify that the metadata of the replacement instruction is compatible with (i.e., not stricter than) the instruction being replaced.

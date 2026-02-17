@@ -1,3 +1,5 @@
+# Subsystem Knowledge for IndVarSimplify
+
 ## Elements Frequently Missed
 
 *   **Semantic Validity of Flags During Type Narrowing**: The optimization pass frequently misses verifying whether instruction flags (specifically `samesign`, but potentially `nsw`/`nuw`) remain valid when the bit-width of an operation is reduced. It incorrectly assumes that if a property holds for a zero-extended wide type (where the sign bit is known to be zero), it continues to hold for the truncated narrow type (where the sign bit position changes).

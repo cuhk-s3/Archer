@@ -1,3 +1,5 @@
+# Subsystem Knowledge for LoadStoreVectorizer
+
 ## Elements Frequently Missed
 
 *   **Instructions with "Non-Returning" Properties**: The optimization pass frequently overlooks instructions that are not guaranteed to transfer control to the successor (e.g., function calls that may `exit`, `throw`, or loop infinitely). The vectorizer treats basic blocks as straight-line code where instruction reordering is safe regarding execution guarantee, failing to recognize that a `call` instruction acts as a control flow barrier.

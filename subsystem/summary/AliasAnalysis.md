@@ -1,3 +1,5 @@
+# Subsystem Knowledge for AliasAnalysis
+
 ## Elements Frequently Missed
 
 *   **Integer Wrapping in Pointer Arithmetic**: The analysis frequently misses the implications of modular arithmetic in `GetElementPtr` (GEP) instructions, specifically those lacking the `inbounds` keyword. It often assumes that if a variable index is non-zero, the scaled offset derived from it must also be non-zero, ignoring cases where `index * scale` wraps to zero due to integer overflow.

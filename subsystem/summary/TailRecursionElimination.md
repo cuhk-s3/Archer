@@ -1,3 +1,5 @@
+# Subsystem Knowledge for TailRecursionElimination
+
 ## Elements Frequently Missed
 
 *   **Parameter Attributes Validation**: Specifically, the `readonly` attribute on function parameters. The optimization pass frequently misses the need to validate and strip restrictive memory attributes when the underlying memory usage pattern changes from read-only to mutable.

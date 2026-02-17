@@ -1,3 +1,5 @@
+# Subsystem Knowledge for LoopFlatten
+
 Based on the analysis of the provided bug-triggering strategy (Issue 58441), here is the subsystem knowledge base for the `LoopFlatten` optimization pass.
 
 ## Elements Frequently Missed

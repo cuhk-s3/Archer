@@ -1,3 +1,5 @@
+# Subsystem Knowledge for InstructionSimplify
+
 ## Elements Frequently Missed
 
 *   **Distinction Between `undef` and `poison`**: The optimizer frequently misses the semantic difference between `undef` (an arbitrary bit pattern) and `poison` (a value representing erroneous execution). It often incorrectly assumes `undef` can be refined to `poison`, or that `poison` can be safely propagated where `undef` was expected, leading to the introduction of undefined behavior on valid paths.

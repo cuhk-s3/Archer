@@ -1,3 +1,5 @@
+# Subsystem Knowledge for SimpleLoopUnswitch
+
 ## Elements Frequently Missed
 
 *   **Branch Successor Operand Ordering**: The specific mapping of the `true` and `false` outcomes to their respective successor labels (successor index 0 vs. successor index 1) is frequently overlooked. The compiler often assumes a default ordering (True targets the loop, False targets the exit) rather than preserving the ordering defined in the original instruction.

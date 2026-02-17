@@ -1,3 +1,5 @@
+# Subsystem Knowledge for InstCombine
+
 ## Elements Frequently Missed
 
 *   **Poison-Generating Metadata and Attributes**: The optimizer frequently fails to strip or invalidate attributes like `noundef`, `!range`, and `samesign` when transforming instructions. When a conditional operation (which guarded against invalid inputs) is converted to an unconditional one, or when operands are simplified, these attributes often remain, escalating benign `poison` values into immediate Undefined Behavior.

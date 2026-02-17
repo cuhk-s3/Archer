@@ -1,3 +1,5 @@
+# Subsystem Knowledge for LoopVectorize
+
 ## Elements Frequently Missed
 
 *   **Poison-Generating Operands in Speculated Chains**: The optimization pass frequently misses that while a memory location might be safe to access (dereferenceable), the *computation chain* used to derive its address may involve `poison` values (e.g., from PHI nodes merging valid pointers with `poison` on non-taken paths). Speculating these chains unconditionally leads to Undefined Behavior.

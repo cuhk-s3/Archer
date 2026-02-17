@@ -1,3 +1,5 @@
+# Subsystem Knowledge for FlattenCFG
+
 ## Elements Frequently Missed
 
 *   **PHI Nodes at Control Flow Merge Points**: The optimization pass frequently overlooks PHI nodes located in blocks that serve as the merge point for one conditional region and the entry point for a subsequent region. It fails to recognize that these nodes represent state changes dependent on the path taken through the first region.

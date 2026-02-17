@@ -1,3 +1,5 @@
+# Subsystem Knowledge for BDCE
+
 ## Elements Frequently Missed
 
 *   **Poison-Generating Flags (`nsw`, `nuw`, `exact`)**: The optimization pass frequently fails to identify that these flags must be dropped when the input operands of an instruction are simplified or modified, even if the instruction's opcode remains the same.

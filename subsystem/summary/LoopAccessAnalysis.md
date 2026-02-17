@@ -1,3 +1,5 @@
+# Subsystem Knowledge for LoopAccessAnalysis
+
 ## Elements Frequently Missed
 
 *   **Pointer Offset Bit-Widths**: The analysis frequently misses the need to use integer types that match the full pointer width (e.g., 64-bit) when calculating memory offsets or distances. Storing these values in narrower types (e.g., 32-bit) leads to truncation, causing large offsets to alias with small offsets (e.g., 4GB + 4 bytes becoming 4 bytes).

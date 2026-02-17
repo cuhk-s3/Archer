@@ -1,3 +1,5 @@
+# Subsystem Knowledge for CorrelatedValuePropagation
+
 ## Elements Frequently Missed
 
 *   **`undef` Operands in Constraint-Enforcing Operations**: The analysis frequently misinterprets `undef` values when they appear as operands to intrinsics that enforce specific properties (like `llvm.abs` enforcing non-negativity). The optimizer often assumes `undef` satisfies the necessary preconditions (e.g., being non-negative) to elide the operation, failing to account that `undef` can resolve to a value violating that property at runtime.

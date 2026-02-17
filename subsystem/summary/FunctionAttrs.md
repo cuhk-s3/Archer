@@ -1,3 +1,5 @@
+# Subsystem Knowledge for FunctionAttrs
+
 ## Elements Frequently Missed
 
 *   **The `inbounds` keyword on `getelementptr` instructions**: The analysis frequently overlooks the absence of the `inbounds` keyword. It assumes that pointer arithmetic based on a non-null pointer yields a non-null result, failing to account for the fact that standard (non-inbounds) pointer arithmetic can wrap or offset to null.

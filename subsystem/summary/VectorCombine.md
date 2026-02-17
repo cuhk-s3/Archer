@@ -1,3 +1,5 @@
+# Subsystem Knowledge for VectorCombine
+
 ## Elements Frequently Missed
 
 *   **Trapping Instruction Safety**: The optimization pass frequently overlooks that certain instructions (e.g., `sdiv`, `urem`, `lshr`) can trigger Undefined Behavior (UB) if their operands are modified or if they are executed speculatively. It often assumes that if the original vector instruction was safe, the transformed scalar or hoisted instruction is also safe, failing to account for `poison` or `undef` values becoming active triggers for UB (e.g., division by zero/poison, over-shifting).

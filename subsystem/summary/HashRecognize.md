@@ -1,3 +1,5 @@
+# Subsystem Knowledge for HashRecognize
+
 ## Elements Frequently Missed
 
 *   **Live-out users of Simple Recurrences**: The optimization pass frequently misses checking whether instructions classified as "simple recurrences" (used to evolve data, such as `lshr`) have users outside the loop structure.

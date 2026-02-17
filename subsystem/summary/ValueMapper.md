@@ -1,3 +1,5 @@
+# Subsystem Knowledge for ValueMapper
+
 ## Elements Frequently Missed
 
 *   **`DIAssignID` Metadata Operands in Debug Records**: The `ValueMapper` frequently misses remapping `DIAssignID` metadata nodes when they appear as operands within `llvm.dbg.assign` intrinsics or debug records. While the metadata attached directly to instructions (e.g., `!DIAssignID` on a `store`) is often correctly mapped to a new ID during cloning, the reference to that ID inside the debug intrinsic's argument list is not updated.

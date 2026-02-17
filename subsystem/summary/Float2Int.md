@@ -1,3 +1,5 @@
+# Subsystem Knowledge for Float2Int
+
 ## Elements Frequently Missed
 
 *   **Conversion Status Flags**: The optimization pass frequently misses checking the return status (e.g., `opStatus` in LLVM's `APFloat`) when converting floating-point constants to integers. It assumes conversions are always valid without verifying if the operation resulted in overflow, underflow, or an invalid representation.

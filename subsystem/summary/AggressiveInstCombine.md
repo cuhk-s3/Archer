@@ -1,3 +1,5 @@
+# Subsystem Knowledge for AggressiveInstCombine
+
 ## Elements Frequently Missed
 
 *   **Target Pointer Index Width**: The optimization pass frequently overlooks the actual bit-width of the pointer index type (e.g., 64-bit) defined in the DataLayout, defaulting to or implicitly truncating to 32-bit representations during internal calculations.

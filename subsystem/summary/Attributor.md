@@ -1,3 +1,5 @@
+# Subsystem Knowledge for Attributor
+
 ## Elements Frequently Missed
 
 *   **Stack-Allocated Temporary Query Objects**: The optimization pass frequently mishandles the lifetime of short-lived, stack-allocated objects used for immediate analysis queries. It fails to distinguish these from long-lived heap objects when managing cache persistence.

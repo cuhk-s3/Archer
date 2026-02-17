@@ -1,3 +1,5 @@
+# Subsystem Knowledge for LoopStrengthReduce
+
 ## Elements Frequently Missed
 
 *   **Implicit Modular Arithmetic (Integer Wrapping)**: The optimization pass frequently overlooks that narrow integer arithmetic (e.g., `i32`) inherently wraps around upon overflow (modular arithmetic). When widening an induction variable (IV) to a larger type (e.g., `i64`), the pass often assumes the arithmetic behavior remains linear, failing to replicate the specific wrap-around value (e.g., `INT_MAX + 1` becoming `INT_MIN`) that occurred in the narrower type.

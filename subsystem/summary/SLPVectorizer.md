@@ -1,3 +1,5 @@
+# Subsystem Knowledge for SLPVectorizer
+
 ## Elements Frequently Missed
 
 *   **External Users of Intermediate Nodes**: The optimization pass frequently overlooks users of instructions that are not the root of the vectorization tree. It often assumes that if the root can be transformed (e.g., demoted in bit width), the entire tree can be, ignoring that intermediate values are used externally in their original full-width or scalar form.

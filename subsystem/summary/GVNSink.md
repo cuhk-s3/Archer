@@ -1,3 +1,5 @@
+# Subsystem Knowledge for GVNSink
+
 ## Elements Frequently Missed
 
 *   **Source Element Types in `getelementptr` Instructions**: The optimization pass frequently overlooks the source element type associated with GEP instructions. While it correctly verifies that the opcode and the operands (base pointer and indices) are identical across predecessor blocks, it fails to validate that the types being indexed into are the same. Since the source element type determines the stride (byte size) of the index calculation, missing this element leads to incorrect memory address computations when the types differ in size (e.g., `i8` vs `i32`).

@@ -1,3 +1,5 @@
+# Subsystem Knowledge for Sink
+
 ## Elements Frequently Missed
 
 *   **`willreturn` Function Attribute**: The optimization pass frequently overlooks the `willreturn` attribute on function calls. It correctly identifies that a call is `readonly` (does not modify memory) and `nounwind` (does not throw exceptions), but fails to verify that the call is guaranteed to return control to the caller.

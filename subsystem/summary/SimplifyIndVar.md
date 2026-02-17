@@ -1,3 +1,5 @@
+# Subsystem Knowledge for SimplifyIndVar
+
 ## Elements Frequently Missed
 
 *   **Trapping Status of Instructions**: The optimization frequently misses checks for instructions that can trap or fault at runtime, specifically integer division (`sdiv`, `udiv`) and remainder (`srem`, `urem`) operations. It assumes that if an instruction's operands are loop-invariant, the instruction itself is safe to move, ignoring the potential for runtime exceptions (like division by zero).

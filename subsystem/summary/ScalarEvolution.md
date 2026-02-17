@@ -1,3 +1,5 @@
+# Subsystem Knowledge for ScalarEvolution
+
 ## Elements Frequently Missed
 
 *   **Sign-Extension Logic for Large Integer Widths**: The optimization pass frequently misses the correct handling of type promotion for integer types larger than 64 bits (e.g., `i128`). Specifically, when internal arithmetic factors (such as -1 used for subtraction) are promoted to the wider type, the system incorrectly defaults to zero-extension instead of sign-extension, corrupting the arithmetic value.
