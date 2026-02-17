@@ -242,8 +242,8 @@ def generate_test(
     if name == "verify":
       try:
         bug = json_repair.loads(res)
+        stats.test_traj.append(res)
         if bug.get("found", False):
-          stats.test_traj.append(res)
           stats.bugs.append(Bug(
             original_ir=bug["original_ir"],
             transformed_ir=bug["transformed_ir"],
@@ -254,8 +254,8 @@ def generate_test(
     if name == "difftest":
       try:
         diff_result = json.loads(res)
+        stats.test_traj.append(res)
         if diff_result.get("found", False):
-          stats.test_traj.append(res)
           stats.bugs.append(Bug(
             original_ir=diff_result["original_ir"],
             transformed_ir=diff_result["transformed_ir"],

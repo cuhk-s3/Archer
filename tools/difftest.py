@@ -117,6 +117,7 @@ class DiffTestTool(FuncToolBase):
       return json.dumps(
         {
           "found": test_result is False,
+          "tool": "difftest",
           "original_ir": orig_ir_body,
           "transformed_ir": transformed_ir_body,
           "log": {
