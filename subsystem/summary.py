@@ -8,8 +8,8 @@ from pathlib import Path
 # Add the project root to sys.path to allow imports from lms and collect
 sys.path.append(str(Path(__file__).parent.parent))
 
-from collect.prompts import PROMPT_SYSTEM_SUMMARY, PROMPT_SUMMARY
-from collect.main import SimpleOpenAIClient, RunStats
+from subsystem.prompts import PROMPT_SYSTEM_SUMMARY, PROMPT_SUMMARY
+from subsystem.main import SimpleOpenAIClient, RunStats
 
 # Setup logging
 logging.basicConfig(

@@ -1,0 +1,17 @@
+## Elements Frequently Missed
+
+*   **Instruction-Level Metadata and Attributes**: The optimizer frequently overlooks metadata attached to specific call sites (e.g., `!range`, `!nonnull`, `!noundef`) when identifying equivalent instructions. It assumes that calls to the same function with the same operands are interchangeable, ignoring that one call site may have stricter constraints that produce `poison` where the other does not.
+*   **Optimization Flags on Binary Operators**: The presence of "No Signed Wrap" (`nsw`) or "No Unsigned Wrap" (`nuw`) flags is often missed during equivalence checks. The optimizer may treat a flagged arithmetic operation as equivalent to an unflagged one (or an intrinsic that wraps), failing to recognize that the flagged operation introduces undefined behavior on overflow.
+*   **Analysis Cache Invalidation**: The optimizer frequently misses the need to invalidate or update analysis caches (such as Memory Dependence Analysis) when instructions are deleted. This is particularly critical when the memory allocator reuses the address of a deleted instruction for a new one, leading to stale cache hits.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Replacement with Stricter Definedness Constraints
+The optimization pass struggles with scenarios where two values are bitwise equivalent but have different conditions for defined behavior. Specifically, the optimizer incorrectly replaces a "loose" instruction (one that is well-defined for a wide range of inputs, such as a standard call or an overflow intrinsic) with a "strict" instruction (one that produces `poison` under specific conditions, such as a call with `!range` metadata or an `add nsw`).
+*   **Issue**: By replacing the loose instruction with the strict one, the optimizer narrows the valid input domain of the program. If the program encounters an input that violates the strict constraints (e.g., an integer overflow or an out-of-range return value), the optimized code produces `poison` or undefined behavior, whereas the original code would have produced a valid, wrapped, or unconstrained value.
+*   **Why it is not well handled**: The equivalence logic prioritizes value identity (computing the same result) but fails to intersect or verify the safety constraints (attributes and flags) of the surviving instruction against the instruction being removed.
+
+### Pattern 2: Stale Analysis Data via Pointer Reuse
+The optimization pass handles the lifecycle of instructions poorly during iterative transformations, specifically regarding the synchronization between the Intermediate Representation (IR) and auxiliary analysis caches.
+*   **Issue**: When the optimizer deletes an instruction (e.g., deduplicating PHI nodes), it may fail to notify analysis passes. If the underlying memory allocator reuses the address of the deleted instruction for a new instruction, the analysis cache may still hold data keyed to that address referring to the *old* instruction.
+*   **Why it is not well handled**: The system relies on the assumption that analysis data remains valid or is implicitly invalidated. It does not robustly handle the "ABA problem" where a new instruction masquerades as an old one due to pointer reuse, causing the optimizer to make decisions for the new instruction based on the properties of the deleted one.

@@ -13,7 +13,7 @@ import time
 # Add the project root to sys.path to allow imports from lms and collect
 sys.path.append(str(Path(__file__).parent.parent))
 
-from collect.prompts import (
+from subsystem.prompts import (
     PROMPT_ANALYZE,
     PROMPT_SYSTEM_ANALYZE,
     PROMPT_SYSTEM_VERIFY,

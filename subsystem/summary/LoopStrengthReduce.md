@@ -1,0 +1,17 @@
+## Elements Frequently Missed
+
+*   **Implicit Modular Arithmetic (Integer Wrapping)**: The optimization pass frequently overlooks that narrow integer arithmetic (e.g., `i32`) inherently wraps around upon overflow (modular arithmetic). When widening an induction variable (IV) to a larger type (e.g., `i64`), the pass often assumes the arithmetic behavior remains linear, failing to replicate the specific wrap-around value (e.g., `INT_MAX + 1` becoming `INT_MIN`) that occurred in the narrower type.
+*   **Distinction Between `sext` and `zext` Contexts**: The pass often misses the specific semantics of the extension instruction used on the IV. It tends to default to a sign-extended interpretation of the recurrence relation, ignoring cases where the original code explicitly used `zext` (zero-extension) to treat the value as unsigned, particularly when the underlying value is negative in a signed context.
+*   **Post-Increment vs. Pre-Increment Value Divergence**: The pass frequently miscalculates the value of the IV specifically at **post-increment** use sites (uses after the loop step) or **post-loop** exit values. It fails to account for the fact that while the pre-increment values might be consistent between narrow and wide types, the post-increment operation can introduce a divergence (via overflow) that the widened recurrence does not capture.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Widening Post-Increment IVs with Signed Overflow
+This pattern occurs when LoopStrengthReduce promotes an induction variable to a wider type (e.g., `i32` to `i64`) where the original IV relies on signed overflow wrapping.
+*   **The Issue**: In the original narrow type, adding the step to the IV causes a wrap-around (e.g., `2147483647 + 1` wraps to `-2147483648`). When LSR widens the IV, it extends the recurrence parameters directly (e.g., `{Start, +, Step}`). In the wider domain, the addition does not overflow (e.g., `2147483647 + 1` becomes `2147483648`).
+*   **Why it is not well handled**: The optimization assumes that extending the abstract recurrence formula is sufficient to represent the IV's behavior. It fails to insert the necessary truncation or masking operations to simulate the original wrapping behavior within the wider type, leading to a value that is numerically correct in the wide domain but semantically wrong regarding the original program's logic.
+
+### Pattern 2: Promotion of IVs with Mismatched Extension Semantics (Sign vs. Zero)
+This pattern involves promoting an IV that evolves to a negative value (in signed interpretation) but is subsequently used in a context that requires zero-extension (unsigned interpretation), such as a `zext` instruction or a `urem` operation outside the loop.
+*   **The Issue**: If a narrow IV evolves to `-1` (`0xFFFFFFFF`), a `zext` to `i64` should produce `0x00000000FFFFFFFF`. However, LSR often promotes the IV by sign-extending the recurrence. The widened IV evolves to `-1` in `i64` (`0xFFFFFFFFFFFFFFFF`).
+*   **Why it is not well handled**: The pass prioritizes a canonical form for the widened recurrence (often defaulting to sign-extension logic) and replaces the original extension instruction with the widened IV directly. It fails to recognize that the "high bits" of the widened IV must be zeroed out to match the `zext` semantics of the original code, effectively leaking sign bits into the upper half of the register.
