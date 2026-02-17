@@ -183,26 +183,17 @@ def get_tool_list(fixenv: Environment, llvm: LLVM, build_dir: str, debugger: Deb
 def get_component_knowledge(component: List[str]) -> str:
   console.print(f"Retrieving knowledge for component: {component} ...")
   
-  knowledge_dir = Path(__file__).parent / "passes"
-
-  component_to_file = {
-    "SLPVectorizer": "SLPVectorizer.md",
-    # Future:
-    # "InstCombine": "InstCombine.md",
-    # "LoopVectorize": "LoopVectorize.md",
-  }
+  knowledge_dir = Path(__file__).parent / "subsystem" / "summary"
 
   knowledge_file = []
-  for comp_name, filename in component_to_file.items():
-    if comp_name in component:
-      knowledge_file.append(knowledge_dir / filename)
+  for comp_name in component:
+    candidate = knowledge_dir / f"{comp_name}.md"
+    if candidate.exists():
+      knowledge_file.append(candidate)
 
   if not knowledge_file:
     return "No specific knowledge provided for this component."
 
-  if not all(f.exists() for f in knowledge_file):
-    return f"No specific knowledge provided for this component. Missing file: {knowledge_file}"
-  
   knowledge = [f.read_text(encoding="utf-8") for f in knowledge_file]
 
   return "\n".join(knowledge)
@@ -325,7 +316,7 @@ def run_mini_agent(
   agent.append_user_message(
     prompts.PROMPT_ANALYZE.format(
       bug_type=fixenv.get_bug_type(),
-      component=fixenv.bug_type,
+      component=", ".join(fixenv.get_hint_components()),
       patch=fixenv.get_reference_patch(),
       knowledge=get_component_knowledge(fixenv.get_hint_components()),
     )
