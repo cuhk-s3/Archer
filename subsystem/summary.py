@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from subsystem.prompts import PROMPT_SYSTEM_SUMMARY, PROMPT_SUMMARY
-from subsystem.main import SimpleOpenAIClient, RunStats
+from subsystem.collect import SimpleOpenAIClient, RunStats
 
 # Setup logging
 logging.basicConfig(
