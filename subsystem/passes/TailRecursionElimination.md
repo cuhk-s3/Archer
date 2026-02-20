@@ -1,54 +1,59 @@
 # Issue 64289
 
-## Summary Title
-Retention of ReadOnly Attribute on Modified ByVal Arguments in Tail Recursion Elimination
+## Tail Recursion Elimination Modifying `readonly byval` Arguments
 
-## Description
-The bug is triggered when the Tail Recursion Elimination pass optimizes a recursive function that accepts a `byval` argument marked with the `readonly` attribute. When converting the tail recursion into a loop, the optimizer reuses the stack memory allocated for the `byval` argument to store the parameters for the next iteration. This involves writing new data into the `byval` pointer's memory location.
+**Description**: 
+The bug is triggered when a function takes a parameter with both `byval` (pass-by-value) and `readonly` attributes, and contains a tail-recursive call. During tail recursion elimination, the compiler transforms the recursive call into a loop. To update the arguments for the next loop iteration, the optimization reuses the existing parameter's memory by inserting memory copy instructions that overwrite the original `byval` argument. 
 
-However, the transformation fails to remove the `readonly` attribute from the function parameter. This results in invalid Intermediate Representation (IR) where a pointer marked `readonly` is explicitly written to within the function body. Subsequent optimization passes, relying on the `readonly` contract, may incorrectly assume the memory pointed to by the argument is never modified, leading to miscompilations such as optimizing away necessary loads or creating infinite loops.
+However, the transformation fails to strip the `readonly` attribute from the function parameter. This creates a semantic contradiction in the IR where a parameter explicitly marked as read-only is being written to. Subsequent optimization passes rely on the `readonly` attribute and incorrectly assume the parameter's memory is never modified throughout the function execution. This false assumption leads to severe downstream miscompilations, such as incorrectly eliding memory loads or optimizing terminating conditions into infinite loops.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test_readonly_byval(i32* readonly byval(i32) %a) {
+%struct.S = type { i64, i64 }
+
+define void @test(%struct.S* byval(%struct.S) readonly align 8 %arg, i32 %count) {
 entry:
-  %val = load i32, i32* %a, align 4
-  %cond = icmp eq i32 %val, 0
-  br i1 %cond, label %ret, label %recurse
+  %cmp = icmp eq i32 %count, 0
+  br i1 %cmp, label %return, label %recurse
 
 recurse:
-  %sub = sub i32 %val, 1
-  %stack_arg = alloca i32, align 4
-  store i32 %sub, i32* %stack_arg, align 4
-  tail call void @test_readonly_byval(i32* byval(i32) %stack_arg)
+  %sub = sub i32 %count, 1
+  %new_arg = alloca %struct.S, align 8
+  tail call void @test(%struct.S* byval(%struct.S) %new_arg, i32 %sub)
   ret void
 
-ret:
+return:
   ret void
 }
+
 ```
 ### Optimized IR
 ```llvm
-define void @test_readonly_byval(i32* readonly byval(i32) %a) {
+%struct.S = type { i64, i64 }
+
+declare void @llvm.memcpy.p0i8.p0i8.i64(i8* noalias nocapture writeonly, i8* noalias nocapture readonly, i64, i1 immarg)
+
+define void @test(%struct.S* byval(%struct.S) readonly align 8 %arg, i32 %count) {
 entry:
-  %stack_arg = alloca i32, align 4
   br label %tailrecurse
 
-tailrecurse:
-  %val = load i32, i32* %a, align 4
-  %cond = icmp eq i32 %val, 0
-  br i1 %cond, label %ret, label %recurse
+tailrecurse:                                      ; preds = %recurse, %entry
+  %count.tr = phi i32 [ %count, %entry ], [ %sub, %recurse ]
+  %cmp = icmp eq i32 %count.tr, 0
+  br i1 %cmp, label %return, label %recurse
 
-recurse:
-  %sub = sub i32 %val, 1
-  store i32 %sub, i32* %stack_arg, align 4
-  %tmp = load i32, i32* %stack_arg, align 4
-  store i32 %tmp, i32* %a, align 4
+recurse:                                          ; preds = %tailrecurse
+  %sub = sub i32 %count.tr, 1
+  %new_arg = alloca %struct.S, align 8
+  %0 = bitcast %struct.S* %arg to i8*
+  %1 = bitcast %struct.S* %new_arg to i8*
+  call void @llvm.memcpy.p0i8.p0i8.i64(i8* align 8 %0, i8* align 8 %1, i64 16, i1 false)
   br label %tailrecurse
 
-ret:
+return:                                           ; preds = %tailrecurse
   ret void
 }
+
 ```

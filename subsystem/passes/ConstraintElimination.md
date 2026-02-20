@@ -1,50 +1,42 @@
 # Issue 105785
 
-## Summary Title
-Incorrect Folding of Three-Way Comparison Intrinsics on Proven Inequality
+## Incorrect Folding of 3-Way Comparison Intrinsics Due to Misinterpreted Analysis Result
 
-## Description
-The bug is triggered when the Constraint Elimination pass attempts to optimize three-way comparison intrinsics (e.g., `scmp`, `ucmp`) by checking if their operands are equal based on dominating constraints. The optimization logic queries the constraint system, which returns a result indicating whether the equality condition is proven true, proven false, or unknown. The error arises because the code checks for the *presence* of a definitive proof result (whether true or false) rather than verifying that the result specifically proves equality (true). Consequently, when the constraint system successfully proves that the operands are *not* equal (returning a "proven false" result), the optimizer misinterprets this as a valid signal to apply the optimization. It then incorrectly replaces the comparison intrinsic with zero (the value representing equality), leading to a miscompilation where unequal operands result in an equality return value.
+**Description**: 
+The bug is triggered when a 3-way comparison intrinsic (such as `scmp` or `ucmp`) is used with operands that can be proven to be strictly unequal by the compiler's constraint analysis. 
+
+When the optimization pass attempts to simplify the intrinsic, it queries the analysis to check if the two operands are equal. The analysis correctly determines that the equality condition is definitively false and returns this result (typically as an optional boolean value). However, due to a logic error in evaluating the result (e.g., checking if the optional result *has a value* rather than if the value itself is *true*), the pass misinterprets the definitive "false" as a "true". 
+
+Consequently, the pass incorrectly assumes the operands are equal and erroneously folds the 3-way comparison intrinsic to `0`, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8 @test_scmp_bug(i32 %a, i32 %b) {
+declare i8 @llvm.scmp.i8.i32(i32, i32)
+declare void @llvm.assume(i1)
+
+define i8 @test_scmp_miscompile(i32 %x, i32 %y) {
 entry:
-  ; Establish a constraint where %a is strictly less than %b
-  %cmp = icmp slt i32 %a, %b
-  br i1 %cmp, label %then, label %else
-
-then:
-  ; Inside this block, %a < %b is known.
-  ; Therefore, %a == %b is proven false.
-  ; The bug causes the optimizer to see the 'proven' status and incorrectly fold this to 0.
-  %res = call i8 @llvm.scmp.i8.i32(i32 %a, i32 %b)
+  %cmp = icmp ne i32 %x, %y
+  call void @llvm.assume(i1 %cmp)
+  %res = call i8 @llvm.scmp.i8.i32(i32 %x, i32 %y)
   ret i8 %res
-
-else:
-  ret i8 0
 }
 
-declare i8 @llvm.scmp.i8.i32(i32, i32)
 ```
 ### Optimized IR
 ```llvm
-define i8 @test_scmp_bug(i32 %a, i32 %b) {
+declare i8 @llvm.scmp.i8.i32(i32, i32)
+declare void @llvm.assume(i1)
+
+define i8 @test_scmp_miscompile(i32 %x, i32 %y) {
 entry:
-  %cmp = icmp slt i32 %a, %b
-  br i1 %cmp, label %then, label %else
-
-then:
-  ; The call to llvm.scmp has been incorrectly replaced with 0
-  ret i8 0
-
-else:
+  %cmp = icmp ne i32 %x, %y
+  call void @llvm.assume(i1 %cmp)
   ret i8 0
 }
 
-declare i8 @llvm.scmp.i8.i32(i32, i32)
 ```
 
 
@@ -52,47 +44,57 @@ declare i8 @llvm.scmp.i8.i32(i32, i32)
 
 # Issue 116553
 
-## Incorrect Propagation of Induction Variable Constraints to Non-Dominated Exit Blocks
+## Incorrect Propagation of Induction Variable Bounds to Non-Dedicated Loop Exits
 
-**Description**:
-The bug is triggered in the `ConstraintElimination` pass when it analyzes loops with induction variables. The optimization logic infers that if a loop is exited, the induction variable must satisfy a specific bound derived from the loop header's comparison (e.g., if the loop continues while `IV < Limit`, then `IV <= Limit` must hold at the exit). The pass attempts to propagate this inferred fact to the loop's exit blocks to facilitate further simplifications.
+**Description:**
+The bug occurs in the Constraint Elimination pass when it infers facts about induction variables in loop exit blocks. When a loop exits based on a condition in its header, the pass assumes that the induction variable satisfies a specific bound (e.g., less than or equal to the loop limit) in all of the loop's exit blocks. 
 
-The critical flaw is that the transformation applies this constraint to **all** exit blocks of the loop without verifying that the loop header dominates them. In LLVM IR, a loop exit block can be a merge point (such as a shared return block) that is also reachable via control flow paths that bypass the loop entirely. For such "non-dedicated" exits, the loop header does not dominate the block. By adding the loop-dependent constraint to these blocks, the optimizer incorrectly assumes the fact holds on all paths, including those that never executed the loop. This introduces a false assumption into the constraint system, leading to invalid simplifications and miscompilation of code on the bypassing paths.
+To trigger this bug, the following strategy can be used at the LLVM IR level:
+1. **Construct a Loop with an Induction Variable:** Create a loop where the header contains an exiting condition (such as an equality or inequality check) based on an induction variable.
+2. **Introduce a Non-Dedicated Exit Block:** Define an exit block for this loop that is non-dedicated. A non-dedicated exit block has incoming edges from outside the loop or from paths that bypass the loop header, meaning the loop header does not strictly dominate the exit block.
+3. **Add Constraints in the Exit Path:** Place a conditional branch, check, or instruction in the non-dedicated exit block (or its successors) that depends on the induction variable or the loop bound.
+4. **Trigger the Miscompilation:** The compiler will incorrectly propagate the loop's exit bound to this non-dedicated exit block, assuming the bound holds true for all paths reaching the block. Because the block can be reached via paths where the loop header was never executed, this invalid assumption leads to the erroneous elimination or simplification of constraints, ultimately causing a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(i32 %start, i32 %limit, i1 %cond) {
+define i1 @test_non_dedicated_exit(i32 %n, i1 %c) {
 entry:
-  br i1 %cond, label %exit, label %loop
+  br i1 %c, label %loop.header, label %exit
 
-loop:
-  %iv = phi i32 [ %start, %entry ], [ %iv.next, %loop ]
+loop.header:
+  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]
+  %cmp = icmp ult i32 %iv, %n
+  br i1 %cmp, label %loop.latch, label %exit
+
+loop.latch:
   %iv.next = add i32 %iv, 1
-  %cmp = icmp ult i32 %iv, %limit
-  br i1 %cmp, label %loop, label %exit
+  br label %loop.header
 
 exit:
-  %val = phi i32 [ %start, %entry ], [ %iv, %loop ]
-  %res = icmp uge i32 %val, %limit
-  ret i1 %res
+  %iv.lcssa = phi i32 [ 0, %entry ], [ %iv, %loop.header ]
+  %cmp.exit = icmp uge i32 %iv.lcssa, %n
+  ret i1 %cmp.exit
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(i32 %start, i32 %limit, i1 %cond) {
+define i1 @test_non_dedicated_exit(i32 %n, i1 %c) {
 entry:
-  br i1 %cond, label %exit, label %loop
+  br i1 %c, label %loop.header, label %exit
 
-loop:
-  %iv = phi i32 [ %start, %entry ], [ %iv.next, %loop ]
+loop.header:
+  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]
+  %cmp = icmp ult i32 %iv, %n
+  br i1 %cmp, label %loop.latch, label %exit
+
+loop.latch:
   %iv.next = add i32 %iv, 1
-  %cmp = icmp ult i32 %iv, %limit
-  br i1 %cmp, label %loop, label %exit
+  br label %loop.header
 
 exit:
-  %val = phi i32 [ %start, %entry ], [ %iv, %loop ]
+  %iv.lcssa = phi i32 [ 0, %entry ], [ %iv, %loop.header ]
   ret i1 true
 }
 ```
@@ -102,53 +104,38 @@ exit:
 
 # Issue 137937
 
-## Incorrect Operand Substitution in Disjoint OR Instructions
+## Incorrect Operand Replacement in Logical Operations with Poison-Generating Flags
 
-**Description**:
-The bug is triggered when the optimizer attempts to simplify a logical `or` instruction marked with the `disjoint` flag. The optimization logic analyzes the constraints on the instruction's operands and determines that the value of one operand is implied by the other (e.g., deducing that if the first operand is false, the second operand must be true). Based on this deduction, the optimizer replaces the implied operand with a constant boolean value (e.g., `true`) in-place.
+**Description:**
+The bug is triggered when the compiler attempts to simplify an operand of a logical operation (such as `or` or `and`) based on the context implied by its other operand, without properly handling poison-generating flags. 
 
-This transformation is incorrect because it fails to respect the invariants required by the `disjoint` flag, which mandates that both operands cannot be true simultaneously. In the original code, the operands dynamically satisfied this condition. However, by replacing one operand with a constant `true`, the transformed instruction violates the disjointness constraint whenever the remaining dynamic operand also evaluates to `true`. This results in undefined behavior (poison) in cases where the original program was well-defined. The optimizer should simplify the entire instruction rather than modifying individual operands of instructions with safety constraints like `disjoint`.
+The strategy to trigger this issue involves the following steps:
+1. **Create a Logical Operation with a Flag**: Introduce a binary logical operation that includes a poison-generating flag. For example, an `or` instruction with the `disjoint` flag, which asserts that the two operands never have common bits set to `1` simultaneously.
+2. **Establish an Implied Condition**: Formulate the operands (typically comparison instructions) such that one operand's value implies the other's value under certain conditions. For instance, design the conditions so that if the first operand of the `or` is `false`, the second operand is statically guaranteed to be `true`.
+3. **Trigger the Flawed Optimization**: The compiler analyzes the logical operation and uses the implied context (e.g., assuming the first operand is `false` to evaluate the second) to simplify the second operand to a constant (`true`). It then replaces the operand in-place while leaving the original logical instruction and its poison-generating flag intact.
+4. **Violate the Flag**: Provide an input where the first operand evaluates to `true`. Because the second operand was replaced with the constant `true`, the instruction now evaluates `true OR true`. This violates the `disjoint` flag's requirement that both operands cannot share set bits, causing the instruction to produce a `poison` value and leading to a miscompilation.
+
+In abstract terms, replacing an operand based on short-circuiting logic is unsafe if the instruction carries exactness or disjointness flags, as the replacement can create invalid combinations of operands for paths that would have otherwise been short-circuited. The correct approach is to simplify the entire logical instruction rather than replacing its operands in-place.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @bug_trigger(i1 %a, i1 %b) {
+define i1 @test(i32 %x) {
 entry:
-  ; Establish the condition that (a || b) is true.
-  ; This implies that if %a is false, %b must be true.
-  %cond = or i1 %a, %b
-  br i1 %cond, label %if.then, label %if.else
-
-if.then:
-  ; In this block, we know (%a || %b) is true.
-  ; The optimizer might incorrectly use the implication (!%a -> %b) to replace %b with true.
-  ; However, if %a is true, %b must be false for 'disjoint' to hold.
-  ; Replacing %b with true makes the case (%a=true) poison.
+  %a = icmp eq i32 %x, 0
+  %b = icmp ne i32 %x, 0
   %res = or disjoint i1 %a, %b
   ret i1 %res
-
-if.else:
-  ret i1 false
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @bug_trigger(i1 %a, i1 %b) {
+define i1 @test(i32 %x) {
 entry:
-  %cond = or i1 %a, %b
-  br i1 %cond, label %if.then, label %if.else
-
-if.then:
-  ; The optimizer incorrectly replaced %b with true based on the constraint (!%a -> %b).
-  ; This transforms the instruction into 'or disjoint i1 %a, true'.
-  ; If %a is true at runtime (which is valid in the original code if %b is false),
-  ; this instruction now executes 'true | true' with the disjoint flag, resulting in Poison.
+  %a = icmp eq i32 %x, 0
   %res = or disjoint i1 %a, true
   ret i1 %res
-
-if.else:
-  ret i1 false
 }
 ```
 
@@ -157,12 +144,12 @@ if.else:
 
 # Issue 140481
 
-## Integer Overflow in Constraint Decomposition Logic
+## Incorrect Handling of Integer Overflow in Linear Expression Decomposition
 
-**Description**
-The bug is triggered when the Constraint Elimination pass attempts to decompose a chain of integer arithmetic instructions (such as additions, subtractions, multiplications, and shifts) into a linear constraint system (e.g., representing a value as $A \times x + B$). During this decomposition, the compiler computes the linear coefficients and constant offsets by accumulating the constant operands from the instruction sequence. 
+**Description:**
+The bug is triggered by a sequence of arithmetic instructions (such as additions, subtractions, multiplications, or shifts) involving variables and large constants. When the compiler attempts to analyze and decompose these chained operations into a linear mathematical expression (e.g., representing them as a sum of variables with coefficients and a constant offset) to build constraints, the internal calculation of these coefficients or offsets can exceed the bounds of the compiler's internal integer representation (typically 64-bit signed integers). 
 
-If the cumulative magnitude of these calculated coefficients or offsets exceeds the capacity of the compiler's internal fixed-width integer representation (typically 64-bit), an arithmetic overflow occurs. The analysis logic previously failed to detect or handle this overflow, instead using the wrapped result to model the variable's constraints. This results in an incorrect mathematical representation of the program state. The constraint solver then uses these invalid constraints to prove conditions (e.g., determining if a comparison is always true or false), leading to erroneous code simplifications and miscompilation.
+If the compiler's decomposition logic silently allows these internal values to overflow or wrap around without invalidating the decomposition, it generates an incorrect mathematical model of the program's values. Consequently, optimization passes that rely on these mathematical constraints to prove properties about variables will evaluate comparisons based on the corrupted model. This leads to invalid simplifications, such as incorrectly folding a comparison instruction to `true` or `false`, ultimately resulting in a miscompilation.
 
 ## Example
 
@@ -170,38 +157,37 @@ If the cumulative magnitude of these calculated coefficients or offsets exceeds 
 ```llvm
 define i1 @test_overflow(i128 %x) {
 entry:
-  ; Ensure x is small so x + 2^64 doesn't overflow i128
-  %cmp = icmp ult i128 %x, 100
-  br i1 %cmp, label %if.then, label %if.end
+  %cmp.pre = icmp sgt i128 %x, 0
+  br i1 %cmp.pre, label %then, label %else
 
-if.then:
-  ; Add 2^64 to x. In unbounded math, this is x + 18446744073709551616.
-  ; If the compiler tracks the offset in a 64-bit integer, it wraps to 0.
-  %add = add nuw i128 %x, 18446744073709551616
-  ; The comparison should be true (x + 2^64 > x).
-  ; If the compiler sees offset 0, it evaluates x > x, which is false.
-  %res = icmp ugt i128 %add, %x
-  ret i1 %res
+then:
+  %mul1 = mul nsw i128 %x, 4611686018427387904
+  %mul2 = mul nsw i128 %mul1, 3
+  %cmp = icmp sgt i128 %mul2, 0
+  ret i1 %cmp
 
-if.end:
+else:
   ret i1 false
 }
+
 ```
 ### Optimized IR
 ```llvm
 define i1 @test_overflow(i128 %x) {
 entry:
-  %cmp = icmp ult i128 %x, 100
-  br i1 %cmp, label %if.then, label %if.end
+  %cmp.pre = icmp sgt i128 %x, 0
+  br i1 %cmp.pre, label %then, label %else
 
-if.then:
-  %add = add nuw i128 %x, 18446744073709551616
-  ; The bug causes the compiler to incorrectly fold the comparison to false.
+then:
+  %mul1 = mul nsw i128 %x, 4611686018427387904
+  %mul2 = mul nsw i128 %mul1, 3
+  %cmp = icmp sgt i128 %mul2, 0
   ret i1 false
 
-if.end:
+else:
   ret i1 false
 }
+
 ```
 
 
@@ -209,31 +195,28 @@ if.end:
 
 # Issue 68751
 
-## Miscompilation due to Coefficient Overflow in Constraint Analysis of Wide Integers
+## Incorrect Decomposition of Wide Integer Types in Constraint Elimination
 
-**Description**:
-The bug is triggered when the optimizer's constraint elimination analysis processes LLVM IR containing integer types with a bit width larger than 64 bits. The analysis attempts to decompose arithmetic operations and values into a system of linear constraints to prove relationships between values (e.g., to eliminate redundant comparisons). However, the internal logic uses fixed 64-bit integers to represent the coefficients and constants of these linear equations. When operating on integers wider than 64 bits, the calculation of these coefficients can overflow the 64-bit internal representation, even if the original operation in the IR is valid within its wider bit width. This overflow causes the constraint solver to construct an incorrect mathematical model of the program, leading it to erroneously deduce that certain conditions are always true or false and incorrectly optimize the code.
+**Description**: 
+The bug is triggered when the compiler analyzes constraints and conditions involving integer types that are wider than the internal coefficient representation used by the optimization pass (typically 64 bits). 
+
+When the compiler attempts to simplify comparisons or conditional branches, it decomposes the underlying arithmetic expressions (such as additions, multiplications, or extensions) into a linear system of variables and constant coefficients. However, if the original integer types are wider than the internal fixed-width integers used to store these coefficients, the arithmetic performed on the coefficients during decomposition can overflow or wrap around. 
+
+Because this internal wrapping does not match the actual semantics of the operations in the original, wider bit width, the compiler constructs an invalid mathematical model of the constraints. This mismatch leads the compiler to deduce incorrect relationships between values, resulting in miscompilations where conditions are erroneously evaluated as always true or always false, and necessary branches or checks are incorrectly eliminated.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_wide_integer_overflow(i128 %a) {
+define i1 @test_wide_int_truncation(i128 %a) {
 entry:
-  ; Ensure %a is small enough so that adding 2^64 doesn't overflow 128 bits
-  %cond = icmp ult i128 %a, 100
-  br i1 %cond, label %then, label %else
+  %pre = icmp ult i128 %a, 10
+  br i1 %pre, label %then, label %else
 
 then:
-  ; Add 2^64 (18446744073709551616) to %a
-  ; This constant fits in i128 but overflows int64_t (which is used internally by the buggy analysis)
-  %val = add nuw i128 %a, 18446744073709551616
-  
-  ; Check if %val > %a. This should always be true.
-  ; However, if the analysis truncates the constant to 64 bits (becoming 0),
-  ; it sees %val = %a + 0, and concludes %val > %a is false.
-  %result = icmp ugt i128 %val, %a
-  ret i1 %result
+  %add = add nuw i128 %a, 18446744073709551615
+  %cmp = icmp ult i128 %add, %a
+  ret i1 %cmp
 
 else:
   ret i1 false
@@ -241,15 +224,14 @@ else:
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_wide_integer_overflow(i128 %a) {
+define i1 @test_wide_int_truncation(i128 %a) {
 entry:
-  %cond = icmp ult i128 %a, 100
-  br i1 %cond, label %then, label %else
+  %pre = icmp ult i128 %a, 10
+  br i1 %pre, label %then, label %else
 
 then:
-  %val = add nuw i128 %a, 18446744073709551616
-  ; The optimizer incorrectly determined the comparison is always false
-  ret i1 false
+  %add = add nuw i128 %a, 18446744073709551615
+  ret i1 true
 
 else:
   ret i1 false
@@ -261,45 +243,90 @@ else:
 
 # Issue 76713
 
-## Incorrect Decomposition of `sub nuw` with Large Constant Operands
+## Incorrect Decomposition of `nuw` Subtraction with Negative Constants
 
 **Description**: 
-The bug is triggered when the `ConstraintElimination` pass attempts to decompose a subtraction instruction marked with the `nuw` (No Unsigned Wrap) attribute where the second operand (the subtrahend) is a constant. 
+The bug is triggered when the compiler analyzes a subtraction instruction marked with the `nuw` (no unsigned wrap) flag, where the second operand (the subtrahend) is a constant that evaluates to a negative value when sign-extended (i.e., a large unsigned constant). 
 
-The issue arises from how the optimization logic converts the constant operand into an offset for the linear constraint system. The logic incorrectly interprets the constant bit pattern as a signed integer and negates it to compute the additive offset. If the constant represents a large unsigned value that has its most significant bit set (which makes it appear negative in a signed interpretation), the negation results in a small positive value. 
+During constraint elimination, the compiler attempts to decompose expressions into a base variable and a constant offset to build a system of linear constraints. However, the specific pattern-matching logic for `nuw` subtractions fails to correctly process these negative constants, leading to an erroneous offset calculation. 
 
-Consequently, the constraint system models the subtraction of a large unsigned number as the addition of a small positive number (e.g., treating `x - 0xFFFF` as `x + 1` for a 16-bit integer). This distortion of the arithmetic relationship leads the optimizer to deduce incorrect facts about value ranges, resulting in the invalid simplification of conditional branches and miscompilation of the program.
+Because of this flawed decomposition, invalid mathematical facts are introduced into the constraint system. Consequently, the compiler may incorrectly evaluate subsequent conditions based on these flawed constraints, improperly folding branch conditions to constants (such as `true` or `false`). This alters the control flow and results in a miscompilation where the program takes the wrong execution path.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(i16 %a) {
+define i1 @test_sub_nuw_negative_constant(i8 %x) {
 entry:
-  %cmp = icmp uge i16 %a, 65280
-  br i1 %cmp, label %if.then, label %if.end
+  %sub = sub nuw i8 %x, 254
+  %cmp = icmp uge i8 %sub, %x
+  br i1 %cmp, label %t, label %f
 
-if.then:
-  %sub = sub nuw i16 %a, 65280
-  %check = icmp ugt i16 %sub, %a
-  ret i1 %check
+t:
+  ret i1 true
 
-if.end:
+f:
   ret i1 false
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(i16 %a) {
+define i1 @test_sub_nuw_negative_constant(i8 %x) {
 entry:
-  %cmp = icmp uge i16 %a, 65280
-  br i1 %cmp, label %if.then, label %if.end
+  %sub = sub nuw i8 %x, 254
+  %cmp = icmp uge i8 %sub, %x
+  br i1 true, label %t, label %f
 
-if.then:
-  %sub = sub nuw i16 %a, 65280
+t:
   ret i1 true
 
-if.end:
+f:
+  ret i1 false
+}
+```
+
+
+---
+
+# Issue 78621
+
+## Unconditional Constraint Addition for Potentially Poisonous Min/Max Intrinsics
+
+**Description**: 
+The bug occurs when the compiler's constraint elimination logic unconditionally adds facts about the results of min/max intrinsics (such as `umin`, `umax`, `smin`, `smax`) to its constraint system, without verifying if the intrinsic's result is guaranteed not to be poison. 
+
+To trigger this miscompilation, the following pattern can be constructed at the LLVM IR level:
+1. **Generate a Potentially Poisonous Value**: Create an instruction that can produce a poison value under certain conditions by using optimization flags (e.g., `nuw`, `nsw` on a shift or arithmetic operation).
+2. **Use in a Min/Max Intrinsic**: Feed this potentially poisonous value as an operand to a min/max intrinsic.
+3. **Avoid Undefined Behavior**: Ensure that the result of the min/max intrinsic is not used in any context that would trigger undefined behavior (UB). The poison value should remain unobserved.
+4. **Test the Original Input**: Include a separate condition (e.g., an `icmp` instruction) that evaluates the original input used to generate the potentially poisonous value.
+
+When the constraint elimination pass processes the min/max intrinsic, it unconditionally adds constraints relating the intrinsic's result to its operands (e.g., `result <= operand`). By doing so, it implicitly assumes that the result and its operands are not poison. This allows the constraint system to incorrectly deduce properties about the original inputs (for example, assuming an input must be non-negative because a `nuw` flag was present on the derived poison value). Finally, the compiler uses these flawed deductions to incorrectly fold or simplify the separate, independent condition, leading to a miscompilation since the poison value never actually caused UB in the original program.
+
+## Example
+
+### Original IR
+```llvm
+declare i8 @llvm.umin.i8(i8, i8)
+
+define i1 @test_umin_nuw(i8 %x, ptr %ptr) {
+entry:
+  %p = add nuw i8 %x, 10
+  %m = call i8 @llvm.umin.i8(i8 %p, i8 10)
+  store i8 %m, ptr %ptr, align 1
+  %cmp = icmp ugt i8 %x, 245
+  ret i1 %cmp
+}
+```
+### Optimized IR
+```llvm
+declare i8 @llvm.umin.i8(i8, i8)
+
+define i1 @test_umin_nuw(i8 %x, ptr %ptr) {
+entry:
+  %p = add nuw i8 %x, 10
+  %m = call i8 @llvm.umin.i8(i8 %p, i8 10)
+  store i8 %m, ptr %ptr, align 1
   ret i1 false
 }
 ```

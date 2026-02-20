@@ -1,83 +1,30 @@
 # Issue 112350
 
-## Incorrect Inversion Analysis for Comparisons with Mismatched `samesign` Flags
+## Incorrect Inversion Analysis for Comparisons with Mismatched Poison-Generating Flags
 
-**Description**
-The bug is triggered when the compiler analyzes two integer comparison instructions to determine if they are logical inverses of each other. The analysis correctly identifies that the comparison predicates are inverses (e.g., `ult` vs `uge`) but fails to check for consistency in the `samesign` optimization flag. If one comparison has the `samesign` flag enabled while the other does not, the flagged instruction yields `poison` for operands with differing signs, whereas the unflagged instruction yields a defined boolean result. By incorrectly classifying these as inverses, the compiler permits transformations (such as converting a `select` to arithmetic logic) that replace a valid, defined result with `poison`, resulting in undefined behavior.
+**Description**: 
+The bug is triggered when the compiler evaluates whether two comparison instructions are exact logical inverses of each other. The strategy involves creating two comparisons with inverse predicates (e.g., `<` and `>=`) operating on the same operands, but applying a poison-generating flag (such as `samesign`) to only one of them. 
 
-## Example
-
-### Original IR
-```llvm
-define i32 @test_inversion_bug(i8 %x, i8 %y) {
-  %cmp_samesign = icmp samesign ult i8 %x, %y
-  %cmp_normal = icmp uge i8 %x, %y
-  %result = select i1 %cmp_normal, i32 1, i32 0
-  call void @use(i1 %cmp_samesign)
-  ret i32 %result
-}
-
-declare void @use(i1)
-```
-### Optimized IR
-```llvm
-define i32 @test_inversion_bug(i8 %x, i8 %y) {
-  %cmp_samesign = icmp samesign ult i8 %x, %y
-  %result = select i1 %cmp_samesign, i32 0, i32 1
-  call void @use(i1 %cmp_samesign)
-  ret i32 %result
-}
-
-declare void @use(i1)
-```
-
-
----
-
-# Issue 137582
-
-## Speculative Execution Analysis Ignores UB-Implying Attributes on Call Instructions
-
-## Description
-The bug is triggered when the compiler's value tracking analysis attempts to reason about the value of a call instruction (such as an intrinsic) by walking up its definition chain. To perform this analysis safely, the compiler checks if the instruction is "safe to speculatively execute," meaning it can be evaluated or hoisted without introducing side effects or undefined behavior.
-
-The flaw arises because the safety check for call instructions only verified that the function was generally `speculatable` (e.g., having properties like `readnone` or `nounwind`), but failed to account for attributes that imply immediate Undefined Behavior (UB), such as `noundef` on return values or parameters. An instruction with `noundef` attributes triggers UB if it processes or returns a `poison` value. By overlooking this, the analysis incorrectly classified these calls as safe to speculate. This allowed the compiler to infer constraints or apply optimizations (such as adding `nsw` or `nuw` flags to operands) based on the assumption that the instruction would execute safely. However, if the operands were `poison` (which is valid in the source if the instruction doesn't trigger UB), the speculated instruction in the target would trigger UB due to the `noundef` attribute, resulting in a miscompilation.
+Because the flag can cause the instruction to yield a poison value under certain conditions, the two comparisons are not strict inverses: one might produce a well-defined boolean result while the other produces poison. The compiler's analysis fails to check for matching poison-generating flags between the two instructions. As a result, it incorrectly assumes they are exact inverses and performs optimizations based on this assumption, such as replacing a conditional `select` instruction with a logical `xor`. This transformation is invalid because it can unconditionally propagate poison from the flagged comparison, whereas the original code might have safely selected the unflagged, well-defined comparison.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_speculation_noundef(i1 %cond, i32 %x) {
-entry:
-  br i1 %cond, label %if.then, label %if.end
-
-if.then:
-  ; The 'noundef' attribute on the return value implies immediate UB if the result is poison.
-  ; However, 'readnone' and 'nounwind' make the function appear safe to speculate.
-  %call = call noundef i32 @func(i32 %x) #0
-  br label %if.end
-
-if.end:
-  %res = phi i32 [ %call, %if.then ], [ 0, %entry ]
-  ret i32 %res
+define i1 @test(i1 %cond, i8 %a, i8 %b) {
+  %cmp1 = icmp samesign ult i8 %a, %b
+  %cmp2 = icmp uge i8 %a, %b
+  %sel = select i1 %cond, i1 %cmp2, i1 %cmp1
+  ret i1 %sel
 }
-
-declare i32 @func(i32) 
-attributes #0 = { readnone nounwind }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_speculation_noundef(i1 %cond, i32 %x) {
-entry:
-  ; The compiler incorrectly speculates (hoists) the call because it ignores the 'noundef' attribute.
-  ; If %x is poison, this hoisted call triggers UB immediately, even if %cond is false.
-  %call = call noundef i32 @func(i32 %x) #0
-  %res = select i1 %cond, i32 %call, i32 0
-  ret i32 %res
+define i1 @test(i1 %cond, i8 %a, i8 %b) {
+  %cmp1 = icmp samesign ult i8 %a, %b
+  %sel = xor i1 %cond, %cmp1
+  ret i1 %sel
 }
-
-declare i32 @func(i32) 
-attributes #0 = { readnone nounwind }
 ```
 
 
@@ -85,29 +32,31 @@ attributes #0 = { readnone nounwind }
 
 # Issue 141017
 
-## Incorrect Usage of Floating-Point Comparison Flags in Select Analysis
+## Incorrect Fast-Math Flags Propagation in Select Patterns
 
-**Description**
-The bug is triggered when the compiler analyzes a `select` instruction controlled by a floating-point comparison (`fcmp`). The analysis logic incorrectly applies the Fast Math Flags (FMF) present on the comparison instruction—such as `nsz` (No Signed Zeros)—to the `select` instruction itself. While these flags allow the comparison to ignore certain floating-point distinctions (like the sign of zero) when computing the condition, they do not grant permission to alter the values returned by the `select`. By conflating the comparison's relaxed semantics with the selection's semantics, the compiler may misidentify the code as a pattern (e.g., a min/max idiom) that is allowed to ignore signed zeros. This leads to invalid transformations where the optimized code produces a result with the wrong sign (e.g., returning `-0.0` instead of `+0.0`), violating the strict floating-point requirements of the original `select` instruction.
+**Description**: 
+The bug is triggered when a floating-point `select` instruction uses the result of a floating-point comparison to form a higher-level pattern, such as a minimum or maximum operation. In this scenario, the comparison instruction is decorated with certain fast-math flags (e.g., `nsz` for no-signed-zeros) that relax its semantics, while the `select` instruction lacks these flags and retains stricter semantics.
+
+During pattern matching and analysis, the compiler incorrectly extracts and uses the fast-math flags from the comparison instruction to represent the properties of the entire select pattern. Because the analysis assumes the relaxed semantics of the comparison apply to the `select` as well, it permits optimizations and canonicalizations that are invalid under the stricter semantics of the original `select` instruction. This leads to miscompilations, such as incorrectly handling signed zeros or other floating-point edge cases, where the transformed code produces a different result than the original IR.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_min_nsz(float %a, float %b) {
+define float @test_min_nsz_cmp(float %a, float %b) {
   %cmp = fcmp nsz olt float %a, %b
-  %val = select i1 %cmp, float %a, float %b
-  ret float %val
+  %sel = select i1 %cmp, float %a, float %b
+  ret float %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define float @test_min_nsz(float %a, float %b) {
-  %val = call float @llvm.minnum.f32(float %a, float %b)
-  ret float %val
-}
-
 declare float @llvm.minnum.f32(float, float)
+
+define float @test_min_nsz_cmp(float %a, float %b) {
+  %sel = call float @llvm.minnum.f32(float %a, float %b)
+  ret float %sel
+}
 ```
 
 
@@ -115,30 +64,37 @@ declare float @llvm.minnum.f32(float, float)
 
 # Issue 143123
 
-## Incorrect Handling of Ordered Comparisons in Select Patterns with Fast Math Flags
+## Miscompilation of Floating-Point Select with Fast-Math Flags and Strict Comparison
 
-**Description:**
-The bug occurs in the compiler's value tracking analysis when identifying floating-point minimum or maximum patterns formed by a `select` instruction and a comparison (`fcmp`). The issue arises when the `select` instruction carries the `nnan` (No NaN) Fast Math Flag, but the controlling `fcmp` instruction does not.
+**Description**:
+The bug is triggered by a specific combination of a floating-point `select` instruction conditioned on a floating-point comparison (`fcmp`), where the two instructions have mismatched fast-math flags. 
 
-The analysis logic uses the `nnan` flag on the `select` to assume that the operands are "safe" (i.e., not NaN). Based on this assumption, it neglects to capture the "ordered" property of the comparison predicate (which dictates that the comparison is false if an operand is NaN). However, the `nnan` flag on the `select` only implies that the result is poison if an operand is NaN; it does not guarantee that the input to the `fcmp` is non-NaN. By dropping the ordered constraint, the compiler treats the pattern as if NaN behavior is irrelevant. This allows invalid transformations, such as inverting the condition and swapping operands, which fail to preserve the original behavior (where an ordered comparison returns false for NaN), leading to a value mismatch when a NaN input is encountered.
+1. **Mismatched Fast-Math Flags**: The `select` instruction is decorated with fast-math flags (such as `nnan` for "no NaNs"), indicating that optimizations can assume it does not produce or operate on NaNs. However, the underlying `fcmp` instruction lacks these flags. As a result, the comparison must still strictly adhere to IEEE 754 rules for NaN inputs (e.g., an ordered comparison must evaluate to false if an operand is NaN).
+2. **Flawed Pattern Matching**: During optimization passes (such as recognizing floating-point min/max patterns), the compiler observes the `select` instruction's fast-math flags and assumes that both operands are entirely safe from NaNs. Because it assumes NaNs are impossible, the pattern-matching logic fails to record and preserve whether the original `fcmp` predicate was ordered or unordered.
+3. **Incorrect Transformation**: Missing the ordered/unordered property of the original comparison, the compiler performs a transformation that is only safe if NaNs truly cannot exist. It inverts the comparison predicate (e.g., changing an ordered "less-than" to an ordered "greater-than-or-equal") and swaps the operands of the `select` instruction.
+4. **Triggering the Bug**: When a NaN value is encountered at runtime, the original strict `fcmp` correctly evaluates to false (since ordered comparisons yield false for NaNs), causing the `select` to return a non-NaN fallback value. This behavior is perfectly valid and respects the `select`'s `nnan` flag. However, in the transformed code, the inverted comparison also evaluates to false for the NaN input, but because the operands were swapped, it incorrectly selects and returns the NaN value. This changes the semantics of the program and results in a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @min_select_nnan(float %a, float %b) {
+define float @test(float %a, float %b) {
+entry:
   %cmp = fcmp olt float %a, %b
   %sel = select nnan i1 %cmp, float %a, float %b
   ret float %sel
 }
+
 ```
 ### Optimized IR
 ```llvm
-define float @min_select_nnan(float %a, float %b) {
-  %cmp = fcmp ogt float %a, %b
+define float @test(float %a, float %b) {
+entry:
+  %cmp = fcmp oge float %a, %b
   %sel = select nnan i1 %cmp, float %b, float %a
   ret float %sel
 }
+
 ```
 
 
@@ -146,35 +102,105 @@ define float @min_select_nnan(float %a, float %b) {
 
 # Issue 157238
 
-## Incorrect Sign Inference for Min/Max Intrinsics with Negative NaN Operands
+## Incorrect Sign Bit Propagation from Potentially NaN Operands in Floating-Point Min/Max Operations
 
-**Description**
-The bug is triggered when the compiler analyzes floating-point `minnum` or `maxnum` intrinsics where one of the operands is a NaN (Not-a-Number) with its sign bit set (effectively a "negative" NaN). 
+**Description:**
+The bug is triggered when the compiler analyzes the sign bit of the result of floating-point minimum or maximum operations (such as `minnum`, `maxnum`, `minimum`, or `maximum`). 
 
-The value tracking analysis attempts to predict the sign bit of the result based on the operands. It incorrectly applies standard comparison logic to the sign bits, assuming that a value with the sign bit set is smaller than a positive value. Consequently, the analysis infers that the result of a `minnum` operation involving a negative NaN and a positive number must be negative. However, the semantics of `minnum` and `maxnum` dictate that if one operand is NaN, the other non-NaN operand is returned, regardless of the NaN's sign. This leads the compiler to incorrectly deduce that the result is negative (or has the sign bit set), causing it to erroneously optimize away subsequent checks, such as those verifying if the result is positive zero.
+When one of the operands has a known sign bit (e.g., it is statically known to be negative) but is not guaranteed to be free of NaNs, the compiler incorrectly assumes that the result of the min/max operation will inherit this sign bit. However, according to the semantics of these floating-point operations, if one operand is a NaN, the operation typically returns the other non-NaN operand. Therefore, the sign bit of the NaN operand is discarded and does not dictate the sign bit of the final result. 
+
+By incorrectly propagating the sign bit from a potentially NaN operand, the compiler makes flawed assumptions about the result's sign or floating-point class. This leads to invalid constant folding and incorrect simplifications, such as erroneously evaluating floating-point class checks (e.g., `is.fpclass`) to a constant boolean value.
 
 ## Example
 
 ### Original IR
 ```llvm
-define double @test_bug() {
-  ; 0xFFF8000000000000 is a negative NaN
-  %neg_nan = bitcast i64 -2251799813685248 to double
-  ; minnum(-NaN, 0.0) should return 0.0 (positive)
-  %m = call double @llvm.minnum.f64(double %neg_nan, double 0.000000e+00)
-  ; copysign(1.0, 0.0) should return 1.0
-  ; If the bug triggers, the compiler infers %m is negative and returns -1.0
-  %r = call double @llvm.copysign.f64(double 1.000000e+00, double %m)
-  ret double %r
+declare float @llvm.copysign.f32(float, float)
+declare float @llvm.minnum.f32(float, float)
+declare i1 @llvm.is.fpclass.f32(float, i32)
+
+define i1 @test_minnum_sign_bit(float %x, float %y) {
+entry:
+  ; %x.neg is guaranteed to have a negative sign bit, but it could be NaN.
+  %x.neg = call float @llvm.copysign.f32(float %x, float -1.0)
+  
+  ; If %x.neg is NaN, minnum returns %y, which could be positive.
+  %min = call float @llvm.minnum.f32(float %x.neg, float %y)
+  
+  ; Check if %min is positive (fcPosNormal | fcPosSubnormal | fcPosZero | fcPosInf = 256 | 128 | 64 | 512 = 960)
+  %cmp = call i1 @llvm.is.fpclass.f32(float %min, i32 960)
+  ret i1 %cmp
 }
 
-declare double @llvm.minnum.f64(double, double)
-declare double @llvm.copysign.f64(double, double)
 ```
 ### Optimized IR
 ```llvm
-define double @test_bug() {
-  ret double -1.000000e+00
+declare float @llvm.copysign.f32(float, float)
+declare float @llvm.minnum.f32(float, float)
+declare i1 @llvm.is.fpclass.f32(float, i32)
+
+define i1 @test_minnum_sign_bit(float %x, float %y) {
+entry:
+  %x.neg = call float @llvm.copysign.f32(float %x, float -1.0)
+  %min = call float @llvm.minnum.f32(float %x.neg, float %y)
+  ; The compiler incorrectly assumes %min is always negative and folds the check to false.
+  ret i1 false
+}
+
+```
+
+
+---
+
+# Issue 161524
+
+## Incorrect Poison Analysis for PHI Nodes with Poison-Generating Flags
+
+**Description**: 
+The bug is triggered by exploiting a flaw in the compiler's analysis of whether a value is guaranteed not to be undefined or poison. Specifically, when evaluating a PHI node, the analysis only verifies that its incoming values are not undef or poison, but fails to account for poison-generating flags (such as fast-math flags like `ninf` or `nnan`) attached directly to the PHI node itself.
+
+To trigger this bug:
+1. Construct a PHI node and attach one or more poison-generating flags to it (e.g., floating-point fast-math flags).
+2. Ensure that all incoming values to this PHI node are guaranteed not to be undef or poison.
+3. Consume the result of the PHI node in an instruction that relies on poison analysis for optimization, such as a `freeze` instruction.
+4. The compiler incorrectly assumes the PHI node's result is safe from being poison solely because its incoming values are safe, completely ignoring the potential for the PHI node's flags to generate poison. This leads to invalid optimizations, such as improperly eliminating the `freeze` instruction.
+5. At runtime, if an incoming value violates the condition of the poison-generating flag (e.g., an infinity value passed to a PHI node with the `ninf` flag), the PHI node produces a poison value. Because the `freeze` instruction was incorrectly removed, the optimized program becomes more poisonous than the original, resulting in a miscompilation.
+
+## Example
+
+### Original IR
+```llvm
+define float @test(i1 %c, float noundef %a, float noundef %b) {
+entry:
+  br i1 %c, label %if, label %else
+
+if:
+  br label %join
+
+else:
+  br label %join
+
+join:
+  %phi = phi nnan ninf float [ %a, %if ], [ %b, %else ]
+  %fr = freeze float %phi
+  ret float %fr
+}
+```
+### Optimized IR
+```llvm
+define float @test(i1 %c, float noundef %a, float noundef %b) {
+entry:
+  br i1 %c, label %if, label %else
+
+if:
+  br label %join
+
+else:
+  br label %join
+
+join:
+  %phi = phi nnan ninf float [ %a, %if ], [ %b, %else ]
+  ret float %phi
 }
 ```
 
@@ -183,33 +209,40 @@ define double @test_bug() {
 
 # Issue 54311
 
-## Unsafe Folding of Select-Guarded Subtraction to Min/Max Intrinsics
+## Incorrect `smin`/`smax` Pattern Matching for `select` with `nsw` Subtraction
 
-**Description**
-The bug is triggered by an optimization pattern that attempts to replace a specific sequence of instructions involving a `select`, a comparison, and a subtraction with a signed minimum or maximum intrinsic. The logic targets patterns where a `select` instruction chooses between zero and the result of a subtraction `X - Y` (marked with the `nsw` or "No Signed Wrap" flag) based on a signed comparison between `X` and `Y`. For example, the pattern `(X < Y) ? 0 : (X -nsw Y)` is identified and transformed into `smax(X -nsw Y, 0)`.
+**Description**:
+The bug is triggered by a sequence of transformations involving a conditional signed subtraction with the `nsw` (no signed wrap) flag. 
 
-The strategy is flawed because it fails to account for cases where the subtraction overflows. The `nsw` flag causes the subtraction to produce a "poison" value upon overflow. In the original code, the comparison condition (e.g., `X < Y`) ensures that if the subtraction would overflow in a way that contradicts the logic (e.g., `INT_MIN - 1`), the `select` instruction chooses the constant zero, effectively discarding the poison value from the unselected subtraction path. By converting this to a min/max intrinsic, the subtraction is passed as an unconditional argument. If the subtraction overflows, the intrinsic receives the poison value and propagates it, resulting in undefined behavior where the original code was well-defined.
+1. Initially, the subtraction is guarded by a conditional branch based on a signed comparison of its operands (e.g., `X <s Y`), ensuring the subtraction only executes when it is guaranteed not to overflow.
+2. Control flow simplification hoists the subtraction, making it unconditional, and replaces the branch with a `select` instruction. The `select` chooses `0` if the condition is met, and the subtraction result otherwise. If the unconditional subtraction overflows, it produces a `poison` value. However, the `select` safely ignores this by choosing `0` when the overflow would occur, keeping the program well-defined.
+3. An optimization pass incorrectly identifies this `select` pattern as a signed minimum (`smin`) or maximum (`smax`) operation between the subtraction result and `0`.
+4. The `select` is transformed into an `smin` or `smax` intrinsic. Unlike the `select` instruction, which conditionally shields the `poison` value, the intrinsic unconditionally evaluates its arguments. If the subtraction overflows, the `poison` value is propagated through the `smin`/`smax` intrinsic, replacing a well-defined `0` with `poison` and leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_unsafe_select_sub_nsw(i32 %x, i32 %y) {
-  %sub = sub nsw i32 %x, %y
-  %cmp = icmp slt i32 %x, %y
-  %res = select i1 %cmp, i32 0, i32 %sub
-  ret i32 %res
+define i32 @test(i32 %X, i32 %Y) {
+entry:
+  %sub = sub nsw i32 %X, %Y
+  %cmp = icmp slt i32 %X, %Y
+  %sel = select i1 %cmp, i32 0, i32 %sub
+  ret i32 %sel
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_unsafe_select_sub_nsw(i32 %x, i32 %y) {
-  %sub = sub nsw i32 %x, %y
-  %res = call i32 @llvm.smax.i32(i32 %sub, i32 0)
-  ret i32 %res
+declare i32 @llvm.smax.i32(i32, i32)
+
+define i32 @test(i32 %X, i32 %Y) {
+entry:
+  %sub = sub nsw i32 %X, %Y
+  %sel = call i32 @llvm.smax.i32(i32 %sub, i32 0)
+  ret i32 %sel
 }
 
-declare i32 @llvm.smax.i32(i32, i32)
 ```
 
 
@@ -217,31 +250,125 @@ declare i32 @llvm.smax.i32(i32, i32)
 
 # Issue 57357
 
-## Incorrect Handling of Signed Zeros in Floating-Point Min/Max Pattern Matching
+## Incorrect Floating-Point Min/Max Matching with Mismatched Signed Zeros
 
 **Description**
-The bug is triggered when the compiler analyzes a `select` instruction controlled by a floating-point comparison to identify minimum or maximum patterns. The issue specifically arises when the comparison involves a zero constant (e.g., `+0.0`) and the `select` instruction returns a zero constant with the opposite sign (e.g., `-0.0`).
 
-The compiler's analysis logic incorrectly assumes that because `+0.0` and `-0.0` compare equal, the zero in the comparison can be treated as identical to the zero in the select output for the purpose of pattern matching. This causes the compiler to misidentify the sequence as a standard floating-point min/max pattern (e.g., treating `x < +0.0 ? -0.0 : x` as equivalent to a canonical minimum operation).
+The bug is triggered by a specific sequence of floating-point comparison (`fcmp`) and `select` instructions involving zero values with different signs. The strategy to trigger this issue involves the following pattern:
 
-Based on this misidentification, the compiler performs a transformation that relaxes the comparison predicate, such as changing a strict inequality (`<`) to a non-strict inequality (`<=`). This transformation is unsound when signed zeros are significant. For an input of `+0.0`, the original strict comparison `+0.0 < +0.0` evaluates to false, preserving the input value `+0.0`. However, the transformed non-strict comparison `+0.0 <= +0.0` evaluates to true, causing the `select` to return the explicit `-0.0` constant. This results in an incorrect sign for the return value.
+1. **Strict Inequality Comparison**: A floating-point comparison instruction uses a strict inequality predicate (e.g., strictly less than `olt`, or strictly greater than `ogt`) to compare a variable against a zero value (e.g., `+0.0`).
+2. **Select with Mismatched Zero**: A `select` instruction uses the boolean result of this comparison to choose between the original variable and a zero constant that has the opposite sign of the zero used in the comparison (e.g., `-0.0`).
+3. **Absence of Fast-Math Flags**: The `select` instruction does not possess the `nsz` (no signed zeros) fast-math flag, meaning the sign of zero must be strictly preserved according to IEEE-754 semantics.
+
+When this pattern occurs, the compiler's value tracking and pattern matching logic incorrectly identifies the sequence as a standard floating-point minimum or maximum operation. Because IEEE-754 comparisons ignore the sign of zero, the compiler attempts to canonicalize the operation by treating the mismatched zeros as identical. It then erroneously transforms the strict inequality predicate into a non-strict inequality (e.g., changing `<` to `<=`).
+
+This transformation introduces a miscompilation when the input variable is zero. For example, in the original strict inequality (`+0.0 < +0.0`), the condition evaluates to `false`, and the `select` correctly returns the original `+0.0`. However, in the transformed non-strict inequality (`+0.0 <= +0.0`), the condition evaluates to `true`, causing the `select` to incorrectly return the `-0.0` branch. This unintended sign flip for zero can drastically alter the results of subsequent operations, such as causing a division by zero to yield negative infinity instead of positive infinity.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_signed_zero_mismatch(float %x) {
-  %cmp = fcmp olt float %x, 0.000000e+00
-  %res = select i1 %cmp, float -0.000000e+00, float %x
-  ret float %res
+define double @test_mismatched_zeros(double %x) {
+  %cmp = fcmp olt double %x, 0.000000e+00
+  %sel = select i1 %cmp, double -0.000000e+00, double %x
+  ret double %sel
+}
+
+```
+### Optimized IR
+```llvm
+define double @test_mismatched_zeros(double %x) {
+  %cmp = fcmp ole double %x, -0.000000e+00
+  %sel = select i1 %cmp, double -0.000000e+00, double %x
+  ret double %sel
+}
+
+```
+
+
+---
+
+# Issue 58046
+
+## Incorrect Non-Negative Assumption for Floating-Point Division with Negative Zero Divisor
+
+**Description**: 
+The bug is triggered by a floating-point division (`fdiv`) where the divisor can evaluate to negative zero (`-0.0`) but cannot be ordered less than zero (i.e., it is never strictly negative). The numerator is typically a positive value. 
+
+The compiler's value tracking analysis incorrectly assumes that if both operands of a floating-point division cannot be ordered less than zero, the result of the division also cannot be ordered less than zero. However, in IEEE 754 floating-point arithmetic, dividing a positive number by negative zero results in negative infinity (`-Inf`), which is strictly less than zero. 
+
+By constructing a scenario where the divisor evaluates to `-0.0` (for example, by multiplying `-0.0` with a guaranteed non-negative value) and then comparing the division result against a negative value (such as `-Inf`), the compiler erroneously concludes that the division result can never be negative. This flawed assumption causes the compiler to incorrectly fold or simplify subsequent instructions, such as evaluating a valid equality comparison to `false`, ultimately leading to a miscompilation.
+
+## Example
+
+### Original IR
+```llvm
+declare double @llvm.fabs.f64(double)
+
+define i1 @test_fdiv_negative_zero(double %x) {
+  %abs = call double @llvm.fabs.f64(double %x)
+  %divisor = fmul double %abs, -0.000000e+00
+  %div = fdiv double 1.000000e+00, %divisor
+  %cmp = fcmp oeq double %div, 0xFFF0000000000000
+  ret i1 %cmp
 }
 ```
 ### Optimized IR
 ```llvm
-define float @test_signed_zero_mismatch(float %x) {
-  %cmp = fcmp ole float %x, 0.000000e+00
-  %res = select i1 %cmp, float -0.000000e+00, float %x
-  ret float %res
+define i1 @test_fdiv_negative_zero(double %x) {
+  ret i1 false
+}
+```
+
+
+---
+
+# Issue 62760
+
+## Incorrect Constant Range Calculation for 1-bit Intrinsics
+
+**Description**: 
+The bug is triggered when the compiler attempts to determine the constant range of the result for certain integer intrinsics (such as absolute value or count leading/trailing zeros) applied to 1-bit (`i1`) values. 
+
+When calculating the upper and lower bounds of the result for these intrinsics, the logic typically adds 1 to the maximum possible value to represent the exclusive upper bound. However, for a 1-bit integer, adding 1 to the maximum value causes an overflow, wrapping the upper bound back to the lower bound. Consequently, the calculated lower bound and upper bound become equal. 
+
+In the compiler's range representation, a range with equal lower and upper bounds is treated as an empty range (indicating no possible valid values) rather than a full range (indicating all possible values). This incorrect empty range propagates through the optimization pipeline, leading the compiler to erroneously assume that the result is poison or that the code path is unreachable, ultimately causing a miscompilation.
+
+## Example
+
+### Original IR
+```llvm
+declare i1 @llvm.abs.i1(i1, i1 immarg)
+declare i1 @llvm.ctlz.i1(i1, i1 immarg)
+declare i1 @llvm.cttz.i1(i1, i1 immarg)
+
+define i1 @test_abs_i1(i1 %x) {
+  %res = call i1 @llvm.abs.i1(i1 %x, i1 false)
+  ret i1 %res
+}
+
+define i1 @test_ctlz_i1(i1 %x) {
+  %res = call i1 @llvm.ctlz.i1(i1 %x, i1 false)
+  ret i1 %res
+}
+
+define i1 @test_cttz_i1(i1 %x) {
+  %res = call i1 @llvm.cttz.i1(i1 %x, i1 false)
+  ret i1 %res
+}
+```
+### Optimized IR
+```llvm
+define i1 @test_abs_i1(i1 %x) {
+  ret i1 poison
+}
+
+define i1 @test_ctlz_i1(i1 %x) {
+  ret i1 poison
+}
+
+define i1 @test_cttz_i1(i1 %x) {
+  ret i1 poison
 }
 ```
 
@@ -250,35 +377,117 @@ define float @test_signed_zero_mismatch(float %x) {
 
 # Issue 63316
 
-## Incorrect Exclusion of NaN Result in Floating-Point Multiplication Analysis
+## Incorrect NaN Deduction for Floating-Point Multiplication of Zero and Infinity
 
 **Description**
-The bug occurs during the static analysis of floating-point multiplication instructions (`fmul`) when the compiler attempts to determine if the result can be Not-a-Number (NaN). In floating-point arithmetic, a multiplication produces NaN if either operand is NaN, or if the operation involves multiplying Zero by Infinity (`0 * Inf`).
 
-The compiler attempts to prove that the result is never NaN by analyzing the properties of the operands. The flaw exists in the logic intended to rule out the `0 * Inf` case. The compiler incorrectly concludes that the result cannot be NaN if both operands independently satisfy a condition where they are either "known to never be Infinity" or "known to never be Zero". 
+The bug is triggered by a floating-point multiplication where one operand can evaluate to zero (but is known not to be infinity) and the other operand can evaluate to infinity (but is known not to be zero). 
 
-This logic is insufficient because it permits a combination where one operand contributes the Zero (satisfying the condition because it is not Infinity) and the other operand contributes the Infinity (satisfying the condition because it is not Zero). As a result, the compiler fails to recognize that `0 * Inf` is possible, leading it to incorrectly optimize away checks for NaN (such as `fcmp uno`) by assuming the result is always a valid number.
+In IEEE-754 arithmetic, multiplying zero by infinity results in a NaN (Not-a-Number). However, the compiler's value tracking analysis contained flawed logic for deducing whether a multiplication could produce a NaN. Specifically, it incorrectly concluded that the result could never be NaN if both operands individually satisfied the condition of being either "never infinity" or "never zero". This logic failed to account for the cross-operand scenario where one operand is zero and the other is infinity.
+
+As a result, when an instruction sequence involves such a multiplication followed by a check for NaN (e.g., an unordered floating-point comparison like `fcmp uno` or `fcmp ord`), the compiler erroneously assumes the multiplication can never yield NaN. This leads to an invalid optimization where the NaN check is folded to a constant boolean value (e.g., `false`), causing a miscompilation. 
+
+To trigger this issue, one can construct an IR pattern with:
+1. A floating-point multiplication where one operand is potentially zero (e.g., the result of an integer-to-float conversion of a value that can be zero) and the other is infinity (e.g., a constant infinity).
+2. A subsequent operation that checks if the result of the multiplication is NaN (e.g., an unordered comparison against zero).
+
+Because of the flawed deduction, the compiler will incorrectly optimize away the NaN check, altering the program's intended behavior when the zero-times-infinity case occurs.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @trigger_fmul_nan_exclusion() {
-  ; Operand A is 0.0 (satisfies 'known to never be Infinity')
-  ; Operand B is Infinity (satisfies 'known to never be Zero')
-  ; The multiplication 0.0 * Infinity results in NaN.
-  %mul = fmul double 0.000000e+00, 0x7FF0000000000000
-  
-  ; Check if the result is NaN (Unordered). Correct result should be true.
-  %is_nan = fcmp uno double %mul, 0.000000e+00
-  ret i1 %is_nan
+define i1 @test(i32 %x) {
+entry:
+  %conv = uitofp i32 %x to double
+  %mul = fmul double %conv, 0x7FF0000000000000
+  %cmp = fcmp uno double %mul, 0.000000e+00
+  ret i1 %cmp
+}
+
+```
+### Optimized IR
+```llvm
+define i1 @test(i32 %x) {
+entry:
+  %conv = uitofp i32 %x to double
+  %mul = fmul double %conv, 0x7FF0000000000000
+  ret i1 false
+}
+
+```
+
+
+---
+
+# Issue 89669
+
+## Invalid Swapping of Select Operands with Poisonous Negation Zero
+
+**Description**:
+The bug occurs in the compiler's instruction combining pass, specifically within the logic that attempts to sink negations through expression trees. 
+
+1. **Pattern Recognition**: The optimizer encounters a negation of a `select` instruction, such as `sub 0, (select cond, -X, X)`. To optimize this, it checks if one operand of the `select` is the known negation of the other.
+2. **Poisonous Negation**: The analysis identifies `-X` as a negation of `X`. In vector types, this negation is often represented as a subtraction from a zero vector. Crucially, the analysis allowed this zero vector to contain `poison` elements (e.g., `sub <0, poison>, X`). These `poison` elements are often introduced by prior optimization steps (like demanded-element simplification) that replace unused constant elements with `poison`.
+3. **Invalid Transformation**: When the optimizer confirms the operands are negations of each other, it attempts to negate the entire `select` instruction by simply swapping its true and false operands, transforming the expression into `select cond, X, -X`.
+4. **Miscompilation**: While mathematically correct, this transformation is invalid in the presence of `poison`. If the condition evaluates such that it selects the non-negated operand in the original code, the original expression evaluates to `sub 0, X`, which is well-defined and free of poison. However, the optimized expression evaluates directly to the negated operand `-X` (i.e., `sub <0, poison>, X`), which contains `poison` elements. 
+5. **Result**: The optimized code becomes "more poisonous" than the original code. It introduces `poison` values into execution paths that were previously well-defined. This violates compiler optimization rules and allows subsequent passes to incorrectly fold or eliminate the code, ultimately leading to a miscompilation (e.g., folding the entire expression to the original value `X` incorrectly).
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i8> @neg_select_poison_zero(<2 x i1> %cond, <2 x i8> %x) {
+  %neg_x = sub <2 x i8> <i8 0, i8 poison>, %x
+  %sel = select <2 x i1> %cond, <2 x i8> %neg_x, <2 x i8> %x
+  %res = sub <2 x i8> zeroinitializer, %sel
+  ret <2 x i8> %res
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @trigger_fmul_nan_exclusion() {
-  ; The compiler incorrectly concludes %mul cannot be NaN based on the flawed logic,
-  ; optimizing the NaN check to false.
-  ret i1 false
+define <2 x i8> @neg_select_poison_zero(<2 x i1> %cond, <2 x i8> %x) {
+  %neg_x = sub <2 x i8> <i8 0, i8 poison>, %x
+  %res = select <2 x i1> %cond, <2 x i8> %x, <2 x i8> %neg_x
+  ret <2 x i8> %res
+}
+```
+
+
+---
+
+# Issue 99436
+
+## Unsafe Operand Substitution in Speculatively Executed Instructions
+
+**Description**: 
+The bug is triggered when the compiler performs operand substitution on an instruction that is executed unconditionally (speculatively), but whose safety relies heavily on the properties of its original operands. 
+
+The strategy involves the following pattern:
+1. **Speculatively Safe Instruction**: An instruction (such as a memory load or a division) is safe to execute unconditionally because its variable operands possess certain guaranteed properties (e.g., a known valid, dereferenceable pointer, or a non-zero divisor).
+2. **Conditional Equivalence**: The result of this instruction is used in a conditional operation (like a `select` instruction). The condition checks if the variable operand is equal to a specific constant (e.g., checking if the pointer is `null`, or if the divisor is `0`).
+3. **Flawed Transformation**: The compiler attempts to optimize the instruction by replacing the variable operand with the constant, assuming the equivalence holds for that specific conditional path. 
+4. **Introduction of Undefined Behavior**: The compiler incorrectly verifies if the instruction is safe to speculatively execute *before* performing the substitution. Replacing the variable operand with the constant (e.g., substituting a valid pointer with `null`) invalidates the very properties that made the instruction safe in the first place. Because the instruction remains unconditionally executed outside the conditional construct, the newly substituted constant operand causes immediate undefined behavior (e.g., a null pointer dereference or division by zero) at runtime.
+
+## Example
+
+### Original IR
+```llvm
+define i32 @test(ptr dereferenceable(4) %p) {
+entry:
+  %val = load i32, ptr %p, align 4
+  %cmp = icmp eq ptr %p, null
+  %res = select i1 %cmp, i32 %val, i32 0
+  ret i32 %res
+}
+```
+### Optimized IR
+```llvm
+define i32 @test(ptr dereferenceable(4) %p) {
+entry:
+  %val = load i32, ptr null, align 4
+  %cmp = icmp eq ptr %p, null
+  %res = select i1 %cmp, i32 %val, i32 0
+  ret i32 %res
 }
 ```

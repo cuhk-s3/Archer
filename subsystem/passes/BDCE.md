@@ -1,32 +1,32 @@
 # Issue 80113
 
-## Failure to Drop Poison-Generating Flags on Fully-Demanded Users
+## Failure to Clear Poison-Generating Flags on Fully Demanded Users
 
-## Description
-The bug is triggered in the Bit-Tracking Dead Code Elimination (BDCE) pass when the optimizer simplifies an instruction (e.g., replacing unused bits with zero) because its output bits are not fully demanded. To preserve correctness, the optimizer is supposed to clear poison-generating flags (such as `nsw`, `nuw`, or `exact`) from any instructions that use this simplified value, as the modified input might violate the assumptions implied by those flags.
+**Description:**
+The bug occurs during bit-tracking dead code elimination when an instruction is simplified based on its demanded bits, but the compiler fails to properly update the assumptions of its users. The triggering strategy involves the following pattern:
 
-The issue arises when a user of the simplified instruction demands all of its own output bits (i.e., the user's result is fully used). The optimization logic incorrectly assumes that because the user's output is fully demanded, the user instruction itself does not need to be visited or modified. Consequently, the optimizer skips clearing the poison-generating flags on this user. When the operand is subsequently simplified, the retained flags on the user instruction may no longer hold true for the new input value, causing the instruction to incorrectly produce a poison value (undefined behavior) instead of a valid result.
+1. **Partially Demanded Definition**: Generate an integer instruction (the definition) where only a subset of its bits are actually demanded by its users.
+2. **Poison-Generating User**: Use this instruction as an operand in a subsequent instruction (the user) that is decorated with poison-generating flags (e.g., `nsw` for no signed wrap, `nuw` for no unsigned wrap, or `exact`).
+3. **Fully Demanded User**: Ensure that all bits of this user instruction are demanded by its own subsequent users in the def-use chain.
+4. **Simplification and Flag Retention**: During optimization, the compiler simplifies the definition instruction by altering its undemanded bits (e.g., zeroing them out). Because the input to the user instruction has changed, the compiler is supposed to clear the poison-generating flags on the user to prevent it from erroneously producing a poison value.
+5. **Incorrect Pruning Logic**: The compiler incorrectly assumes that if a user instruction has *all* of its bits demanded, neither it nor its def-use chain needs to be processed. Consequently, it skips the user instruction entirely and fails to drop its poison-generating flags.
+6. **Miscompilation**: At runtime, the altered input from the simplified definition causes the user instruction to violate its retained poison-generating flags (e.g., causing an overflow). This produces a poison value that propagates through the program, leading to incorrect execution results.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test(i32 %x) {
-  ; %A has high bits set (e.g., 0xFFFFFF80 if %x is 0)
-  %A = or i32 %x, -128
-  ; shl nsw is valid because input is negative and result is negative (no sign change)
+define i32 @test(i32 %x, i32 %z) {
+  %y = shl i32 %z, 8
+  %A = or i32 %x, %y
   %B = shl nsw i32 %A, 24
   ret i32 %B
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test(i32 %x) {
-  ; BDCE simplifies the constant because high bits are not demanded by the shl
-  ; -128 (0xFFFFFF80) becomes 128 (0x00000080)
-  %A = or i32 %x, 128
-  ; BUG: nsw flag is retained. Input is now positive (128), result is negative (INT_MIN).
-  ; This sign change violates nsw, causing poison.
+define i32 @test(i32 %x, i32 %z) {
+  %A = or i32 %x, 0
   %B = shl nsw i32 %A, 24
   ret i32 %B
 }

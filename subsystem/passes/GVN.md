@@ -1,43 +1,54 @@
 # Issue 113997
 
-## Unsafe Common Subexpression Elimination of Function Calls with Incompatible Attributes
+## Miscompilation due to Improper Handling of Call Attributes during CSE/GVN
 
-**Description**
-The bug is triggered when the optimizer performs Common Subexpression Elimination (CSE) or Global Value Numbering (GVN) on function calls or intrinsics. The optimization logic identifies two calls as equivalent solely because they invoke the same function with identical operands, ignoring differences in attributes or metadata attached to the specific call sites (such as `range`, `nonnull`, or `noundef`).
+**Description:**
+The bug occurs when Common Subexpression Elimination (CSE) or Global Value Numbering (GVN) optimizations replace a function call with a dominating equivalent call without properly reconciling their return attributes. 
 
-The issue arises when the earlier call (used as the replacement value) has stricter attributes than the later call (the instruction being replaced). The stricter attributes may cause the earlier call to yield `poison` or undefined behavior for specific inputs, whereas the later call—having looser or no attributes—would produce a well-defined result for those same inputs. When the optimizer replaces the later call with the earlier one without intersecting or verifying the attributes, it introduces `poison` into a program path where the value was originally well-defined. This leads to miscompilation if the inputs violate the strict attributes of the replacement value but are valid for the original instruction.
+The bug triggering strategy involves the following sequence:
+1. The program contains two identical function calls (or intrinsics) with the same arguments, making the dominated call a candidate for elimination.
+2. The dominating call possesses more restrictive return attributes (such as `range` or `nonnull`) compared to the dominated call.
+3. For specific inputs, the dominating call evaluates to `poison` because its restrictive attributes are violated. However, in the original program, this `poison` value is safely ignored or masked by the control flow.
+4. The dominated call, which lacks these restrictive attributes (or has more relaxed ones), evaluates to a well-defined value for the same inputs.
+5. The optimization pass replaces the dominated call with the dominating call but fails to intersect or strip the incompatible attributes.
+6. As a result, the uses of the dominated call incorrectly receive the `poison` value from the dominating call, leading to a miscompilation where the optimized program is more poisonous than the original source.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_unsafe_cse(i32 %x) {
-  ; Call 1: Has strict range metadata [0, 10). If @fn returns 20, this is poison.
-  %v1 = call i32 @fn(i32 %x) #0, !range !0
-  ; Call 2: No range metadata. If @fn returns 20, this is 20.
-  %v2 = call i32 @fn(i32 %x) #0
-  ; The program should return the well-defined value from %v2.
-  ret i32 %v2
+declare ptr @foo(ptr) memory(none)
+
+define ptr @test(ptr %p, i1 %c) {
+entry:
+  %call1 = call nonnull ptr @foo(ptr %p)
+  br i1 %c, label %then, label %else
+
+then:
+  ret ptr %call1
+
+else:
+  %call2 = call ptr @foo(ptr %p)
+  ret ptr %call2
 }
 
-declare i32 @fn(i32) #0
-
-attributes #0 = { readnone nounwind }
-!0 = !{i32 0, i32 10}
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_unsafe_cse(i32 %x) {
-  ; The optimizer incorrectly CSEs %v2 to %v1, ignoring the stricter metadata on %v1.
-  ; If @fn returns 20, the return value is now poison instead of 20.
-  %v1 = call i32 @fn(i32 %x) #0, !range !0
-  ret i32 %v1
+declare ptr @foo(ptr) memory(none)
+
+define ptr @test(ptr %p, i1 %c) {
+entry:
+  %call1 = call nonnull ptr @foo(ptr %p)
+  br i1 %c, label %then, label %else
+
+then:
+  ret ptr %call1
+
+else:
+  ret ptr %call1
 }
 
-declare i32 @fn(i32) #0
-
-attributes #0 = { readnone nounwind }
-!0 = !{i32 0, i32 10}
 ```
 
 
@@ -45,61 +56,50 @@ attributes #0 = { readnone nounwind }
 
 # Issue 64598
 
-## Stale Analysis Cache via Address Reuse in PHI Deduplication
+## Stale Analysis Cache due to Unnotified Instruction Deletion during PHI Deduplication
 
-**Description**
-The bug is triggered during the Global Value Numbering (GVN) optimization pass when it attempts to eliminate duplicate PHI nodes within a basic block. The pass utilizes a helper routine to identify and remove these redundant PHI nodes. However, this helper routine deallocates the instructions immediately without notifying the GVN pass or invalidating its associated analysis caches (specifically, Memory Dependence Analysis).
+**Description:**
+During optimization, a pass may identify and eliminate duplicate PHI nodes within a basic block to simplify the control flow graph. The bug occurs when the utility responsible for this deduplication directly removes and frees the memory of the duplicate PHI nodes without notifying the calling optimization pass. 
 
-The critical failure occurs when the memory address of a just-deleted PHI node is reallocated for a new instruction. Because the analysis cache was not cleared, it retains an entry keyed by that memory address containing information about the old, deleted PHI node. When GVN subsequently analyzes the new instruction, it queries the cache and retrieves the stale data. This leads the optimizer to apply transformations to the new instruction based on the properties of the deleted one, resulting in invalid code generation.
+Because the optimization pass maintains internal analysis caches (such as memory dependence or value numbering information) that are keyed by instruction memory addresses, directly deleting the instructions leaves stale pointers in these caches. If a new instruction is subsequently allocated at the exact same memory address as one of the deleted PHI nodes, the optimization pass will incorrectly look up and reuse the stale analysis data for the new instruction. This causes the compiler to make incorrect assumptions about the program's data flow or memory dependencies, ultimately leading to invalid transformations and miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test(i1 %c, i32* %p) {
+define i32 @test(i1 %cond, i32* %p) {
 entry:
-  store i32 42, i32* %p
-  br i1 %c, label %if, label %else
+  br i1 %cond, label %bb1, label %bb2
 
-if:
-  br label %merge
+bb1:
+  br label %bb3
 
-else:
-  br label %merge
+bb2:
+  br label %bb3
 
-merge:
-  ; Two identical PHI nodes to trigger deduplication logic in GVN
-  %phi1 = phi i32 [ 0, %if ], [ 0, %else ]
-  %phi2 = phi i32 [ 0, %if ], [ 0, %else ]
-  
-  ; A load instruction that depends on the store in entry.
-  ; If the bug triggers, the address of the deleted %phi2 might be reused for a new instruction
-  ; or confuse the analysis cache for this load, causing it to return stale data (e.g., 0 from the PHI).
+bb3:
+  %phi1 = phi i32 [ 1, %bb1 ], [ 2, %bb2 ]
+  %phi2 = phi i32 [ 1, %bb1 ], [ 2, %bb2 ]
   %load = load i32, i32* %p
-  
-  ; Computation to use the values
-  %sum = add i32 %phi1, %phi2
-  %res = add i32 %sum, %load
-  ret i32 %res
+  %add = add i32 %phi1, %load
+  ret i32 %add
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test(i1 %c, i32* %p) {
+define i32 @test(i1 %cond, i32* %p) {
 entry:
-  store i32 42, i32* %p
-  br i1 %c, label %if, label %else
+  br i1 %cond, label %bb1, label %bb2
 
-if:                                               ; preds = %entry
-  br label %merge
+bb1:
+  br label %bb3
 
-else:                                             ; preds = %entry
-  br label %merge
+bb2:
+  br label %bb3
 
-merge:                                            ; preds = %else, %if
-  ; INCORRECT TRANSFORMATION:
-  ; The load was incorrectly folded to 0 (the value of the deleted PHI) due to stale analysis cache.
-  ; The correct return value should be 42.
-  ret i32 0
+bb3:
+  %phi1 = phi i32 [ 1, %bb1 ], [ 2, %bb2 ]
+  %add = add i32 %phi1, %phi1
+  ret i32 %add
 }
 ```

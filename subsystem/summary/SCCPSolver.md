@@ -1,0 +1,16 @@
+# Subsystem Knowledge for SCCPSolver
+
+## Elements Frequently Missed
+
+* **`undef` Values in PHI Nodes**: The solver frequently misses the full implications of `undef` incoming values in PHI nodes. Instead of treating `undef` as a value that can assume any possible bit pattern (which would result in a full/overdefined range), the solver often ignores it or treats it as an uninitialized state that does not affect the range of other defined incoming values.
+* **Constant Range Lattice Merging**: The lattice state merging logic misses the requirement to widen the constant range to the maximum possible bounds when a known constant or restricted range is merged with an `undef` value that is actually consumed by subsequent instructions.
+* **Poison-Generating Flags (`nuw`, `nsw`, `exact`)**: The solver misses the potential for integer wrapping or exactness violations when evaluating operations that consume potentially `undef` operands. It incorrectly assumes the operation is safe from wrapping based on an overly optimistic range.
+* **Range-Tracked Operations with Mixed Operands**: Instructions that support constant range tracking (such as binary operators like `add`, `and`, `or`, and casts like `zext`, `trunc`) are frequently mishandled when their operands are a mix of well-defined ranges and `undef`.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Optimistic Range Calculation with `undef` Operands
+When an instruction (such as a binary operator or cast) consumes a value that can potentially evaluate to `undef` (typically originating from a PHI node with at least one `undef` incoming value), SCCPSolver computes an overly optimistic, narrowed constant range. The solver calculates the range based solely on the known, defined values and completely ignores the `undef` possibility. Because `undef` can theoretically take any value at runtime, the correct behavior should be to evaluate the result as a full or overdefined range. By failing to handle this pattern, the solver creates a fundamental mismatch between the compiler's assumed range and the actual runtime possibilities.
+
+### Pattern 2: Erroneous Deduction of Poison-Generating Flags and Folds
+This pattern is a direct consequence of the optimistic range calculations. Once an overly narrow constant range is incorrectly established for a value, SCCPSolver propagates this flawed range to subsequent instructions. When these subsequent instructions (such as `trunc`, `add`, or `icmp`) are evaluated, the compiler applies aggressive range-based optimizations. For example, it may erroneously attach poison-generating flags like `nuw` (no unsigned wrap) or `nsw` (no signed wrap) to a `trunc` instruction, or it might incorrectly fold an `icmp` condition to a constant boolean. This pattern is not well handled because the solver's flag deduction mechanism blindly trusts the upstream constant range without verifying if the original operands contained `undef`, leading to severe miscompilations when the runtime value inevitably falls outside the assumed narrow range.

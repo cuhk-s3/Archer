@@ -1,134 +1,48 @@
-# Issue 38847
+# Issue 58039
 
-## Incorrect Type Extension of Post-Increment Loop Induction Variables
+## Incorrect Type Conversion of Normalized Post-Increment Induction Variables
 
-**Description**
-The bug is triggered during the Loop Strength Reduction (LSR) optimization pass when the compiler generates alternative formulae for loop induction variables that require type promotion (e.g., sign-extending a narrower integer to a wider one).
+**Description**: 
+The bug is triggered during loop optimizations that attempt to simplify or reduce the strength of loop induction variables. It specifically involves induction variables that have "post-increment" uses, meaning the value of the variable is used after it has been stepped or updated (often occurring outside the loop or at the loop's exit).
 
-The issue specifically affects "post-increment" uses of induction variables—instances where the variable is used after the loop's increment step has been applied. When creating a widened version of such a variable, the compiler incorrectly applies the type extension directly to the normalized recurrence expression (the abstract formula representing the loop variable's evolution, such as `{Start, +, Step}`).
+To handle these post-increment uses, the compiler normalizes the underlying recurrence expression, which typically involves shifting its starting value to align with the post-increment state. 
 
-This approach is flawed because it ignores potential arithmetic overflows or wrapping that occur in the original, narrower type during the increment. By extending the recurrence parameters directly, the calculation is moved to the wider type domain where the wrap-around does not happen (or happens at a much larger value). Consequently, the optimized code computes a value that differs from the original program semantics, which relied on the modular arithmetic behavior of the narrower type.
+The bug manifests when these post-increment uses also require a type conversion, such as a sign-extension to a wider integer type or a truncation to a narrower one. The compiler's transformation logic incorrectly applies the type extension or truncation directly to the *already normalized* recurrence expression. 
 
-## Example
-
-### Original IR
-```llvm
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_lsr_postinc_overflow(i32* %ptr) {
-entry:
-  br label %loop
-
-loop:
-  ; Induction variable starts at INT_MAX (2147483647)
-  %iv = phi i32 [ 2147483647, %entry ], [ %iv.next, %loop ]
-  
-  ; Increment causes signed overflow to INT_MIN (-2147483648)
-  %iv.next = add i32 %iv, 1
-  
-  ; Post-increment use: Sign extend the wrapped value
-  ; Correct behavior: sext(INT_MIN) -> 0xFFFFFFFF80000000 (negative i64)
-  %idx = sext i32 %iv.next to i64
-  
-  ; Memory access using the extended index
-  %gep = getelementptr i32, i32* %ptr, i64 %idx
-  store i32 1, i32* %gep
-  
-  ; Exit condition
-  %cond = icmp eq i32 %iv.next, -2147483648
-  br i1 %cond, label %exit, label %loop
-
-exit:
-  ret void
-}
-```
-### Optimized IR
-```llvm
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_lsr_postinc_overflow(i32* %ptr) {
-entry:
-  br label %loop
-
-loop:
-  ; BUG: LSR creates a wide induction variable (i64) but incorrectly extends the recurrence.
-  ; Instead of wrapping to negative, it extends the domain to positive.
-  ; 2147483647 + 1 in i64 is 2147483648 (0x0000000080000000).
-  %lsr.iv = phi i64 [ 2147483648, %entry ], [ %lsr.iv.next, %loop ]
-  
-  %lsr.iv.next = add i64 %lsr.iv, 1
-  
-  ; The GEP now uses the positive 64-bit index instead of the negative wrapped index.
-  %gep = getelementptr i32, i32* %ptr, i64 %lsr.iv
-  store i32 1, i32* %gep
-  
-  ; Exit condition updated to match the wide IV (demonstrating the logic shift)
-  %cond = icmp eq i64 %lsr.iv, 2147483648
-  br i1 %cond, label %exit, label %loop
-
-exit:
-  ret void
-}
-```
-
-
----
-
-# Issue 62852
-
-## Incorrect Sign-Extension of Post-Loop Induction Variables
-
-**Description**:
-The bug is triggered when the LoopStrengthReduce (LSR) pass promotes an induction variable (IV) to a wider type (e.g., from `i32` to `i64`) and that IV is used outside the loop (a post-increment use). When generating the expression for the widened IV's value at the loop exit, the compiler incorrectly extends the IV's recurrence relation.
-
-Specifically, when handling post-increment uses, the compiler uses a normalized form of the recurrence expression and applies an extension (typically sign-extension) to match the wider type. If the original narrow IV evolved to a value that is negative when interpreted as signed (e.g., `-1` or `0xFFFFFFFF`), the widened recurrence produces a sign-extended value (e.g., `0xFFFFFFFFFFFFFFFF`). However, if the original program used this value in a context that treats it as unsigned (such as `urem` or `zext`), the extra high bits introduced by the sign-extension result in a miscalculation. The compiler fails to account for the fact that extending the normalized recurrence directly does not preserve the correct bitwise value required by the original unsigned use of the narrow IV.
+Because the normalized expression has a shifted base value, naively extending or truncating it can alter its wrapping semantics or sign-bit behavior in the new type. For example, an expression that correctly represents the post-increment value in the original type might yield an incorrect sequence of values when its normalized form is directly sign-extended to a wider type. This flawed transformation leads to miscompilations where the program computes and uses an incorrect value for the induction variable in the converted type.
 
 ## Example
 
 ### Original IR
 ```llvm
-target datalayout = "n8:16:32:64"
-target triple = "x86_64-unknown-linux-gnu"
-
-define i64 @buggy_sign_ext() {
+define i32 @test_postinc_sext(i1 %c) {
 entry:
   br label %loop
 
 loop:
-  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]
-  %iv.next = add i32 %iv, -1
-  %cond = icmp eq i32 %iv.next, -1
-  br i1 %cond, label %exit, label %loop
+  %iv = phi i8 [ 127, %entry ], [ %iv.next, %loop ]
+  %iv.next = add i8 %iv, 1
+  br i1 %c, label %exit, label %loop
 
 exit:
-  ; The original intention is to zero-extend the 32-bit value -1 (0xFFFFFFFF)
-  ; to 64-bit (0x00000000FFFFFFFF).
-  %res = zext i32 %iv.next to i64
-  ret i64 %res
+  %iv.lcssa = phi i8 [ %iv.next, %loop ]
+  %ext = sext i8 %iv.lcssa to i32
+  ret i32 %ext
 }
 ```
 ### Optimized IR
 ```llvm
-target datalayout = "n8:16:32:64"
-target triple = "x86_64-unknown-linux-gnu"
-
-define i64 @buggy_sign_ext() {
+define i32 @test_postinc_sext(i1 %c) {
 entry:
   br label %loop
 
 loop:
-  ; LSR promotes the IV to i64.
-  %lsr.iv = phi i64 [ 0, %entry ], [ %lsr.iv.next, %loop ]
-  %lsr.iv.next = add i64 %lsr.iv, -1
-  %cond = icmp eq i64 %lsr.iv.next, -1
-  br i1 %cond, label %exit, label %loop
+  %indvars.iv = phi i32 [ 127, %entry ], [ %indvars.iv.next, %loop ]
+  %indvars.iv.next = add nsw i32 %indvars.iv, 1
+  br i1 %c, label %exit, label %loop
 
 exit:
-  ; BUG: The compiler incorrectly uses the sign-extended widened IV directly.
-  ; The value of %lsr.iv.next is -1 (0xFFFFFFFFFFFFFFFF), which differs from
-  ; the expected zero-extended value (0x00000000FFFFFFFF).
-  ret i64 %lsr.iv.next
+  %ext = phi i32 [ %indvars.iv.next, %loop ]
+  ret i32 %ext
 }
 ```

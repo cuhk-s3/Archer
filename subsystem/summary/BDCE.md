@@ -2,13 +2,15 @@
 
 ## Elements Frequently Missed
 
-*   **Poison-Generating Flags (`nsw`, `nuw`, `exact`)**: The optimization pass frequently fails to identify that these flags must be dropped when the input operands of an instruction are simplified or modified, even if the instruction's opcode remains the same.
-*   **Fully-Demanded Instructions**: Instructions where all output bits are required by downstream users are often skipped during the update phase. The analyzer incorrectly assumes that if no output bits are dead, the instruction itself requires no modification, missing the necessity to sanitize flags based on changed inputs.
-*   **Users of Simplified Operands**: When an instruction is simplified (e.g., constant folding or bit masking) based on limited demand, the users of that instruction are not always correctly revisited to check for validity constraints, specifically regarding undefined behavior triggers.
+* **Poison-Generating Flags (`nsw`, `nuw`, `exact`) on User Instructions**: The optimization pass frequently misses the need to clear these flags on instructions when their operands are modified. When a parent instruction is simplified based on demanded bits, the altered input can cause the user instruction to violate these flags, but the pass fails to strip them.
+* **Fully Demanded User Instructions**: The pruning logic in the pass incorrectly assumes that if an instruction has 100% of its bits demanded by its own users, it does not need to be processed or updated. This causes the pass to completely skip evaluating these instructions for necessary flag removals.
+* **Def-Use Chain Dependency Updates**: The pass misses the implicit dependency between altering the undemanded bits of a definition and the validity of the assumptions (flags) on its subsequent users in the def-use chain.
 
 ## Patterns Not Well Handled
 
-### Pattern 1: Flag Retention on Fully-Demanded Users of Simplified Operands
-This pattern occurs when the BDCE pass identifies that an operand (Instruction A) can be simplified because its user (Instruction B) does not demand all of its bits. However, Instruction B is a "fully-demanded" user (all its output bits are used elsewhere) and carries poison-generating flags like `nsw` (No Signed Wrap), `nuw` (No Unsigned Wrap), or `exact`.
+### Pattern 1: Simplification of Partially Demanded Definitions with Fully Demanded Poison-Generating Users
+This pattern occurs when a definition instruction is only partially demanded by its users, allowing BDCE to simplify it (e.g., by zeroing out the undemanded bits). This simplified definition is then used as an operand in a subsequent instruction that carries poison-generating flags (such as `nsw`, `nuw`, or `exact`). 
 
-The issue arises because the optimization logic treats the "fully-demanded" status of Instruction B as a signal that Instruction B does not need to be modified. Consequently, Instruction A is simplified (e.g., high bits are zeroed out), but Instruction B retains its flags. The simplification of A changes the input values to B such that the flags are no longer valid (e.g., a sign change occurs that violates `nsw`), causing the instruction to produce a poison value instead of a valid result. The optimizer fails to couple the simplification of an operand with the necessary sanitization of the user's flags when that user is not otherwise being dead-code eliminated.
+The issue arises when this user instruction is *fully demanded* by its own subsequent users. BDCE's pruning logic is designed to skip processing instructions that are fully demanded, under the flawed assumption that no simplification or update is needed for them. As a result, the pass alters the input to the user instruction (by simplifying the parent definition) but skips the user instruction entirely, failing to drop its poison-generating flags. 
+
+This pattern is not well handled because the pruning logic relies solely on the demanded bits of the current instruction, ignoring the fact that changes to a parent instruction's undemanded bits can invalidate the current instruction's flags. At runtime, the modified input can cause the user instruction to trigger an overflow or exactness violation, producing a poison value that propagates and leads to miscompilation.

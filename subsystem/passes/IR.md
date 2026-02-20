@@ -1,79 +1,63 @@
 # Issue 112356
 
-## Summary Title
-Missing Poison-Generating Flag Check for `icmp samesign` Instructions
+## Unrecognized Poison-Generating Flags on Compare Instructions
 
-## Description
-The bug is triggered when the optimizer transforms `icmp` instructions that utilize the `samesign` attribute. In LLVM IR, the `samesign` keyword specifies that the comparison yields a poison value if the operands do not have the same sign. The compiler's analysis logic, responsible for identifying instructions that can generate poison, failed to check for the presence of the `samesign` flag on integer comparisons.
+**Description**: 
+The bug is triggered by utilizing a compare instruction with a poison-generating flag (such as `samesign`) within a conditionally executed context, like a `select` instruction or a conditional branch. 
 
-As a result, optimization passes incorrectly treated these instructions as unconditionally safe and well-defined. This incorrect assumption allowed the compiler to perform transformations—such as simplifying `select` instructions or speculating execution—that are only valid for operations that do not generate poison. This led to miscompilations where the transformed code produced poison for specific inputs (due to sign mismatches) where the original code produced a defined value, effectively introducing undefined behavior.
+When optimizations attempt to simplify the control flow or conditional operations, they may bypass the condition and unconditionally evaluate or return the result of the compare instruction. Because the compiler's analysis fails to recognize that this specific flag can generate poison when its semantic conditions are violated (e.g., operands having different signs), it incorrectly assumes the instruction is safe to hoist or evaluate unconditionally. This leads to a miscompilation where the optimized program yields a poison value instead of a well-defined result under circumstances where the original condition would have prevented the poison from being observed.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_samesign_poison_check(i32 %a, i32 %b, i1 %cond) {
-  %cmp = icmp samesign ult i32 %a, %b
+define i1 @test(i32 %a) {
+entry:
+  %cond = icmp sge i32 %a, 0
+  %cmp = icmp samesign ult i32 %a, 10
   %res = select i1 %cond, i1 %cmp, i1 false
   ret i1 %res
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_samesign_poison_check(i32 %a, i32 %b, i1 %cond) {
-  %cmp = icmp samesign ult i32 %a, %b
-  %res = and i1 %cond, %cmp
-  ret i1 %res
+define i1 @test(i32 %a) {
+entry:
+  %cmp = icmp samesign ult i32 %a, 10
+  ret i1 %cmp
 }
 ```
 
 
 ---
 
-# Issue 137582
+# Issue 114191
 
-## Speculative Execution Analysis Ignores UB-Implying Attributes on Call Instructions
+## Eager Poison Folding of Vector Division/Remainder Threaded Over Select
 
-## Description
-The bug is triggered when the compiler's value tracking analysis attempts to reason about the value of a call instruction (such as an intrinsic) by walking up its definition chain. To perform this analysis safely, the compiler checks if the instruction is "safe to speculatively execute," meaning it can be evaluated or hoisted without introducing side effects or undefined behavior.
+The bug is triggered by a vector integer division or remainder instruction where the divisor is a `select` instruction. The `select` chooses between two constant vectors, and at least one of these constant vectors contains a zero or `undef` element. 
 
-The flaw arises because the safety check for call instructions only verified that the function was generally `speculatable` (e.g., having properties like `readnone` or `nounwind`), but failed to account for attributes that imply immediate Undefined Behavior (UB), such as `noundef` on return values or parameters. An instruction with `noundef` attributes triggers UB if it processes or returns a `poison` value. By overlooking this, the analysis incorrectly classified these calls as safe to speculate. This allowed the compiler to infer constraints or apply optimizations (such as adding `nsw` or `nuw` flags to operands) based on the assumption that the instruction would execute safely. However, if the operands were `poison` (which is valid in the source if the instruction doesn't trigger UB), the speculated instruction in the target would trigger UB due to the `noundef` attribute, resulting in a miscompilation.
+When the compiler attempts to optimize this pattern by threading the division or remainder operation over the `select`, it evaluates the operation against each constant vector independently. During this process, if the simplification logic encounters a constant vector with a zero or `undef` element as the divisor, it eagerly folds the entire division or remainder operation for that vector into `poison` (due to division by zero being undefined behavior). 
+
+This transformation is incorrect because the zero or `undef` element might be masked out by the `select` condition at runtime. By unconditionally folding the operation to `poison`, the compiler introduces a miscompilation, as the `poison` value propagates to the final result even when the division by zero would not have dynamically occurred.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_speculation_noundef(i1 %cond, i32 %x) {
-entry:
-  br i1 %cond, label %if.then, label %if.end
-
-if.then:
-  ; The 'noundef' attribute on the return value implies immediate UB if the result is poison.
-  ; However, 'readnone' and 'nounwind' make the function appear safe to speculate.
-  %call = call noundef i32 @func(i32 %x) #0
-  br label %if.end
-
-if.end:
-  %res = phi i32 [ %call, %if.then ], [ 0, %entry ]
-  ret i32 %res
+define <2 x i32> @test_sdiv(<2 x i1> %cond, <2 x i32> %x) {
+  %sel = select <2 x i1> %cond, <2 x i32> <i32 1, i32 0>, <2 x i32> <i32 2, i32 1>
+  %div = sdiv <2 x i32> %x, %sel
+  ret <2 x i32> %div
 }
-
-declare i32 @func(i32) 
-attributes #0 = { readnone nounwind }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_speculation_noundef(i1 %cond, i32 %x) {
-entry:
-  ; The compiler incorrectly speculates (hoists) the call because it ignores the 'noundef' attribute.
-  ; If %x is poison, this hoisted call triggers UB immediately, even if %cond is false.
-  %call = call noundef i32 @func(i32 %x) #0
-  %res = select i1 %cond, i32 %call, i32 0
-  ret i32 %res
+define <2 x i32> @test_sdiv(<2 x i1> %cond, <2 x i32> %x) {
+  %div.2 = sdiv <2 x i32> %x, <i32 2, i32 1>
+  %div = select <2 x i1> %cond, <2 x i32> poison, <2 x i32> %div.2
+  ret <2 x i32> %div
 }
-
-declare i32 @func(i32) 
-attributes #0 = { readnone nounwind }
 ```
 
 
@@ -81,26 +65,32 @@ attributes #0 = { readnone nounwind }
 
 # Issue 59301
 
-## Incorrect NSW Inference for 1-bit Integer Multiplication
+## Incorrect `nsw` (No Signed Wrap) Inference for 1-bit Integer Multiplication
 
-**Description**
-The bug is triggered when the compiler analyzes integer multiplication instructions (`mul`) operating on 1-bit integers (`i1`) to determine if the `nsw` (No Signed Wrap) flag can be added. The analysis logic incorrectly assumes that multiplying by the constant `1` is always safe from signed overflow, treating it as the multiplicative identity. However, for a 1-bit integer type, the bit pattern `1` represents the signed value `-1`. Multiplying `1` by `1` in this context is mathematically `(-1) * (-1) = +1`, which exceeds the range of a 1-bit signed integer (which can only represent `0` and `-1`). The compiler overlooks this corner case for 1-bit types and incorrectly annotates the multiplication with `nsw`, causing the instruction to yield a `poison` value instead of the correct wrapped result when executed.
+**Description**: 
+The bug is triggered when the compiler attempts to deduce and attach the `nsw` (no signed wrap) flag to a 1-bit integer multiplication (`mul i1`). 
+
+The optimization logic incorrectly assumes that multiplying a value by `1` will never result in a signed overflow, which is a valid assumption for wider integer types. However, for 1-bit integers, the representable signed value range is `[-1, 0]`, and the bit pattern for `1` actually represents `-1`. When multiplying `-1` by `-1` (i.e., `1 * 1` in 1-bit arithmetic), the true mathematical result is `1`. Because `1` falls outside the representable 1-bit signed range of `[-1, 0]`, the operation inherently experiences a signed overflow. 
+
+By erroneously assuming no overflow can occur and adding the `nsw` flag, the compiler introduces poison values when the operands evaluate to `1`. To trigger this miscompilation, one needs to construct an LLVM IR containing a 1-bit multiplication where the operands can be `1`, and then run an optimization pass (such as correlated value propagation) that infers overflow flags based on constant ranges.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_mul_i1_nsw(i1 %a) {
-  %res = mul i1 %a, 1
-  ret i1 %res
+define i1 @test(i1 %x) {
+  %mul = mul i1 %x, 1
+  ret i1 %mul
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_mul_i1_nsw(i1 %a) {
-  %res = mul nsw i1 %a, 1
-  ret i1 %res
+define i1 @test(i1 %x) {
+  %mul = mul nsw i1 %x, 1
+  ret i1 %mul
 }
+
 ```
 
 
@@ -108,25 +98,28 @@ define i1 @test_mul_i1_nsw(i1 %a) {
 
 # Issue 59887
 
-## Incorrect Range Analysis for 1-bit Absolute Value
+## Incorrect Constant Range Calculation for 1-Bit Absolute Value
 
-**Description**
-The bug is triggered during value range analysis of the absolute value operation (`llvm.abs`) when the operand is a 1-bit integer. When the input range to the `abs` function includes both zero and negative values (which represents the full range of a 1-bit integer), the compiler calculates the result's upper bound by incrementing the maximum absolute value of the input. Due to the 1-bit width, adding one to the maximum value (1) causes an overflow, wrapping the upper bound back to 0. This results in a range where the lower and upper bounds are identical (e.g., `[0, 0)`). The compiler incorrectly interprets this as an empty range—implying the result is impossible—rather than a full range containing all possible values. Optimization passes, such as Correlated Value Propagation (CVP), use this erroneous "empty" range information to incorrectly replace the function call with a constant zero or optimize away the code.
+The bug is triggered when the compiler attempts to compute the constant range for an absolute value operation on a 1-bit integer. 
+
+When the input range of the operation contains both negative and non-negative values (i.e., it crosses zero, which is the case for a full 1-bit range), the compiler calculates the upper bound of the resulting absolute value range by finding the maximum possible absolute value and adding one. However, for a 1-bit integer, adding one to the maximum absolute value causes an overflow, wrapping the upper bound back to zero. 
+
+This wrap-around causes the compiler's range analysis to incorrectly construct an empty constant range instead of a full range. Consequently, optimization passes that rely on these ranges (such as Correlated Value Propagation) misinterpret the empty range and incorrectly fold the operation or subsequent dependent instructions into a constant (e.g., `false` or `0`), leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_abs_i1(i1 %x) {
-  %res = call i1 @llvm.abs.i1(i1 %x, i1 false)
-  ret i1 %res
-}
-
 declare i1 @llvm.abs.i1(i1, i1)
+
+define i1 @test(i1 %x) {
+  %abs = call i1 @llvm.abs.i1(i1 %x, i1 false)
+  ret i1 %abs
+}
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_abs_i1(i1 %x) {
+define i1 @test(i1 %x) {
   ret i1 false
 }
 ```
@@ -136,29 +129,33 @@ define i1 @test_abs_i1(i1 %x) {
 
 # Issue 61984
 
-## Incorrect Folding of Bitcast and Floating-Point Cast Sequences
+## Incorrect Elimination of Bitcast Between Same-Width Floating-Point Types
 
-**Description**
-The bug is triggered when the optimizer encounters a sequence of two cast instructions involving floating-point types. Specifically, the sequence consists of a `bitcast` instruction converting between two different floating-point types of the same bit width (e.g., `bfloat` to `half` or vice versa), followed immediately by a floating-point conversion instruction (such as `fpext` or `fptrunc`).
+**Description:**
+The bug is triggered by a sequence of cast instructions involving floating-point types that share the same bit width but have different internal representations (such as `bfloat` and `half`). Specifically, the pattern consists of a `bitcast` instruction converting a value from one floating-point type to another of the same width, immediately followed by a floating-point cast instruction (such as a floating-point extension or truncation).
 
-The optimization logic incorrectly identifies this pair of casts as eliminable. It assumes that because the bit width is unchanged by the `bitcast`, the intermediate cast can be removed, and the operation can be reduced to a single floating-point cast from the initial source type to the final destination type.
+The compiler's optimization logic incorrectly assumes that a `bitcast` between any two floating-point types of the same size is a semantic no-op. Based on this flawed assumption, it attempts to optimize the cast pair by eliminating the `bitcast` entirely and applying the second floating-point cast directly to the original source type. 
 
-This transformation is invalid because `bitcast` preserves the bit pattern but changes the semantic interpretation of those bits (e.g., how the exponent and mantissa are defined), whereas floating-point casts perform value-preserving conversions based on the input type's semantics. By eliminating the `bitcast`, the optimizer forces the subsequent cast to interpret the bits according to the original source format rather than the reinterpreted intermediate format. Since the two floating-point formats have different internal representations, this results in the computation of an incorrect numeric value.
+However, because the source and destination types of the `bitcast` have different binary representations (e.g., different allocations for exponent and mantissa bits), the `bitcast` fundamentally alters the interpreted numerical value. Bypassing the `bitcast` and directly casting the original type leads to an incorrect conversion. This causes subsequent operations, such as constant folding or comparisons, to operate on the wrong numerical value, ultimately resulting in a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_incorrect_fold(bfloat %src) {
-  %1 = bitcast bfloat %src to half
-  %2 = fpext half %1 to float
-  ret float %2
+define float @test_bitcast_bfloat_to_half_fpext(bfloat %x) {
+entry:
+  %bc = bitcast bfloat %x to half
+  %ext = fpext half %bc to float
+  ret float %ext
 }
+
 ```
 ### Optimized IR
 ```llvm
-define float @test_incorrect_fold(bfloat %src) {
-  %1 = fpext bfloat %src to float
-  ret float %1
+define float @test_bitcast_bfloat_to_half_fpext(bfloat %x) {
+entry:
+  %ext = fpext bfloat %x to float
+  ret float %ext
 }
+
 ```

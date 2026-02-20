@@ -1,57 +1,80 @@
 # Issue 142286
 
-## Incorrect Default Case Elimination in Switch Instructions
+## Incorrect Unreachable Default Branch in Switch Instructions Due to Out-of-Range Cases
 
-**Description**
-The bug occurs in an optimization that attempts to eliminate the default destination of a `switch` instruction by proving it is unreachable. The optimization relies on comparing the size of the inferred value range of the switch condition (the number of possible values it can take) against the number of explicit switch cases that are determined to be reachable.
+### Description
+This bug occurs during the optimization of `switch` instructions when the compiler attempts to determine if the default destination is unreachable. The miscompilation is triggered by an inconsistency between different analysis methods used to evaluate the switch condition's possible values.
 
-The logic posits that if the number of reachable explicit cases is greater than or equal to the size of the condition's value range, then the explicit cases must exhaustively cover the range, making the default destination dead.
-
-The issue arises because the calculation of "reachable cases" can include case values that fall strictly outside the inferred value range. This happens when the specific analysis used to prune individual cases fails to prove a case is impossible, even if it contradicts the broader value range constraint. Consequently, the count of reachable cases becomes artificially inflated. This leads the compiler to incorrectly satisfy the condition (case count $\ge$ range size) and erroneously mark the default destination as unreachable, even when there are valid values within the range that are not covered by any explicit case and should execute the default path.
+The bug triggering strategy involves the following sequence:
+1. **Restricted Condition Range**: The compiler determines that the condition of a `switch` instruction has a restricted, known range of possible values (e.g., a bounded integer range).
+2. **Out-of-Range Cases**: The `switch` instruction contains explicit cases with values that fall outside this known valid range.
+3. **Inconsistent Dead Case Elimination**: The compiler iterates through the cases and uses a specific analysis query to check if each case is unreachable. However, due to analysis limitations or inconsistencies, this query may fail to prove that an out-of-range case is impossible. As a result, the out-of-range case is incorrectly kept and counted as a "reachable" case.
+4. **Faulty Coverage Assumption**: The compiler compares the total count of these supposedly reachable cases against the total number of possible values in the condition's known range. If the number of surviving cases equals or exceeds the size of the range, the compiler assumes that all possible valid values are explicitly covered by the cases.
+5. **Miscompilation**: Because the counted cases include out-of-range values, the actual cases *within* the valid range do not cover all possible runtime values. Despite this, the compiler erroneously marks the default destination of the `switch` as unreachable. At runtime, if the condition evaluates to a valid value that lacks an explicit case, the program will branch to an unreachable block, leading to undefined behavior or a crash.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_switch_bug(i32 %x) {
+declare void @f1()
+declare void @f2()
+declare void @f5()
+declare void @f_def()
+
+define void @test(i8 range(i8 1, 4) %x) {
 entry:
-  ; The condition is limited to range [0, 4) (values 0, 1, 2, 3)
-  %cond = and i32 %x, 3
-  switch i32 %cond, label %default [
-    i32 0, label %case_valid
-    i32 1, label %case_valid
-    i32 2, label %case_valid
-    ; This case is outside the range [0, 4), but counts towards the case count
-    i32 5, label %case_valid
+  switch i8 %x, label %default [
+    i8 1, label %case1
+    i8 2, label %case2
+    i8 5, label %case5
   ]
 
-case_valid:
-  ret i32 1
-
 default:
-  ; This path should be taken when %cond is 3
-  ret i32 0
+  call void @f_def()
+  ret void
+
+case1:
+  call void @f1()
+  ret void
+
+case2:
+  call void @f2()
+  ret void
+
+case5:
+  call void @f5()
+  ret void
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_switch_bug(i32 %x) {
+declare void @f1()
+declare void @f2()
+declare void @f5()
+declare void @f_def()
+
+define void @test(i8 range(i8 1, 4) %x) {
 entry:
-  %cond = and i32 %x, 3
-  ; The optimizer incorrectly determines that the 4 explicit cases cover the range of size 4,
-  ; making the default unreachable. However, case 5 is impossible, and value 3 is missing.
-  switch i32 %cond, label %unreachable [
-    i32 0, label %case_valid
-    i32 1, label %case_valid
-    i32 2, label %case_valid
-    i32 5, label %case_valid
+  switch i8 %x, label %default [
+    i8 1, label %case1
+    i8 2, label %case2
+    i8 5, label %case5
   ]
 
-case_valid:
-  ret i32 1
-
-unreachable:
+default:
   unreachable
+
+case1:
+  call void @f1()
+  ret void
+
+case2:
+  call void @f2()
+  ret void
+
+case5:
+  call void @f5()
+  ret void
 }
 ```
 
@@ -60,49 +83,55 @@ unreachable:
 
 # Issue 68682
 
-## Incorrect Removal of `llvm.abs` Intrinsic on `undef` Values
+## Incorrect Simplification of Absolute Value Intrinsic with Undef Operand
 
 **Description**
-The bug is triggered when the compiler attempts to optimize an `llvm.abs` (absolute value) intrinsic call by determining if the operation is redundant. The optimizer replaces `abs(x)` with `x` if it can prove that `x` is already non-negative (or `INT_MIN`, for which the operation is also an identity in two's complement).
 
-The issue arises when the operand `x` is a value that can be `undef` (undefined) on certain execution paths, such as a PHI node that merges a known non-negative value with an `undef` value. The compiler's range analysis incorrectly assumes that the `undef` value satisfies the non-negative condition or ignores it, leading to the conclusion that the `abs` operation can be safely removed. However, `undef` can resolve to any bit pattern at runtime, including negative integers. If the `abs` operation is elided and the value resolves to a negative number, the program incorrectly preserves the negative sign instead of computing the positive magnitude, resulting in a miscompilation.
+The bug occurs when a compiler optimization pass attempts to simplify an absolute value intrinsic (e.g., `llvm.abs`) based on the inferred value range or predicates of its operand. 
+
+The triggering strategy involves the following sequence:
+1. The operand of the absolute value intrinsic is constructed such that it can be either a known non-negative (or non-positive) value or `undef` (for example, through a PHI node with an `undef` incoming value).
+2. The absolute value intrinsic is configured such that taking the absolute value of the minimum signed integer (`INT_MIN`) is well-defined and does not yield poison (i.e., the `is_int_min_poison` flag is set to `false`).
+3. The compiler's value tracking analysis evaluates the range or predicate of the operand. When encountering `undef`, the analysis optimistically assumes that `undef` can take a specific value that satisfies the non-negative (or non-positive) condition.
+4. Relying on this optimistic analysis, the optimization pass concludes that the operand is always non-negative (or non-positive) and replaces the absolute value intrinsic directly with the operand (or its negation).
+5. This transformation is invalid and leads to a miscompilation. The original absolute value intrinsic guarantees that its result is strictly non-negative (or exactly `INT_MIN`). However, replacing the intrinsic with the operand itself allows the `undef` value to be evaluated as any arbitrary negative value later in the program. This incorrectly expands the set of possible values, violating the semantics of the absolute value operation. 
+
+To correctly handle this pattern, the analysis must treat `undef` as a full range (rather than optimistically assigning it a constrained value) whenever the absolute value intrinsic does not treat `INT_MIN` as poison.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_abs_undef(i1 %cond) {
+declare i32 @llvm.abs.i32(i32, i1 immarg)
+
+define i32 @test(i1 %c) {
 entry:
-  br i1 %cond, label %bb_pos, label %bb_undef
+  br i1 %c, label %if.then, label %if.end
 
-bb_pos:
-  br label %merge
+if.then:
+  br label %if.end
 
-bb_undef:
-  br label %merge
-
-merge:
-  %x = phi i32 [ 1, %bb_pos ], [ undef, %bb_undef ]
-  %res = call i32 @llvm.abs.i32(i32 %x, i1 false)
-  ret i32 %res
+if.end:
+  %p = phi i32 [ 5, %if.then ], [ undef, %entry ]
+  %abs = call i32 @llvm.abs.i32(i32 %p, i1 false)
+  ret i32 %abs
 }
 
-declare i32 @llvm.abs.i32(i32, i1)
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_abs_undef(i1 %cond) {
+declare i32 @llvm.abs.i32(i32, i1 immarg)
+
+define i32 @test(i1 %c) {
 entry:
-  br i1 %cond, label %bb_pos, label %bb_undef
+  br i1 %c, label %if.then, label %if.end
 
-bb_pos:
-  br label %merge
+if.then:
+  br label %if.end
 
-bb_undef:
-  br label %merge
-
-merge:
-  %x = phi i32 [ 1, %bb_pos ], [ undef, %bb_undef ]
-  ret i32 %x
+if.end:
+  %p = phi i32 [ 5, %if.then ], [ undef, %entry ]
+  ret i32 %p
 }
+
 ```

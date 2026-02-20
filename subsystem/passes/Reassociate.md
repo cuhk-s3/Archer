@@ -1,46 +1,38 @@
 # Issue 57683
 
-## Incorrect Reuse of Vector Negation Containing Poison Elements
+## Incorrect Reuse of Partially Poisoned Vector Operations
 
-**Description**
-The bug is triggered when the reassociation pass attempts to optimize vector expressions by reusing an existing subtraction instruction that acts as a negation. The optimizer incorrectly identifies a vector subtraction of the form `C - X` as a valid negation of `X` (i.e., `0 - X`), even when the constant vector `C` contains `poison` or `undef` elements in some lanes. By treating this instruction as a canonical negation and reusing it to rewrite other expressions involving `X`, the compiler introduces `poison` values into lanes that were originally well-defined. This propagation of poison corrupts the resulting vector, leading to incorrect values in the program output.
+**Description**: 
+The bug is triggered by exploiting the compiler's instruction reuse and matching logic during the reassociation of vector expressions. The strategy involves the following steps:
+
+1. **Create a Partially Poisoned Operation**: Generate a vector arithmetic operation (such as a negation via subtraction) using a constant vector that contains a mix of valid elements (e.g., zeros) and `poison` or `undef` elements. 
+2. **Safe Consumption**: Use the result of this partially poisoned operation in a subsequent instruction that safely discards or ignores the `poison`/`undef` lanes, such as a `shufflevector` or `extractelement` mask. This ensures the original program semantics remain well-defined and valid.
+3. **Introduce a Fully Defined Operation**: Introduce another instruction in the same function that requires the fully defined version of the same computation (e.g., a full negation of the same input vector, but without any `poison` or `undef` lanes).
+4. **Trigger the Miscompilation**: The compiler's optimization pass scans for existing, equivalent expressions to reuse. It incorrectly matches the partially poisoned operation as a valid substitute for the fully defined operation, failing to account for the fact that the constant operand contains `poison` or `undef` lanes.
+5. **Poison Propagation**: The pass replaces the fully defined computation with the partially poisoned one. Because the new context does not discard the invalid lanes, `poison` or `undef` values are propagated into vector lanes that were previously well-defined, ultimately leading to an incorrect result and a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i32> @test(<2 x i32> %x, <2 x i32> %y) {
-  ; This subtraction acts as a negation for lane 0, but contains poison in lane 1.
-  ; The Reassociate pass might incorrectly identify this as a canonical negation of %x.
-  %bad_neg = sub <2 x i32> <i32 0, i32 poison>, %x
-  
-  ; We must use %bad_neg to prevent Dead Code Elimination from removing it.
-  call void @use(<2 x i32> %bad_neg)
-  
-  ; This is a clean subtraction (y - x). It is well-defined in both lanes.
-  ; The optimizer should not replace the implicit negation of %x here with %bad_neg.
-  %res = sub <2 x i32> %y, %x
-  
+define <2 x i32> @test(<2 x i32> %x) {
+entry:
+  %partially_poisoned = sub <2 x i32> <i32 0, i32 poison>, %x
+  %safe_use = extractelement <2 x i32> %partially_poisoned, i32 0
+  %fully_defined = sub <2 x i32> zeroinitializer, %x
+  %res = insertelement <2 x i32> %fully_defined, i32 %safe_use, i32 0
   ret <2 x i32> %res
 }
-
-declare void @use(<2 x i32>)
 ```
 ### Optimized IR
 ```llvm
-define <2 x i32> @test(<2 x i32> %x, <2 x i32> %y) {
-  %bad_neg = sub <2 x i32> <i32 0, i32 poison>, %x
-  call void @use(<2 x i32> %bad_neg)
-  
-  ; BUG: The optimizer has replaced 'sub %y, %x' with 'add %bad_neg, %y'.
-  ; Since %bad_neg contains poison in lane 1, the result %res now has poison in lane 1,
-  ; whereas the original code produced a well-defined value (y1 - x1).
-  %res = add <2 x i32> %bad_neg, %y
-  
+define <2 x i32> @test(<2 x i32> %x) {
+entry:
+  %partially_poisoned = sub <2 x i32> <i32 0, i32 poison>, %x
+  %safe_use = extractelement <2 x i32> %partially_poisoned, i32 0
+  %res = insertelement <2 x i32> %partially_poisoned, i32 %safe_use, i32 0
   ret <2 x i32> %res
 }
-
-declare void @use(<2 x i32>)
 ```
 
 
@@ -48,33 +40,45 @@ declare void @use(<2 x i32>)
 
 # Issue 91417
 
-## Summary Title ##
-Incorrect Modular Reduction of Exponent Counts in Reassociate Pass
+## Failure to Drop Poison-Generating Flags During Operand Weight Reduction in Associative Expressions
 
-## Description ##
-The bug is triggered when the `Reassociate` pass optimizes a sequence of associative binary operations (such as multiplication) where a specific operand is repeated multiple times (e.g., computing a power $x^n$). The optimization logic attempts to reduce the number of repetitions (the exponent) based on modular arithmetic properties, assuming that for a given bitwidth, high powers are equivalent to lower powers (e.g., $x^n \equiv x^m$).
+**Description:**
+The bug is triggered by constructing an expression tree of associative operations (such as integer multiplication) that repeatedly applies the operation to the same operand. 
 
-This reduction manifests in two ways:
-1.  **Explicit Reduction**: The pass uses number-theoretic properties (such as the Carmichael function) to explicitly lower the exponent count, aiming to simplify the expression tree.
-2.  **Implicit Reduction via Counter Overflow**: The pass tracks the number of operand occurrences using an integer variable with the same bitwidth as the operand itself. If the repetition count exceeds the maximum value representable by that bitwidth, the counter overflows (wraps around), effectively reducing the count modulo $2^{\text{bitwidth}}$.
+To trigger the issue, the following conditions must be met:
+1. **Repeated Operands**: The expression must use the same operand multiple times, accumulating a high "weight" (occurrence count) for that operand.
+2. **Weight Reduction**: The total weight of the operand must be large enough to trigger a mathematical simplification based on finite-precision arithmetic properties. For example, in integer multiplication, the compiler may use Carmichael's theorem to reduce the number of multiplications for a specific bit-width (e.g., reducing `x^5` to `x^3` in 3-bit arithmetic).
+3. **Poison-Generating Flags**: One or more instructions in the original expression tree must be decorated with poison-generating flags (such as `nsw` for no signed wrap or `nuw` for no unsigned wrap).
 
-While these reductions are mathematically valid for the values computed in standard modular arithmetic, they are unsound when operations carry `nsw` (No Signed Wrap) or `nuw` (No Unsigned Wrap) flags. The reduction changes the sequence of operations and the intermediate values produced. As a result, the optimized code may trigger an overflow (resulting in a `poison` value) for inputs where the original, longer computation sequence remained within valid bounds and produced a defined result.
+When the compiler optimizes the expression, it reduces the operand's weight and rewrites the expression tree to perform fewer operations. During this process, it reuses some of the original instructions but fails to clear their poison-generating flags because those specific instructions fall outside the tracked range of modified expressions. 
+
+Because the mathematical reduction alters the intermediate values computed by the chain of operations, the original flags may no longer be valid for the new intermediate results. Preserving these flags on the modified expression tree causes the operations to incorrectly trigger overflow conditions and produce `poison` values, ultimately leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i2 @test_counter_overflow(i2 %x) {
-  %1 = mul i2 %x, %x
-  %2 = mul i2 %1, %x
-  %3 = mul i2 %2, %x
-  %4 = mul i2 %3, %x
-  ret i2 %4
+define i3 @test(i3 %a, i3 %b) {
+entry:
+  %x = add i3 %a, 1
+  %y = add i3 %x, %b
+  %m1 = mul nsw i3 %x, %y
+  %m2 = mul nsw i3 %m1, %x
+  %m3 = mul nsw i3 %m2, %x
+  %m4 = mul nsw i3 %m3, %x
+  %m5 = mul nsw i3 %m4, %x
+  ret i3 %m5
 }
 ```
 ### Optimized IR
 ```llvm
-define i2 @test_counter_overflow(i2 %x) {
-  ret i2 %x
+define i3 @test(i3 %a, i3 %b) {
+entry:
+  %x = add i3 %a, 1
+  %y = add i3 %x, %b
+  %m1 = mul i3 %x, %x
+  %m2 = mul nsw i3 %m1, %x
+  %m5 = mul i3 %m2, %y
+  ret i3 %m5
 }
 ```

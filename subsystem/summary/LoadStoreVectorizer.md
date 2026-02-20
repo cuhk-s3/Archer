@@ -2,12 +2,17 @@
 
 ## Elements Frequently Missed
 
-*   **Instructions with "Non-Returning" Properties**: The optimization pass frequently overlooks instructions that are not guaranteed to transfer control to the successor (e.g., function calls that may `exit`, `throw`, or loop infinitely). The vectorizer treats basic blocks as straight-line code where instruction reordering is safe regarding execution guarantee, failing to recognize that a `call` instruction acts as a control flow barrier.
-*   **Conditional Fault Safety**: The pass misses the dependency between the execution of a load and the successful completion of preceding instructions. It assumes that if a sequence of loads is contiguous in memory, they can be loaded simultaneously at the point of the first load, ignoring that the validity of accessing the later memory addresses might be conditional on the program *not* exiting at an intermediate point.
+* **The `willreturn` Attribute**: The optimization pass frequently misses checking for the `willreturn` attribute on interleaved function calls. It fails to verify whether an instruction is guaranteed to transfer execution to its successor before reordering memory operations across it.
+* **Instructions Not Guaranteed to Transfer Execution**: Function calls, traps, or potentially infinite loops that lack the `willreturn` property are overlooked. The pass treats them as safe to bypass as long as they do not interfere with memory state, ignoring their control-flow implications.
+* **Implicit Control-Flow Dependencies for Undefined Behavior**: The pass misses the implicit dependency where a subsequent memory access's safety (e.g., avoiding out-of-bounds access) relies entirely on a preceding instruction halting or diverging execution. 
 
 ## Patterns Not Well Handled
 
-### Pattern 1: Hoisting Vectorized Loads Across Non-Returning Calls
-This pattern involves a sequence of contiguous scalar loads that are interleaved with a function call or instruction that may not return (e.g., `call void @may_not_return()`).
-*   **The Transformation**: The `LoadStoreVectorizer` identifies the contiguous loads (e.g., `load i32` at offset 0 and `load i32` at offset 4) and combines them into a single vector load (e.g., `load <2 x i32>`). To satisfy dependencies, it hoists this new vector load to the location of the first scalar load, placing it *before* the intervening function call.
-*   **The Issue**: In the original code, the second load is guarded by the function call; if the call terminates the program (or loops forever), the second load never executes. By hoisting the combined load above the call, the optimizer forces the program to access the memory for the second element unconditionally. If that memory address is invalid (e.g., out of bounds), the optimized program crashes (traps) immediately, whereas the original program would have exited or diverged safely without faulting. The optimizer fails to preserve the property that the later load is control-dependent on the intervening instruction returning.
+### Pattern 1: Vectorization Across Non-Returning Instructions
+This pattern occurs when contiguous memory accesses (such as consecutive loads or stores) are interleaved with an instruction that does not interfere with the memory state (e.g., a function call marked `inaccessiblememonly`) but is not guaranteed to return or transfer execution to its successor. 
+
+**Issues Caused:**
+The vectorizer incorrectly assumes it is safe to group the contiguous memory accesses together. It hoists or sinks the accesses across the non-returning instruction to form a single, wider vectorized memory operation. If the later memory access is out-of-bounds or invalid, moving it before the non-returning instruction transforms a dynamically unreachable undefined behavior into an unconditional undefined behavior.
+
+**Why it is not well handled:**
+The LoadStoreVectorizer relies too heavily on memory alias analysis while neglecting control-flow safety. Because the interleaved instruction (like an `inaccessiblememonly` call) does not read or write the target memory, the alias analysis correctly reports no memory interference. However, the pass fails to account for the fact that reordering a potentially faulting memory access across an instruction that might exit, trap, or loop infinitely is fundamentally unsafe. It lacks the necessary checks to ensure that the interleaved instructions are guaranteed to return (`willreturn`) before allowing the vectorization and reordering of memory accesses.

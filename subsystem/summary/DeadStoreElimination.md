@@ -1,0 +1,18 @@
+# Subsystem Knowledge for DeadStoreElimination
+
+## Elements Frequently Missed
+
+*   **Pointer Attributes on Modified Pointers**: Attributes such as `dereferenceable`, `dereferenceable_or_null`, and `align` are strictly tied to the exact pointer value they decorate. When DSE modifies a pointer (e.g., by adding an offset to shorten a memory intrinsic), it frequently misses the need to strip or recalculate these attributes, incorrectly preserving them and over-promising memory guarantees.
+*   **Semantics of `byval` in the Presence of `initializes`**: DSE frequently misses the overriding semantics of the `byval` attribute when evaluating memory clobbers. While `initializes` suggests a memory range will be overwritten, `byval` dictates that the callee operates on a private copy. DSE misses this interaction, erroneously treating the caller's original memory as overwritten.
+*   **Ephemeral Instructions in Capture Tracking**: Instructions whose results are only used by assumption intrinsics (like `llvm.assume`) are considered "ephemeral." DSE and its underlying alias/capture analysis frequently miss the fact that as long as these instructions remain in the IR, they can still capture pointers or access memory. Ignoring them prematurely leads to incorrect "no-escape" assumptions.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Memory Intrinsic Shortening with Partial Prefix Overwrites
+This pattern occurs when a memory intrinsic (like `llvm.memset` or `llvm.memcpy`) is immediately followed by a store that completely overwrites the beginning (prefix) of the modified memory region. DSE handles the dead store elimination by advancing the intrinsic's base pointer and reducing its length. However, this pattern is not well handled because the optimization pass fails to drop or update the pointer attributes (like `dereferenceable(N)` or `align`) on the newly offset pointer. Consequently, the compiler generates invalid IR that asserts incorrect alignment or out-of-bounds dereferenceable guarantees, leading to undefined behavior.
+
+### Pattern 2: Conflicting Parameter Attributes on Function Calls
+This pattern involves a caller function storing a value to a local memory location and then passing a pointer to that location to a callee function. The callee's parameter is decorated with both `byval` (indicating a pass-by-value copy) and `initializes` (indicating the callee writes to the memory). DSE does not handle this combination well because it evaluates the `initializes` attribute in isolation, assuming the call acts as a strong overwrite of the caller's memory. It fails to recognize that `byval` restricts the initialization to the callee's local copy. As a result, DSE incorrectly deletes the caller's initial store, leaving the caller's memory uninitialized.
+
+### Pattern 3: Premature Discarding of Ephemeral Uses in Capture Tracking
+This pattern involves a local allocation (`alloca`) that is stored to, subsequently captured (e.g., via `ptrtoint` or passed to a function), and ultimately used only by an `llvm.assume` intrinsic. DSE relies on pointer capture tracking to determine if the memory is strictly local. This pattern is not well handled because the analysis prematurely ignores the ephemeral instructions feeding the `llvm.assume`. By ignoring these instructions, the analysis incorrectly concludes the pointer does not escape. DSE then aggressively and erroneously eliminates the stores to that memory as dead, causing the ephemeral instructions (which still exist in the IR at this stage) to read uninitialized or stale memory.

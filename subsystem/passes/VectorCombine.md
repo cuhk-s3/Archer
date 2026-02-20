@@ -1,28 +1,31 @@
 # Issue 108698
 
-## Unsafe Narrowing of Vector Logical Right Shifts
+## Narrowing of Logical Shift Right Without Shift Amount Validation
 
-**Description**
-The bug is triggered when the optimizer attempts to reduce the bit width of a vector logical right shift (`lshr`) instruction. This optimization occurs when the value being shifted is the result of a zero-extension (`zext`) from a narrower type (e.g., extending `i1` to `i32`). The compiler attempts to optimize this pattern by performing the shift directly on the narrower type and zero-extending the result, rather than extending the input first.
+**Description**: 
+The bug is triggered when the compiler attempts to narrow the type of a logical shift right (`lshr`) instruction that operates on a zero-extended value. The optimization shrinks the shift operation to use the smaller source type of the zero-extension and truncates the shift amount accordingly. 
 
-The issue arises because the optimizer fails to verify that the shift amount is valid for the narrower type. In LLVM IR, a shift instruction produces a poison value if the shift amount is greater than or equal to the bit width of the type being shifted. While the shift amount might be valid for the original wider type, it can exceed the capacity of the narrower type (e.g., shifting by 1 is valid for `i32` but undefined for `i1`). Consequently, the transformed instruction yields undefined behavior instead of the correct result (often 0), leading to miscompilation.
+However, the transformation fails to verify whether the shift amount is strictly less than the bitwidth of the smaller type. In the original wider type, a shift amount greater than or equal to the smaller type's bitwidth would safely shift out all the active bits, correctly producing a zero result. When the operation is narrowed, applying the same (or truncated) shift amount to the smaller type results in undefined behavior (a `poison` value) because the shift amount exceeds or equals the new, smaller bitwidth. This leads to a miscompilation where valid zero results are incorrectly replaced with `poison`.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i32> @test_unsafe_narrowing(<2 x i1> %x) {
-  %ext = zext <2 x i1> %x to <2 x i32>
-  %res = lshr <2 x i32> %ext, <i32 1, i32 1>
-  ret <2 x i32> %res
+define i32 @test(i8 %x, i32 %shamt) {
+entry:
+  %ext = zext i8 %x to i32
+  %shift = lshr i32 %ext, %shamt
+  ret i32 %shift
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x i32> @test_unsafe_narrowing(<2 x i1> %x) {
-  %narrow = lshr <2 x i1> %x, <i1 true, i1 true>
-  %res = zext <2 x i1> %narrow to <2 x i32>
-  ret <2 x i32> %res
+define i32 @test(i8 %x, i32 %shamt) {
+entry:
+  %shamt.trunc = trunc i32 %shamt to i8
+  %shift.narrow = lshr i8 %x, %shamt.trunc
+  %ext = zext i8 %shift.narrow to i32
+  ret i32 %ext
 }
 ```
 
@@ -31,47 +34,43 @@ define <2 x i32> @test_unsafe_narrowing(<2 x i1> %x) {
 
 # Issue 114901
 
-## Incorrect Vectorization of Non-Commutative Binary Operations on Extracted Comparisons
+## Vectorization of Non-Commutative Binary Operations on Extracted Comparisons
 
-**Description**:
-The bug is triggered when the compiler attempts to optimize a specific pattern of scalar instructions back into vector operations. The pattern involves:
-1. Extracting two elements from a vector using `extractelement`.
-2. Performing integer comparisons (`icmp`) on these extracted elements.
-3. Combining the resulting boolean values using a **non-commutative** binary operator (e.g., `ashr`, `sub`, `shl`).
+**Description:**
+The bug is triggered by a specific pattern involving a scalar non-commutative binary operation (such as arithmetic or logical shifts) applied to two boolean values. These boolean values are the results of comparison operations performed on elements extracted from different indices of the same vector.
 
-The optimization attempts to replace this sequence with a single vector comparison followed by a vector binary operation and an extraction. However, the transformation logic fails to correctly handle the operand ordering required for non-commutative operations. It blindly constructs the vector binary operation without ensuring that the Left-Hand Side (LHS) and Right-Hand Side (RHS) of the original scalar operation map correctly to the LHS and RHS of the generated vector operation. This leads to a miscompilation where the operands are effectively swapped or misaligned in the vector domain.
+When the compiler attempts to optimize this pattern, it tries to vectorize the operations by:
+1. Performing a single vector comparison against a combined constant vector.
+2. Using a shuffle operation to align the comparison results into the same vector lane.
+3. Applying the binary operation as a vector operation.
+4. Extracting the final scalar result from the vector.
+
+The flaw in this transformation is that it assumes the binary operation is commutative or otherwise fails to correctly track and preserve the original left-hand side and right-hand side operand ordering. Consequently, for non-commutative binary operations, the operands can end up swapped or incorrectly ordered in the newly generated vector binary operation. This leads to a miscompilation where the optimized code evaluates the binary operation with reversed arguments, producing incorrect values or poison.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(<2 x i32> %vec) {
-  %e0 = extractelement <2 x i32> %vec, i32 0
-  %e1 = extractelement <2 x i32> %vec, i32 1
-  %c0 = icmp eq i32 %e0, 10
-  %c1 = icmp eq i32 %e1, 20
-  ; Non-commutative operation: shl. Order is c1 << c0.
-  %res = shl i1 %c1, %c0
+define i1 @test_shl_extracted_cmps(<2 x i32> %v) {
+  %e0 = extractelement <2 x i32> %v, i32 0
+  %e1 = extractelement <2 x i32> %v, i32 1
+  %c0 = icmp eq i32 %e0, 42
+  %c1 = icmp eq i32 %e1, 24
+  %res = shl i1 %c0, %c1
   ret i1 %res
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(<2 x i32> %vec) {
-  ; The optimization vectorizes the comparison
-  %1 = icmp eq <2 x i32> %vec, <i32 10, i32 20>
-  ; %1 is <c0, c1>
-  
-  ; The optimization incorrectly maps the scalar operands to vector lanes for the non-commutative op.
-  ; It assumes the first vector lane (c0) corresponds to the LHS and the second (c1) to the RHS,
-  ; or simply aligns them incorrectly, resulting in c0 << c1 instead of c1 << c0.
-  %2 = shufflevector <2 x i1> %1, <2 x i1> poison, <2 x i32> <i32 1, i32 0>
-  %3 = shl <2 x i1> %1, %2
-  
-  ; Extracting index 0 yields (c0 << c1), which is the swapped operation.
+define i1 @test_shl_extracted_cmps(<2 x i32> %v) {
+  %1 = icmp eq <2 x i32> %v, <i32 42, i32 24>
+  %2 = shufflevector <2 x i1> %1, <2 x i1> poison, <2 x i32> <i32 1, i32 poison>
+  %3 = shl <2 x i1> %2, %1
   %res = extractelement <2 x i1> %3, i32 0
   ret i1 %res
 }
+
 ```
 
 
@@ -79,33 +78,36 @@ define i1 @test(<2 x i32> %vec) {
 
 # Issue 115575
 
-## Incorrect Scalarization of Vector Operations with Out-of-Bounds Insertion Indices
+## Scalarization of Vector Operations with Out-of-Bounds Insertion Indices
 
-**Description**:
-The bug is triggered when the compiler attempts to scalarize a vector binary operation (such as integer division or remainder) where one of the operands is created by an `insertelement` instruction using an out-of-bounds index.
+**Description**: 
+The bug occurs when the compiler attempts to scalarize a vector binary operation or comparison where one of the operands is an `insertelement` instruction using an out-of-bounds index. 
 
-In LLVM IR, an `insertelement` instruction with an index greater than or equal to the vector size produces a `poison` vector. Consequently, any subsequent binary operation using this vector as an input should also result in `poison`, which is a safe and well-defined state that does not execute the operation.
+When an insertion index is greater than or equal to the number of elements in the vector, the `insertelement` instruction evaluates to `poison`. In the original IR, the subsequent vector operation simply takes this `poison` vector and propagates it, resulting in a `poison` value without causing Undefined Behavior (UB). 
 
-The optimization logic, however, fails to verify that the insertion index is within the valid bounds of the vector type. It proceeds to transform the vector operation into a scalar operation by extracting the inserted scalar value and attempting to retrieve the corresponding element from the second vector operand using the same out-of-bounds index. Accessing the second operand at an invalid index typically yields an `undef` value. When this `undef` value is used as a divisor in instructions like `sdiv` or `urem`, it triggers immediate Undefined Behavior (UB). This transformation incorrectly replaces a safe code path (producing `poison`) with one that exhibits Undefined Behavior, resulting in a miscompilation.
+However, during the scalarization transformation, the compiler attempts to fold the operation by extracting the corresponding element from the other operand (such as a constant vector) using the same out-of-bounds index. This out-of-bounds extraction yields a `poison` value. The compiler then constructs a scalar version of the binary operation using the originally inserted scalar and the extracted `poison` value. 
+
+For certain operations, such as integer division (`sdiv`, `udiv`) or remainder (`srem`, `urem`), having `poison` as an operand (e.g., as the divisor) triggers immediate Undefined Behavior. Consequently, the transformation incorrectly elevates a safe `poison` result into UB, leading to a miscompilation where the optimized code is less defined than the original code.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test(i32 %a, <2 x i32> %b) {
-  %ins = insertelement <2 x i32> poison, i32 %a, i32 2
-  %op = sdiv <2 x i32> %ins, %b
-  %res = extractelement <2 x i32> %op, i32 2
-  ret i32 %res
+define <2 x i32> @test(i32 %x) {
+  %ins = insertelement <2 x i32> poison, i32 %x, i32 2
+  %div = sdiv <2 x i32> %ins, <i32 42, i32 42>
+  ret <2 x i32> %div
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i32 @test(i32 %a, <2 x i32> %b) {
-  %ext = extractelement <2 x i32> %b, i32 2
-  %res = sdiv i32 %a, %ext
-  ret i32 %res
+define <2 x i32> @test(i32 %x) {
+  %div.scalar = sdiv i32 %x, poison
+  %div = insertelement <2 x i32> poison, i32 %div.scalar, i32 2
+  ret <2 x i32> %div
 }
+
 ```
 
 
@@ -113,31 +115,34 @@ define i32 @test(i32 %a, <2 x i32> %b) {
 
 # Issue 121110
 
-## Summary Title
-Incorrect Folding of Shuffles with Swapped Comparison Predicates
+## Incorrect Folding of Shuffled Compares with Conditionally Equivalent Predicates
 
-## Description
-The bug is triggered in the `VectorCombine` pass when the optimizer attempts to fold a shuffle instruction that merges the results of two comparison instructions into a single vector comparison. The optimization logic identifies two scalar or vector comparisons feeding into a shuffle and tries to combine them. The issue arises because the pattern matching logic permitted the two comparisons to have different predicates if they were logically equivalent via operand swapping (e.g., `less-than` vs. `greater-than`). 
+**Description**:
+The bug occurs in a compiler optimization that attempts to fold a `shufflevector` of two compare instructions into a single compare of shuffled operands. Specifically, it tries to transform a pattern like `shuffle (cmp P1 X, Y), (cmp P2 Z, W)` into `cmp P1 (shuffle X, Z), (shuffle Y, W)`. 
 
-When such a match occurred, the pass constructed a new vector comparison using the predicate of the first instruction for all lanes, relying on the matcher to swap the operands of the second instruction to compensate. However, this transformation strategy—unifying two different predicates into a single SIMD operation by swapping operands—was flawed or unsafe in this context, leading to miscompilation. The resulting vector instruction did not correctly preserve the semantics of the original code, causing incorrect values to be computed.
+To perform this transformation, the optimization checks if the two source compare instructions have "equivalent" predicates. However, the matching logic used to compare these predicates is too permissive. It allows matching predicates that are only equivalent under specific conditions or flags. For example, it considers an unsigned compare with a `samesign` flag (which asserts that both operands have the same sign, making signed and unsigned comparisons logically identical) as equivalent to a regular signed compare.
+
+When the transformation combines the two compares, it blindly applies the predicate and flags from the first compare (the LHS) to the newly created combined compare. If the LHS compare was an unsigned compare with a `samesign` assumption, but the RHS compare was a regular signed compare without that assumption, the new instruction will evaluate the RHS lanes using the unsigned predicate. 
+
+This leads to a miscompilation because the operands from the RHS lanes are not guaranteed to have the same sign. Evaluating them with an unsigned predicate instead of their original signed predicate produces incorrect boolean results (e.g., when comparing negative numbers). This silently corrupts the logic of the program, altering control flow or output. The issue is resolved by strictly requiring the base predicates of both compares to match exactly before allowing the fold, rather than relying on conditional equivalence.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i1> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {
-  %cmp1 = icmp slt <2 x i32> %a, %b
-  %cmp2 = icmp sgt <2 x i32> %c, %d
+define <2 x i1> @test_shuffle_cmp_samesign(<2 x i32> %x, <2 x i32> %y, <2 x i32> %z, <2 x i32> %w) {
+  %cmp1 = icmp samesign ult <2 x i32> %x, %y
+  %cmp2 = icmp slt <2 x i32> %z, %w
   %shuf = shufflevector <2 x i1> %cmp1, <2 x i1> %cmp2, <2 x i32> <i32 0, i32 2>
   ret <2 x i1> %shuf
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x i1> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {
-  %1 = shufflevector <2 x i32> %a, <2 x i32> %c, <2 x i32> <i32 0, i32 2>
-  %2 = shufflevector <2 x i32> %b, <2 x i32> %d, <2 x i32> <i32 0, i32 2>
-  %shuf = icmp slt <2 x i32> %1, %2
+define <2 x i1> @test_shuffle_cmp_samesign(<2 x i32> %x, <2 x i32> %y, <2 x i32> %z, <2 x i32> %w) {
+  %1 = shufflevector <2 x i32> %x, <2 x i32> %z, <2 x i32> <i32 0, i32 2>
+  %2 = shufflevector <2 x i32> %y, <2 x i32> %w, <2 x i32> <i32 0, i32 2>
+  %shuf = icmp samesign ult <2 x i32> %1, %2
   ret <2 x i1> %shuf
 }
 ```
@@ -145,33 +150,41 @@ define <2 x i1> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {
 
 ---
 
-# Issue 126085
+# Issue 158197
 
-## Incorrect Vector Type in Shuffle Cost Calculation for Size-Mismatched Vectors
+## Endian-Unaware Vector-to-Scalar Packing and Extraction
 
-**Description**
-The bug is triggered when the vector combiner attempts to fold a sequence of vector operations—specifically involving the extraction of an element from a source vector and its insertion into a destination vector—into a sequence of shuffle operations. The issue arises when the source vector and the destination vector have different lengths, particularly when the source vector is larger than the destination vector.
+**Description**: 
+The bug is triggered by a transformation that attempts to optimize vector element extractions by packing an entire vector into a single, large scalar integer. Once packed, the optimization replaces the original vector extraction instructions with scalar bitwise operations, specifically logical right shifts and bitwise AND masks, to isolate the desired vector lane. 
 
-When calculating the estimated cost of the transformation, the compiler constructs a shuffle mask to represent the permutation of the source vector. However, when querying the Target Transform Info (TTI) for the cost of this shuffle, the compiler incorrectly provides the *destination* vector type (the smaller vector) instead of the *source* vector type. If the index of the element being extracted from the larger source vector exceeds the bounds of the smaller destination vector, the cost model validates the mask indices against the incorrect, smaller type. This results in an assertion failure indicating an out-of-bounds shuffle mask element.
+The vulnerability lies in the calculation of the shift amount used to locate the specific element within the packed integer. The transformation hardcodes a little-endian assumption, calculating the bit offset simply as the element index multiplied by the element size (i.e., assuming the element at index 0 resides in the least significant bits). 
+
+On big-endian targets, the memory layout dictates that the first vector element occupies the most significant bits of the packed integer. Because the transformation fails to query the target's data layout to adjust the bit offset accordingly, it shifts by the wrong amount and extracts incorrect bits. To trigger this issue, the input LLVM IR must contain vector extraction operations that the compiler attempts to scalarize into bitwise arithmetic while compiling for a target with a big-endian data layout.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x float> @test_vector_combine_mismatch(<4 x float> %src, <2 x float> %dest) {
-  %ext = extractelement <4 x float> %src, i32 3
-  %ins = insertelement <2 x float> %dest, float %ext, i32 0
-  ret <2 x float> %ins
+target datalayout = "E-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64"
+target triple = "powerpc-unknown-linux-gnu"
+
+define i8 @test_extract(<4 x i8> %v) {
+entry:
+  %ext = extractelement <4 x i8> %v, i32 1
+  ret i8 %ext
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x float> @test_vector_combine_mismatch(<4 x float> %src, <2 x float> %dest) {
-  ; The optimization incorrectly attempts to form a shuffle using the destination type (<2 x float>)
-  ; but with an index (3) derived from the larger source type (<4 x float>).
-  ; This results in an out-of-bounds mask index for the smaller vector type.
-  %1 = shufflevector <2 x float> %dest, <2 x float> poison, <2 x i32> <i32 3, i32 1>
-  ret <2 x float> %1
+target datalayout = "E-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64"
+target triple = "powerpc-unknown-linux-gnu"
+
+define i8 @test_extract(<4 x i8> %v) {
+entry:
+  %0 = bitcast <4 x i8> %v to i32
+  %1 = lshr i32 %0, 8
+  %2 = trunc i32 %1 to i8
+  ret i8 %2
 }
 ```
 
@@ -180,31 +193,39 @@ define <2 x float> @test_vector_combine_mismatch(<4 x float> %src, <2 x float> %
 
 # Issue 67060
 
-## Incorrect Scalarization of Packed Vector Elements Leading to Adjacent Data Corruption
+## Scalarization of Memory Operations on Vectors with Non-Byte-Sized Elements
 
-**Description**
-The bug is triggered when the compiler attempts to optimize a sequence of vector operations—specifically a vector load, an element modification (e.g., `insertelement`), and a vector store—into a single scalar store of the modified element. The optimization logic validates that the total bit width of the vector matches its storage size in memory, assuming this ensures the memory layout allows for scalar access.
+**Description:**
+The bug is triggered by a sequence of instructions that modify or extract a single element of a vector in memory (e.g., loading a vector, inserting or extracting an element, and then storing or using the result). 
 
-However, this check is insufficient for vectors with sub-byte element types (such as `<N x i1>`), where elements are bit-packed. While the whole vector may be byte-aligned, individual elements are not. When the compiler converts the operation into a scalar store, it generates an instruction that writes the architecture's minimum addressable unit (typically a byte). Because the target element occupies fewer bits than a byte, the scalar store inadvertently overwrites adjacent bits belonging to other elements in the vector, leading to data corruption.
+Specifically, the issue occurs when the vector type has a total size that is a multiple of bytes (i.e., it is byte-sized), but its individual scalar elements are not byte-sized (such as a vector of `i1` elements, like `<32 x i1>`). 
+
+The optimization pass attempts to simplify the operation by scalarizing it—replacing the full vector memory access with a direct scalar memory access (load or store) to the specific element. However, the transformation logic incorrectly verifies the byte-size property against the entire vector type rather than the scalar element type. Since the whole vector is byte-sized, the check passes, and the pass emits a scalar memory operation for the non-byte-sized element. 
+
+When this scalar memory operation is later lowered by the backend, it is expanded to a full byte-sized memory access. For a store, this results in writing a full byte, which incorrectly clobbers adjacent bits belonging to other vector elements.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test_vector_corruption(<8 x i1>* %ptr, i1 %val) {
-  %vec = load <8 x i1>, <8 x i1>* %ptr
-  %ins = insertelement <8 x i1> %vec, i1 %val, i32 0
-  store <8 x i1> %ins, <8 x i1>* %ptr
+define void @test(ptr %ptr, i1 %val) {
+entry:
+  %load = load <32 x i1>, ptr %ptr, align 4
+  %insert = insertelement <32 x i1> %load, i1 %val, i32 2
+  store <32 x i1> %insert, ptr %ptr, align 4
   ret void
 }
+
 ```
 ### Optimized IR
 ```llvm
-define void @test_vector_corruption(<8 x i1>* %ptr, i1 %val) {
-  %1 = bitcast <8 x i1>* %ptr to i1*
-  store i1 %val, i1* %1
+define void @test(ptr %ptr, i1 %val) {
+entry:
+  %0 = getelementptr inbounds i1, ptr %ptr, i64 2
+  store i1 %val, ptr %0, align 1
   ret void
 }
+
 ```
 
 
@@ -212,32 +233,36 @@ define void @test_vector_corruption(<8 x i1>* %ptr, i1 %val) {
 
 # Issue 89390
 
-## Unsafe Hoisting of Shuffle over Division/Remainder with Poison Masks
+## Hoisting Shufflevector with Poison Mask Above Division/Remainder Operations
 
-## Description
-The bug is triggered when the compiler optimizes a vector shuffle instruction that combines the results of two integer division or remainder operations. The optimization attempts to reduce instruction count by "hoisting" the shuffle before the operations, transforming a pattern like `shuffle(div(A, B), div(C, D))` into `div(shuffle(A, C), shuffle(B, D))`.
+**Description**:
+The bug is triggered by an incorrect optimization that folds a `shufflevector` of two binary operations into a binary operation of two `shufflevector`s. The specific pattern involves:
 
-The issue arises when the shuffle mask contains `poison` or undefined elements, which indicate that the values in specific lanes of the result are not needed. When the compiler transforms the code, it propagates these `poison` elements into the generated shuffle instructions for the operands. Specifically, this creates a new divisor vector that contains `poison` or undefined values in the lanes corresponding to the mask's `poison` elements.
+1. A `shufflevector` instruction that operates on the results of two identical integer division or remainder instructions (e.g., `sdiv`, `udiv`, `srem`, or `urem`).
+2. The mask of the `shufflevector` instruction contains one or more `poison` (or `undef`) elements.
+3. The compiler attempts to optimize this by hoisting the `shufflevector` above the binary operations. It creates new `shufflevector` instructions for the operands and then applies the division/remainder operation to the results of these new shuffles.
+4. Because the original shuffle mask contained `poison`, the newly created `shufflevector` instructions produce `poison` in the corresponding lanes. 
+5. When these `poison` values are fed into the new division or remainder instruction—specifically into the divisor operand—it triggers immediate Undefined Behavior (UB). 
 
-While the original code performed the division or remainder on valid operands and simply discarded the result for those lanes, the transformed code executes the division or remainder with a `poison` or undefined value in the divisor. For division and remainder operations, having an undefined or poison value in the divisor can trigger immediate Undefined Behavior (e.g., if treated as zero), rendering the transformation unsafe.
+In the original IR, the division/remainder operations were executed before the shuffle, meaning the divisors were valid, and the `poison` only safely appeared in the final shuffled result. The transformation incorrectly introduces full UB by forcing the division/remainder operation to evaluate with a `poison` divisor.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i32> @test_unsafe_hoist_sdiv(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {
+define <2 x i32> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {
   %div1 = sdiv <2 x i32> %a, %b
   %div2 = sdiv <2 x i32> %c, %d
-  %res = shufflevector <2 x i32> %div1, <2 x i32> %div2, <2 x i32> <i32 0, i32 poison>
-  ret <2 x i32> %res
+  %shuf = shufflevector <2 x i32> %div1, <2 x i32> %div2, <2 x i32> <i32 0, i32 poison>
+  ret <2 x i32> %shuf
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x i32> @test_unsafe_hoist_sdiv(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {
-  %1 = shufflevector <2 x i32> %a, <2 x i32> %c, <2 x i32> <i32 0, i32 poison>
-  %2 = shufflevector <2 x i32> %b, <2 x i32> %d, <2 x i32> <i32 0, i32 poison>
-  %res = sdiv <2 x i32> %1, %2
-  ret <2 x i32> %res
+define <2 x i32> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {
+  %shuf.a = shufflevector <2 x i32> %a, <2 x i32> %c, <2 x i32> <i32 0, i32 poison>
+  %shuf.b = shufflevector <2 x i32> %b, <2 x i32> %d, <2 x i32> <i32 0, i32 poison>
+  %shuf = sdiv <2 x i32> %shuf.a, %shuf.b
+  ret <2 x i32> %shuf
 }
 ```

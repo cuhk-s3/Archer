@@ -1,28 +1,31 @@
 # Issue 116249
 
-## Summary Title
-Incorrect Preservation of `samesign` Flag During Integer Comparison Narrowing
+## Incorrect Preservation of `samesign` Flag when Narrowing Comparisons
 
-## Description
-The bug occurs when an optimization narrows the bit width of an integer comparison (e.g., converting a 32-bit comparison to an 8-bit comparison) to simplify control flow or loop exit conditions. Specifically, if the original comparison instruction carries the `samesign` flag, the optimizer incorrectly preserves this flag on the new, narrower comparison instruction.
+**Description:**
+The bug is triggered when an integer comparison (`icmp`) instruction annotated with the `samesign` flag is optimized by narrowing its operands to a smaller integer type. The `samesign` flag asserts that both operands of the comparison share the same sign (i.e., both are non-negative or both are negative) in their current type. 
 
-The `samesign` flag asserts that both operands share the same sign bit. However, narrowing the type changes the position of the sign bit. Operands that shared a sign bit in the wider type (often because they were zero-extended and thus both positive) may have differing sign bits when truncated to the narrower type. By retaining the `samesign` flag on the narrowed operation, the compiler introduces undefined behavior for inputs where the new sign bits differ, leading to a miscompilation.
+When the comparison is narrowed (e.g., from `i32` to `i8`), the position of the sign bit changes to the most significant bit of the new, narrower type. Two values that have the same sign in a wider type may not have the same sign in the narrower type after truncation. For example, `0` and `128` are both non-negative in `i32`, but when truncated to `i8`, `0` remains non-negative while `128` becomes negative. 
+
+The optimization incorrectly preserves the `samesign` flag on the newly narrowed comparison. Because the same-sign guarantee no longer holds for the truncated operands, the comparison evaluates to `poison`. This leads to undefined behavior when the `poison` value is subsequently used, such as in a conditional branch for a loop exit.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_samesign_narrowing(i8 %a, i8 %b) {
-  %ext_a = zext i8 %a to i32
-  %ext_b = zext i8 %b to i32
-  %cmp = icmp samesign ult i32 %ext_a, %ext_b
+define i1 @narrow_icmp_samesign(i8 %x, i8 %y) {
+entry:
+  %x.ext = zext i8 %x to i32
+  %y.ext = zext i8 %y to i32
+  %cmp = icmp samesign ult i32 %x.ext, %y.ext
   ret i1 %cmp
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_samesign_narrowing(i8 %a, i8 %b) {
-  %cmp = icmp samesign ult i8 %a, %b
+define i1 @narrow_icmp_samesign(i8 %x, i8 %y) {
+entry:
+  %cmp = icmp samesign ult i8 %x, %y
   ret i1 %cmp
 }
 ```
@@ -32,34 +35,39 @@ define i1 @test_samesign_narrowing(i8 %a, i8 %b) {
 
 # Issue 66986
 
-## Unsafe Speculation of Trapping Instructions during Loop Exit Expansion
+## Unsafe Speculation of Trapping Operations during Loop Exit Count Expansion
 
-**Description**
-The bug is triggered during the Linear Function Test Replacement (LFTR) transformation within the induction variable simplification pass. This optimization aims to replace a loop's complex exit condition with a simpler comparison against a pre-calculated exit count. The issue arises when the Scalar Evolution (SCEV) expression representing this exit count involves a potentially trapping operation, such as integer division, which is guarded by a conditional check in the original LLVM IR.
+**Description:**
+The bug is triggered when a loop optimization pass attempts to rewrite a loop's exit condition based on its computed exit count, but incorrectly speculates operations that can trap at runtime. 
 
-When the optimization expands this SCEV expression into executable instructions to form the new loop test, it fails to verify whether the operations are safe to execute speculatively. As a result, the trapping instruction is hoisted out of its protective context (e.g., moved to the loop preheader) and executed unconditionally. If the runtime values trigger the trap (for example, a divisor is zero), the program crashes, whereas the original code would have safely skipped the operation due to the guard.
+1. A loop contains an exit condition that depends on an expression involving a potentially trapping operation, such as an integer division or remainder.
+2. In the original program, this trapping operation is safely guarded by control flow (e.g., an `if` statement checking if the divisor is zero) that prevents the operation from executing with invalid operands.
+3. The compiler analyzes the loop using Scalar Evolution (SCEV) and computes an expression for the loop's exact exit count, which inherently incorporates the trapping operation.
+4. During loop transformations like Linear Function Test Replace (LFTR), the pass attempts to replace the original induction variable-based exit test with a new test against the computed exit count.
+5. To do this, the pass expands the SCEV expression for the exit count into actual LLVM IR instructions. However, it fails to verify whether the operations within the expression are safe to unconditionally expand (speculate).
+6. Consequently, the potentially trapping operation is generated outside of its original protective control flow guard. When the program executes, the speculated instruction may evaluate with invalid operands (like a zero divisor), leading to a runtime fault such as a floating-point exception.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @func(i32 %n, i32 %d) {
+define void @test(i32 %a, i32 %b) {
 entry:
   br label %loop
 
 loop:
-  %i = phi i32 [ 0, %entry ], [ %inc, %latch ]
-  ; Guard: If d is 0, exit the loop safely.
-  %guard = icmp eq i32 %d, 0
-  br i1 %guard, label %exit, label %latch
+  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]
+  %cmp1 = icmp eq i32 %b, 0
+  br i1 %cmp1, label %exit, label %loop.cont
 
-latch:
-  ; The exit condition depends on multiplication by d.
-  ; This implies a division by d to calculate the trip count.
-  %mul = mul i32 %i, %d
-  %cond = icmp ult i32 %mul, %n
-  %inc = add i32 %i, 1
-  br i1 %cond, label %loop, label %exit
+loop.cont:
+  %div = udiv i32 %a, %b
+  %cmp2 = icmp ult i32 %iv, %div
+  br i1 %cmp2, label %loop.latch, label %exit
+
+loop.latch:
+  %iv.next = add i32 %iv, 1
+  br label %loop
 
 exit:
   ret void
@@ -67,26 +75,23 @@ exit:
 ```
 ### Optimized IR
 ```llvm
-define void @func(i32 %n, i32 %d) {
+define void @test(i32 %a, i32 %b) {
 entry:
-  ; BUG: The trip count calculation (involving udiv) is hoisted to the preheader.
-  ; This executes unconditionally. If %d is 0, this instruction traps,
-  ; whereas the original code would have safely exited via the guard.
-  %tmp = sub i32 %n, 1
-  %trip.count = udiv i32 %tmp, %d
-  %limit = add i32 %trip.count, 1
+  %div.spec = udiv i32 %a, %b
   br label %loop
 
 loop:
-  %i = phi i32 [ 0, %entry ], [ %inc, %latch ]
-  %guard = icmp eq i32 %d, 0
-  br i1 %guard, label %exit, label %latch
+  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]
+  %cmp1 = icmp eq i32 %b, 0
+  br i1 %cmp1, label %exit, label %loop.cont
 
-latch:
-  ; LFTR has replaced the original exit condition with a check against the pre-calculated limit.
-  %inc = add i32 %i, 1
-  %exitcond = icmp ne i32 %inc, %limit
-  br i1 %exitcond, label %loop, label %exit
+loop.cont:
+  %exitcond = icmp ne i32 %iv, %div.spec
+  br i1 %exitcond, label %loop.latch, label %exit
+
+loop.latch:
+  %iv.next = add i32 %iv, 1
+  br label %loop
 
 exit:
   ret void

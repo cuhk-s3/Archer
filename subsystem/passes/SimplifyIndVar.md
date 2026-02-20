@@ -1,35 +1,39 @@
 # Issue 62992
 
-## Speculative Hoisting of Trapping Instructions during Loop Invariant Expansion
+## Unsafe Hoisting of Potentially Trapping Loop-Invariant Expressions
 
-**Description**
-The bug is triggered when the compiler attempts to simplify a comparison involving a loop induction variable by hoisting the loop-invariant operand of that comparison into the loop preheader. The optimization identifies an expression that does not vary within the loop and generates code to compute this expression before the loop begins, aiming to canonicalize the loop or reduce computational overhead.
+**Description**: 
+The bug is triggered when a loop optimization pass attempts to simplify an induction variable comparison by hoisting its loop-invariant operands into the loop preheader. 
 
-However, the transformation fails to verify whether the expression is safe to execute speculatively. Specifically, it does not check if the expression contains instructions that can trap, such as integer division or remainder operations, which cause a runtime fault if the divisor is zero. In the original code, these operations are typically guarded by conditional checks (e.g., ensuring the divisor is non-zero) or are located within control flow that prevents their execution under unsafe conditions. By moving the computation to the preheader without preserving these guards, the compiler causes the trapping instruction to execute unconditionally. Consequently, if the runtime values trigger the trap (e.g., a zero divisor), the program crashes with an exception, violating the semantics of the original guarded code.
+In the original program, the loop-invariant expression may contain a potentially trapping operation (such as an integer division or remainder). To prevent runtime faults, this operation is typically guarded by a condition within the loop body (e.g., checking that the divisor is not zero), ensuring it is only executed when safe. 
+
+However, the optimization transformation fails to verify whether the loop-invariant expression is safe to expand and execute speculatively at the new insertion point in the preheader. By unconditionally hoisting and expanding the expression outside the loop, the compiler bypasses the original protective guards. As a result, the potentially trapping operation is executed unconditionally before the loop begins, leading to runtime exceptions (such as a division by zero fault) that would not have occurred in the unoptimized code.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test_loop_hoist(i32 %n, i32 %d) {
+define void @test(i32 %n, i32 %x, i32 %d) {
 entry:
-  br label %header
+  br label %loop
 
-header:
+loop:
   %i = phi i32 [ 0, %entry ], [ %i.next, %latch ]
-  %cond = icmp slt i32 %i, %n
-  br i1 %cond, label %body, label %exit
+  %cmp.guard = icmp ne i32 %d, 0
+  br i1 %cmp.guard, label %guarded, label %latch
+
+guarded:
+  %div = sdiv i32 %x, %d
+  %cmp = icmp slt i32 %i, %div
+  br i1 %cmp, label %body, label %latch
 
 body:
-  ; This instruction is loop invariant but can trap (divide by zero).
-  ; It is guarded by the loop condition (i < n).
-  %div = sdiv i32 42, %d
-  %cmp = icmp eq i32 %i, %div
   br label %latch
 
 latch:
   %i.next = add i32 %i, 1
-  br label %header
+  %exitcond = icmp eq i32 %i.next, %n
+  br i1 %exitcond, label %exit, label %loop
 
 exit:
   ret void
@@ -37,26 +41,27 @@ exit:
 ```
 ### Optimized IR
 ```llvm
-define void @test_loop_hoist(i32 %n, i32 %d) {
+define void @test(i32 %n, i32 %x, i32 %d) {
 entry:
-  ; BUG: The trapping instruction is hoisted to the preheader.
-  ; It now executes unconditionally. If %d is 0 and %n is 0, this traps
-  ; whereas the original code would have exited safely.
-  %div = sdiv i32 42, %d
-  br label %header
+  %div = sdiv i32 %x, %d
+  br label %loop
 
-header:
+loop:
   %i = phi i32 [ 0, %entry ], [ %i.next, %latch ]
-  %cond = icmp slt i32 %i, %n
-  br i1 %cond, label %body, label %exit
+  %cmp.guard = icmp ne i32 %d, 0
+  br i1 %cmp.guard, label %guarded, label %latch
+
+guarded:
+  %cmp = icmp slt i32 %i, %div
+  br i1 %cmp, label %body, label %latch
 
 body:
-  %cmp = icmp eq i32 %i, %div
   br label %latch
 
 latch:
   %i.next = add i32 %i, 1
-  br label %header
+  %exitcond = icmp eq i32 %i.next, %n
+  br i1 %exitcond, label %exit, label %loop
 
 exit:
   ret void

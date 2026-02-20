@@ -1,38 +1,86 @@
-# Issue 112068
+# Issue 111934
 
-## Incorrect Promotion of Poison to Undefined Behavior in Intrinsic Simplification
+## Failure to Drop Poison-Generating Annotations When Removing Guarding Conditions
 
-**Description**
-The bug is triggered when the optimizer simplifies `cttz` or `ctlz` intrinsics by changing the `is_zero_poison` argument from `false` to `true`. This transformation is applied when the result of the intrinsic is used exclusively as a shift amount, relying on the fact that shifting by the bit width (the value returned by the intrinsic for zero input when `is_zero_poison` is false) produces a poison value. However, the optimizer fails to strip attributes that imply immediate undefined behavior, such as `noundef`, from the intrinsic call. Consequently, when the input is zero, the modified intrinsic produces a poison value which the attribute immediately escalates to Undefined Behavior, whereas the original code simply propagated a poison value through the shift operation.
+**Description**: 
+The bug occurs when an optimization simplifies a logical expression (such as a logical AND/OR or a `select` instruction) that guards an instruction with poison-generating annotations (e.g., `range` attributes). The triggering pattern involves the following sequence:
+
+1. An instruction (such as an intrinsic call) is annotated with poison-generating attributes, meaning it evaluates to `poison` for certain input values.
+2. The propagation of this `poison` value is guarded by a condition within a logical operation (e.g., a `select` instruction acting as a logical AND). If the input value would cause the instruction to yield `poison`, the logical operation selects a safe, non-poison value, preventing the `poison` from affecting the final result.
+3. A compiler optimization recognizes a specific pattern (e.g., checking if a value is a power of two) and folds the logical operation. It removes the explicit condition check and simplifies the expression to unconditionally use the result of the annotated instruction.
+4. However, the optimization fails to drop the poison-generating annotations from the underlying instruction.
+5. Consequently, when the input matches the previously guarded condition, the instruction generates `poison`. Because the guarding condition was removed, this `poison` now unconditionally propagates to the final result, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_cttz_noundef_shift(i32 %x, i32 %y) {
-  ; The intrinsic is called with is_zero_poison = false.
-  ; The noundef attribute asserts the result is not poison.
-  ; If %x is 0, cttz returns 32 (bit width).
-  %cnt = call noundef i32 @llvm.cttz.i32(i32 %x, i1 false)
-  ; Shifting by 32 results in poison, but not immediate UB.
-  %res = shl i32 %y, %cnt
-  ret i32 %res
+declare i32 @llvm.ctpop.i32(i32)
+
+define i1 @test(i32 %x) {
+entry:
+  %cmp = icmp ne i32 %x, 0
+  %pop = call i32 @llvm.ctpop.i32(i32 %x), !range !0
+  %cmp2 = icmp ult i32 %pop, 2
+  %res = select i1 %cmp, i1 %cmp2, i1 false
+  ret i1 %res
 }
 
-declare i32 @llvm.cttz.i32(i32, i1)
+!0 = !{i32 1, i32 33}
+
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_cttz_noundef_shift(i32 %x, i32 %y) {
-  ; The optimizer incorrectly changes is_zero_poison to true while keeping noundef.
-  ; If %x is 0, cttz returns poison.
-  ; The noundef attribute immediately escalates this poison to Undefined Behavior.
-  %cnt = call noundef i32 @llvm.cttz.i32(i32 %x, i1 true)
-  %res = shl i32 %y, %cnt
-  ret i32 %res
+declare i32 @llvm.ctpop.i32(i32)
+
+define i1 @test(i32 %x) {
+entry:
+  %pop = call i32 @llvm.ctpop.i32(i32 %x), !range !0
+  %res = icmp eq i32 %pop, 1
+  ret i1 %res
 }
 
-declare i32 @llvm.cttz.i32(i32, i1)
+!0 = !{i32 1, i32 33}
+
+```
+
+
+---
+
+# Issue 112068
+
+## Failure to Drop UB-Implying Attributes When Refining Intrinsics to Return Poison
+
+**Description**: 
+The bug is triggered when the compiler optimizes an intrinsic call that features a boolean flag controlling whether a specific edge-case input yields a poison value (such as the `is_zero_poison` argument in count-leading-zeros or count-trailing-zeros intrinsics). 
+
+Initially, the intrinsic is configured to return a well-defined value for the edge-case input (i.e., the flag is set to `false`), and the call is annotated with an attribute that strictly forbids poison or undefined values, such as `noundef`. 
+
+During optimization, the compiler analyzes the uses of the intrinsic's result (for example, being used solely as a shift amount) and determines that it is safe to relax the intrinsic to return poison for the edge-case input. It does this by toggling the flag to `true`. However, the transformation logic fails to drop the `noundef` attribute and other UB-implying metadata from the intrinsic call. 
+
+As a result, if the edge-case input occurs at runtime, the modified intrinsic produces a poison value. Because the `noundef` attribute was incorrectly retained, returning a poison value immediately escalates into undefined behavior, miscompiling a previously well-defined program.
+
+## Example
+
+### Original IR
+```llvm
+declare i32 @llvm.cttz.i32(i32, i1 immarg)
+
+define i32 @test(i32 %x) {
+  %tz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 false)
+  %shl = shl i32 1, %tz
+  ret i32 %shl
+}
+```
+### Optimized IR
+```llvm
+declare i32 @llvm.cttz.i32(i32, i1 immarg)
+
+define i32 @test(i32 %x) {
+  %tz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 true)
+  %shl = shl i32 1, %tz
+  ret i32 %shl
+}
 ```
 
 
@@ -40,49 +88,41 @@ declare i32 @llvm.cttz.i32(i32, i1)
 
 # Issue 112076
 
-## Summary Title
-Unsafe Propagation of Poison-Generating Metadata When Linearizing Select Instructions
+## Unconditional Propagation of Poison from Conditionally Used Annotated Instructions
 
-## Description
-The bug is triggered when the optimizer transforms a `select` instruction, which implements a specific mathematical idiom (such as `bit_ceil`), into an unconditional sequence of arithmetic operations. The original code pattern involves an intrinsic call (e.g., `llvm.ctlz`) that is annotated with poison-generating metadata, such as a `!range` attribute. For certain input values, this metadata causes the intrinsic to produce `poison`. In the source IR, the `select` instruction effectively masks this poison by choosing a safe alternative value (e.g., a constant) whenever the input would cause the intrinsic to violate its metadata constraints.
+**Description**: 
+The bug is triggered when an optimization transforms a conditional operation (such as a `select` instruction) into an unconditional sequence of arithmetic or bitwise operations, failing to account for poison-generating annotations on the operands. 
 
-The optimization replaces this conditional logic with a branchless calculation that always consumes the result of the intrinsic. However, the transformation fails to remove the poison-generating metadata from the intrinsic. Consequently, for inputs that violate the metadata constraints, the intrinsic generates `poison` which now unconditionally propagates through the optimized arithmetic sequence. This results in the transformed code returning `poison` for inputs that yielded a well-defined value in the original code.
+The strategy involves the following pattern:
+1. An instruction produces a value and is decorated with poison-generating annotations (e.g., a `range` attribute).
+2. The result of this instruction is used as an operand in a conditional operation (like a `select` instruction). The condition effectively guards against the specific edge cases that would violate the annotation and produce a `poison` value.
+3. A compiler optimization folds or replaces the conditional operation with an unconditional sequence of instructions that directly use the result of the annotated instruction.
+4. Because the conditional guard is removed, the `poison` value generated by the annotation is no longer bypassed. Instead, it propagates unconditionally through the new sequence of instructions, making the final result of the transformed code more poisonous than the original code.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @trigger(i32 %x) {
-  ; The ctlz intrinsic is annotated with range metadata [0, 32).
-  ; For i32, ctlz(0) returns 32. The metadata implies the result is never 32,
-  ; effectively asserting that %x is never 0. If %x is 0, this produces poison.
-  %val = call i32 @llvm.ctlz.i32(i32 %x, i1 false), !range !0
-  
-  ; The select instruction masks the poison case. If %x is 0, it returns 32 (safe).
-  ; If %x is not 0, it returns %val (safe, within range).
-  %cond = icmp eq i32 %x, 0
-  %res = select i1 %cond, i32 32, i32 %val
-  ret i32 %res
+define i32 @test(ptr %p, i32 %x) {
+  %v = load i32, ptr %p, !range !0
+  %c = icmp eq i32 %x, 0
+  %sel = select i1 %c, i32 %v, i32 %x
+  ret i32 %sel
 }
 
-declare i32 @llvm.ctlz.i32(i32, i1)
-
-!0 = !{i32 0, i32 32}
+!0 = !{i32 0, i32 2}
 ```
 ### Optimized IR
 ```llvm
-define i32 @trigger(i32 %x) {
-  ; The optimizer recognizes that ctlz(0) == 32 and folds the select.
-  ; However, it incorrectly preserves the !range metadata.
-  ; Now, if %x is 0, the intrinsic returns 32, which violates the [0, 32) range,
-  ; causing the function to return poison instead of 32.
-  %val = call i32 @llvm.ctlz.i32(i32 %x, i1 false), !range !0
-  ret i32 %val
+declare i32 @llvm.umax.i32(i32, i32)
+
+define i32 @test(ptr %p, i32 %x) {
+  %v = load i32, ptr %p, !range !0
+  %sel = call i32 @llvm.umax.i32(i32 %v, i32 %x)
+  ret i32 %sel
 }
 
-declare i32 @llvm.ctlz.i32(i32, i1)
-
-!0 = !{i32 0, i32 32}
+!0 = !{i32 0, i32 2}
 ```
 
 
@@ -90,30 +130,34 @@ declare i32 @llvm.ctlz.i32(i32, i1)
 
 # Issue 112467
 
-## Incorrect Poison Propagation in Logical to Bitwise Conversion of `samesign` Comparisons
+## Incorrect Poison Propagation in Logical to Bitwise AND/OR Conversion with Poison-Generating Flags
 
-## Description
-The bug is triggered when the compiler optimizes a logical AND/OR operation (typically represented as a `select` instruction) involving integer comparisons, where one of the comparisons carries the `samesign` optimization flag. The optimizer attempts to fold these comparisons into a more efficient bitwise expression (e.g., converting a logical OR into a bitwise OR).
+**Description**: 
+The bug is triggered when a logical AND or OR operation (often represented as a `select` instruction with a boolean constant) is optimized into a bitwise AND or OR operation. The operands of the logical operation are comparison instructions, and the right-hand side (RHS) comparison is decorated with a poison-generating flag (such as `samesign`).
 
-The flaw lies in preserving the `samesign` flag during this conversion. The `samesign` flag specifies that the comparison yields `poison` if the operands do not share the same sign. In the original logical form, if the result is determined by the other operand (e.g., the first operand of a logical OR is true), the potential `poison` from the `samesign` comparison is suppressed. However, the transformed bitwise operation evaluates all operands eagerly and propagates `poison` if any operand is `poison`. Consequently, for inputs where the `samesign` constraint is violated but the logical operation would have short-circuited, the optimized code produces `poison` instead of a defined value, resulting in a miscompilation.
+In the original logical operation, short-circuiting behavior ensures that the RHS is only evaluated if the left-hand side (LHS) does not determine the final result. Consequently, any poison generated by the RHS flag is only conditionally propagated. However, when the compiler transforms the logical operation into a bitwise operation, both operands are evaluated unconditionally. 
+
+The miscompilation occurs because the optimization reuses the RHS comparison instruction but fails to drop its poison-generating flag. As a result, the poison from the RHS unconditionally propagates to the result of the bitwise operation. This makes the transformed code more poisonous than the original code, specifically in cases where the LHS would have short-circuited the evaluation and masked the poison.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_poison_propagation(i32 %a, i32 %b) {
-  %cmp1 = icmp eq i32 %a, -1
-  %cmp2 = icmp samesign ult i32 %a, %b
-  %res = select i1 %cmp1, i1 true, i1 %cmp2
+define i1 @test_logical_and(i32 %a, i32 %b, i32 %c, i32 %d) {
+entry:
+  %cmp1 = icmp eq i32 %a, %b
+  %cmp2 = icmp samesign ult i32 %c, %d
+  %res = select i1 %cmp1, i1 %cmp2, i1 false
   ret i1 %res
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_poison_propagation(i32 %a, i32 %b) {
-  %cmp1 = icmp eq i32 %a, -1
-  %cmp2 = icmp samesign ult i32 %a, %b
-  %res = or i1 %cmp1, %cmp2
+define i1 @test_logical_and(i32 %a, i32 %b, i32 %c, i32 %d) {
+entry:
+  %cmp1 = icmp eq i32 %a, %b
+  %cmp2 = icmp samesign ult i32 %c, %d
+  %res = and i1 %cmp1, %cmp2
   ret i1 %res
 }
 ```
@@ -123,27 +167,33 @@ define i1 @test_poison_propagation(i32 %a, i32 %b) {
 
 # Issue 112476
 
-## Preservation of `samesign` Attribute During ICmp Operand Simplification
+## Bug Triggering Strategy
 
-**Description**:
-The bug is triggered when the optimizer simplifies an integer comparison (`icmp`) instruction that is annotated with the `samesign` attribute. The `samesign` attribute implies that the comparison yields a poison value if the operands do not share the same sign bit. The optimizer performs a transformation that simplifies the sequence of operations feeding into the comparison (such as combining shifts and bitwise AND/OR operations) into a more efficient form. 
+### Incorrect Preservation of `samesign` Flag in `icmp` Transformations
 
-While the transformed operands maintain the correct logical truth value for the comparison (e.g., equality or inequality against zero), the transformation may produce a value with a different sign bit than the original expression. Specifically, the new operand might be negative while the original was positive, or vice versa. Because the optimizer retains the `samesign` attribute on the transformed instruction, the new operands—which now have differing signs—violate the attribute's constraint. This causes the instruction to incorrectly evaluate to poison instead of the expected boolean result.
+**Description:**
+The bug is triggered when a compiler optimization modifies the operands of an integer comparison (`icmp`) instruction but incorrectly preserves its `samesign` flag. 
+
+1. **Initial State:** The original IR contains an `icmp` instruction with the `samesign` flag. This flag asserts that both operands have the same sign (either both non-negative or both negative). In the original context, the operations feeding into the `icmp` (e.g., bitwise `and` with a positive constant) guarantee that the operands will indeed have the same sign, making the `samesign` flag valid.
+2. **Transformation:** An optimization pass (such as folding bitwise operations, shifts, or converting `select` instructions) rearranges the logic and changes the operands being compared by the `icmp`. 
+3. **Incorrect Logic:** The transformation reuses the original `icmp` instruction or explicitly copies its flags to the new instruction, failing to drop the `samesign` flag. 
+4. **Miscompilation:** The newly computed operands may no longer guarantee the same sign properties as the original ones. When the transformed code is executed with inputs that cause the new operands to have different signs, the incorrectly retained `samesign` flag causes the `icmp` to evaluate to `poison`. This makes the optimized code more poisonous than the original, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(i32 %a) {
-  %shr = lshr i32 %a, 31
-  %cmp = icmp samesign ne i32 %shr, 0
+define i1 @test(i32 %x) {
+  %shr = lshr i32 %x, 1
+  %cmp = icmp samesign eq i32 %shr, 1073741824
   ret i1 %cmp
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(i32 %a) {
-  %cmp = icmp samesign slt i32 %a, 0
+define i1 @test(i32 %x) {
+  %masked = and i32 %x, -2
+  %cmp = icmp samesign eq i32 %masked, -2147483648
   ret i1 %cmp
 }
 ```
@@ -151,31 +201,140 @@ define i1 @test(i32 %a) {
 
 ---
 
-# Issue 113423
+# Issue 112666
 
-## Incorrect Fast Math Flag Propagation when Hoisting Floating-Point Operations over Select
+## Incorrect Preservation of Poison-Generating Flags when Negating Select Instructions
 
-**Description**
-The bug is triggered when the compiler optimizes a `select` instruction where one operand is a floating-point binary operation and the other is a value that can be factored into that operation (e.g., transforming `select(cond, x, x * y)` into `x * select(cond, 1.0, y)`). This optimization effectively hoists the binary operation above the `select`.
+**Description**: 
+The bug occurs when the compiler attempts to negate a `select` instruction, typically during algebraic simplifications (e.g., converting a subtraction where the `select` is the subtrahend into an addition). To negate the `select`, the compiler pushes the negation into its operands. If the true and false values of the `select` are already negations of each other, the compiler optimizes this by simply swapping the operands to form the new `select`. 
 
-The incorrect transformation occurs because the newly created binary operation blindly inherits the Fast Math Flags (FMF) from the original binary operation found in one of the branches. These flags (such as `ninf` for "no infinity" or `nnan` for "no NaN") assert that the operands and results do not violate specific constraints, producing `poison` if they do. In the original code, these constraints only applied to the branch containing the operation. However, the transformation applies the operation—and its restrictive flags—to the branch that originally bypassed the operation. If the value on that path violates the flags (e.g., it is infinity when `ninf` is set), the transformed code incorrectly evaluates to `poison`, whereas the original code would have returned a valid result.
+However, a miscompilation arises if the existing negated operand possesses poison-generating flags (such as `nsw`, `nuw`, or `exact`). By reusing this flagged instruction and swapping the `select` operands without dropping the flags, the compiler alters the conditions under which the poison value is chosen. 
+
+In the original code, the poison value generated by the flagged instruction might not be selected for certain inputs (e.g., when the condition is false), keeping the overall result well-defined. In the transformed code, swapping the operands means the poison value is now selected for those exact inputs. This incorrectly propagates poison to the result, making the optimized program more poisonous than the original source. To resolve this, the compiler must drop the poison-generating flags from the operands of the newly created `select` instruction.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_fmul_select_hoist_ninf(i1 %cond, float %x, float %y) {
-  %mul = fmul ninf float %x, %y
-  %result = select i1 %cond, float %x, float %mul
-  ret float %result
+define i32 @test(i32 %a, i1 %c, i32 %x) {
+  %sub = sub nsw i32 0, %x
+  %sel = select i1 %c, i32 %x, i32 %sub
+  %res = sub i32 %a, %sel
+  ret i32 %res
 }
 ```
 ### Optimized IR
 ```llvm
-define float @test_fmul_select_hoist_ninf(i1 %cond, float %x, float %y) {
-  %operand = select i1 %cond, float 1.000000e+00, float %y
-  %result = fmul ninf float %x, %operand
-  ret float %result
+define i32 @test(i32 %a, i1 %c, i32 %x) {
+  %sub = sub nsw i32 0, %x
+  %sel = select i1 %c, i32 %sub, i32 %x
+  %res = add i32 %a, %sel
+  ret i32 %res
+}
+```
+
+
+---
+
+# Issue 113123
+
+## Incorrect Propagation of Poison-Generating Flags in Logical Operations of Floating-Point Comparisons
+
+**Description**:
+The bug is triggered by folding a logical (short-circuiting) `and` or `or` operation—often represented as a `select` instruction in LLVM IR—that combines two floating-point comparisons (`fcmp`). 
+
+When the two comparisons have different poison-generating flags (such as FastMathFlags like `ninf` or `nnan`), the optimization attempts to combine them into a single, unconditionally executed operation (e.g., an absolute value intrinsic followed by a single comparison). 
+
+The flaw occurs because the transformation incorrectly takes the union of the flags from both the left-hand side (LHS) and right-hand side (RHS) comparisons and applies them to the newly created instruction. Because the original logical operation short-circuits, the RHS comparison is only conditionally evaluated. By unconditionally applying the RHS's poison-generating flags to the new instruction, the optimized code evaluates to poison for inputs that would have safely short-circuited in the original code. This results in a miscompilation where the optimized target is more poisonous than the original source.
+
+## Example
+
+### Original IR
+```llvm
+define i1 @test(float %x) {
+  %cmp1 = fcmp nnan ogt float %x, 1.000000e+00
+  %cmp2 = fcmp ninf olt float %x, -1.000000e+00
+  %res = select i1 %cmp1, i1 true, i1 %cmp2
+  ret i1 %res
+}
+```
+### Optimized IR
+```llvm
+declare float @llvm.fabs.f32(float)
+
+define i1 @test(float %x) {
+  %1 = call nnan ninf float @llvm.fabs.f32(float %x)
+  %res = fcmp nnan ninf ogt float %1, 1.000000e+00
+  ret i1 %res
+}
+```
+
+
+---
+
+# Issue 113301
+
+## Incorrect Replacement of Select Operand with Undef-Containing Constant
+
+**Description**: 
+The bug is triggered by a `select` instruction whose condition is an equality comparison (`icmp eq` or `icmp ne`) between a non-constant value (e.g., a variable) and a constant. When the `select` is structured to return the non-constant value if the comparison indicates equality (e.g., `X == C ? X : Y` or `X != C ? Y : X`), the compiler attempts to optimize the instruction by replacing the non-constant value with the constant `C` in the `select`'s operands.
+
+This transformation is flawed when the constant `C` contains undefined (`undef`) elements, such as in a vector constant with `undef` lanes. In the context of the comparison, an `undef` element acts as a wildcard and can match any value. However, replacing the selected non-constant value with the `undef`-containing constant introduces a new `undef` into the result. Because `undef` values can be evaluated independently, the `undef` in the `select` result may take on a completely different value than the specific value it matched in the comparison. This breaks the intended value equivalence and results in a miscompilation, as the selected value diverges from the original variable's actual value.
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i32> @test(<2 x i32> %x, <2 x i32> %y) {
+  %cmp = icmp eq <2 x i32> %x, <i32 1, i32 undef>
+  %sel = select <2 x i1> %cmp, <2 x i32> %x, <2 x i32> %y
+  ret <2 x i32> %sel
+}
+
+```
+### Optimized IR
+```llvm
+define <2 x i32> @test(<2 x i32> %x, <2 x i32> %y) {
+  %cmp = icmp eq <2 x i32> %x, <i32 1, i32 undef>
+  %sel = select <2 x i1> %cmp, <2 x i32> <i32 1, i32 undef>, <2 x i32> %y
+  ret <2 x i32> %sel
+}
+
+```
+
+
+---
+
+# Issue 113423
+
+## Incorrect FastMathFlags Propagation when Folding Select into Floating-Point Binary Operator
+
+**Description:**
+
+The bug is triggered when a `select` instruction is folded into a floating-point binary operator. 
+
+In the original IR, a floating-point binary operator is executed with restrictive FastMathFlags (FMF) (such as `ninf` or `nnan`), which can produce a `poison` value for certain inputs. A subsequent `select` instruction, which has less restrictive or no FMF, chooses between the result of this binary operator and another value (often one of the operands of the binary operator). If the inputs violate the binary operator's FMF, it yields `poison`; however, if the `select` condition chooses the other non-poisonous value, the final result remains valid and non-poisonous.
+
+The optimization transforms this pattern by pushing the `select` instruction into the operands of the binary operator. It creates a new `select` to choose the appropriate operands, followed by a new binary operator that computes the final result. 
+
+The miscompilation occurs because the newly created binary operator incorrectly inherits the restrictive FMF from the original binary operator in their entirety, without intersecting them with the flags of the `select` instruction. As a result, when the new binary operator processes the safely selected operands, the restrictive flags can still be violated, causing the operation to produce `poison`. Since the binary operator is now the final instruction in the sequence, this `poison` value propagates to the output. This makes the transformed IR more poisonous than the original IR, leading to a miscompilation.
+
+## Example
+
+### Original IR
+```llvm
+define float @test(i1 %cond, float %x, float %y) {
+  %add = fadd ninf float %x, %y
+  %sel = select i1 %cond, float %add, float %x
+  ret float %sel
+}
+```
+### Optimized IR
+```llvm
+define float @test(i1 %cond, float %x, float %y) {
+  %1 = select i1 %cond, float %y, float -0.000000e+00
+  %sel = fadd ninf float %x, %1
+  ret float %sel
 }
 ```
 
@@ -184,126 +343,34 @@ define float @test_fmul_select_hoist_ninf(i1 %cond, float %x, float %y) {
 
 # Issue 113869
 
-## Incorrect Poison Handling in Saturated Add Folding
-
-**Description**
-The bug occurs when the compiler attempts to optimize a `select` instruction sequence that implements unsigned saturated addition (e.g., `(X < Y) ? -1 : (Y + ~X)`) by replacing it with a `uadd.sat` intrinsic.
-
-The error arises from the pattern matching logic for the bitwise NOT operation (`~X`), which is typically implemented as an XOR with an all-ones constant. The compiler incorrectly matched cases where the all-ones constant contained poison elements (e.g., in a vector constant).
-
-In the original code, if the saturation condition (`X < Y`) is met, the `select` instruction returns a defined constant (`-1`), ignoring the `Y + ~X` calculation. Consequently, even if `~X` evaluates to poison (due to the poisonous mask), the final result is well-defined. However, the optimized transformation generates `uadd.sat(~X, Y)`, which unconditionally uses `~X` as an operand. If `~X` is poison, the intrinsic propagates the poison to the result. This leads to a miscompilation where the target code produces undefined behavior (poison) for inputs where the source code produced a valid value.
-
-## Example
-
-### Original IR
-```llvm
-define <2 x i8> @src(<2 x i8> %x, <2 x i8> %y) {
-  %not_x = xor <2 x i8> %x, <i8 -1, i8 poison>
-  %sum = add <2 x i8> %y, %not_x
-  %cond = icmp ult <2 x i8> %x, %y
-  %res = select <2 x i1> %cond, <2 x i8> <i8 -1, i8 -1>, <2 x i8> %sum
-  ret <2 x i8> %res
-}
-```
-### Optimized IR
-```llvm
-define <2 x i8> @src(<2 x i8> %x, <2 x i8> %y) {
-  %not_x = xor <2 x i8> %x, <i8 -1, i8 poison>
-  %res = call <2 x i8> @llvm.uadd.sat.v2i8(<2 x i8> %not_x, <2 x i8> %y)
-  ret <2 x i8> %res
-}
-
-declare <2 x i8> @llvm.uadd.sat.v2i8(<2 x i8>, <2 x i8>)
-```
-
-
----
-
-# Issue 115149
-
-## Incorrect No-Wrap Flag Intersection in PHI-of-GEPs Optimization
+## Poison Propagation in Vector Select to Saturated Add Fold
 
 **Description**:
-The bug is triggered when the optimizer attempts to fold a PHI node, whose incoming values are `getelementptr` (GEP) instructions, into a single GEP instruction acting on a new PHI of the operands. During this transformation, the compiler calculates the no-wrap flags (such as `inbounds`) for the resulting GEP by intersecting the flags of the original GEPs. The flaw is that the logic initializes the flag set to an optimistic state (assuming all flags are present) and only intersects it with the flags of the incoming GEPs starting from the second operand, failing to account for the flags of the first operand.
+The bug is triggered when a `select` instruction is optimized into a saturated addition intrinsic (e.g., `uadd.sat`). The original pattern selects between an all-ones vector constant and the result of an addition involving a bitwise NOT operation (`~X + Y`), based on an unsigned comparison (`X u< Y` or similar). 
 
-If the first GEP operand lacks specific flags (e.g., it is not `inbounds` and thus allows overflow) while the subsequent operands possess them, the resulting merged GEP incorrectly retains the restrictive flags. This causes the compiler to treat valid pointer arithmetic as undefined behavior, enabling subsequent optimizations to incorrectly alter the program logic, such as removing valid loops or checks.
+The issue occurs when the bitwise NOT operation is represented as an XOR with an all-ones vector constant that contains `poison` elements. In the original IR, if the comparison evaluates to true for a lane corresponding to a `poison` element, the `select` instruction safely returns the well-defined all-ones value for that lane, effectively masking the `poison`. 
 
-## Example
-
-### Original IR
-```llvm
-define i8* @test_phi_gep_flags(i8* %base, i1 %cond, i64 %idx1, i64 %idx2) {
-entry:
-  br i1 %cond, label %bb1, label %bb2
-
-bb1:
-  ; This GEP does NOT have inbounds. It is the first operand in the PHI below.
-  %gep1 = getelementptr i8, i8* %base, i64 %idx1
-  br label %exit
-
-bb2:
-  ; This GEP HAS inbounds.
-  %gep2 = getelementptr inbounds i8, i8* %base, i64 %idx2
-  br label %exit
-
-exit:
-  ; The optimizer merges these into a single GEP. 
-  ; Due to the bug, it ignores the flags of the first operand (%gep1) and keeps inbounds from %gep2.
-  %res = phi i8* [ %gep1, %bb1 ], [ %gep2, %bb2 ]
-  ret i8* %res
-}
-```
-### Optimized IR
-```llvm
-define i8* @test_phi_gep_flags(i8* %base, i1 %cond, i64 %idx1, i64 %idx2) {
-entry:
-  br i1 %cond, label %bb1, label %bb2
-
-bb1:
-  br label %exit
-
-bb2:
-  br label %exit
-
-exit:
-  %idx.phi = phi i64 [ %idx1, %bb1 ], [ %idx2, %bb2 ]
-  ; BUG: The resulting GEP has 'inbounds' set, implying %gep1 was inbounds, which is false.
-  %res = getelementptr inbounds i8, i8* %base, i64 %idx.phi
-  ret i8* %res
-}
-```
-
-
----
-
-# Issue 115465
-
-## Summary Title
-Unsafe Folding of Shufflevector into Select with Scalar Condition
-
-## Description
-The bug is triggered by an optimization that folds a `shufflevector` instruction into a preceding `select` instruction. This transformation targets patterns where a `select` instruction provides one of the input vectors to a `shufflevector`, specifically matching the form `shufflevector (select cond, v1, v2), v3, mask`. The compiler attempts to sink the shuffle operation into the operands of the select, rewriting the expression as `select cond, (shufflevector v1, v3, mask), (shufflevector v2, v3, mask)`.
-
-This transformation is incorrect when the `select` uses a scalar condition (e.g., `i1`) that can be `poison`. In the original instruction sequence, if the scalar condition is `poison`, the `select` produces a fully poison vector. However, the subsequent `shufflevector` can still produce valid, non-poison elements if its mask selects values from the second operand (`v3`), assuming `v3` itself contains defined values. 
-
-In the transformed sequence, the `select` becomes the outermost operation. If the scalar condition is `poison`, the `select` instruction forces the entire result to be `poison`, regardless of the operands. This effectively discards the valid values that would have been retrieved from `v3` in the original code. By turning defined values into poison, the transformation violates the rule that optimizations cannot make the target code more poisonous than the source.
+However, the optimization folds this pattern into a saturated add intrinsic, directly reusing the bitwise NOT value. Because the NOT value contains `poison` elements, the saturated add unconditionally propagates the `poison` to the result for those lanes. This results in the transformed code being more poisonous than the original code, leading to a miscompilation. The core problem is matching and reusing a vector constant with `poison` elements in a context where the original conditional selection could have masked the `poison`.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i8> @test(i1 %cond, <2 x i8> %v1, <2 x i8> %v2, <2 x i8> %v3) {
-  %sel = select i1 %cond, <2 x i8> %v1, <2 x i8> %v2
-  %shuf = shufflevector <2 x i8> %sel, <2 x i8> %v3, <2 x i32> <i32 2, i32 3>
-  ret <2 x i8> %shuf
+define <2 x i8> @test(<2 x i8> %x, <2 x i8> %y) {
+  %notx = xor <2 x i8> %x, <i8 -1, i8 poison>
+  %add = add <2 x i8> %notx, %y
+  %cmp = icmp ult <2 x i8> %x, %y
+  %sel = select <2 x i1> %cmp, <2 x i8> <i8 -1, i8 -1>, <2 x i8> %add
+  ret <2 x i8> %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x i8> @test(i1 %cond, <2 x i8> %v1, <2 x i8> %v2, <2 x i8> %v3) {
-  %shuf1 = shufflevector <2 x i8> %v1, <2 x i8> %v3, <2 x i32> <i32 2, i32 3>
-  %shuf2 = shufflevector <2 x i8> %v2, <2 x i8> %v3, <2 x i32> <i32 2, i32 3>
-  %sel = select i1 %cond, <2 x i8> %shuf1, <2 x i8> %shuf2
+declare <2 x i8> @llvm.uadd.sat.v2i8(<2 x i8>, <2 x i8>)
+
+define <2 x i8> @test(<2 x i8> %x, <2 x i8> %y) {
+  %notx = xor <2 x i8> %x, <i8 -1, i8 poison>
+  %sel = call <2 x i8> @llvm.uadd.sat.v2i8(<2 x i8> %notx, <2 x i8> %y)
   ret <2 x i8> %sel
 }
 ```
@@ -311,68 +378,280 @@ define <2 x i8> @test(i1 %cond, <2 x i8> %v1, <2 x i8> %v2, <2 x i8> %v3) {
 
 ---
 
-# Issue 118798
+# Issue 113989
 
-## Infinite Loop in Shift Reassociation with Non-Immediate Constants
+## Incorrect FastMathFlags Propagation from Conditionally Selected Negation to Select Instruction
 
-**Description**
-The bug is triggered by a sequence of nested shift instructions (e.g., `(X << A) << B`) where the shift amounts `A` and `B` are symbolic constants (such as pointers cast to integers or other constant expressions) rather than immediate integer literals. 
+The bug occurs during the instruction combining phase when the compiler optimizes floating-point `select` instructions that conditionally negate a value based on a floating-point comparison (`fcmp`). The high-level pattern typically involves a `select` choosing between a floating-point value and its negation (e.g., `select (fcmp pred X, 0.0), -X, X`).
 
-The optimization logic attempts to canonicalize such patterns by reassociating the operations to group constants together, intending to fold them (e.g., transforming `(X << A) << B` into `(X << B) << A` if `B` is a constant). However, the detection logic for "constants" was too broad and included non-immediate symbolic constants. When both shift amounts fell into this category, the optimizer treated them symmetrically and repeatedly swapped the operands back and forth in an infinite loop, preventing the compilation from terminating.
+The bug triggering strategy and the resulting miscompilation unfold as follows:
+
+1. **Unsound Flag Propagation**: The compiler attempts to optimize the `select` instruction by forward-propagating FastMathFlags (FMF), such as `nnan` (No NaNs) and `ninf` (No Infs). In the buggy logic, the compiler unconditionally copies these flags from the negation instruction (e.g., `fneg nnan X` or `fsub nnan 0.0, X`) to the resulting `select` instruction.
+2. **Conditional Execution Mismatch**: This unconditional propagation is invalid because the negation instruction is only conditionally executed. If the input `X` is a NaN or Infinity, and the `fcmp` predicate evaluates such that the `select` chooses the original, unmodified `X` (the non-negated path), the result of the `select` will still be NaN or Infinity. The negation instruction's `nnan` or `ninf` flags do not apply to this path and should not dictate the properties of the overall `select`.
+3. **Triggering Invalid Transformations**: By incorrectly attaching `nnan` or `ninf` to the `select` instruction, the compiler is tricked into assuming the result can never be NaN or Infinity. This false assumption enables further invalid optimizations. Specifically, it allows the compiler to fold the `select` pattern into an `fabs` (absolute value) instruction, assuming that edge cases like NaNs do not need to be strictly preserved.
+4. **Value Mismatch on NaNs**: The `fabs` instruction inherently clears the sign bit of all inputs, including NaNs. If the original `select` logic was designed to return the original NaN value with its sign bit intact (which happens when the non-negated path is chosen), replacing it with `fabs` alters the bitwise representation of the NaN. This results in a silent miscompilation where the sign bit of the NaN is incorrectly modified.
+
+In summary, the bug is triggered by unconditionally propagating fast-math flags from a conditionally selected negation instruction to a `select` instruction, which subsequently enables an invalid fold to `fabs` that corrupts the sign bit of NaN values.
 
 ## Example
 
 ### Original IR
 ```llvm
-@g1 = external global i32
-@g2 = external global i32
-
-define i64 @test_loop(i64 %x) {
-  %shl1 = shl i64 %x, ptrtoint (i32* @g1 to i64)
-  %shl2 = shl i64 %shl1, ptrtoint (i32* @g2 to i64)
-  ret i64 %shl2
+define float @test(float %x) {
+  %cmp = fcmp olt float %x, 0.000000e+00
+  %neg = fneg nnan float %x
+  %sel = select i1 %cmp, float %neg, float %x
+  ret float %sel
 }
 ```
 ### Optimized IR
 ```llvm
-@g1 = external global i32
-@g2 = external global i32
+declare float @llvm.fabs.f32(float)
 
-define i64 @test_loop(i64 %x) {
-  %1 = add i64 ptrtoint (i32* @g1 to i64), ptrtoint (i32* @g2 to i64)
-  %shl2 = shl i64 %x, %1
-  ret i64 %shl2
+define float @test(float %x) {
+  %sel = call nnan float @llvm.fabs.f32(float %x)
+  ret float %sel
 }
 ```
 
 
 ---
 
-# Issue 120361
+# Issue 114181
 
-## Incorrect Preservation of `samesign` Flag During Simplification of Logical Conjunctions
+## Incorrect Preservation of Poison-Generating Flags when Distributing Negation over Select
 
-**Description**:
-The bug is triggered when the optimizer simplifies a logical conjunction (such as a bitwise `AND` of booleans or a `select` instruction) involving two integer comparisons, where one comparison implies the other. For example, checking if a value is equal to a specific non-zero constant implies that the value is not zero. When the optimizer folds the expression to retain only the "stronger" comparison (the one that implies the other), it fails to remove the `samesign` flag from that instruction.
+**Description:**
+The bug occurs when the compiler attempts to optimize the negation of a `select` instruction. The transformation distributes the negation into the arms of the `select`, converting a pattern like `-select(C, A, B)` into `select(C, -A, -B)`. 
 
-This preservation is incorrect because the `samesign` flag asserts that the operands must have the same sign; otherwise, the result is `poison`. In the original conjunction, inputs that would violate the `samesign` constraint of the stronger comparison might be handled by the weaker comparison evaluating to `false`, resulting in a well-defined `false` for the whole expression. By reducing the expression to solely the stronger comparison with `samesign` intact, these inputs now produce `poison`, making the transformed code more undefined than the original.
+During this transformation, the compiler may reuse existing instructions or create new ones to represent the negated operands (`-A` and `-B`). If these instructions carry poison-generating flags (such as `nsw` for no signed wrap, `nuw`, or `exact`), the compiler incorrectly preserves them in the new `select` arms. 
+
+This is unsafe because the poison-generating flags might only be valid in their original context. When moved or reused inside the new `select` instruction, the conditions guaranteeing the absence of overflow or exactness may no longer hold for the selected paths. Consequently, if the input triggers the poison condition (e.g., negating `INT_MIN` with `nsw`), the new `select` can return a poison value. In the original code, the outer negation lacked these flags, or the poison-producing instruction was not selected, meaning no poison was propagated. By retaining the flags, the transformation makes the target more poisonous than the source, leading to a miscompilation. 
+
+To trigger this issue, one can construct a `select` instruction whose result is subsequently negated. The operands of the `select` should be chosen such that their negations fold into instructions with poison-generating flags. Providing inputs that violate these flags (like `INT_MIN` for `nsw`) while ensuring the original code safely handles or ignores the value will expose the miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(i8 %x) {
-  %strong = icmp samesign ult i8 %x, 10
-  %weak = icmp ne i8 %x, -1
-  %res = select i1 %weak, i1 %strong, i1 false
-  ret i1 %res
+define i32 @test(i1 %c, i32 %x, i32 %y, i32 %z, i32 %w) {
+entry:
+  %sub1 = sub nsw i32 %x, %y
+  %sub2 = sub nsw i32 %z, %w
+  %sel = select i1 %c, i32 %sub1, i32 %sub2
+  %neg = sub i32 0, %sel
+  ret i32 %neg
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(i8 %x) {
-  %strong = icmp samesign ult i8 %x, 10
-  ret i1 %strong
+define i32 @test(i1 %c, i32 %x, i32 %y, i32 %z, i32 %w) {
+entry:
+  %sub1.neg = sub nsw i32 %y, %x
+  %sub2.neg = sub nsw i32 %w, %z
+  %neg = select i1 %c, i32 %sub1.neg, i32 %sub2.neg
+  ret i32 %neg
+}
+```
+
+
+---
+
+# Issue 114191
+
+## Eager Poison Folding of Vector Division/Remainder Threaded Over Select
+
+The bug is triggered by a vector integer division or remainder instruction where the divisor is a `select` instruction. The `select` chooses between two constant vectors, and at least one of these constant vectors contains a zero or `undef` element. 
+
+When the compiler attempts to optimize this pattern by threading the division or remainder operation over the `select`, it evaluates the operation against each constant vector independently. During this process, if the simplification logic encounters a constant vector with a zero or `undef` element as the divisor, it eagerly folds the entire division or remainder operation for that vector into `poison` (due to division by zero being undefined behavior). 
+
+This transformation is incorrect because the zero or `undef` element might be masked out by the `select` condition at runtime. By unconditionally folding the operation to `poison`, the compiler introduces a miscompilation, as the `poison` value propagates to the final result even when the division by zero would not have dynamically occurred.
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i32> @test_sdiv(<2 x i1> %cond, <2 x i32> %x) {
+  %sel = select <2 x i1> %cond, <2 x i32> <i32 1, i32 0>, <2 x i32> <i32 2, i32 1>
+  %div = sdiv <2 x i32> %x, %sel
+  ret <2 x i32> %div
+}
+```
+### Optimized IR
+```llvm
+define <2 x i32> @test_sdiv(<2 x i1> %cond, <2 x i32> %x) {
+  %div.2 = sdiv <2 x i32> %x, <i32 2, i32 1>
+  %div = select <2 x i1> %cond, <2 x i32> poison, <2 x i32> %div.2
+  ret <2 x i32> %div
+}
+```
+
+
+---
+
+# Issue 115149
+
+## Incorrect NoWrap Flags Intersection When Folding Pointer Arithmetic into PHI Nodes
+
+**Description**:
+When the compiler optimizes a PHI node whose incoming values are all pointer arithmetic instructions (such as `getelementptr`) with identical structures, it may attempt to fold them into a single pointer arithmetic instruction that operates on newly created PHI nodes. During this transformation, the compiler must determine the correct non-wrapping flags (e.g., `inbounds`, `nusw`, `nuw`) for the new instruction by intersecting the flags of all the original incoming instructions. The new instruction should only possess a specific flag if *all* the original incoming instructions also possessed it.
+
+The bug is triggered because the intersection logic incorrectly initializes the flags to the maximum possible set and then iterates through the incoming instructions, but mistakenly skips the first incoming operand. Consequently, the non-wrapping flags of the first instruction are completely ignored. 
+
+If the first instruction lacks a certain flag (meaning its pointer arithmetic could potentially wrap or go out of bounds) while all other incoming instructions have that flag, the resulting folded instruction will incorrectly inherit the restrictive flag. This improperly strengthens the semantics of the pointer arithmetic, leading to invalid assumptions in subsequent optimization passes. These false assumptions can ultimately result in incorrect `poison` value generation, aggressive dead-code elimination, or miscompiled memory accesses.
+
+## Example
+
+### Original IR
+```llvm
+define ptr @test_fold_gep_phi_flags(i1 %cond, ptr %p, i64 %x, i64 %y) {
+entry:
+  br i1 %cond, label %if.true, label %if.false
+
+if.true:
+  %gep1 = getelementptr i8, ptr %p, i64 %x
+  br label %end
+
+if.false:
+  %gep2 = getelementptr inbounds i8, ptr %p, i64 %y
+  br label %end
+
+end:
+  %res = phi ptr [ %gep1, %if.true ], [ %gep2, %if.false ]
+  ret ptr %res
+}
+
+```
+### Optimized IR
+```llvm
+define ptr @test_fold_gep_phi_flags(i1 %cond, ptr %p, i64 %x, i64 %y) {
+entry:
+  br i1 %cond, label %if.true, label %if.false
+
+if.true:
+  br label %end
+
+if.false:
+  br label %end
+
+end:
+  %0 = phi i64 [ %x, %if.true ], [ %y, %if.false ]
+  %res = getelementptr inbounds i8, ptr %p, i64 %0
+  ret ptr %res
+}
+
+```
+
+
+---
+
+# Issue 115465
+
+## Unsafe Folding of ShuffleVector into Select with Potentially Poisonous Condition
+
+**Description**
+
+The bug is triggered when a `shufflevector` instruction takes a `select` instruction as its first operand (LHS) and a non-poison value as its second operand (RHS). The `select` instruction must have a scalar condition (e.g., an `i1` type rather than a vector of booleans). 
+
+The optimization incorrectly attempts to fold the `shufflevector` into the `select` by distributing the shuffle operation into the true and false branches of the `select`. This creates a new `select` instruction whose true and false values are the results of the `shufflevector` applied to the original true and false values, respectively.
+
+This transformation is unsafe if the scalar condition of the `select` can evaluate to `poison`. In the original IR, if the condition is `poison`, the `select` produces a fully `poison` vector. The subsequent `shufflevector` then combines this `poison` vector with the non-poison RHS vector, producing a result where elements chosen from the RHS remain non-poison. 
+
+However, in the transformed IR, the new `select` instruction evaluates the `poison` condition and propagates it to the entire resulting vector, making all elements `poison`. This causes the target to be more poisonous than the source, leading to a miscompilation. The transformation is only safe if the `select` condition is guaranteed not to be `poison`, or if the RHS of the `shufflevector` is also `poison` (which would mean no non-poison elements could be lost).
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i8> @test(i1 %c, <2 x i8> %x, <2 x i8> %y, <2 x i8> %z) {
+  %sel = select i1 %c, <2 x i8> %x, <2 x i8> %y
+  %shuf = shufflevector <2 x i8> %sel, <2 x i8> %z, <2 x i32> <i32 0, i32 2>
+  ret <2 x i8> %shuf
+}
+```
+### Optimized IR
+```llvm
+define <2 x i8> @test(i1 %c, <2 x i8> %x, <2 x i8> %y, <2 x i8> %z) {
+  %shuf.x = shufflevector <2 x i8> %x, <2 x i8> %z, <2 x i32> <i32 0, i32 2>
+  %shuf.y = shufflevector <2 x i8> %y, <2 x i8> %z, <2 x i32> <i32 0, i32 2>
+  %sel = select i1 %c, <2 x i8> %shuf.x, <2 x i8> %shuf.y
+  ret <2 x i8> %sel
+}
+```
+
+
+---
+
+# Issue 121428
+
+## Incorrect Retention of UB-Implying Attributes When Relaxing Intrinsics to Return Poison
+
+**Description**: 
+The bug occurs when the compiler optimizes an intrinsic (such as count leading/trailing zeros) whose result is conditionally chosen by a `select` instruction based on its input value. 
+
+Specifically, if the intrinsic's result is only used when the input is safe (e.g., non-zero), the compiler may optimize the intrinsic by setting a flag that allows it to return `poison` for unsafe inputs. This is generally a valid transformation because the `poison` value would be discarded by the `select` instruction. 
+
+However, a miscompilation arises if the original intrinsic call was marked with the `noundef` attribute (or other attributes/metadata that imply undefined behavior if the result is `poison` or `undef`). When the compiler updates the intrinsic to potentially return `poison` but fails to drop these UB-implying attributes, it introduces unintended undefined behavior. If the unsafe input is encountered at runtime, the modified intrinsic returns `poison`, which immediately violates the `noundef` attribute and triggers undefined behavior, whereas the original program would have safely discarded a well-defined result.
+
+## Example
+
+### Original IR
+```llvm
+declare i32 @llvm.cttz.i32(i32, i1 immarg)
+
+define i32 @test(i32 %x) {
+  %cmp = icmp eq i32 %x, 0
+  %cttz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 false)
+  %res = select i1 %cmp, i32 32, i32 %cttz
+  ret i32 %res
+}
+
+```
+### Optimized IR
+```llvm
+declare i32 @llvm.cttz.i32(i32, i1 immarg)
+
+define i32 @test(i32 %x) {
+  %cmp = icmp eq i32 %x, 0
+  %cttz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 true)
+  %res = select i1 %cmp, i32 32, i32 %cttz
+  ret i32 %res
+}
+
+```
+
+
+---
+
+# Issue 121430
+
+## Incorrect Fast-Math Flag Propagation from Conditionally Selected Floating-Point Operations
+
+**Description**: 
+The bug is triggered by a pattern involving a floating-point comparison, a floating-point operation (such as negation) decorated with fast-math flags (e.g., `ninf` or `nnan`), and a `select` instruction that chooses between the original floating-point value and the result of the modified operation based on the comparison. 
+
+The compiler's optimization pass incorrectly propagates the fast-math flags from the conditionally selected floating-point operation directly to the `select` instruction. This transformation is flawed because the modified operation might not be chosen at runtime. If the original value violates the fast-math flags (for example, if it is an infinity or NaN) and is the value actually chosen by the `select`, the incorrectly propagated flags on the `select` instruction will result in a contradiction, leading to poison values or miscompilations. 
+
+To be valid, fast-math flags should only be propagated to the `select` if they are guaranteed to hold regardless of which branch is chosen, such as deriving them from the comparison instruction itself, or if the selection condition strictly guarantees the flag's validity for the chosen path.
+
+## Example
+
+### Original IR
+```llvm
+define float @test(float %x) {
+  %cmp = fcmp ogt float %x, 0.000000e+00
+  %neg = fneg nnan ninf float %x
+  %sel = select i1 %cmp, float %x, float %neg
+  ret float %sel
+}
+```
+### Optimized IR
+```llvm
+define float @test(float %x) {
+  %cmp = fcmp ogt float %x, 0.000000e+00
+  %neg = fneg nnan ninf float %x
+  %sel = select nnan ninf i1 %cmp, float %x, float %neg
+  ret float %sel
 }
 ```
 
@@ -381,35 +660,37 @@ define i1 @test(i8 %x) {
 
 # Issue 121432
 
-## Incorrect Fast Math Flag Propagation in Nested Copysign Simplification
+## Incorrect FastMathFlags Propagation in Nested Floating-Point Operations Simplification
 
-**Description**
-The bug is triggered when the compiler optimizes a nested sequence of `llvm.copysign` intrinsics, specifically transforming the pattern `copysign(Magnitude, copysign(Intermediate, Sign))` into `copysign(Magnitude, Sign)`.
+**Description**:
+The bug is triggered when the compiler simplifies nested floating-point operations (e.g., nested `copysign` intrinsics) where the outer operation is decorated with FastMathFlags (FMF) such as `nnan`, `ninf`, or `nsz`, while the inner operation lacks these flags.
 
-The incorrect transformation logic involves unconditionally propagating the Fast Math Flags (such as `nnan` for "no NaNs" or `ninf` for "no infinities") from the outer `copysign` call to the simplified instruction. In the original code, the outer flags apply to the result of the inner `copysign`. Since `copysign` derives its magnitude from the `Intermediate` operand, the result of the inner call can be a valid, finite number even if the `Sign` operand is NaN or Infinity.
+During the optimization, the compiler folds the sequence by bypassing the inner operation and directly feeding one of its operands into the outer operation. In doing so, it incorrectly retains the FMF of the outer operation on the newly folded instruction. 
 
-By bypassing the intermediate step and applying the outer flags directly to the `Sign` operand, the optimizer incorrectly asserts that `Sign` itself must satisfy the constraints (e.g., not being NaN). If the `Sign` operand violates these flags, the transformed instruction yields a poison value (undefined behavior), whereas the original code was well-defined. This results in a miscompilation where the optimized code is more restrictive than the source.
+This transformation is flawed because the inner operation may act as a filter or mask for special floating-point values. For instance, an inner operation might only extract the sign bit of a NaN, Infinity, or Zero operand, yielding a normal floating-point value. Consequently, the original outer operation would receive a normal value and safely execute without violating its FMF. However, by eliminating the inner operation, the raw operand is directly exposed to the FMF-bearing outer operation. If the operand is a special value, it will violate the FMF assumptions, causing the folded instruction to incorrectly produce `poison` (making the target more poisonous than the source). 
+
+To maintain correctness, the optimization must intersect the FastMathFlags of both the inner and outer operations rather than blindly propagating the outer operation's flags.
 
 ## Example
 
 ### Original IR
 ```llvm
-define double @test_copysign_nested_flags(double %mag, double %intermediate, double %sign) {
-  %inner = call double @llvm.copysign.f64(double %intermediate, double %sign)
-  %res = call nnan double @llvm.copysign.f64(double %mag, double %inner)
-  ret double %res
-}
+declare float @llvm.copysign.f32(float, float)
 
-declare double @llvm.copysign.f64(double, double)
+define float @test_copysign_fold(float %x, float %y) {
+  %inner = call float @llvm.copysign.f32(float %x, float %y)
+  %outer = call nnan ninf nsz float @llvm.copysign.f32(float 1.000000e+00, float %inner)
+  ret float %outer
+}
 ```
 ### Optimized IR
 ```llvm
-define double @test_copysign_nested_flags(double %mag, double %intermediate, double %sign) {
-  %res = call nnan double @llvm.copysign.f64(double %mag, double %sign)
-  ret double %res
-}
+declare float @llvm.copysign.f32(float, float)
 
-declare double @llvm.copysign.f64(double, double)
+define float @test_copysign_fold(float %x, float %y) {
+  %outer = call nnan ninf nsz float @llvm.copysign.f32(float 1.000000e+00, float %y)
+  ret float %outer
+}
 ```
 
 
@@ -417,57 +698,59 @@ declare double @llvm.copysign.f64(double, double)
 
 # Issue 121459
 
-## Incorrect Propagation of Inbounds Flag when Folding PHI of GEPs
+## Incorrect Propagation of Poison-Generating Flags when Folding Pointer Arithmetic through PHI Nodes
 
-**Description**
-The bug is triggered when the optimizer attempts to fold a PHI node where the incoming values are `getelementptr` (GEP) instructions that share the same base pointer but differ in indices or offsets. When unifying these incoming GEPs into a single GEP instruction (typically by creating a new PHI node for the varying offsets), the optimizer incorrectly propagates the `inbounds` no-wrap flag from one of the source GEPs to the newly created GEP.
-
-If the incoming GEPs have inconsistent flags—for example, one has `inbounds` and another does not—the optimizer fails to intersect these flags (i.e., it does not drop `inbounds` if any input lacks it). As a result, the transformed code asserts `inbounds` behavior for all paths. This causes miscompilation when the control flow takes a path corresponding to a GEP that originally allowed wrapping or out-of-bounds arithmetic; the new GEP evaluates to `poison` instead of a valid pointer value.
+**Description:**
+1. Construct a control flow graph with multiple paths converging at a single basic block.
+2. Along these paths, perform pointer arithmetic operations (e.g., `getelementptr`) on the same base pointer. Ensure that these operations have different poison-generating flags (e.g., one path uses `inbounds` or `nuw`, while another path does not).
+3. Merge the resulting pointers from these paths using a PHI node in the converging basic block.
+4. Perform a subsequent pointer arithmetic operation using the result of the PHI node as its base pointer.
+5. The compiler attempts to optimize this pattern by folding the subsequent pointer arithmetic operation into the incoming ones. This is typically done by creating a new pointer arithmetic operation that uses a newly created PHI node of the offsets.
+6. The bug is triggered because the optimization incorrectly copies the poison-generating flags from just one of the original incoming pointer arithmetic operations to the newly created operation, rather than taking the intersection of the flags from all incoming operations. 
+7. As a result, the newly created pointer arithmetic operation becomes overly restrictive. If the control flow takes a path where the original operation lacked those flags (e.g., a path without `inbounds`), the new operation may incorrectly produce a poison value, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8* @test_phi_gep_inbounds_propagation(i8* %base, i1 %cond) {
+define ptr @test(i1 %cond, ptr %base, i64 %idx1, i64 %idx2, i64 %idx3) {
 entry:
-  br i1 %cond, label %if.true, label %if.false
+  br i1 %cond, label %if.then, label %if.else
 
-if.true:
-  ; This path has 'inbounds'
-  %gep.inbounds = getelementptr inbounds i8, i8* %base, i64 10
+if.then:
+  %gep1 = getelementptr inbounds i8, ptr %base, i64 %idx1
   br label %merge
 
-if.false:
-  ; This path does NOT have 'inbounds'
-  %gep.no.inbounds = getelementptr i8, i8* %base, i64 20
+if.else:
+  %gep2 = getelementptr i8, ptr %base, i64 %idx2
   br label %merge
 
 merge:
-  ; The PHI node combines both GEPs
-  %res = phi i8* [ %gep.inbounds, %if.true ], [ %gep.no.inbounds, %if.false ]
-  ret i8* %res
+  %phi = phi ptr [ %gep1, %if.then ], [ %gep2, %if.else ]
+  %gep3 = getelementptr i8, ptr %phi, i64 %idx3
+  ret ptr %gep3
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i8* @test_phi_gep_inbounds_propagation(i8* %base, i1 %cond) {
+define ptr @test(i1 %cond, ptr %base, i64 %idx1, i64 %idx2, i64 %idx3) {
 entry:
-  br i1 %cond, label %if.true, label %if.false
+  br i1 %cond, label %if.then, label %if.else
 
-if.true:
+if.then:
   br label %merge
 
-if.false:
+if.else:
   br label %merge
 
 merge:
-  ; The optimizer sinks the GEP and creates a PHI for the indices.
-  %gep.idx = phi i64 [ 10, %if.true ], [ 20, %if.false ]
-  ; BUG: The 'inbounds' flag is incorrectly preserved on the merged GEP.
-  ; It should be dropped because the 'if.false' path did not have it.
-  %res = getelementptr inbounds i8, i8* %base, i64 %gep.idx
-  ret i8* %res
+  %phi.idx = phi i64 [ %idx1, %if.then ], [ %idx2, %if.else ]
+  %new.idx = add i64 %phi.idx, %idx3
+  %gep3 = getelementptr inbounds i8, ptr %base, i64 %new.idx
+  ret ptr %gep3
 }
+
 ```
 
 
@@ -475,25 +758,32 @@ merge:
 
 # Issue 121581
 
-## Unsafe Simplification of Pointer Comparisons with Identical Offsets
+## Incorrect Folding of Pointer Comparisons with Identical Offsets Lacking No-Wrap Guarantees
 
-The bug is triggered when the optimizer simplifies an integer comparison (`icmp`) between two `getelementptr` (GEP) instructions that have different base pointers but identical indices. The compiler incorrectly folds the comparison `cmp (gep base1, idx), (gep base2, idx)` into `cmp base1, base2` without verifying that the pointer arithmetic is guaranteed not to wrap (overflow) the address space. For relational comparisons (such as `ult`), if the addition of the offset causes a wrap-around, the relative order of the resulting pointers may differ from the relative order of the base pointers, rendering the optimization invalid.
+**Description**: 
+The bug is triggered when two `getelementptr` (GEP) instructions with different base pointers but identical indices (offsets) are compared using an `icmp` instruction. 
+
+If these GEP instructions lack no-wrap guarantees (such as `inbounds` or `nusw` flags), their pointer arithmetic might wrap around the boundaries of the address space. The optimizer incorrectly assumes that adding the exact same offset to both base pointers will always preserve their relative ordering. Consequently, it folds the comparison of the GEP results into a direct comparison of the original base pointers. 
+
+This transformation is invalid because if one pointer wraps around the address space while the other does not (or if they wrap differently), the relative ordering of the resulting addresses changes. To trigger this issue, one simply needs to construct a relational comparison (e.g., unsigned less than) between two GEPs that share the same offset but do not have no-wrap flags.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_gep_icmp_no_inbounds(i8* %base1, i8* %base2, i64 %idx) {
-  %gep1 = getelementptr i8, i8* %base1, i64 %idx
-  %gep2 = getelementptr i8, i8* %base2, i64 %idx
-  %cmp = icmp ult i8* %gep1, %gep2
+define i1 @test_gep_cmp_no_nowrap(ptr %base1, ptr %base2, i64 %offset) {
+entry:
+  %gep1 = getelementptr i8, ptr %base1, i64 %offset
+  %gep2 = getelementptr i8, ptr %base2, i64 %offset
+  %cmp = icmp ult ptr %gep1, %gep2
   ret i1 %cmp
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_gep_icmp_no_inbounds(i8* %base1, i8* %base2, i64 %idx) {
-  %cmp = icmp ult i8* %base1, %base2
+define i1 @test_gep_cmp_no_nowrap(ptr %base1, ptr %base2, i64 %offset) {
+entry:
+  %cmp = icmp ult ptr %base1, %base2
   ret i1 %cmp
 }
 ```
@@ -503,30 +793,34 @@ define i1 @test_gep_icmp_no_inbounds(i8* %base1, i8* %base2, i64 %idx) {
 
 # Issue 121584
 
-## Incorrect Preservation of NSW Flag When Converting Left Shift to Multiplication
+## Incorrect `nsw` Preservation when Converting Left Shift by `BW - 1` to Multiplication
 
-## Description
-The bug is triggered during the optimization of signed remainder (`srem`) instructions where the operands are defined by left-shift (`shl`) or multiplication (`mul`) operations sharing a common variable (e.g., `srem (shl X, C), (mul X, Y)`). To simplify these expressions, the compiler analyzes the left-shift operation as if it were a multiplication by a power of two.
+### Description
+In LLVM IR, a left shift instruction (`shl`) by a constant is often conceptually converted into a multiplication (`mul`) by a power of two to unify instruction matching and simplify expressions. However, their signed overflow behaviors differ in a specific edge case involving the sign bit.
 
-The issue arises because the compiler incorrectly preserves the `nsw` (No Signed Wrap) flag when converting the `shl` instruction into its conceptual `mul` equivalent. While `shl nsw` and `mul nsw` are often compatible, they diverge when the shift amount is equal to the bit width minus one (creating `INT_MIN`). In this specific case, `shl nsw` is well-defined for certain inputs (like -1) where the equivalent `mul nsw` would result in a signed overflow (poison). By incorrectly attaching `nsw` to the synthesized multiplication, the optimizer infers overly aggressive constraints on the input values—assuming valid inputs are impossible—which leads to a miscompilation of the remainder operation.
+When a value `X` is left-shifted by `BW - 1` (where `BW` is the bit width of the integer type), the operation is equivalent to `X * INT_MIN`. If the `shl` instruction has the `nsw` (no signed wrap) flag, it guarantees that the mathematical result of `X * 2^(BW - 1)` fits within the signed integer type. For `X = -1`, `shl nsw -1, BW - 1` evaluates to `INT_MIN`, which is perfectly representable and does not overflow. 
+
+Conversely, if this shift is converted to a multiplication and the `nsw` flag is preserved (`mul nsw X, INT_MIN`), evaluating it for `X = -1` results in `-1 * INT_MIN`. Mathematically, this equals `INT_MAX + 1`, which exceeds the maximum representable signed value. This causes a signed overflow and yields a `poison` value.
+
+The bug is triggered when an optimization pass (such as simplifying remainder operations like `srem` where both operands are scaled by a common factor) matches a `shl nsw X, BW - 1` instruction and conceptually converts it into `mul nsw X, INT_MIN`. By incorrectly preserving the `nsw` flag during this conversion, the compiler introduces `poison` for `X = -1`. This flawed assumption propagates, leading the compiler to incorrectly deduce that `X` cannot be `-1`, which ultimately results in an invalid and overly aggressive simplification of the surrounding operations.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8 @test(i8 %x, i8 %y) {
-  %shl = shl nsw i8 %x, 7
-  %mul = mul nsw i8 %x, %y
-  %rem = srem i8 %shl, %mul
-  ret i8 %rem
+define i8 @test(i8 %X, i8 %Y) {
+  %shl = shl nsw i8 %X, 7
+  %mul = mul i8 %Y, -128
+  %srem = srem i8 %shl, %mul
+  ret i8 %srem
 }
 ```
 ### Optimized IR
 ```llvm
-define i8 @test(i8 %x, i8 %y) {
-  %1 = srem i8 -128, %y
-  %rem = mul nsw i8 %1, %x
-  ret i8 %rem
+define i8 @test(i8 %X, i8 %Y) {
+  %srem.unscaled = srem i8 %X, %Y
+  %srem = mul nsw i8 %srem.unscaled, -128
+  ret i8 %srem
 }
 ```
 
@@ -535,30 +829,34 @@ define i8 @test(i8 %x, i8 %y) {
 
 # Issue 121890
 
-## Unsafe Folding of GEP Comparisons with Multi-Byte Strides
+## Incorrect Simplification of GEP Comparisons Lacking No-Wrap Flags
 
-**Description**
-The bug occurs in the `InstCombine` pass when optimizing equality comparisons (`icmp eq` or `icmp ne`) between two `getelementptr` (GEP) instructions. The issue arises when the two GEP instructions share the same base pointer and differ by exactly one index operand. The compiler incorrectly transforms the pointer comparison into a direct comparison of the differing indices.
+**Description**: 
+The bug is triggered when the compiler attempts to optimize a comparison (e.g., equality or inequality) between two GetElementPtr (GEP) instructions that share the same base pointer and differ by exactly one index. The compiler incorrectly simplifies the pointer comparison into a direct comparison of the differing indices. 
 
-This transformation relies on the assumption that different indices always produce different memory addresses (injectivity). However, this assumption is flawed for standard GEP instructions that lack "no-wrap" flags (such as `inbounds` or `nuw`). Pointer arithmetic in LLVM IR is modular; if the size of the element being indexed (the stride) is greater than one byte, the offset calculation (`index * stride`) can wrap around the address space. Consequently, two distinct indices can result in the same effective memory address if their difference multiplied by the stride is a multiple of the address space size. The compiler failed to verify that the GEP instructions had flags guaranteeing no overflow, leading to miscompilations where the optimized code reported indices as unequal while the original pointers were equal due to address wrapping.
+This transformation is invalid if the GEP instructions lack no-wrap flags (such as `nuw` or `nusw`) and the scale factor of the index is greater than one byte. Without no-wrap flags, the pointer arithmetic can overflow or wrap around the address space. Consequently, two different index values could result in the same final pointer offset after wrapping. By directly comparing the indices instead of the resulting pointers, the compiler fails to account for this wrap-around behavior, leading to a miscompilation where the simplified index comparison yields a different boolean result than the original pointer comparison.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_unsafe_gep_fold(ptr %base, i64 %idx1, i64 %idx2) {
+define i1 @test_gep_cmp_no_nowrap(ptr %base, i64 %idx1, i64 %idx2) {
+entry:
   %gep1 = getelementptr i32, ptr %base, i64 %idx1
   %gep2 = getelementptr i32, ptr %base, i64 %idx2
   %cmp = icmp eq ptr %gep1, %gep2
   ret i1 %cmp
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_unsafe_gep_fold(ptr %base, i64 %idx1, i64 %idx2) {
+define i1 @test_gep_cmp_no_nowrap(ptr %base, i64 %idx1, i64 %idx2) {
+entry:
   %cmp = icmp eq i64 %idx1, %idx2
   ret i1 %cmp
 }
+
 ```
 
 
@@ -566,71 +864,44 @@ define i1 @test_unsafe_gep_fold(ptr %base, i64 %idx1, i64 %idx2) {
 
 # Issue 124387
 
-## Invalid Range Metadata Retention after Operand Simplification in Funnel Shifts
+## Failure to Drop Poison-Generating Return Attributes During Demanded Bits Simplification
 
-**Description**
-The bug is triggered during an optimization pass that simplifies the operands of a funnel shift intrinsic (e.g., `llvm.fshl`) based on demanded bits analysis. Specifically, if the funnel shift instruction carries a `range` metadata attribute that constrains its possible return values, simplifying the input operands can alter the computation such that the result no longer falls within the specified range. The compiler fails to drop or invalidate this `range` attribute after modifying the operands. Consequently, the instruction is treated as producing a `poison` value because the new result violates the stale range constraint, leading to undefined behavior and miscompilation.
+**Description**: 
+The bug can be triggered by exploiting the interaction between demanded bits simplification and poison-generating return attributes (such as `range`) on specific intrinsics or instructions (e.g., funnel shifts). The strategy involves the following steps:
 
-## Example
-
-### Original IR
-```llvm
-define i1 @test(i8 %x) {
-  %b = or i8 %x, 127
-  %res = call i8 @llvm.fshl.i8(i8 %b, i8 %b, i8 1), !range !0
-  %t = trunc i8 %res to i1
-  ret i1 %t
-}
-
-declare i8 @llvm.fshl.i8(i8, i8, i8)
-
-!0 = !{i8 128, i8 0}
-```
-### Optimized IR
-```llvm
-define i1 @test(i8 %x) {
-  %1 = and i8 %x, -128
-  %res = call i8 @llvm.fshl.i8(i8 %1, i8 %1, i8 1), !range !0
-  %t = trunc i8 %res to i1
-  ret i1 %t
-}
-
-declare i8 @llvm.fshl.i8(i8, i8, i8)
-
-!0 = !{i8 128, i8 0}
-```
-
-
----
-
-# Issue 126974
-
-## Incorrect Propagation of `samesign` Flag During Min/Max Comparison Folding
-
-**Description**
-The bug is triggered when the optimizer attempts to simplify an integer comparison (`icmp`) that compares the result of a minimum or maximum operation (e.g., `umax(X, Y)`) against another value `Z`. Specifically, the issue arises when the original comparison instruction carries the `samesign` flag, which asserts that the operands of the comparison are known to share the same sign bit.
-
-To optimize the code, the compiler attempts to decompose the comparison `icmp samesign Pred (MinMax X, Y), Z` into simpler comparisons involving the individual operands, such as `icmp samesign Pred X, Z` and `icmp samesign Pred Y, Z`. The flaw is that the optimizer incorrectly preserves the `samesign` flag on these decomposed instructions. While the *result* of the min/max operation is guaranteed to have the same sign as `Z` (validating the original `samesign` flag), the individual inputs `X` or `Y` are not guaranteed to share that sign. If one of the inputs has a different sign than `Z` (but was discarded by the min/max logic), asserting `samesign` on it creates a poison value (undefined behavior). This allows the compiler to make invalid assumptions—such as assuming a variable is non-negative when it is not—leading to miscompilation.
+1. **Annotate with Return Attributes**: Create an instruction or intrinsic call (like a funnel shift) that is annotated with a poison-generating return attribute, such as a `range` attribute specifying the expected bounds of the return value.
+2. **Restrict Demanded Bits**: Use the result of this instruction in a subsequent operation that only demands a subset of its output bits (for example, via a bitwise AND or a truncation).
+3. **Enable Operand Simplification**: Provide operands to the instruction that can be simplified when only the demanded bits are considered. The compiler will attempt to optimize the operands by ignoring the bits that do not affect the demanded output.
+4. **Violate the Original Range**: Ensure that the simplification of the operands alters the undemanded bits of the instruction's result. This change causes the new overall return value of the instruction to fall outside the bounds specified by the original `range` attribute.
+5. **Trigger Miscompilation**: The compiler simplifies the operands based on the demanded bits but fails to drop the now-invalid poison-generating return attributes from the instruction. Consequently, the instruction violates its own `range` attribute and incorrectly produces a poison value, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_bug(i32 %x, i32 %y) {
-  %min = call i32 @llvm.umin.i32(i32 %x, i32 %y)
-  %cmp = icmp samesign ult i32 %min, 10
-  ret i1 %cmp
-}
+declare i8 @llvm.fshl.i8(i8, i8, i8)
 
-declare i32 @llvm.umin.i32(i32, i32)
+define i8 @test(i8 %x) {
+  ; 126 is 01111110 in binary. Bits 0 and 7 are 0.
+  %a = or i8 %x, 126
+  ; Rotating %a left by 1 guarantees bits 2-7 are 1, so the result is in [252, 255].
+  %f = call range(i8 252, 0) i8 @llvm.fshl.i8(i8 %a, i8 %a, i8 1)
+  ; Demanding only bits 0 and 1 of the result demands only bits 7 and 0 of %a.
+  %res = and i8 %f, 3
+  ret i8 %res
+}
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_bug(i32 %x, i32 %y) {
-  %cmp1 = icmp samesign ult i32 %x, 10
-  %cmp2 = icmp samesign ult i32 %y, 10
-  %cmp = or i1 %cmp1, %cmp2
-  ret i1 %cmp
+declare i8 @llvm.fshl.i8(i8, i8, i8)
+
+define i8 @test(i8 %x) {
+  ; The 'or' is simplified away because its demanded bits (7 and 0) are 0.
+  ; However, the compiler fails to drop the poison-generating 'range' attribute.
+  ; If %x is 0, %f will evaluate to 0, violating the [252, 0) range and causing a miscompilation.
+  %f = call range(i8 252, 0) i8 @llvm.fshl.i8(i8 %x, i8 %x, i8 1)
+  %res = and i8 %f, 3
+  ret i8 %res
 }
 ```
 
@@ -639,31 +910,36 @@ define i1 @test_bug(i32 %x, i32 %y) {
 
 # Issue 136430
 
-## Incorrect Fast-Math Flag Propagation in FCmp/Select to Min/Max Folding
+## Incorrect Propagation of Fast-Math Flags from Select to Min/Max Operations
 
-**Description**
-The bug occurs during an optimization that folds a floating-point comparison (`fcmp`) followed by a `select` instruction into a floating-point minimum or maximum intrinsic (e.g., `llvm.maxnum` or `llvm.minnum`). When generating the new intrinsic, the compiler incorrectly propagates the "no infinities" (`ninf`) fast-math flag solely from the `select` instruction.
+The bug is triggered when a floating-point `select` instruction, conditioned on a floating-point comparison, is optimized into a floating-point minimum or maximum operation (such as a `minnum` or `maxnum` intrinsic). 
 
-In the original instruction sequence, a `select` instruction marked with `ninf` does not necessarily produce poison if an unselected operand is infinite. However, the replacement `min`/`max` intrinsic operates on both inputs. If the generated intrinsic inherits the `ninf` flag but receives an infinite input (which was validly handled in the source), the result becomes poison. The optimization failed to ensure that the `ninf` flag on the new intrinsic was consistent with the original comparison instruction, which determines whether the operation is safe to perform under the assumption of no infinities.
+During this transformation, the optimization incorrectly propagates fast-math flags—specifically the "no infinities" (`ninf`) flag—directly from the `select` instruction to the newly created min/max operation. 
+
+This causes a miscompilation due to the differing semantics of fast-math flags on these two types of instructions:
+1. **Select Instructions**: On a `select`, flags like `ninf` only assert that the *selected result* is not infinity. It is entirely valid for the unselected operand to be infinity without causing undefined behavior or producing a poison value.
+2. **Min/Max Operations**: On binary floating-point operations or intrinsics, the same flags assert that *both arguments* (as well as the result) are not infinity. If any argument is infinity, the operation immediately produces a `poison` value.
+
+Consequently, if the original `select` instruction processes inputs where the unselected operand is infinity, it safely ignores the infinite value and returns the valid selected operand. However, the transformed min/max operation, having improperly inherited the `ninf` flag, observes the infinity argument and evaluates to `poison`. This results in a miscompilation where the optimized target is incorrectly more poisonous than the original source.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_ninf_propagation(float %a, float %b) {
-  %cond = fcmp olt float %a, %b
-  %res = select ninf i1 %cond, float %a, float %b
-  ret float %res
+define float @test_select_ninf(float %a, float %b) {
+  %cmp = fcmp olt float %a, %b
+  %sel = select ninf i1 %cmp, float %a, float %b
+  ret float %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define float @test_ninf_propagation(float %a, float %b) {
-  %res = call ninf float @llvm.minnum.f32(float %a, float %b)
-  ret float %res
-}
-
 declare float @llvm.minnum.f32(float, float)
+
+define float @test_select_ninf(float %a, float %b) {
+  %sel = call ninf float @llvm.minnum.f32(float %a, float %b)
+  ret float %sel
+}
 ```
 
 
@@ -671,28 +947,117 @@ declare float @llvm.minnum.f32(float, float)
 
 # Issue 136646
 
-## Incorrect Transformation of Select-Based Absolute Value to Fabs for Negative NaNs
+## Incorrect Folding of Conditional Negation to Absolute Value for NaN Inputs
 
-The bug is triggered when the compiler optimizes a manual implementation of the floating-point absolute value operation into the `fabs` intrinsic. The original pattern involves a floating-point comparison (`fcmp`) of a value against zero, which controls a `select` instruction that chooses between the original value and its negation (typically represented as a subtraction from zero).
+**Description:**
+The bug is triggered by a pattern where a `select` instruction chooses between a floating-point value and its negation based on a comparison against zero (e.g., `X > 0.0 ? X : -X` or `X <= 0.0 ? -X : X`). The compiler attempts to optimize this conditional selection into a floating-point absolute value (`fabs`) operation. 
 
-The flaw arises because the optimization fails to preserve the sign bit of NaN (Not-a-Number) inputs in specific scenarios. If the comparison predicate is "unordered" (e.g., `ugt`), the comparison evaluates to true for NaN inputs. In the original instruction sequence, this causes the `select` to return the input NaN unchanged, thereby preserving its sign bit. In contrast, the `fabs` intrinsic unconditionally clears the sign bit. Consequently, if the input is a negative NaN, the transformation incorrectly changes the result from a negative NaN to a positive NaN, altering the semantics of the program.
+However, this transformation is unsafe when the input value can be a NaN (Not-a-Number). In the original unoptimized IR, if the input is a NaN, the comparison evaluates to either true or false depending on the specific predicate used (e.g., unordered predicates like `ugt` will return true for NaNs). The `select` instruction then simply passes the chosen NaN value through, preserving its original sign bit. 
+
+In contrast, the `fabs` operation unconditionally clears the sign bit of its input, including for NaN values. By performing this fold without verifying that the input is known not to be NaN (such as checking for `nnan` fast-math flags or using value tracking), the compiler incorrectly alters the sign bit of NaN values. This leads to a miscompilation that violates IEEE-754 semantics, where the sign bit of a NaN should be preserved if no arithmetic operation is performed on it.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_negative_nan_sign_preservation(float %x) {
-  %neg = fsub float -0.000000e+00, %x
-  %cond = fcmp uge float %x, -0.000000e+00
-  %res = select i1 %cond, float %x, float %neg
-  ret float %res
+define float @test(float %x) {
+entry:
+  %cmp = fcmp ugt float %x, 0.000000e+00
+  %neg = fneg float %x
+  %sel = select i1 %cmp, float %x, float %neg
+  ret float %sel
+}
+
+```
+### Optimized IR
+```llvm
+declare float @llvm.fabs.f32(float)
+
+define float @test(float %x) {
+entry:
+  %0 = call float @llvm.fabs.f32(float %x)
+  ret float %0
+}
+
+```
+
+
+---
+
+# Issue 136650
+
+## Incorrect Folding of Logical AND Involving Floating-Point Comparisons and Sign-Manipulating Operations
+
+**Description**:
+The bug is triggered when a logical AND operation (typically represented in LLVM IR as a `select` instruction where the false value is `false`/`0`) combines two floating-point comparisons (`fcmp`). 
+
+The pattern involves:
+1. A first comparison that checks if a base floating-point value is ordered (e.g., `ord`) or finite.
+2. A second comparison that evaluates a derived value—created by applying sign-manipulating operations (such as `copysign` or `fabs`) to the base value—against infinity or a specific magnitude.
+
+The optimization incorrectly folds this logical AND into a single floating-point comparison that directly evaluates the derived value. This transformation fails to account for the short-circuiting semantics of a logical AND. 
+
+In the original IR, if the base value is a NaN, the first comparison evaluates to false, and the second comparison is never evaluated. If the sign-manipulating operation introduces a `poison` value (for instance, if the sign operand of a `copysign` is `poison`), the original logical AND safely masks the poison and returns false. However, the optimized single comparison unconditionally evaluates the derived value, resulting in `poison`. This breaks the short-circuiting behavior, making the target code more poisonous than the source and causing a miscompilation.
+
+## Example
+
+### Original IR
+```llvm
+declare double @llvm.copysign.f64(double, double)
+
+define i1 @test(double %x, double %y) {
+  %ord = fcmp ord double %x, 0.0
+  %derived = call double @llvm.copysign.f64(double %x, double %y)
+  %cmp = fcmp oeq double %derived, 0x7FF0000000000000
+  %and = select i1 %ord, i1 %cmp, i1 false
+  ret i1 %and
 }
 ```
 ### Optimized IR
 ```llvm
-define float @test_negative_nan_sign_preservation(float %x) {
-  %res = call float @llvm.fabs.f32(float %x)
-  ret float %res
+declare double @llvm.copysign.f64(double, double)
+
+define i1 @test(double %x, double %y) {
+  %derived = call double @llvm.copysign.f64(double %x, double %y)
+  %cmp = fcmp oeq double %derived, 0x7FF0000000000000
+  ret i1 %cmp
+}
+```
+
+
+---
+
+# Issue 137196
+
+## Incorrect Sign Bit Folding for NaN Values in Demanded Floating-Point Class Simplification
+
+**Description**
+The bug is triggered when the compiler attempts to simplify floating-point instructions that manipulate the sign bit (such as `copysign`) based on demanded floating-point classes. 
+
+The optimization relies on analyzing the context (e.g., function return attributes like `nofpclass`) to determine which floating-point classes are allowed or demanded. If the compiler observes that the demanded mask excludes all negative (or all positive) floating-point classes, it assumes the sign of the result is strictly known. It then optimizes the instruction by forcing the sign bit to a constant (e.g., replacing the sign operand with a constant positive or negative value).
+
+However, the compiler's internal representation of floating-point classes does not distinguish between positive and negative NaNs; NaNs are not categorized under the strictly "positive" or "negative" class masks. Consequently, if the context excludes all negative (or positive) non-NaN values but still allows NaN values, the compiler's check passes, and it incorrectly forces the sign bit of the result.
+
+This transformation is invalid because it overwrites the sign bit of NaN values. The sign bit of a NaN is observable (e.g., via bitcasting to an integer) and must be perfectly preserved by instructions like `copysign`. By ignoring the presence of NaNs in the demanded mask, the compiler incorrectly alters the NaN sign bit, leading to a miscompilation.
+
+## Example
+
+### Original IR
+```llvm
+define nofpclass(ninf nnorm nsub nzero) float @test_copysign_nan(float %x, float %y) {
+entry:
+  %ret = call float @llvm.copysign.f32(float %x, float %y)
+  ret float %ret
+}
+
+declare float @llvm.copysign.f32(float, float)
+```
+### Optimized IR
+```llvm
+define nofpclass(ninf nnorm nsub nzero) float @test_copysign_nan(float %x, float %y) {
+entry:
+  %ret = call float @llvm.fabs.f32(float %x)
+  ret float %ret
 }
 
 declare float @llvm.fabs.f32(float)
@@ -701,40 +1066,51 @@ declare float @llvm.fabs.f32(float)
 
 ---
 
-# Issue 136650
+# Issue 140215
 
-## Unsafe Folding of Logical AND of Floating-Point Comparisons with Sign-Bit Operations
+## Incorrect Removal of Initialization and Destruction Intrinsics Across Copy Operations
 
-**Description**
-The bug is triggered when the optimizer attempts to fold a logical conjunction (typically represented by a `select` instruction acting as a logical AND) of two floating-point comparisons into a single ordered comparison. The specific pattern involves:
-1.  A primary check determining if a floating-point value is ordered (i.e., not NaN).
-2.  A secondary check determining if a derived version of that value—modified by sign-bit manipulation operations like `copysign`—is infinite.
+**Description:**
+The bug is triggered by a specific sequence of operations managing a resource, such as a variable argument list (`va_list`). The sequence involves:
+1. Initializing a source resource (e.g., via a `va_start` intrinsic).
+2. Copying the source resource to a destination resource (e.g., via a `va_copy` intrinsic).
+3. Immediately destroying the source resource (e.g., via a `va_end` intrinsic).
 
-The optimization incorrectly merges these two conditions into a single ordered comparison against infinity. This transformation is unsound when the sign-bit manipulation operation depends on additional operands that may be poison (e.g., the second argument of `copysign`). In the original logical conjunction, if the primary check fails (the value is NaN), the result is a defined `false`, effectively masking any poison present in the secondary check. However, the transformed code performs a single comparison on the derived value. If that derived value is poison, the result becomes poison. Consequently, the optimization causes the target code to be "more poisonous" than the source code when the input is NaN and the sign source is poison.
+The compiler features an optimization that attempts to eliminate trivially empty ranges of initialization and destruction. When processing the destruction instruction, the optimization scans backwards through the instruction stream to find the matching initialization instruction. During this scan, it encounters the copy instruction. 
+
+Because the copy instruction also serves as an initialization for the *destination* resource, the optimization logic incorrectly categorizes it solely as an unrelated initialization and skips over it. It fails to account for the fact that the copy instruction actively reads from the *source* resource. As a result, the optimization incorrectly concludes that the source resource is completely unused between its initialization and destruction, and removes both instructions. This miscompilation leaves the copy instruction reading from an uninitialized resource, leading to undefined behavior.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(double %x, double %y) {
-  %z = call double @llvm.copysign.f64(double %x, double %y)
-  %ord = fcmp ord double %x, 0.0
-  %inf = fcmp oeq double %z, 0x7FF0000000000000
-  %res = select i1 %ord, i1 %inf, i1 false
-  ret i1 %res
+declare void @llvm.va_start(ptr)
+declare void @llvm.va_copy(ptr, ptr)
+declare void @llvm.va_end(ptr)
+
+define void @test(ptr %dest, ...) {
+entry:
+  %src = alloca ptr, align 8
+  call void @llvm.va_start(ptr nonnull %src)
+  call void @llvm.va_copy(ptr nonnull %dest, ptr nonnull %src)
+  call void @llvm.va_end(ptr nonnull %src)
+  ret void
 }
 
-declare double @llvm.copysign.f64(double, double)
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(double %x, double %y) {
-  %z = call double @llvm.copysign.f64(double %x, double %y)
-  %res = fcmp oeq double %z, 0x7FF0000000000000
-  ret i1 %res
+declare void @llvm.va_start(ptr)
+declare void @llvm.va_copy(ptr, ptr)
+declare void @llvm.va_end(ptr)
+
+define void @test(ptr %dest, ...) {
+entry:
+  %src = alloca ptr, align 8
+  call void @llvm.va_copy(ptr nonnull %dest, ptr nonnull %src)
+  ret void
 }
 
-declare double @llvm.copysign.f64(double, double)
 ```
 
 
@@ -742,33 +1118,31 @@ declare double @llvm.copysign.f64(double, double)
 
 # Issue 140994
 
-## Summary Title
-Incorrect Propagation of Fast Math Flags from Floating-Point Comparison to Select Instruction
+## Incorrect Fast-Math Flag Propagation from Comparison to Selection
 
-## Description
-The bug is triggered when the compiler optimizes a `select` instruction whose condition is a floating-point comparison (`fcmp`) annotated with Fast Math Flags (FMF), such as `nsz` (No Signed Zeros). 
+**Description**: 
+The bug is triggered by a pattern involving a floating-point selection operation that depends on a floating-point comparison, where fast-math flags are improperly handled during optimization:
 
-When the optimizer transforms the `select` instruction—for instance, by inverting the comparison predicate and swapping the operands to canonicalize the instruction—it incorrectly propagates the Fast Math Flags from the `fcmp` condition to the newly created `select` instruction. 
-
-Flags on an `fcmp` instruction control the semantics of the comparison itself (e.g., treating -0.0 and +0.0 as equal), whereas flags on a `select` instruction control the semantics of the resulting value. By transferring these flags, the compiler incorrectly grants the `select` instruction permission to ignore specific floating-point distinctions (like the sign of zero) in its output. This allows subsequent optimizations to aggressively fold the `select` or substitute operands (e.g., returning -0.0 instead of +0.0) when the original program semantics required the exact bit pattern to be preserved.
+1. A floating-point comparison instruction is defined with specific fast-math flags (such as `nsz` for no signed zeros) that relax strict IEEE-754 floating-point semantics.
+2. A selection instruction (e.g., `select`) uses the boolean result of this comparison as its condition to choose between two floating-point values. Crucially, the selection instruction itself does not possess these fast-math flags and is expected to adhere to strict floating-point rules.
+3. During compiler optimizations—such as canonicalizing the pattern by inverting the comparison predicate and swapping the true/false operands of the selection—the compiler generates a new selection instruction.
+4. The compiler incorrectly propagates the fast-math flags from the comparison instruction directly to the newly created selection instruction.
+5. This improper flag propagation illegally relaxes the semantics of the selection operation. It enables subsequent invalid simplifications, such as completely folding the selection into one of its operands. This leads to a miscompilation when the original strict semantics (like correctly distinguishing and preserving the sign of zero) are violated at runtime.
 
 ## Example
 
 ### Original IR
 ```llvm
-define double @test(double %x, double %y, double %a, double %b) {
-  %cmp = fcmp nsz uge double %x, %y
-  %not = xor i1 %cmp, true
-  %sel = select i1 %not, double %a, double %b
-  ret double %sel
+define float @test(float %x) {
+  %cmp = fcmp nsz une float %x, 0.000000e+00
+  %sel = select i1 %cmp, float %x, float 0.000000e+00
+  ret float %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define double @test(double %x, double %y, double %a, double %b) {
-  %cmp = fcmp nsz olt double %x, %y
-  %sel = select nsz i1 %cmp, double %b, double %a
-  ret double %sel
+define float @test(float %x) {
+  ret float %x
 }
 ```
 
@@ -777,29 +1151,69 @@ define double @test(double %x, double %y, double %a, double %b) {
 
 # Issue 142518
 
-## Unsafe Sinking of Bitwise NOT into Binary Operators with Dependent Operands
+## Sinking `Not` into Logical Operations with Interdependent Operands
 
-**Description**
-The bug is triggered when the compiler attempts to optimize a logical expression by sinking a bitwise NOT operation into a binary operator (such as `AND` or `OR`) using De Morgan's laws. This transformation involves inverting the operands of the binary operator.
+**Description**: 
+The bug is triggered by a specific pattern involving logical operations (such as `and` or `or`) where one operand is the logical negation (`not`) of the other operand, and the result of the logical operation is itself negated. 
 
-The issue arises specifically when the operands of the binary operator are dependent on each other, such as when one operand is explicitly defined as the bitwise NOT of the other (e.g., `A | ~A`). In this scenario, the second operand is a user of the first operand. When the optimizer processes the first operand to invert it, it may aggressively update its users to reflect the inversion. This update inadvertently modifies the second operand (or the instruction's reference to it) while the transformation is still in progress. The optimizer fails to account for this mutation, leading it to use stale or incorrect information when processing the second operand, resulting in a miscompilation of the logic.
+When the compiler attempts to optimize this pattern by sinking the outer `not` instruction into the logical operation (applying De Morgan's laws), it must invert both operands of the logical operation. The compiler processes these inversions sequentially. 
+
+However, because one operand is derived from the other (specifically, it is a user of the other operand), inverting the first operand inadvertently modifies the second operand in place. When the compiler subsequently attempts to invert the second operand, it operates on an outdated or already altered instruction state. This interference between the operands during the transformation leads to incorrect intermediate representation and ultimately causes a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_unsafe_sink(i32 %a) {
-  %not_a = xor i32 %a, -1
-  %or = or i32 %a, %not_a
-  %res = xor i32 %or, -1
+define i32 @test(i1 %cond, i32 %x, i32 %y) {
+  %a = select i1 %cond, i32 %x, i32 %y
+  %b = xor i32 %a, -1
+  %and = and i32 %a, %b
+  %res = xor i32 %and, -1
   ret i32 %res
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_unsafe_sink(i32 %a) {
-  %not_a = xor i32 %a, -1
-  ret i32 %not_a
+define i32 @test(i1 %cond, i32 %x, i32 %y) {
+  %a = select i1 %cond, i32 %y, i32 %x
+  ret i32 %a
+}
+```
+
+
+---
+
+# Issue 143122
+
+## Incorrect Fast-Math Flag Propagation when Commuting Floating-Point Truncation and Intrinsics
+
+**Description**: 
+The bug is triggered when a floating-point truncation (`fptrunc`) is applied to the result of a floating-point intrinsic (such as `fabs`) that possesses restrictive fast-math flags (e.g., `ninf`, which assumes no infinity). 
+
+During optimization, the compiler attempts to commute the two operations, applying the truncation first and then the intrinsic. However, the compiler incorrectly copies the fast-math flags from the original intrinsic to the newly created intrinsic. 
+
+Because a floating-point truncation can convert a large finite value into an infinity (if the value exceeds the representable range of the narrower target type), the truncated value may violate the restrictive fast-math flags (like `ninf`) attached to the new intrinsic. This violation causes the transformed instruction to produce `poison` for inputs that evaluated to valid values (like infinity) in the original code, leading to a miscompilation. The issue stems from propagating the fast-math flags from the inner intrinsic rather than the outer truncation instruction.
+
+## Example
+
+### Original IR
+```llvm
+declare double @llvm.fabs.f64(double)
+
+define half @test(double %x) {
+  %fabs = call ninf double @llvm.fabs.f64(double %x)
+  %trunc = fptrunc double %fabs to half
+  ret half %trunc
+}
+```
+### Optimized IR
+```llvm
+declare half @llvm.fabs.f16(half)
+
+define half @test(double %x) {
+  %trunc = fptrunc double %x to half
+  %fabs = call ninf half @llvm.fabs.f16(half %trunc)
+  ret half %fabs
 }
 ```
 
@@ -808,80 +1222,31 @@ define i32 @test_unsafe_sink(i32 %a) {
 
 # Issue 161492
 
-## Incorrect Self-Replacement of Freeze Instructions
+## Incorrect Self-Replacement of Freeze Instruction in Select
 
-**Description**
-The bug occurs during the optimization of `freeze` instructions that operate on a `poison` (or `undef`) operand. The optimizer attempts to eliminate these instructions by finding a suitable concrete replacement value derived from the instruction's uses. A specific issue arises when the `freeze` instruction is used in a `select` instruction in a way that makes the optimizer identify the `freeze` instruction itself as the best replacement candidate (for example, if the `freeze` value is used in both arms of the `select`, or if the other arm is equivalent to the `freeze`).
+The bug is triggered when a `freeze` instruction, which takes an `undef` or `poison` value as its operand, is used as both the true and false values of a `select` instruction (e.g., `select cond, freeze_inst, freeze_inst`). 
 
-In the optimization framework, instructing the system to replace an instruction with itself is interpreted as a signal to replace all its uses with `poison`. While this mechanism is valid for some dead code scenarios, it is semantically incorrect for `freeze`. A `freeze` instruction is explicitly designed to return a fixed, non-poison value. By replacing it with `poison`, the optimizer incorrectly re-introduces undefined behavior, causing a miscompilation where a valid arbitrary value becomes `poison`.
+During optimization, the compiler attempts to eliminate the `freeze` instruction by deducing a safe replacement value from its uses. When analyzing the `select` instruction, the compiler looks for the "other" value in the `select` to use as a replacement. Because both branches of the `select` use the same `freeze` instruction, the "other" value is simply the `freeze` instruction itself. 
 
-## Example
+The compiler then checks if this chosen replacement value is guaranteed not to be `undef` or `poison`. Since the value is a `freeze` instruction, this safety check passes, and the compiler decides to replace the `freeze` instruction with itself. 
 
-### Original IR
-```llvm
-define i32 @test_freeze_bug(i1 %cond) {
-  %f = freeze i32 poison
-  %sel = select i1 %cond, i32 %f, i32 %f
-  ret i32 %sel
-}
-```
-### Optimized IR
-```llvm
-define i32 @test_freeze_bug(i1 %cond) {
-  ret i32 poison
-}
-```
-
-
----
-
-# Issue 161493
-
-## Incorrect Reuse of Poison-Generating Instructions in Funnel Shift Transformation
-
-**Description**
-The bug is triggered when the compiler optimizes a sequence of bitwise operations (typically `OR`s of shifted values) into a funnel shift (rotate) intrinsic. The optimization identifies that a value being computed is equivalent to rotating another existing value found elsewhere in the code. To optimize, it replaces the computation of the target value with a funnel shift applied to that existing source value.
-
-However, the instructions computing the existing source value (such as shift instructions) may possess poison-generating flags (like `nsw` or `nuw`). If specific inputs violate these flags, the source value becomes poison. By reusing this source value to compute the target value via a funnel shift, the optimization propagates the poison to the target. This is incorrect if the original instruction sequence for the target value was computed independently without those specific flags, meaning the original code would have produced a well-defined result while the optimized code produces poison.
+However, within the instruction combining framework, replacing an instruction with itself is treated as a special signal that replaces all of its uses with `poison`. This leads to a miscompilation: the `freeze` instruction is intended to produce a well-defined, non-poisonous value, but the incorrect self-replacement logic causes it to be folded to `poison`.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test(i32 %x) {
-  ; This instruction generates poison if %x << 1 overflows (e.g. x = 0x40000000)
-  %poison_source = shl nsw i32 %x, 1
-  call void @use(i32 %poison_source)
-
-  ; This instruction is safe and equivalent in bits to %poison_source
-  %safe_source = shl i32 %x, 1
-
-  ; Funnel shift pattern (rotate left by 1) using the safe source
-  %part1 = shl i32 %safe_source, 1
-  %part2 = lshr i32 %safe_source, 31
-  %res = or i32 %part1, %part2
-
-  ret i32 %res
+define i8 @test(i1 %c) {
+  %f = freeze i8 poison
+  %s = select i1 %c, i8 %f, i8 %f
+  ret i8 %s
 }
-
-declare void @use(i32)
 ```
 ### Optimized IR
 ```llvm
-define i32 @test(i32 %x) {
-  ; The poison-generating instruction is preserved
-  %poison_source = shl nsw i32 %x, 1
-  call void @use(i32 %poison_source)
-
-  ; The optimization incorrectly reuses %poison_source for the funnel shift
-  ; If %poison_source is poison, the result %res becomes poison, whereas originally it was well-defined
-  %res = call i32 @llvm.fshl.i32(i32 %poison_source, i32 %poison_source, i32 1)
-
-  ret i32 %res
+define i8 @test(i1 %c) {
+  ret i8 poison
 }
-
-declare void @use(i32)
-declare i32 @llvm.fshl.i32(i32, i32, i32)
 ```
 
 
@@ -889,28 +1254,30 @@ declare i32 @llvm.fshl.i32(i32, i32, i32)
 
 # Issue 161525
 
-## Incorrect Fast Math Flag Propagation when Folding Floating-Point Subtraction Comparisons
+## Incorrect Fast-Math Flag Preservation in Floating-Point Comparison Folding
 
-## Description
-The bug is triggered when the optimizer simplifies a floating-point comparison between the result of a subtraction and zero (e.g., `fcmp (fsub x, y), 0.0`) into a direct comparison of the subtraction operands (e.g., `fcmp x, y`).
+**Description**:
+The bug occurs when the compiler optimizes a floating-point comparison (`fcmp`) between the result of a floating-point binary operation (such as `fsub`) and a constant (like `0.0`) into a direct comparison between the operands of the binary operation. 
 
-During this transformation, the optimizer incorrectly retains the `ninf` (No Infs) Fast Math Flag from the original comparison instruction on the new comparison instruction. The `ninf` flag asserts that the operands of the instruction are not infinite. In the original sequence, this assertion applied to the result of the subtraction (`x - y`). In the transformed sequence, it applies directly to the inputs `x` and `y`.
+During this transformation, the compiler incorrectly preserves the fast-math flags (e.g., `ninf` or `nnan`) from the original comparison instruction and applies them to the newly formed comparison. However, fast-math flags on the original comparison only assert properties about its specific operands (the result of the binary operation and the constant). They do not guarantee that the inputs to the binary operation also satisfy these properties. 
 
-This creates a correctness issue because it is possible for the inputs `x` or `y` to be infinite while the result of the subtraction is not (e.g., if the operation results in `NaN`). In such cases, the original instruction was well-defined (as the operand was not infinite), but the new instruction yields `poison` because its operands violate the `ninf` constraint. The optimizer should instead derive the Fast Math Flags for the new comparison from the underlying subtraction instruction, rather than preserving them from the original comparison.
+If the inputs to the binary operation are values that violate the fast-math flags (e.g., infinity or NaN) but the result of the binary operation does not (e.g., an operation on infinity and NaN producing a NaN, which does not violate a `ninf` flag), the original comparison would evaluate correctly. In contrast, the optimized comparison directly uses the inputs and the preserved flags, causing it to incorrectly evaluate to `poison`. This leads to a miscompilation where the target is more poisonous than the source. 
+
+To trigger this issue, one can construct a floating-point binary operation without certain fast-math flags, feed its result into a comparison that has those flags, and provide inputs that violate the flags but produce a valid result for the original comparison.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_ninf_propagation(float %x, float %y) {
+define i1 @test(float %x, float %y) {
   %sub = fsub float %x, %y
-  %cmp = fcmp ninf oeq float %sub, 0.0
+  %cmp = fcmp ninf oeq float %sub, 0.000000e+00
   ret i1 %cmp
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_ninf_propagation(float %x, float %y) {
+define i1 @test(float %x, float %y) {
   %cmp = fcmp ninf oeq float %x, %y
   ret i1 %cmp
 }
@@ -919,108 +1286,156 @@ define i1 @test_ninf_propagation(float %x, float %y) {
 
 ---
 
+# Issue 161634
+
+## Incorrect Propagation of `ninf` Flag when Folding Select into Floating-Point Binary Operation
+
+**Description:**
+The bug is triggered by an invalid propagation of fast-math flags during the optimization that folds a `select` instruction into a floating-point binary operation (such as `fadd`, `fsub`, or `fmul`). 
+
+The problematic pattern involves:
+1. A floating-point binary operation with two operands, `A` and `B`.
+2. A `select` instruction that chooses between the result of this binary operation and one of its operands (e.g., `A`). 
+3. The `select` instruction is decorated with the `ninf` (no infinity) fast-math flag, but lacks the `nnan` (no NaN) flag.
+
+To optimize this, the compiler transforms the code by creating a new `select` instruction that chooses between the other operand (`B`) and the binary operation's identity value. It then applies the binary operation to `A` and the result of the new `select`. 
+
+The miscompilation occurs because the compiler blindly propagates the `ninf` flag from the original `select` to the newly created `select`. This is incorrect because operand `B` can be infinity. If `B` is infinity and `A` is a value that causes the binary operation to evaluate to NaN (e.g., `-inf + +inf = NaN` or `0 * inf = NaN`), the original `select` would return NaN. Since NaN is not infinity, the original `ninf` flag is not violated. However, in the transformed code, the new `select` will directly return `B` (infinity), which violates the incorrectly propagated `ninf` flag and evaluates to `poison`. This ultimately poisons the final result, leading to a more poisonous state than the original source.
+
+## Example
+
+### Original IR
+```llvm
+define float @test_select_fadd(i1 %cond, float %A, float %B) {
+  %add = fadd float %A, %B
+  %res = select ninf i1 %cond, float %add, float %A
+  ret float %res
+}
+
+```
+### Optimized IR
+```llvm
+define float @test_select_fadd(i1 %cond, float %A, float %B) {
+  %1 = select ninf i1 %cond, float %B, float -0.000000e+00
+  %res = fadd float %A, %1
+  ret float %res
+}
+
+```
+
+
+---
+
 # Issue 161636
 
-## Incorrect Pointer Substitution in Select Simplification
+## Invalid Pointer Replacement Based on Equality Comparison in Select Instructions
 
-**Description**
-The bug is triggered by an optimization strategy that simplifies `select` instructions controlled by an equality comparison (e.g., `icmp eq ptr %a, %b`). The optimizer assumes that because the condition guarantees the two operands are equal in the "true" branch, it is safe to substitute one operand for the other in the selected value. For example, it might transform the pattern `select (%a == %b), %a, %b` directly into `%b`.
+**Description**: 
+The bug is triggered when an optimization simplifies a `select` instruction whose condition is an equality comparison between two pointers (or a derived condition, such as a frozen equality comparison). When the operands of the `select` involve the compared pointers, the optimization may attempt to replace one pointer with the other, assuming that because they compare equal, they are strictly interchangeable. 
 
-This assumption is incorrect for pointers in LLVM IR. Pointer equality implies only that the memory addresses are the same, not that the pointers possess the same provenance (i.e., they may refer to different underlying memory objects or have different validity states). A valid pointer can compare equal to an invalid pointer (such as a pointer to a freed object or a past-the-end pointer of a different allocation). Substituting a valid pointer with one that has different provenance based solely on address equality can produce a result that is illegal to dereference, leading to undefined behavior or value mismatches.
+However, in LLVM's memory model, pointers that compare equal can still have different provenances (for example, a past-the-end pointer of one allocation might have the same address as the base pointer of an adjacent allocation). Replacing one pointer with another solely based on an equality comparison can incorrectly alter or lose the provenance information of the resulting pointer. This leads to a miscompilation because the substituted pointer may not be valid for the same memory operations as the original pointer. The issue arises from failing to verify whether the pointers have compatible provenances before performing the substitution.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_provenance_substitution(ptr %a, ptr %b) {
-  %cmp = icmp eq ptr %a, %b
-  %sel = select i1 %cmp, ptr %a, ptr %b
-  %val = load i32, ptr %sel, align 4
-  ret i32 %val
+define ptr @test_select_eq_pointers(ptr %p, ptr %q) {
+  %cmp = icmp eq ptr %p, %q
+  %fr = freeze i1 %cmp
+  %sel = select i1 %fr, ptr %p, ptr %q
+  ret ptr %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_provenance_substitution(ptr %a, ptr %b) {
-  %val = load i32, ptr %b, align 4
-  ret i32 %val
+define ptr @test_select_eq_pointers(ptr %p, ptr %q) {
+  ret ptr %q
 }
 ```
 
 
 ---
 
-# Issue 173793
+# Issue 173787
 
-## Stale Range Metadata Preservation on Funnel Shift Simplification
+## Non-Power-of-Two Integer Widths in Bitwise Masking Transformations
 
-**Description**
-The bug is triggered when the optimizer simplifies the operands of a funnel shift intrinsic (such as `fshl` or `fshr`) based on demanded bits analysis. This simplification rewrites the operands (e.g., by replacing bits that are not demanded with constants), which effectively changes the result value of the operation. However, the optimizer fails to drop or invalidate the `!range` metadata attached to the instruction. Consequently, the new result value may violate the constraints specified by the stale `!range` metadata, causing the instruction to be incorrectly treated as producing a `poison` value.
+**Description**: 
+The bug is triggered by using non-power-of-two integer types (e.g., `i33`, `i15`) in operations that the compiler attempts to optimize using bitwise masking tricks derived from the type's bitwidth. 
+
+Specifically, when a transformation replaces an arithmetic operation—such as a subtraction or modulo involving the bitwidth—with a bitwise AND operation using `BitWidth - 1` as the mask, it implicitly assumes that the bitwidth is a power of two. For power-of-two bitwidths, `BitWidth - 1` forms a continuous all-ones mask, making the bitwise AND mathematically equivalent to the original arithmetic. However, for non-power-of-two bitwidths, `BitWidth - 1` does not form an all-ones mask. 
+
+To trigger this issue, one can construct LLVM IR that performs the targeted arithmetic pattern (like computing a shift amount based on leading zeros) on a non-power-of-two integer type. The compiler will erroneously apply the bitwise AND transformation, applying an invalid mask and producing an entirely different result, which ultimately leads to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8 @test(i8 %a, i8 %b) {
-  ; The fshl result is constrained to [4, 8) (i.e., 4, 5, 6, 7).
-  ; This implies bit 2 is always 1, which comes from %a.
-  %res = call i8 @llvm.fshl.i8(i8 %a, i8 %b, i8 1), !range !0
-  ; We only demand bit 0 of the result, which comes from %b.
-  %out = and i8 %res, 1
-  ret i8 %out
+define i33 @test_shift(i33 %x, i33 %y) {
+  %ctlz = call i33 @llvm.ctlz.i33(i33 %y, i1 false)
+  %rem = urem i33 %ctlz, 33
+  %shl = shl i33 %x, %rem
+  ret i33 %shl
 }
 
-declare i8 @llvm.fshl.i8(i8, i8, i8)
-
-!0 = !{i8 4, i8 8}
+declare i33 @llvm.ctlz.i33(i33, i1)
 ```
 ### Optimized IR
 ```llvm
-define i8 @test(i8 %a, i8 %b) {
-  ; The optimizer sees that %a is not demanded for the final result (bit 0).
-  ; It simplifies %a to 0.
-  ; However, fshl(0, %b, 1) produces 0 or 1 (since 0 << 1 is 0).
-  ; This violates the preserved !range !0 which requires values in [4, 8).
-  ; The instruction is now poison.
-  %res = call i8 @llvm.fshl.i8(i8 0, i8 %b, i8 1), !range !0
-  %out = and i8 %res, 1
-  ret i8 %out
+define i33 @test_shift(i33 %x, i33 %y) {
+  %ctlz = call i33 @llvm.ctlz.i33(i33 %y, i1 false)
+  %and = and i33 %ctlz, 32
+  %shl = shl i33 %x, %and
+  ret i33 %shl
 }
 
-declare i8 @llvm.fshl.i8(i8, i8, i8)
-
-!0 = !{i8 4, i8 8}
+declare i33 @llvm.ctlz.i33(i33, i1)
 ```
 
 
 ---
 
-# Issue 37809
+# Issue 178245
 
-## Unsafe Expansion of Unsigned Remainder with Undef Operand
+## Incorrect Demanded Bits Simplification for Multi-Use Bitcast in Copysign
 
-**Description**
-The bug is triggered when the compiler optimizes an unsigned remainder (`urem`) instruction where the divisor is a constant with its sign bit set (i.e., it would be negative if treated as a signed integer). To avoid the performance cost of a hardware remainder operation, the optimizer expands this single instruction into a sequence of simpler operations, typically involving a comparison, a subtraction, and a conditional select (or equivalent arithmetic logic).
+**Description:**
+The bug occurs when a floating-point operation, such as `copysign`, only demands specific bits (e.g., the sign bit) from one of its arguments, and that argument is a bitcast from an integer type. 
 
-This expansion logic is flawed because it duplicates the dividend operand (the first argument of the remainder), increasing its number of uses from one in the original code to multiple uses in the generated sequence. If the dividend is an undefined value (`undef`), LLVM semantics allow each individual use to resolve to a different arbitrary value. Consequently, the transformed code may execute with inconsistent views of the operand—for example, treating it as one value to satisfy the comparison condition and a different value when performing the subtraction—resulting in a computed value that contradicts the semantics of the original instruction.
+The compiler attempts to optimize the integer source of the bitcast by applying demanded bits analysis, assuming only the bits required by the floating-point operation (the sign bit) are needed. However, if the bitcast instruction has multiple uses (for example, it is also used in a floating-point comparison that checks for NaN), the other uses will demand all bits of the value. 
+
+By simplifying the integer source based solely on the restricted bits demanded by the `copysign` operation, the compiler incorrectly alters the underlying integer computation. This corrupts the value for the other uses of the bitcast, resulting in a miscompilation. The issue is triggered because the optimization fails to check if the bitcast itself has a single use before propagating the restricted demanded bits to its source.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_urem_undef() {
-  %res = urem i32 undef, 2147483648
-  ret i32 %res
+declare float @llvm.copysign.f32(float, float)
+
+define float @test_multi_use_bitcast(i32 %a, float %b) {
+entry:
+  %or = or i32 %a, 1
+  %bc = bitcast i32 %or to float
+  %cs = call float @llvm.copysign.f32(float %b, float %bc)
+  %cmp = fcmp uno float %bc, 0.000000e+00
+  %sel = select i1 %cmp, float %cs, float %bc
+  ret float %sel
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_urem_undef() {
-  %cmp = icmp ult i32 undef, 2147483648
-  %sub = sub i32 undef, 2147483648
-  %res = select i1 %cmp, i32 undef, i32 %sub
-  ret i32 %res
+declare float @llvm.copysign.f32(float, float)
+
+define float @test_multi_use_bitcast(i32 %a, float %b) {
+entry:
+  %bc = bitcast i32 %a to float
+  %cs = call float @llvm.copysign.f32(float %b, float %bc)
+  %cmp = fcmp uno float %bc, 0.000000e+00
+  %sel = select i1 %cmp, float %cs, float %bc
+  ret float %sel
 }
+
 ```
 
 
@@ -1028,36 +1443,36 @@ define i32 @test_urem_undef() {
 
 # Issue 44206
 
-## Incorrect Inbounds Preservation When Swapping Nested GEP Offsets
+## Incorrect `inbounds` Preservation During GEP Reassociation
 
 **Description**
-The bug is triggered when the optimizer reorders nested `getelementptr` (GEP) instructions, effectively swapping the order in which two offsets are applied to a base pointer. This transformation is often performed to move loop-invariant offsets to the inner GEP, allowing them to be hoisted out of loops.
+The bug is triggered when the compiler reassociates or swaps the order of two consecutive `getelementptr` (GEP) instructions. This transformation is typically performed to canonicalize the instruction order or to separate loop-invariant offsets from loop-variant ones, allowing subsequent passes to hoist the invariant parts out of the loop.
 
-The issue arises because the optimizer unconditionally preserves the `inbounds` keyword on the new GEP instructions without verifying that the new intermediate pointer calculation remains within the bounds of the allocated object. If the two offsets have opposite signs (e.g., one is positive and one is negative), the original order might produce a valid intermediate pointer, whereas the swapped order might cause the intermediate pointer to go out of bounds (e.g., stepping before the start of an array). By marking this invalid intermediate calculation as `inbounds`, the optimizer causes the result to become a poison value, leading to a miscompilation where valid code becomes undefined.
+When both original GEP instructions are marked with the `inbounds` flag, the compiler historically preserved this flag on the newly swapped GEPs. However, this logic is flawed if the offsets of the two GEPs can have different signs (e.g., one offset is positive and the other is negative). 
+
+By changing the order in which the offsets are applied, the new intermediate pointer might temporarily point outside the boundaries of the allocated object (for instance, moving before the base address). Because the compiler incorrectly retains the `inbounds` flag on the swapped GEPs, this out-of-bounds intermediate pointer evaluates to a `poison` value. This results in a miscompilation, as the original sequence of GEPs may have safely remained within the object's bounds at every step, whereas the transformed sequence introduces poison that can propagate and cause undefined behavior.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8* @test_gep_inbounds_preservation(i8* %ptr, i64 %idx) {
-  ; Original order: Apply positive variable offset first, then negative constant offset.
-  ; If %idx is large enough, the intermediate pointer is inbounds.
-  %gep1 = getelementptr inbounds i8, i8* %ptr, i64 %idx
-  %gep2 = getelementptr inbounds i8, i8* %gep1, i64 -10
-  ret i8* %gep2
+define ptr @test(ptr %p, i64 %x) {
+entry:
+  %gep1 = getelementptr inbounds i8, ptr %p, i64 %x
+  %gep2 = getelementptr inbounds i8, ptr %gep1, i64 -8
+  ret ptr %gep2
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i8* @test_gep_inbounds_preservation(i8* %ptr, i64 %idx) {
-  ; Optimized order (Buggy): Offsets swapped to hoist constant.
-  ; The inner GEP applies the negative offset first.
-  ; If %ptr is the start of an object, %gep1 is out-of-bounds.
-  ; Because 'inbounds' is preserved, %gep1 becomes poison, causing the result to be poison.
-  %gep1 = getelementptr inbounds i8, i8* %ptr, i64 -10
-  %gep2 = getelementptr inbounds i8, i8* %gep1, i64 %idx
-  ret i8* %gep2
+define ptr @test(ptr %p, i64 %x) {
+entry:
+  %gep1 = getelementptr inbounds i8, ptr %p, i64 -8
+  %gep2 = getelementptr inbounds i8, ptr %gep1, i64 %x
+  ret ptr %gep2
 }
+
 ```
 
 
@@ -1065,30 +1480,38 @@ define i8* @test_gep_inbounds_preservation(i8* %ptr, i64 %idx) {
 
 # Issue 47012
 
-## Unsafe Folding of Select with Variable Shift into Bitwise Mask
+## Unconditional Execution of Variable Shift in Select Folding
 
-**Description**
-The bug is triggered when the optimizer attempts to fold a `select` instruction that chooses between a bit-test result (derived from a shift instruction) and a constant. The optimization strategy converts this pattern into a sequence of bitwise operations (typically creating a mask via `shl` and combining it with `or`) to test the relevant bits in a single step.
+**Description**: 
+The bug is triggered when a conditional selection (`select`) between a constant and a bit-test involving a variable shift amount is folded into an unconditional sequence of bitwise operations and shifts. 
 
-The issue arises because the transformation unconditionally uses the shift amount from the original shift instruction to generate the mask. In the original IR, the `select` instruction acts as a filter: if the condition directs execution to the constant arm, the result of the shift is ignored. This means that if the shift amount is `poison` (or otherwise invalid), the `poison` value is suppressed and does not affect the return value. In the transformed IR, however, the shift amount is used to compute the mask regardless of the condition. If the shift amount is `poison`, the resulting mask and the subsequent computation become `poison`. This results in the target code evaluating to `poison` in cases where the source code would have returned a valid, non-poison constant.
+In the original code, the result of the shift operation is only evaluated if the `select` condition dictates it. If the variable shift amount is `poison` or out-of-bounds, the `poison` value can be safely ignored when the `select` instruction chooses the other, non-poisonous operand (such as a constant). 
+
+However, the optimization transforms this pattern into an unconditional sequence where the shift is always executed. If the variable shift amount is `poison` or out-of-bounds, the unconditional shift in the transformed code evaluates to `poison` and propagates it to the final result. By failing to account for the potential of variable shift amounts to introduce `poison` unconditionally, the transformation incorrectly makes the target code more poisonous than the source, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_unsafe_select_fold(i1 %cond, i32 %y) {
-  %mask = shl i32 1, %y
-  %res = select i1 %cond, i32 %mask, i32 0
-  ret i32 %res
+define i32 @test(i1 %cond, i32 %x, i32 %y) {
+entry:
+  %bit = shl i32 1, %y
+  %tst = and i32 %x, %bit
+  %sel = select i1 %cond, i32 %tst, i32 0
+  ret i32 %sel
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_unsafe_select_fold(i1 %cond, i32 %y) {
-  %zext = zext i1 %cond to i32
-  %res = shl i32 %zext, %y
-  ret i32 %res
+define i32 @test(i1 %cond, i32 %x, i32 %y) {
+entry:
+  %cond.ext = zext i1 %cond to i32
+  %shl = shl i32 %cond.ext, %y
+  %and = and i32 %x, %shl
+  ret i32 %and
 }
+
 ```
 
 
@@ -1096,35 +1519,36 @@ define i32 @test_unsafe_select_fold(i1 %cond, i32 %y) {
 
 # Issue 53252
 
-## Stale Predicate Variable in Clamp Canonicalization
+## Miscompilation in Clamp-Like Pattern Canonicalization Due to Stale Predicate
 
-**Description**
-The bug is triggered when the optimizer attempts to simplify a sequence of `select` instructions that resemble a "clamp" operation (limiting a value within a specific range). Specifically, the issue arises when the comparison predicate in the `select` condition uses a strict inequality (such as unsigned greater-than `ugt` or unsigned less-than-or-equal `ule`) that the optimizer tries to canonicalize into a non-strict form (such as `uge` or `ult`) by adjusting the comparison constant.
+**Description**: 
+The bug is triggered when the compiler attempts to optimize a clamp-like pattern composed of nested `select` instructions driven by integer comparisons (`icmp`). 
 
-During this canonicalization process, the optimizer correctly updates the constant operand (e.g., incrementing it) but fails to update the internal variable tracking the predicate type. Subsequent logic relies on this predicate variable to determine the orientation of the range bounds—specifically, whether to swap the lower and upper thresholds of the clamp. Because the variable retains the old, non-canonical predicate, the check fails, and the necessary swap is skipped. This results in the optimized code using incorrect bounds for the clamp, leading to a miscompilation where the wrong value is selected.
+During the optimization, if one of the comparisons uses a non-canonical predicate (such as an unsigned greater-than or unsigned less-than-or-equal), the compiler tries to canonicalize it to its flipped-strictness equivalent (e.g., converting `ugt` to `uge`, or `ule` to `ult`) by adjusting the comparison constant (e.g., adding 1). 
+
+However, the transformation logic fails to update its internal tracking of the predicate type after adjusting the constant. Later in the same optimization pass, the compiler relies on this predicate type to correctly assign or swap the high and low threshold values for the clamp operation. Because the tracked predicate is stale and does not reflect the canonicalized form, the necessary threshold adjustments (such as swapping the bounds for a greater-than-or-equal condition) are skipped. This results in an incorrect transformation where the replacement values for the clamp's upper and lower bounds are mixed up, leading to a miscompilation of the nested `select` instructions.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8 @test(i8 %a) {
-  %cmp1 = icmp ugt i8 %a, 4
-  %sel1 = select i1 %cmp1, i8 %a, i8 5
-  %cmp2 = icmp ult i8 %sel1, 2
-  %sel2 = select i1 %cmp2, i8 %sel1, i8 2
+define i8 @test_clamp(i8 %x) {
+entry:
+  %cmp1 = icmp ugt i8 %x, 10
+  %sel1 = select i1 %cmp1, i8 10, i8 %x
+  %cmp2 = icmp ule i8 %sel1, 4
+  %sel2 = select i1 %cmp2, i8 5, i8 %sel1
   ret i8 %sel2
 }
 ```
 ### Optimized IR
 ```llvm
-define i8 @test(i8 %a) {
-  %1 = call i8 @llvm.umax.i8(i8 %a, i8 2)
-  %2 = call i8 @llvm.umin.i8(i8 %1, i8 5)
-  ret i8 %2
+define i8 @test_clamp(i8 %x) {
+entry:
+  %0 = call i8 @llvm.umin.i8(i8 %x, i8 5)
+  %1 = call i8 @llvm.umax.i8(i8 %0, i8 10)
+  ret i8 %1
 }
-
-declare i8 @llvm.umax.i8(i8, i8)
-declare i8 @llvm.umin.i8(i8, i8)
 ```
 
 
@@ -1132,89 +1556,66 @@ declare i8 @llvm.umin.i8(i8, i8)
 
 # Issue 54077
 
-## Incorrect Propagation of Fast Math Flags in Select to Copysign Transformation
+## Incorrect Propagation of Fast-Math Flags in Select to Sign-Manipulation Transformation
 
-**Description**
-The bug is triggered when the compiler optimizes a code pattern that manually selects between floating-point constants based on the sign of a value (often implemented via bitcasts and integer comparisons) by replacing it with a `copysign` intrinsic. During this transformation, the optimizer incorrectly propagates Fast Math Flags (specifically "no signed zeros" or `nsz`) from the original `select` instruction to the newly generated instructions, such as the `copysign` call or an intermediate `fneg` instruction used to invert the sign argument.
+**Description**: 
+The bug is triggered when a conditional selection instruction (e.g., `select`) is used to choose between two floating-point constants with opposite signs, based on the sign bit of another floating-point value (typically extracted via a bitcast and integer comparison). 
 
-The issue arises because the `copysign` logic relies on the precise preservation of the sign bit to replicate the behavior of the original explicit sign check. However, the `nsz` flag permits the compiler to treat positive and negative zero as interchangeable. When this flag is applied to the generated instructions, the compiler may canonicalize the sign argument (e.g., converting `-0.0` to `+0.0`), causing `copysign` to produce a result with the wrong sign. This leads to a value mismatch between the original strict bitwise logic and the optimized floating-point logic when processing zero values.
+When the compiler optimizes this pattern by replacing the selection with floating-point sign-manipulation operations (such as `copysign` and `fneg`), it incorrectly propagates the fast-math flags (like `nsz` - no signed zeros) from the original selection instruction to the newly created floating-point instructions. 
+
+This improper propagation of fast-math flags alters the strict semantics of the sign manipulation. For example, applying the `nsz` flag to a negation operation allows the compiler to ignore the sign of zero, which changes the outcome of the subsequent `copysign` operation. This leads to a miscompilation where the transformed code produces an incorrect sign for edge cases like zero, diverging from the behavior of the original code.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_nsz_propagation(float %x) {
-  %i = bitcast float %x to i32
-  %cond = icmp slt i32 %i, 0
-  %r = select nsz i1 %cond, float -1.0, float 1.0
-  ret float %r
+define float @test(float %x) {
+  %bc = bitcast float %x to i32
+  %cmp = icmp slt i32 %bc, 0
+  %sel = select nsz i1 %cmp, float 1.000000e+00, float -1.000000e+00
+  ret float %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define float @test_nsz_propagation(float %x) {
-  %r = call nsz float @llvm.copysign.f32(float 1.0, float %x)
-  ret float %r
-}
-
 declare float @llvm.copysign.f32(float, float)
+
+define float @test(float %x) {
+  %neg = fneg nsz float %x
+  %sel = call nsz float @llvm.copysign.f32(float 1.000000e+00, float %neg)
+  ret float %sel
+}
 ```
 
 
 ---
 
-# Issue 55721
+# Issue 55150
 
-## Incorrect Replacement of PHI Node with Switch Condition by Ignoring Default Case
+## Incorrect Folding of Integer-to-Floating-Point-to-Integer Casts
 
-## Description
-The bug occurs in an optimization that attempts to replace a PHI node with the condition operand of a dominating `switch` instruction. This transformation is valid only if, for every control flow path from the `switch` to the PHI node, the value incoming to the PHI is equal to the value the `switch` condition must hold to take that path.
+**Description**: 
+The bug is triggered by a sequence of cast instructions where a wide integer is converted to a floating-point type, and then converted back to a narrower, signed integer type. The compiler attempts to optimize this sequence by folding it into a direct integer truncation. 
 
-The issue arises because the analysis logic verifies this relationship by iterating over the explicit cases of the `switch` instruction but fails to account for the `default` case. If the `default` case leads to the PHI node (either directly or via a shared successor), the `switch` condition can hold any value not covered by the explicit cases, while the PHI node typically receives a specific, fixed value for that path. Since the optimizer neglects to check the constraints of the `default` path, it incorrectly concludes that the PHI value is always equivalent to the `switch` condition. This leads to a miscompilation where the PHI node is replaced by the raw condition value, causing incorrect results when the execution falls through the `default` case.
+To determine if this transformation is safe, the compiler checks whether the intermediate floating-point type has a sufficient mantissa width to represent the destination integer's value exactly without precision loss. However, the optimization logic incorrectly subtracts one bit (intended to account for the sign bit) from the destination integer's bit width before comparing it against the floating-point mantissa width. 
+
+As a result, if the destination signed integer's bit width is exactly one bit larger than the floating-point mantissa width, the compiler erroneously concludes that the floating-point type has enough precision and performs the fold. For large input values, the initial integer-to-floating-point conversion may incur rounding. The direct integer truncation completely bypasses this rounding step, leading to a mismatch between the optimized output and the original execution, ultimately resulting in a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @bug_trigger(i32 %cond) {
-entry:
-  switch i32 %cond, label %sw.default [
-    i32 0, label %sw.bb
-  ]
-
-sw.bb:
-  br label %exit
-
-sw.default:
-  br label %exit
-
-exit:
-  ; The PHI node returns 0 if %cond is 0 (via sw.bb).
-  ; It returns 42 if %cond is not 0 (via sw.default).
-  ; The bug is that the optimizer sees the explicit case (0 -> 0) matches %cond,
-  ; but ignores the default case where %cond != 42.
-  %result = phi i32 [ 0, %sw.bb ], [ 42, %sw.default ]
-  ret i32 %result
+define i25 @test_cast(i32 %x) {
+  %f = sitofp i32 %x to float
+  %r = fptosi float %f to i25
+  ret i25 %r
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @bug_trigger(i32 %cond) {
-entry:
-  switch i32 %cond, label %sw.default [
-    i32 0, label %sw.bb
-  ]
-
-sw.bb:
-  br label %exit
-
-sw.default:
-  br label %exit
-
-exit:
-  ; The optimizer incorrectly replaced the PHI node with %cond.
-  ; If %cond is 5, this returns 5, whereas the original code returned 42.
-  ret i32 %cond
+define i25 @test_cast(i32 %x) {
+  %r = trunc i32 %x to i25
+  ret i25 %r
 }
 ```
 
@@ -1223,39 +1624,38 @@ exit:
 
 # Issue 55722
 
-## Invalid `inbounds` Preservation when Merging GetElementPtr Instructions with Opposing Offset Signs
+## Incorrect `inbounds` Preservation in GEP Merging with Mixed-Sign Indices
 
-## Description
-The bug is triggered when the optimizer merges two consecutive `getelementptr` (GEP) instructions into a single GEP instruction. When both original instructions are marked with the `inbounds` keyword, the optimizer attempts to preserve this property on the resulting merged instruction.
+**Description**
+The bug is triggered when the compiler optimizes a chain of `getelementptr` (GEP) instructions by merging them into a single GEP. When the original GEP instructions are marked with the `inbounds` flag, the compiler attempts to preserve this flag on the newly merged GEP. 
 
-The issue arises from how the merged GEP represents the combined offset. The optimization may restructure the address calculation by combining a positive offset from one GEP and a negative offset from the other into a sequence of indices on the new GEP. For instance, a net small negative offset might be represented in the merged GEP as a large negative step (e.g., decrementing a base array index) followed by a positive step (e.g., accessing a field within a struct).
+However, a miscompilation occurs if the combined offset is represented in the merged GEP using multiple constant indices that have mixed signs (e.g., a large negative index followed by a positive index). According to LLVM's `inbounds` semantics, not only the final computed address, but *every intermediate pointer calculation* within the GEP must remain within the bounds of the allocated object. 
 
-According to LLVM IR semantics, the `inbounds` keyword implies that not only the final address but also every intermediate address formed by the successive addition of indices must remain within the bounds of the allocated object. While the original sequence of instructions may have kept all intermediate values within bounds, the restructured calculation in the merged GEP can introduce an intermediate address that steps out of bounds (for example, stepping before the start of the allocation). By incorrectly retaining the `inbounds` keyword on this new calculation sequence, the optimizer transforms a valid pointer calculation into a poison value.
+When the merged GEP contains indices with different signs, an intermediate calculation might temporarily step out of bounds (e.g., moving far backward before moving forward again), even if the final overall offset is valid and in bounds. By unconditionally preserving the `inbounds` flag without ensuring that all constant indices share the same sign, the compiler violates the strict `inbounds` rules. This can lead to undefined behavior and incorrect subsequent optimizations that rely on the `inbounds` guarantee.
 
 ## Example
 
 ### Original IR
 ```llvm
-%struct.S = type { [100 x i8] }
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
 
-define i8* @test(%struct.S* %ptr) {
-  ; Step 1: Move forward 99 bytes (within the first struct)
-  %gep1 = getelementptr inbounds %struct.S, %struct.S* %ptr, i64 0, i32 0, i64 99
-  ; Step 2: Move backward 100 bytes (net offset -1 byte)
-  %gep2 = getelementptr inbounds i8, i8* %gep1, i64 -100
-  ret i8* %gep2
+define ptr @test(ptr %p) {
+entry:
+  %gep1 = getelementptr inbounds { i32, i32, i32, i32 }, ptr %p, i64 1
+  %gep2 = getelementptr inbounds i8, ptr %gep1, i64 -20
+  ret ptr %gep2
 }
 ```
 ### Optimized IR
 ```llvm
-%struct.S = type { [100 x i8] }
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
 
-define i8* @test(%struct.S* %ptr) {
-  ; Merged GEP: Decomposed into -1 struct index (-100 bytes) and +99 array index (+99 bytes)
-  ; This creates an intermediate address (%ptr - 100 bytes) which may be out of bounds
-  ; even if the final address (%ptr - 1 byte) is valid.
-  %gep2 = getelementptr inbounds %struct.S, %struct.S* %ptr, i64 -1, i32 0, i64 99
-  ret i8* %gep2
+define ptr @test(ptr %p) {
+entry:
+  %gep2 = getelementptr inbounds { i32, i32, i32, i32 }, ptr %p, i64 -1, i32 3
+  ret ptr %gep2
 }
 ```
 
@@ -1264,31 +1664,70 @@ define i8* @test(%struct.S* %ptr) {
 
 # Issue 57899
 
-## Incorrect Optimization of ZExt on Equality Comparison
+## Zero-Extension of Equality Comparison with Power-of-Two Constant
 
-**Description**
-The bug is triggered when the compiler optimizes a zero-extension (`zext`) instruction applied to an equality comparison (`icmp eq` or `icmp ne`). The issue arises specifically when comparing a value `X` against a constant `C` that is a power of two, under the condition that `X` is statically analyzed to have at most one specific bit potentially set (i.e., `X` is known to be either zero or a specific power of two).
+**Description:**
+The bug is triggered by a specific pattern of instructions involving an equality comparison (`icmp eq` or `icmp ne`) followed by a zero-extension (`zext`). The strategy to trigger this miscompilation involves the following conditions:
 
-The optimizer attempts to simplify the expression `zext(X == C)` by directly extracting the potentially set bit from `X` (e.g., by shifting `X` so that the bit moves to the least significant position). This transformation assumes that checking `X == C` is equivalent to checking if `X` is non-zero. However, this assumption is only valid if the bit position set in the constant `C` matches the bit position that can be set in `X`. The compiler fails to verify that these bit positions align. Consequently, if `X` has a potential bit at position $N$ and `C` has a bit at position $M$ (where $N \neq M$), the optimizer incorrectly transforms the comparison—which should be false—into a value that evaluates to true when `X` is non-zero.
+1. **Constrained Value:** A value `X` is generated such that the compiler's known bits analysis can determine it has at most one specific bit set (i.e., the value can only ever be `0` or a specific power of two). This can occur through masking operations or previous logical evaluations.
+2. **Equality Comparison:** This value `X` is compared against a constant `C` using an equality or inequality operator, where `C` is also a power of two. Crucially, the set bit in `C` is *different* from the potentially set bit in `X`.
+3. **Zero-Extension:** The boolean result of this comparison is then zero-extended to a wider integer type.
+
+When the compiler attempts to optimize this `zext(icmp eq/ne X, C)` pattern, it incorrectly assumes that the single potentially set bit in `X` aligns perfectly with the set bit in the constant `C`. Based on this flawed assumption, it transforms the zero-extended comparison directly into a sequence of bitwise shifts and logical XOR operations on `X`. Because it fails to verify that the bit positions actually match, comparing `X` against a mismatched power-of-two constant results in an incorrect folded value, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_bug(i8 %x) {
-  %masked = and i8 %x, 4
-  %cmp = icmp eq i8 %masked, 8
-  %res = zext i1 %cmp to i32
-  ret i32 %res
+define i32 @test(i32 %y) {
+entry:
+  %x = and i32 %y, 8
+  %cmp = icmp ne i32 %x, 2
+  %ext = zext i1 %cmp to i32
+  ret i32 %ext
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_bug(i8 %x) {
-  %masked = and i8 %x, 4
-  %shifted = lshr i8 %masked, 2
-  %res = zext i8 %shifted to i32
-  ret i32 %res
+define i32 @test(i32 %y) {
+entry:
+  %x = and i32 %y, 8
+  %0 = xor i32 %x, 2
+  %ext = lshr i32 %0, 1
+  ret i32 %ext
+}
+```
+
+
+---
+
+# Issue 59279
+
+## Incorrect Folding of Conditional Negation to Absolute Value Intrinsic
+
+**Description**
+The bug is triggered when a conditional selection (`select`) instruction chooses between a floating-point value and its negated form based on a comparison (e.g., checking if the value is less than or equal to zero). The compiler attempts to optimize this pattern by folding it into a floating-point absolute value (`fabs`) intrinsic. 
+
+This transformation is semantically incorrect when the input can be a NaN (Not-a-Number). The original `select` instruction preserves the exact NaN payload of the input when the condition selects the unmodified value. In contrast, the `fabs` intrinsic is not guaranteed to preserve the NaN payload and may produce a non-deterministic NaN result. Consequently, replacing the `select` with `fabs` alters the observable behavior of the program for NaN inputs, leading to a miscompilation unless fast-math flags (such as `nnan`) explicitly indicate that NaN inputs are not possible.
+
+## Example
+
+### Original IR
+```llvm
+define float @test(float %x) {
+  %cmp = fcmp ole float %x, 0.000000e+00
+  %neg = fneg float %x
+  %sel = select i1 %cmp, float %neg, float %x
+  ret float %sel
+}
+```
+### Optimized IR
+```llvm
+declare float @llvm.fabs.f32(float)
+
+define float @test(float %x) {
+  %1 = call float @llvm.fabs.f32(float %x)
+  ret float %1
 }
 ```
 
@@ -1297,35 +1736,47 @@ define i32 @test_bug(i8 %x) {
 
 # Issue 59836
 
-## Summary Title
-**Unsafe Optimization of Comparison Involving Wrapping Multiplication of Zero-Extended Operands**
+## Incorrect Transformation of Zero-Extended Multiplication to Overflow Intrinsic
 
-## Description
-The bug is triggered when the compiler optimizes an integer comparison (`icmp`) where one operand is a multiplication of two zero-extended values (e.g., `mul (zext A), (zext B)`). The optimization logic attempts to recognize this pattern as an overflow check or a range check on the product of `A` and `B`, transforming it into a canonical form that checks the properties of the full, non-overflowing product (often utilizing overflow intrinsics).
+**Description:**
+The bug involves a miscompilation in the instruction combiner when optimizing a comparison of a multiplication of zero-extended values. 
 
-The flaw in this strategy is the assumption that the multiplication instruction always computes the exact, full-precision product of the extended operands. However, if the bit width of the multiplication's result type is insufficient to hold the maximum possible product of `A` and `B` (i.e., the width is less than the sum of the widths of `A` and `B`), the multiplication wraps (performs modulo arithmetic). In such scenarios, the original code compares the wrapped result, whereas the optimized code behaves as if comparing the unwrapped, infinite-precision product. This discrepancy leads to incorrect execution when the multiplication actually overflows in the original program. The transformation is only valid if the multiplication is guaranteed not to wrap (e.g., it has the `nuw` flag).
+The triggering strategy requires the following pattern:
+1. Two values of a smaller integer type are zero-extended (`zext`) to a wider integer type.
+2. A multiplication (`mul`) is performed on these zero-extended values in the wider type. Crucially, the wider type must not be large enough to prevent unsigned wrapping (i.e., its bitwidth is strictly less than twice the bitwidth of the smaller type), allowing the multiplication to wrap around.
+3. The result of the multiplication is compared (`icmp`) against a constant, typically the maximum value of the smaller type, to check if it exceeds a certain bound.
+
+When this pattern is encountered, the compiler erroneously assumes that the multiplication in the wider type does not wrap. It then transforms the multiplication and comparison into an unsigned multiplication with overflow intrinsic (`umul.with.overflow`) operating on the original, smaller type. 
+
+This transformation is invalid because the multiplication in the wider type can experience unsigned wrapping. When it wraps, the truncated result might satisfy the comparison condition (e.g., evaluating to true). However, the `umul.with.overflow` intrinsic evaluates the true mathematical product and correctly identifies that it overflows the smaller type, leading to an inverted or incorrect boolean result. 
+
+The issue is triggered because the compiler failed to verify that the multiplication in the extended type is free of unsigned wrapping before applying the optimization. By ensuring the transformation only occurs when the multiplication is explicitly marked with the `nuw` (No Unsigned Wrap) flag, the compiler guarantees that the multiplication does not wrap in the extended type, making the conversion to the overflow intrinsic safe.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_unsafe_mul_opt(i8 %a, i8 %b) {
-  %ext_a = zext i8 %a to i12
-  %ext_b = zext i8 %b to i12
-  %mul = mul i12 %ext_a, %ext_b
-  %cmp = icmp ugt i12 %mul, 4000
+define i1 @test(i8 %a, i8 %b) {
+entry:
+  %a.ext = zext i8 %a to i15
+  %b.ext = zext i8 %b to i15
+  %mul = mul i15 %a.ext, %b.ext
+  %cmp = icmp ugt i15 %mul, 255
   ret i1 %cmp
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_unsafe_mul_opt(i8 %a, i8 %b) {
-  %ext_a = zext i8 %a to i16
-  %ext_b = zext i8 %b to i16
-  %mul = mul i16 %ext_a, %ext_b
-  %cmp = icmp ugt i16 %mul, 4000
+declare { i8, i1 } @llvm.umul.with.overflow.i8(i8, i8)
+
+define i1 @test(i8 %a, i8 %b) {
+entry:
+  %0 = call { i8, i1 } @llvm.umul.with.overflow.i8(i8 %a, i8 %b)
+  %cmp = extractvalue { i8, i1 } %0, 1
   ret i1 %cmp
 }
+
 ```
 
 
@@ -1333,61 +1784,36 @@ define i1 @test_unsafe_mul_opt(i8 %a, i8 %b) {
 
 # Issue 60906
 
-## Unsafe Sinking of Integer Division/Remainder Past Select Instruction
+## Sinking Division/Remainder Operations After Select with Poison Condition Introduces Undefined Behavior
 
-## Description
-The bug is triggered when the optimizer attempts to reduce code size by sinking an integer division or remainder operation (such as `sdiv`, `udiv`, `srem`, or `urem`) through a `select` instruction. This optimization targets patterns where a `select` chooses between two division/remainder operations that share a common operand (e.g., `select(cond, X / Y, X / Z)`). The optimizer transforms this into a single operation where the differing operand is selected first (e.g., `X / select(cond, Y, Z)`).
+**Description:**
+The bug is triggered by an optimization that attempts to sink division or remainder operations (such as `sdiv`, `srem`, `udiv`, or `urem`) after a `select` instruction. When a `select` chooses between the results of two division or remainder operations that share a common operand (either the dividend or the divisor), the compiler transforms this pattern into a single division/remainder operation. In this transformed code, the non-common operands are chosen by a newly formed `select` instruction, which then feeds into the division/remainder.
 
-This transformation is incorrect when the condition of the `select` instruction is poison. In the original code, if the divisors (`Y` and `Z`) are safe (non-zero) values, the operations are well-defined, and a poison condition merely results in a poison output without side effects. However, in the transformed code, a poison condition causes the `select` to produce a poison value as the new operand for the division/remainder. Since integer division or remainder with a poison divisor (or a poison dividend in signed cases susceptible to overflow) is treated as Undefined Behavior (because poison can be refined to values like zero), the transformation introduces immediate Undefined Behavior in scenarios where the original code was safe.
+This transformation becomes unsafe if the condition of the `select` can evaluate to `poison`. In the original code, a `poison` condition simply causes the `select` instruction to yield a `poison` result. As long as the original division/remainder operations are safe (e.g., no division by zero), no immediate Undefined Behavior (UB) occurs. 
+
+However, in the optimized code, the `poison` condition causes the new `select` to evaluate to `poison`, which is subsequently used as an operand in the newly formed division/remainder instruction. This can introduce immediate UB that did not exist in the original program. For example:
+- If the `poison` value is used as a divisor, it can dynamically take the value of `0`, leading to a division-by-zero UB.
+- If the `poison` value is used as a dividend in a signed division or remainder, it can dynamically take the value of the minimum representable integer (`INT_MIN`) while the divisor is `-1`, triggering a signed overflow UB. 
+
+By failing to account for the `poison` condition, the optimization incorrectly converts a safe propagation of `poison` into immediate Undefined Behavior.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_unsafe_sink(i1 %cond, i32 %x) {
-  %div1 = sdiv i32 %x, 42
-  %div2 = sdiv i32 %x, 24
+define i32 @test(i1 %cond, i32 %a, i32 %b, i32 %c) {
+  %div1 = sdiv i32 %a, %b
+  %div2 = sdiv i32 %a, %c
   %res = select i1 %cond, i32 %div1, i32 %div2
   ret i32 %res
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_unsafe_sink(i1 %cond, i32 %x) {
-  %1 = select i1 %cond, i32 42, i32 24
-  %res = sdiv i32 %x, %1
+define i32 @test(i1 %cond, i32 %a, i32 %b, i32 %c) {
+  %sel = select i1 %cond, i32 %b, i32 %c
+  %res = sdiv i32 %a, %sel
   ret i32 %res
-}
-```
-
-
----
-
-# Issue 62401
-
-## Unsafe expansion of urem to select with duplicated undef operands
-
-**Description**: 
-The bug is triggered when the compiler optimizes an unsigned remainder (`urem`) instruction where the divisor is a sign-extended boolean value (which results in either 0 or -1). The optimization attempts to replace the arithmetic operation `urem %y, -1` with a logically equivalent `select` sequence: `(%y == -1) ? 0 : %y`.
-
-The issue arises because the transformation duplicates the dividend operand (`%y`), using it once in the comparison condition and again as the "false" value of the `select` instruction. In LLVM IR, multiple uses of an `undef` value can independently resolve to different concrete values. This allows a scenario where the comparison `(%y == -1)` resolves to false (implying `%y` is not -1), but the `%y` returned by the `select` resolves to -1. Consequently, the transformed code can return -1. However, in the original `urem` operation, if the input is -1, the result is 0; if the input is not -1, the result is the input itself (which is not -1). Therefore, the original instruction can never produce -1. The transformation introduces a value that was impossible in the original program, leading to a miscompilation.
-
-## Example
-
-### Original IR
-```llvm
-define i8 @test(i1 %c) {
-  %ext = sext i1 %c to i8
-  %rem = urem i8 undef, %ext
-  ret i8 %rem
-}
-```
-### Optimized IR
-```llvm
-define i8 @test(i1 %c) {
-  %cmp = icmp eq i8 undef, -1
-  %rem = select i1 %cmp, i8 0, i8 undef
-  ret i8 %rem
 }
 ```
 
@@ -1396,35 +1822,38 @@ define i8 @test(i1 %c) {
 
 # Issue 70509
 
-## Incorrect Fallback Transformation for Multi-Use Arithmetic Shifts in Comparisons
+## Miscompilation of `icmp` with `ashr` and a Constant Due to Single-Use Restriction
 
-## Description
-The bug is triggered at the LLVM IR level when the optimizer processes an integer comparison (`icmp`) instruction that uses the result of an arithmetic shift right (`ashr`) instruction with a constant shift amount. The specific condition required to trigger the issue is that the `ashr` instruction must have **multiple uses** (i.e., its result is consumed by the comparison and at least one other instruction).
+**Description:**
+The bug is triggered by an LLVM IR pattern involving an arithmetic right shift (`ashr`) instruction that has multiple uses, where at least one of its uses is an integer comparison (`icmp`) against a constant value. This pattern frequently arises from sign extensions (often represented as a shift left followed by an arithmetic shift right) that are stored to multiple variables or used in multiple expressions before being compared to a constant.
 
-In the faulty optimization logic, a specialized handler designed to correctly transform `ashr` comparisons is guarded by a check that restricts its application to instructions with a single use. When the `ashr` instruction has multiple uses, this correct handler is skipped. Consequently, the execution flow falls through to a subsequent, more generic transformation logic. This generic logic fails to properly account for the sign-extension behavior of arithmetic shifts, effectively treating the `ashr` as a logical shift (`lshr`) or a generic binary operation. This results in an invalid simplification of the comparison—such as incorrect constant folding or predicate modification—leading to runtime miscompilations, particularly when the shifted value is negative.
+When the compiler's optimization pass attempts to fold the comparison, a strict single-use restriction incorrectly prevents the application of a safe, exact folding rule for the `ashr` instruction. Because this correct folding path is skipped, the optimization logic falls through to an alternative, more general folding path. This fallback path contains flawed logic for handling arithmetic shifts, resulting in an invalid transformation of the comparison instruction. Consequently, the comparison yields an incorrect boolean result, leading to a miscompilation of the program's control flow or logic.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(i8 %x) {
-  %y = ashr i8 %x, 4
-  %z = icmp ugt i8 %y, 15
-  call void @use(i8 %y)
-  ret i1 %z
+define i1 @test(i32 %x, ptr %p) {
+entry:
+  %shl = shl i32 %x, 24
+  %ashr = ashr exact i32 %shl, 24
+  store i32 %ashr, ptr %p, align 4
+  %cmp = icmp eq i32 %ashr, 2
+  ret i1 %cmp
 }
 
-declare void @use(i8)
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(i8 %x) {
-  %y = ashr i8 %x, 4
-  call void @use(i8 %y)
-  ret i1 false
+define i1 @test(i32 %x, ptr %p) {
+entry:
+  %shl = shl i32 %x, 24
+  %ashr = ashr exact i32 %shl, 24
+  store i32 %ashr, ptr %p, align 4
+  %cmp = icmp eq i32 %shl, 2
+  ret i1 %cmp
 }
 
-declare void @use(i8)
 ```
 
 
@@ -1432,29 +1861,35 @@ declare void @use(i8)
 
 # Issue 72927
 
-## Incorrect Non-Negative Inference for Zero-Extension Used as Shift Amount
+## Incorrect `nneg` Inference on Zero-Extension Used as Shift Amount
 
-**Description**:
-The bug is triggered when the optimizer incorrectly infers the `nneg` (non-negative) flag for a zero-extension (`zext`) instruction that is used as the shift amount operand in a shift instruction. 
+**Description:**
+The bug is triggered when a zero-extension (`zext`) instruction is used exclusively as the shift amount for a shift operation, and the bit width of the shifted type is sufficiently large compared to the source type of the extension.
 
-The optimization relies on the constraint that a shift amount must be strictly less than the bit width of the type being shifted to be well-defined. The compiler assumes that this upper bound on the value implies the value is always "small" and therefore non-negative within the smaller source type of the `zext`. However, this assumption fails when the bit width of the shifted type is large enough to allow shift amounts that, while valid for the shift, correspond to negative values (values with the sign bit set) in the `zext`'s source type. By adding the `nneg` flag in these cases, the compiler incorrectly asserts that the source value must be positive, turning valid shift operations into undefined behavior.
+In LLVM, a shift amount must be strictly less than the bit width of the shifted type to be well-defined; otherwise, it results in a poison value. The compiler attempts to optimize the `zext` instruction by adding the `nneg` (non-negative) flag, under the assumption that any valid shift amount is small enough that its sign bit would always be zero in the original source type. 
+
+However, the compiler's validation logic for this optimization was flawed. It only checked if the source type's bit width was greater than a small, hardcoded constant (e.g., 2 bits), rather than properly comparing it against the maximum possible valid shift amount determined by the destination type's bit width. 
+
+If the shifted type is very wide (e.g., 256 bits), the maximum valid shift amount (e.g., 255) requires multiple bits to represent. If the source type of the `zext` is relatively small (e.g., `i8`), a valid shift amount like 255 will have its highest bit set, meaning it is actually a negative value in the context of that smaller signed type (e.g., 255 is `-1` in `i8`). 
+
+By constructing a sequence where a small integer is zero-extended and used as a shift amount for a wide integer type, the compiler incorrectly assumes the source value is always non-negative and erroneously applies the `nneg` flag to the `zext` instruction. This false assertion about the value's sign propagates incorrect assumptions, leading to miscompilations in subsequent optimization passes.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i256 @trigger(i8 %x, i256 %y) {
-  %z = zext i8 %x to i256
-  %s = shl i256 %y, %z
-  ret i256 %s
+define i256 @test(i256 %a, i8 %b) {
+  %ext = zext i8 %b to i256
+  %shl = shl i256 %a, %ext
+  ret i256 %shl
 }
 ```
 ### Optimized IR
 ```llvm
-define i256 @trigger(i8 %x, i256 %y) {
-  %z = zext nneg i8 %x to i256
-  %s = shl i256 %y, %z
-  ret i256 %s
+define i256 @test(i256 %a, i8 %b) {
+  %ext = zext nneg i8 %b to i256
+  %shl = shl i256 %a, %ext
+  ret i256 %shl
 }
 ```
 
@@ -1463,30 +1898,30 @@ define i256 @trigger(i8 %x, i256 %y) {
 
 # Issue 74739
 
-## Incorrect Retention of Poison-Generating Flags During Associative Constant Folding
+## Failure to Drop Poison-Generating Flags in Associative Binary Operations with Casts
 
-**Description**:
-The bug is triggered during an optimization pass that simplifies chains of associative binary operations (such as bitwise OR or integer addition) interrupted by a cast instruction. The transformation identifies a pattern where an inner binary operation with a constant operand is followed by a cast, which is then followed by an outer binary operation with another constant operand (e.g., `(Cast (Op X, C1)) Op C2`).
+**Description**: 
+The bug is triggered when the compiler optimizes a sequence of associative binary operations separated by a cast instruction (e.g., an expression matching the pattern `op1(cast(op2(X, C1)), C2)`). During this optimization, the compiler attempts to simplify the expression by folding the constants (`C1` and `C2`) across the cast, subsequently updating the operands of the outer binary operator (`op1`). 
 
-The optimization attempts to fold the two constants (`C1` and `C2`) together and reassociate the expression to reduce instruction count. The flaw in the logic is that it correctly updates the operands of the outer binary operation but fails to remove its poison-generating flags (such as `disjoint`, `nsw`, or `nuw`). These flags assert strict constraints on the operands, such as the absence of overlapping bits or signed overflow. Because the operands have been modified by the reassociation, the original constraints may no longer hold. Consequently, the transformed instruction incorrectly evaluates to a `poison` value when these conditions are violated, leading to miscompilation.
+The incorrect transformation logic lies in the fact that the compiler fails to drop the poison-generating flags (such as `nsw`, `nuw`, or `disjoint`) from the outer binary operator after its operands are modified. Because the newly folded operands may no longer satisfy the strict conditions required by the original flags, retaining them is unsafe. This oversight causes the modified instruction to incorrectly generate a poison value during execution, which then propagates through the program and results in a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i16 @test(i8 %x) {
-  %inner = or i8 %x, 1
-  %cast = zext i8 %inner to i16
-  %outer = or disjoint i16 %cast, 2
-  ret i16 %outer
+define i32 @test(i8 %x) {
+  %or1 = or i8 %x, 1
+  %ext = zext i8 %or1 to i32
+  %or2 = or disjoint i32 %ext, 2
+  ret i32 %or2
 }
 ```
 ### Optimized IR
 ```llvm
-define i16 @test(i8 %x) {
-  %cast = zext i8 %x to i16
-  %outer = or disjoint i16 %cast, 3
-  ret i16 %outer
+define i32 @test(i8 %x) {
+  %ext = zext i8 %x to i32
+  %or2 = or disjoint i32 %ext, 3
+  ret i32 %or2
 }
 ```
 
@@ -1495,70 +1930,170 @@ define i16 @test(i8 %x) {
 
 # Issue 76441
 
-## Incorrect Constant Extension in Inverted Addition Optimization
+## Incorrect Constant Extension in Addition of Inverted Values for Large Integer Types
 
-**Description**
-The bug is triggered when the compiler optimizes an addition instruction where both operands are identified as bitwise-inverted values (e.g., `~A + ~B`). The optimizer attempts to simplify this pattern into an equivalent subtraction form: `-2 - (A + B)`.
+**Description**: 
+The bug is triggered when the compiler attempts to optimize an addition instruction where both operands are bitwise inverted values (e.g., `~A + ~B`). The optimization logic tries to fold this pattern into a subtraction of their sum from the constant `-2` (i.e., `-2 - (A + B)`). 
 
-The issue arises from how the constant `-2` is generated for this transformation. The compiler uses a method that interprets the immediate value `-2` as a 64-bit integer and zero-extends it to the bit width of the operation's type. When the target type is wider than 64 bits (such as `i128`), this results in a large positive constant (representing `2^64 - 2`) rather than the intended sign-extended negative value. Consequently, the transformed expression computes an incorrect result for wide integer types.
+However, when the integer type of the operation is larger than 64 bits (such as `i128`), the constant `-2` is incorrectly zero-extended instead of sign-extended during the creation of the new subtraction instruction. Because the internal representation of the constant defaults to a 64-bit integer, zero-extending `-2` (which is `0xFFFFFFFFFFFFFFFE`) to a wider type results in the upper bits being erroneously set to zero rather than one. This leads to a miscompilation where the transformed subtraction uses an incorrect large positive constant instead of the intended `-2`.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i128 @test_incorrect_const_ext(i128 %a, i128 %b) {
+define i128 @test(i128 %a, i128 %b) {
+entry:
   %not_a = xor i128 %a, -1
   %not_b = xor i128 %b, -1
-  %res = add i128 %not_a, %not_b
-  ret i128 %res
+  %add = add i128 %not_a, %not_b
+  ret i128 %add
+}
+
+```
+### Optimized IR
+```llvm
+define i128 @test(i128 %a, i128 %b) {
+entry:
+  %0 = add i128 %a, %b
+  %1 = sub i128 18446744073709551614, %0
+  ret i128 %1
+}
+
+```
+
+
+---
+
+# Issue 78024
+
+## Incorrect Folding of Pointer Comparisons with `inttoptr` Casts from Larger Integer Types
+
+**Description**: 
+The bug is triggered when a comparison instruction (`icmp`) evaluates two pointers that are the result of `inttoptr` casts from integer values. Specifically, this occurs when the source integer type has a larger bit width than the destination pointer type, meaning the `inttoptr` cast implicitly truncates the upper bits of the integers. 
+
+The optimization incorrectly folds the pointer comparison into a direct comparison of the original source integers. This transformation is semantically incorrect because the direct integer comparison evaluates the full width of the integers, including the upper bits that would have been discarded during the cast to the smaller pointer type. As a result, the folded comparison may yield a different boolean outcome than the original pointer comparison, leading to a miscompilation.
+
+## Example
+
+### Original IR
+```llvm
+target datalayout = "p:32:32"
+
+define i1 @test_inttoptr_cmp(i64 %x, i64 %y) {
+  %p1 = inttoptr i64 %x to ptr
+  %p2 = inttoptr i64 %y to ptr
+  %cmp = icmp eq ptr %p1, %p2
+  ret i1 %cmp
 }
 ```
 ### Optimized IR
 ```llvm
-define i128 @test_incorrect_const_ext(i128 %a, i128 %b) {
-  %1 = add i128 %a, %b
-  %res = sub i128 18446744073709551614, %1
-  ret i128 %res
+target datalayout = "p:32:32"
+
+define i1 @test_inttoptr_cmp(i64 %x, i64 %y) {
+  %cmp = icmp eq i64 %x, %y
+  ret i1 %cmp
 }
 ```
 
 
 ---
 
-# Issue 85536
+# Issue 82052
 
-## Summary Title
-Speculation of Instructions with UB-Implying Attributes into Select Operands
+## Incorrect Replacement of Vector Binary Operation with Poisoned Shuffle Equivalent
 
-## Description
-The bug is triggered when the optimizer attempts to fold an instruction that operates on the result of a `select` instruction into the operands of that `select`. This transformation involves cloning the instruction and applying it speculatively to both the true and false input values of the `select`, effectively hoisting the operation before the selection logic.
+**Description**:
+The bug is triggered by an interaction between vector demanded elements optimization and binary operation deduplication. The strategy to trigger this miscompilation involves the following sequence of vector operations:
 
-The issue arises because the cloned instructions retain attributes and metadata (such as `noundef`, `nonnull`, or range constraints) that imply Undefined Behavior (UB) if their inputs do not satisfy specific conditions. In the original program, the instruction is only executed on the selected value, which is implicitly guaranteed to be valid for that operation. However, the transformation speculates the instruction on the unselected value as well. If the unselected value violates the strict attributes of the instruction (e.g., it is `poison` or out of range), the transformed code introduces UB on a valid execution path where the operation would not have originally occurred on that value. This incorrect introduction of UB allows the compiler to erroneously optimize away valid code, leading to miscompilation.
+1. **Initial Setup**: Create a vector shuffle operation that broadcasts a specific lane (e.g., lane 0) of a base vector. 
+2. **First Binary Operation**: Create a binary operation (`Op1`) that takes the shuffled vector and a second vector as operands.
+3. **Second Binary Operation**: Create another binary operation (`Op2`) of the same type, but using the original, unshuffled base vector and the same second vector operand.
+4. **Demanded Elements Optimization**: Use the result of `Op1` in such a way that its 0-th lane is not demanded (for example, by extracting only a different lane). The compiler recognizes this and optimizes the shuffle mask by replacing the unneeded 0-th index with `poison`.
+5. **Demand the Original Lane**: Use the result of `Op2` in a way that its 0-th lane *is* demanded (for example, by shuffling or broadcasting it to other lanes that are subsequently extracted and returned).
+6. **Flawed Deduplication**: During optimization, the compiler attempts to simplify the IR by replacing `Op2` with `Op1`. To do this, it checks if `Op1`'s shuffle mask is a zero-broadcast mask. Because the compiler's pattern matching treats `poison` as a wildcard that can match zero, it incorrectly assumes the `<poison, 0, ...>` mask is a safe zero-broadcast mask and replaces `Op2` with `Op1`.
+7. **Miscompilation**: Since `Op1` evaluates to `poison` in its 0-th lane, replacing `Op2` with `Op1` inadvertently poisons the 0-th lane of the result. Because subsequent operations actually demand the 0-th lane of `Op2`, this `poison` value propagates to the final observable output, leading to incorrect program behavior.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_bug(i1 %cond, i32 %a) {
-  %sel = select i1 %cond, i32 %a, i32 poison
-  %res = call i32 @speculatable_fn(i32 noundef %sel)
-  ret i32 %res
+define <2 x i32> @test(<2 x i32> %base, <2 x i32> %v2) {
+  ; 1. Initial Setup: Broadcast lane 0 of %base
+  %shuf = shufflevector <2 x i32> %base, <2 x i32> poison, <2 x i32> zeroinitializer
+  
+  ; 2. First Binary Operation: Op1 uses the shuffled vector
+  %op1 = add <2 x i32> %shuf, %v2
+  
+  ; 3. Second Binary Operation: Op2 uses the original base vector
+  %op2 = add <2 x i32> %base, %v2
+  
+  ; 4. Demanded Elements Optimization: Demand only lane 1 of Op1
+  %ext1 = extractelement <2 x i32> %op1, i32 1
+  
+  ; 5. Demand the Original Lane: Broadcast lane 0 of Op2
+  %shuf2 = shufflevector <2 x i32> %op2, <2 x i32> poison, <2 x i32> zeroinitializer
+  
+  ; Combine results to ensure both are used and returned
+  %res = insertelement <2 x i32> %shuf2, i32 %ext1, i32 1
+  ret <2 x i32> %res
 }
-
-declare i32 @speculatable_fn(i32 noundef) #0
-attributes #0 = { speculatable willreturn memory(none) }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_bug(i1 %cond, i32 %a) {
-  %1 = call i32 @speculatable_fn(i32 noundef %a)
-  %2 = call i32 @speculatable_fn(i32 noundef poison)
-  %res = select i1 %cond, i32 %1, i32 %2
-  ret i32 %res
+define <2 x i32> @test(<2 x i32> %base, <2 x i32> %v2) {
+  ; 4. The unneeded 0-th index of %shuf is replaced with poison
+  %shuf = shufflevector <2 x i32> %base, <2 x i32> poison, <2 x i32> <i32 poison, i32 0>
+  
+  %op1 = add <2 x i32> %shuf, %v2
+  %ext1 = extractelement <2 x i32> %op1, i32 1
+  
+  ; 6 & 7. Flawed Deduplication & Miscompilation:
+  ; The compiler incorrectly assumes %shuf is a safe zero-broadcast mask,
+  ; replaces the use of Op2 (%shuf2) with Op1, and inadvertently poisons lane 0.
+  %res = insertelement <2 x i32> poison, i32 %ext1, i32 1
+  ret <2 x i32> %res
 }
+```
 
-declare i32 @speculatable_fn(i32 noundef) #0
-attributes #0 = { speculatable willreturn memory(none) }
+
+---
+
+# Issue 84025
+
+## Incorrect Shift Calculation when Converting Wide Integer Bitcasts to Vector Insertions
+
+**Description**
+
+The bug is triggered by a sequence of instructions that pack scalar variables and constants into a wide integer, which is subsequently bitcasted to a vector type. The packing typically involves zero-extensions, bitwise shifts (e.g., `shl`), and bitwise combinations (e.g., `or`).
+
+When the compiler attempts to optimize this pattern, it tries to replace the wide integer operations and the bitcast with a series of `insertelement` instructions that construct the vector directly. To do this, it recursively traverses the integer expression tree, keeping track of the accumulated bit shift to determine which vector lane each part of the integer belongs to.
+
+The miscompilation occurs when the traversal encounters a constant value. The optimization logic attempts to slice the constant into vector-element-sized pieces. However, it incorrectly adds the accumulated shift to the local element offset when calculating how much to right-shift the constant to extract the piece. This effectively applies the accumulated shift twice—once when extracting the piece from the constant, and again when determining the piece's position in the final vector. 
+
+Consequently, the constant's bits are shifted by an excessively large amount, often shifting them out of bounds or placing them into the wrong vector lane. This results in the constant being erroneously dropped or corrupted in the optimized vector representation.
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i32> @test(i32 %x) {
+entry:
+  %x.ext = zext i32 %x to i64
+  %or = or i64 %x.ext, 42
+  %shl = shl i64 %or, 32
+  %vec = bitcast i64 %shl to <2 x i32>
+  ret <2 x i32> %vec
+}
+```
+### Optimized IR
+```llvm
+define <2 x i32> @test(i32 %x) {
+entry:
+  %0 = insertelement <2 x i32> poison, i32 0, i64 0
+  %1 = insertelement <2 x i32> %0, i32 %x, i64 1
+  ret <2 x i32> %1
+}
 ```
 
 
@@ -1566,37 +2101,43 @@ attributes #0 = { speculatable willreturn memory(none) }
 
 # Issue 89338
 
-## Incorrect Canonicalization of Funnel Shift Right to Funnel Shift Left
+## Incorrect Conversion Between Funnel Shift Intrinsics with Zero Shift Amount
 
 **Description**
-The bug is triggered when the optimizer attempts to canonicalize a funnel shift right (`fshr`) intrinsic into a funnel shift left (`fshl`) intrinsic. The transformation logic relies on the mathematical relationship that shifting right by `N` is often equivalent to shifting left by `BitWidth - N`. Consequently, the optimizer rewrites `fshr(Op0, Op1, ShiftAmt)` as `fshl(Op0, Op1, BitWidth - ShiftAmt)`.
 
-However, this transformation is invalid when the `ShiftAmt` is zero (or a multiple of the bit width). In the case of a zero shift:
-*   `fshr(Op0, Op1, 0)` returns the second operand (`Op1`), as it extracts the lower bits of the concatenated value.
-*   `fshl(Op0, Op1, 0)` returns the first operand (`Op0`), as it extracts the upper bits of the concatenated value (note that `BitWidth - 0` modulo `BitWidth` is `0`).
+The bug occurs during the optimization of funnel shift intrinsics, specifically when the compiler attempts to convert a funnel shift right (`fshr`) into a funnel shift left (`fshl`). The transformation logic assumes that a right shift by an amount `C` is equivalent to a left shift by the complementary amount `BitWidth - C`. 
 
-The optimizer failed to verify that the shift amount was non-zero before applying this transformation. As a result, when the shift amount is effectively zero, the transformed code returns the wrong operand (`Op0` instead of `Op1`), leading to a miscompilation.
+However, this equivalence breaks down when the effective shift amount (i.e., the shift amount modulo the bitwidth) is zero. Funnel shifts concatenate two operands and extract a bitwidth-sized value, meaning a shift amount of zero has distinct, direction-dependent behaviors:
+- A funnel shift right by zero extracts and returns the **second** operand.
+- A funnel shift left by zero extracts and returns the **first** operand.
+
+When the original shift amount `C` is zero or a multiple of the bitwidth, the complementary shift amount `BitWidth - C` also evaluates to zero modulo the bitwidth. By blindly replacing the `fshr` instruction with an `fshl` instruction, the compiler inadvertently changes the semantics of the operation: it will incorrectly return the first operand instead of the second operand.
+
+To trigger this bug at the LLVM IR level, one can construct a funnel shift right (`fshr`) instruction where:
+1. The first and second operands are different values.
+2. The shift amount (or at least one element's shift amount, in the case of vectors) evaluates to zero modulo the bitwidth.
+
+The compiler will erroneously transform this into a funnel shift left (`fshl`), leading to a miscompilation where the resulting value is taken from the wrong operand.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_canonicalize_fshr(i32 %op0, i32 %op1, i32 %amt) {
-  %res = call i32 @llvm.fshr.i32(i32 %op0, i32 %op1, i32 %amt)
-  ret i32 %res
-}
+declare <2 x i32> @llvm.fshr.v2i32(<2 x i32>, <2 x i32>, <2 x i32>)
 
-declare i32 @llvm.fshr.i32(i32, i32, i32)
+define <2 x i32> @test_fshr_to_fshl(<2 x i32> %x, <2 x i32> %y) {
+  %res = call <2 x i32> @llvm.fshr.v2i32(<2 x i32> %x, <2 x i32> %y, <2 x i32> <i32 0, i32 7>)
+  ret <2 x i32> %res
+}
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_canonicalize_fshr(i32 %op0, i32 %op1, i32 %amt) {
-  %sub = sub i32 32, %amt
-  %res = call i32 @llvm.fshl.i32(i32 %op0, i32 %op1, i32 %sub)
-  ret i32 %res
-}
+declare <2 x i32> @llvm.fshl.v2i32(<2 x i32>, <2 x i32>, <2 x i32>)
 
-declare i32 @llvm.fshl.i32(i32, i32, i32)
+define <2 x i32> @test_fshr_to_fshl(<2 x i32> %x, <2 x i32> %y) {
+  %res = call <2 x i32> @llvm.fshl.v2i32(<2 x i32> %x, <2 x i32> %y, <2 x i32> <i32 32, i32 25>)
+  ret <2 x i32> %res
+}
 ```
 
 
@@ -1604,29 +2145,33 @@ declare i32 @llvm.fshl.i32(i32, i32, i32)
 
 # Issue 89500
 
-## Incorrect Poison Propagation in Select Folding with Bitwise Not
+## Poison Propagation in Select Folding with Poisonous Vector Constants
 
-**Description**
-The bug is triggered when the compiler optimizes a `select` instruction by replacing it with its "false" operand, relying on a logical equivalence between the "true" and "false" branches when the condition (an equality comparison) is met. This optimization specifically targets patterns involving bitwise operations, where the "false" operand is constructed using a bitwise NOT operation (represented in LLVM IR as an XOR with an all-ones constant).
+**Description**: 
+The bug is triggered by a transformation that folds a vector `select` instruction by replacing it entirely with one of its operands (e.g., the false value). 
 
-The vulnerability lies in the pattern matching logic for the bitwise NOT operation, which incorrectly treats vector constants containing `poison` elements as valid all-ones masks. If the constant mask used for the NOT operation contains `poison`, the resulting value becomes `poison` in the corresponding vector lanes. When the optimizer unconditionally replaces the `select` with this "false" operand, it introduces `poison` into lanes that would have otherwise yielded a well-defined value from the "true" branch. This causes the transformed code to be more poisonous than the original source, resulting in a miscompilation.
+The issue occurs when the chosen operand is derived from an operation that uses a vector constant containing `poison` elements. For example, a bitwise `not` operation is often represented as an `xor` with an all-ones vector, and the compiler's pattern matcher may allow some lanes of this all-ones vector to be `poison`. 
+
+In the original code, the `select` instruction acts as a shield: for the vector lanes where the constant has `poison`, the `select` condition might evaluate such that it picks the other operand (which may be non-poisonous). 
+
+When the optimization removes the `select` and substitutes it with the operand containing the poisonous constant, the `poison` elements unconditionally propagate to the result. This causes the transformed code to produce `poison` in lanes where the original code produced valid values, resulting in a "target is more poisonous than source" miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i8> @test(<2 x i8> %a) {
-  %not = xor <2 x i8> %a, <i8 -1, i8 poison>
-  %cmp = icmp eq <2 x i8> %a, zeroinitializer
-  %sel = select <2 x i1> %cmp, <2 x i8> <i8 -1, i8 -1>, <2 x i8> %not
-  ret <2 x i8> %sel
+define <2 x i32> @test(<2 x i32> %x) {
+  %cmp = icmp eq <2 x i32> %x, <i32 -1, i32 -1>
+  %xor = xor <2 x i32> %x, <i32 -1, i32 poison>
+  %sel = select <2 x i1> %cmp, <2 x i32> zeroinitializer, <2 x i32> %xor
+  ret <2 x i32> %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x i8> @test(<2 x i8> %a) {
-  %not = xor <2 x i8> %a, <i8 -1, i8 poison>
-  ret <2 x i8> %not
+define <2 x i32> @test(<2 x i32> %x) {
+  %xor = xor <2 x i32> %x, <i32 -1, i32 poison>
+  ret <2 x i32> %xor
 }
 ```
 
@@ -1635,32 +2180,68 @@ define <2 x i8> @test(<2 x i8> %a) {
 
 # Issue 89516
 
-## Incorrect Pattern Matching Overwrites Variable Binding in Select Optimization
+## Missing Equivalence Check in Select with Signed Remainder Pattern
 
-**Description**
-The bug occurs in an optimization that attempts to simplify a `select` instruction based on a specific pattern involving signed remainder (`srem`) and addition operations. The intended pattern is `select (X < 0), (X + M), X`, where `X` is the result of `srem(..., M)`. This pattern canonicalizes modulo arithmetic for negative results.
+**Description**: 
+The bug is triggered by a `select` instruction whose condition checks if a value is negative (e.g., `icmp slt X, 0`). The `select` chooses between an `add` instruction (e.g., `add Y, Z`) and a signed remainder instruction (e.g., `Y = srem W, Z`), where `Z` is a known power of two. 
 
-The issue arises because the pattern matching logic fails to enforce that the value checked in the condition (`X`) is the same as the value used in the arithmetic operations. The optimizer first identifies the value `X` from the `select`'s condition (e.g., `icmp slt X, 0`). It then attempts to match the addition instruction in the `true` branch. However, instead of checking that one of the addition's operands is specifically `X`, the matcher uses a binding mechanism that captures the operand into the variable holding `X`.
+The optimization is designed to fold this specific pattern into a more efficient sequence, but it relies on the assumption that the value tested in the condition (`X`) is identical to the result of the remainder operation (`Y`). However, the pattern matching logic contains a flaw: instead of verifying that the first operand of the `add` instruction is the exact same value as the one tested in the condition, it incorrectly binds a new value to the variable, overwriting the condition's operand with the `add`'s operand. 
 
-This action overwrites the original value of `X` (from the condition) with the operand found in the addition (let's call it `Y`). The subsequent logic validates `Y` (checking if it is an `srem` and matches the `false` branch), but the constraint that `X` must equal `Y` is lost. Consequently, the optimization incorrectly triggers for code like `select (X < 0), (Y + M), Y` where `X` and `Y` are different values. The optimizer then transforms the code assuming the condition applies to `Y`, leading to a miscompilation.
+Because the equivalence check is effectively bypassed, the compiler incorrectly applies the transformation even when the `select` condition evaluates an entirely unrelated variable (i.e., when `X` is not equal to `Y`). This leads to a miscompilation where the original control flow and data dependencies are ignored, and the `select` is folded as if it were checking the remainder result.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8 @test(i8 %a, i8 %x) {
-  %y = srem i8 %a, 16
-  %cond = icmp slt i8 %x, 0
-  %add = add i8 %y, 16
-  %res = select i1 %cond, i8 %add, i8 %y
-  ret i8 %res
+define i32 @test(i32 %W, i32 %X) {
+  %Y = srem i32 %W, 4
+  %cond = icmp slt i32 %X, 0
+  %add = add i32 %Y, 4
+  %sel = select i1 %cond, i32 %add, i32 %Y
+  ret i32 %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define i8 @test(i8 %a, i8 %x) {
-  %res = and i8 %a, 15
-  ret i8 %res
+define i32 @test(i32 %W, i32 %X) {
+  %sel = and i32 %W, 3
+  ret i32 %sel
+}
+```
+
+
+---
+
+# Issue 89669
+
+## Invalid Swapping of Select Operands with Poisonous Negation Zero
+
+**Description**:
+The bug occurs in the compiler's instruction combining pass, specifically within the logic that attempts to sink negations through expression trees. 
+
+1. **Pattern Recognition**: The optimizer encounters a negation of a `select` instruction, such as `sub 0, (select cond, -X, X)`. To optimize this, it checks if one operand of the `select` is the known negation of the other.
+2. **Poisonous Negation**: The analysis identifies `-X` as a negation of `X`. In vector types, this negation is often represented as a subtraction from a zero vector. Crucially, the analysis allowed this zero vector to contain `poison` elements (e.g., `sub <0, poison>, X`). These `poison` elements are often introduced by prior optimization steps (like demanded-element simplification) that replace unused constant elements with `poison`.
+3. **Invalid Transformation**: When the optimizer confirms the operands are negations of each other, it attempts to negate the entire `select` instruction by simply swapping its true and false operands, transforming the expression into `select cond, X, -X`.
+4. **Miscompilation**: While mathematically correct, this transformation is invalid in the presence of `poison`. If the condition evaluates such that it selects the non-negated operand in the original code, the original expression evaluates to `sub 0, X`, which is well-defined and free of poison. However, the optimized expression evaluates directly to the negated operand `-X` (i.e., `sub <0, poison>, X`), which contains `poison` elements. 
+5. **Result**: The optimized code becomes "more poisonous" than the original code. It introduces `poison` values into execution paths that were previously well-defined. This violates compiler optimization rules and allows subsequent passes to incorrectly fold or eliminate the code, ultimately leading to a miscompilation (e.g., folding the entire expression to the original value `X` incorrectly).
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i8> @neg_select_poison_zero(<2 x i1> %cond, <2 x i8> %x) {
+  %neg_x = sub <2 x i8> <i8 0, i8 poison>, %x
+  %sel = select <2 x i1> %cond, <2 x i8> %neg_x, <2 x i8> %x
+  %res = sub <2 x i8> zeroinitializer, %sel
+  ret <2 x i8> %res
+}
+```
+### Optimized IR
+```llvm
+define <2 x i8> @neg_select_poison_zero(<2 x i1> %cond, <2 x i8> %x) {
+  %neg_x = sub <2 x i8> <i8 0, i8 poison>, %x
+  %res = select <2 x i1> %cond, <2 x i8> %x, <2 x i8> %neg_x
+  ret <2 x i8> %res
 }
 ```
 
@@ -1669,52 +2250,71 @@ define i8 @test(i8 %a, i8 %x) {
 
 # Issue 91127
 
-## Incorrect Extension Logic when Swapping Operands in Truncated Comparison Folding
+## Incorrect Extension Type in ICmp with Truncated Operands
 
-**Description**
-The bug occurs in the instruction combination pass when optimizing an integer comparison between two truncated values (e.g., `icmp (trunc X), (trunc Y)`). The optimizer attempts to eliminate the truncations by widening the comparison to the original source types (e.g., comparing `X` and `Y` directly, potentially with extensions).
+**Description:**
+The bug is triggered by an integer comparison (e.g., equality or inequality) where the operands are the results of truncating wider integer types. Specifically, the truncation instructions are annotated with the `nsw` (no signed wrap) flag, indicating that the truncation preserves the signed value of the original integer. 
 
-During this process, the optimizer may canonicalize the comparison by swapping the operands. The issue is that the logic fails to correctly update the extension mode (sign-extension vs. zero-extension) for the operand that is moved to the right-hand side after the swap. The decision to sign-extend or zero-extend is based on the flags of the truncation instruction (such as `nsw` or `nuw`). When the operands are swapped, the optimizer incorrectly retains the extension decision derived from the previous operand or fails to re-evaluate it for the new right-hand operand.
-
-This leads to the generation of an incorrect extension instruction (e.g., `zext` instead of `sext`) for the widened comparison. Consequently, if the value requires sign-extension (e.g., it is negative), the zero-extended value will differ, causing the optimized comparison to yield an incorrect result compared to the original code.
+When the compiler attempts to optimize the comparison by eliminating the truncations and comparing the values at a wider type, it needs to extend the narrower source operand to match the wider source type. However, due to a flaw in the transformation logic, the compiler incorrectly applies a zero-extension instead of a sign-extension when the `nsw` flag is present without the `nuw` (no unsigned wrap) flag. This leads to a miscompilation because negative values are zero-extended (yielding large positive numbers) rather than properly sign-extended, causing the optimized comparison to yield incorrect results at runtime.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_trunc_cmp_swap_bug(i32 %a, i32 %b) {
-  ; %a_zext is effectively zero-extended from i8 (0..255)
-  %a_zext = and i32 %a, 255
-  ; %b_sext is effectively sign-extended from i8 (-128..127)
-  %b_shl = shl i32 %b, 24
-  %b_sext = ashr i32 %b_shl, 24
-  
-  %t1 = trunc i32 %a_zext to i8
-  %t2 = trunc i32 %b_sext to i8
-  
-  ; Signed comparison of truncated values.
-  ; If %a_zext is 255 (0xFF), %t1 is -1.
-  ; If %b_sext is 0, %t2 is 0.
-  ; -1 < 0 is true.
-  %cmp = icmp slt i8 %t1, %t2
+define i1 @test(i32 %a, i16 %b) {
+  %t1 = trunc nsw i32 %a to i8
+  %t2 = trunc nsw i16 %b to i8
+  %cmp = icmp eq i8 %t1, %t2
   ret i1 %cmp
+}
+
+```
+### Optimized IR
+```llvm
+define i1 @test(i32 %a, i16 %b) {
+  %1 = zext i16 %b to i32
+  %cmp = icmp eq i32 %a, %1
+  ret i1 %cmp
+}
+
+```
+
+
+---
+
+# Issue 91691
+
+## Improper Retention of Poison-Generating Flags when Eliminating Select Guards
+
+**Description**: 
+The bug is triggered when a compiler optimization eliminates a conditional selection (such as a `select` instruction) that guards the result of a computation containing poison-generating flags (e.g., `nuw`, `nsw`). 
+
+In the original IR, an arithmetic operation may have a poison-generating flag that is only valid for a subset of inputs. A subsequent `select` instruction acts as a guard, ensuring that the potentially poison-producing result is only chosen when the operation does not wrap or violate the flag's condition. For inputs that would cause the operation to produce poison, the `select` chooses an alternative safe value, preventing the poison from propagating.
+
+When an optimization recognizes a specific high-level pattern (such as a bit-manipulation idiom) and folds the `select` into an unconditional sequence of operations, it must ensure that the new unconditional execution path does not introduce undefined behavior or poison values. If the optimization fails to drop the poison-generating flags from the underlying arithmetic instructions, those instructions will produce poison for the previously guarded inputs. Since the `select` guard has been removed, the poison value propagates to the final result, leading to a miscompilation. 
+
+To trigger this, one needs to construct a pattern where a `select` instruction guards an arithmetic operation with a wrap flag, and the pattern matches an optimization rule that removes the `select` without stripping the flags. Passing an input that triggers the wrap condition will then expose the bug.
+
+## Example
+
+### Original IR
+```llvm
+define i32 @clear_lowest_set_bit(i32 %x) {
+entry:
+  %cmp = icmp eq i32 %x, 0
+  %sub = sub nuw i32 %x, 1
+  %and = and i32 %x, %sub
+  %sel = select i1 %cmp, i32 0, i32 %and
+  ret i32 %sel
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_trunc_cmp_swap_bug(i32 %a, i32 %b) {
-  %a_zext = and i32 %a, 255
-  %b_shl = shl i32 %b, 24
-  %b_sext = ashr i32 %b_shl, 24
-  
-  ; BUG: The comparison is widened to i32, but the extension logic is incorrect.
-  ; %a_zext is treated as the value itself (zero-extended), but for a signed comparison
-  ; corresponding to 'slt i8', it should have been sign-extended.
-  ; If %a_zext is 255, it is positive in i32.
-  ; If %b_sext is 0, it is 0.
-  ; 255 < 0 is false. The result differs from the original.
-  %cmp = icmp slt i32 %a_zext, %b_sext
-  ret i1 %cmp
+define i32 @clear_lowest_set_bit(i32 %x) {
+entry:
+  %sub = sub nuw i32 %x, 1
+  %and = and i32 %x, %sub
+  ret i32 %and
 }
 ```
 
@@ -1723,65 +2323,64 @@ define i1 @test_trunc_cmp_swap_bug(i32 %a, i32 %b) {
 
 # Issue 92887
 
-## Incorrect Refinement of Undef to Poison in Shuffle Vector Optimization
+## Incorrect Conversion of `undef` to `poison` in Single-Source Vector Shuffles
 
-## Description
-The bug is triggered when the optimizer attempts to simplify a `shufflevector` instruction where the first operand is a vector instruction (such as a binary operation or cast) and the second operand is an `undef` constant.
-
-The optimization strategy involves "sinking" the shuffle into the operands of the first instruction, effectively rewriting the code to evaluate the operation in the shuffled element order directly. This transformation treats the shuffle as a single-source operation, assuming that the second operand serves merely as a placeholder for unused or "don't care" lanes, effectively treating it as `poison`.
-
-However, in LLVM IR, `undef` and `poison` have distinct semantics: `undef` represents an unspecified bit pattern, while `poison` represents a deferred undefined behavior that propagates through operations. When the second operand is `undef`, the transformation incorrectly upgrades it to `poison`. If the shuffle mask selects elements from this `undef` operand, the optimized code produces `poison` instead of `undef`. This is an invalid refinement because it makes the target code more undefined than the source, potentially causing valid computations to result in `poison`.
+**Description**: 
+The bug is triggered when a vector shuffle operation uses an `undef` value (rather than `poison`) as its second operand. The compiler attempts to optimize this single-source shuffle by evaluating the operations of the first operand in a different element order. However, the optimization logic incorrectly assumes that the second operand is `poison` or inadvertently replaces the `undef` value with `poison` during the transformation. Since `poison` is a stronger, more restrictive state than `undef`, this transformation makes the resulting value more poisonous than the original source. This violates compiler correctness rules, leading to a miscompilation where valid values or `undef` are incorrectly evaluated as `poison`.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i8> @test(<2 x i8> %a, <2 x i8> %b) {
-  %op = add <2 x i8> %a, %b
-  %res = shufflevector <2 x i8> %op, <2 x i8> undef, <2 x i32> <i32 0, i32 2>
-  ret <2 x i8> %res
+define <2 x i32> @test_add(<2 x i32> %a, <2 x i32> %b) {
+  %op = add <2 x i32> %a, %b
+  %shuf = shufflevector <2 x i32> %op, <2 x i32> undef, <2 x i32> <i32 0, i32 2>
+  ret <2 x i32> %shuf
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x i8> @test(<2 x i8> %a, <2 x i8> %b) {
-  %1 = shufflevector <2 x i8> %a, <2 x i8> poison, <2 x i32> <i32 0, i32 2>
-  %2 = shufflevector <2 x i8> %b, <2 x i8> poison, <2 x i32> <i32 0, i32 2>
-  %res = add <2 x i8> %1, %2
-  ret <2 x i8> %res
+define <2 x i32> @test_add(<2 x i32> %a, <2 x i32> %b) {
+  %1 = shufflevector <2 x i32> %a, <2 x i32> poison, <2 x i32> <i32 0, i32 2>
+  %2 = shufflevector <2 x i32> %b, <2 x i32> poison, <2 x i32> <i32 0, i32 2>
+  %shuf = add <2 x i32> %1, %2
+  ret <2 x i32> %shuf
 }
 ```
 
 
 ---
 
-# Issue 93769
+# Issue 94897
 
-## Incorrect Propagation of No-Infinities Flag During Constant Folding of Floating-Point Negation
+## Incorrect Wrap Flag Propagation in Shift-Compare to Truncate-Compare Transformation
 
-**Description**
-The bug is triggered when the optimizer folds a floating-point negation (`fneg`) instruction into a preceding floating-point binary operation (such as multiplication or division) by negating a constant operand. The issue arises because the transformation incorrectly propagates the `ninf` (No Infinities) FastMathFlag from the `fneg` instruction to the newly created binary operation.
+**Description**: 
+The bug is triggered when the compiler attempts to optimize an integer comparison (`icmp`) that evaluates the result of a left-shift (`shl`) instruction against a constant. 
 
-Semantically, the `ninf` flag on an `fneg` instruction only asserts that the value being negated (the result of the preceding operation) is not infinity. It does not impose constraints on the operands of that preceding operation. For instance, a multiplication involving an infinite operand can validly produce a `NaN` result (e.g., `0 * Inf`), which satisfies the `ninf` constraint of the subsequent negation.
+When the left-shift instruction is marked with a "no signed wrap" (`nsw`) flag, the optimization simplifies the pattern by replacing the shift operation with a truncation (`trunc`) and comparing it against a newly computed constant. However, due to an argument mismatch in the transformation logic, the `nsw` property from the original shift instruction is incorrectly applied as a "no unsigned wrap" (`nuw`) flag on the newly generated truncation instruction. 
 
-However, applying `ninf` to a binary operation asserts that both its operands and its result are not infinity. By transferring this flag from the negation to the binary operation, the optimizer incorrectly assumes the operands must be finite. This causes valid program states—where infinite operands produce non-infinite results—to be treated as undefined behavior (poison) in the transformed code, leading to a miscompilation.
+This erroneous flag assignment alters the semantics of the program. It causes subsequent compiler optimization passes to make false assumptions about the absence of unsigned wrapping during the truncation, ultimately leading to invalid optimizations and miscompilations.
 
 ## Example
 
 ### Original IR
 ```llvm
-define float @test_ninf_propagation(float %x) {
-  %mul = fmul float %x, 0.000000e+00
-  %neg = fneg ninf float %mul
-  ret float %neg
+define i1 @test(i32 %x) {
+  %shl = shl nsw i32 %x, 16
+  %cmp = icmp eq i32 %shl, 65536
+  ret i1 %cmp
 }
+
 ```
 ### Optimized IR
 ```llvm
-define float @test_ninf_propagation(float %x) {
-  %neg = fmul ninf float %x, -0.000000e+00
-  ret float %neg
+define i1 @test(i32 %x) {
+  %trunc = trunc nuw i32 %x to i16
+  %cmp = icmp eq i16 %trunc, 1
+  ret i1 %cmp
 }
+
 ```
 
 
@@ -1789,52 +2388,87 @@ define float @test_ninf_propagation(float %x) {
 
 # Issue 95547
 
-## Unsafe Narrowing of Trapping Instructions Based on Future Context
+## Context-Driven Truncation Across Non-Speculatable Instructions Introducing Traps
 
-**Description:**
-The bug is triggered when the compiler attempts to optimize integer division or remainder instructions by reducing their bit-width (e.g., demoting a 16-bit division to an 8-bit division) to match a subsequent truncation of the result. To perform this transformation safely, the compiler verifies that the high bits of the operands are zero, ensuring that the values fit within the narrower type without data loss.
+**Description**: 
+The bug is triggered when the compiler attempts to push a truncation operation backward through a non-speculatable instruction, such as a division or remainder. To determine if this transformation is valid, the compiler checks whether the upper bits of the non-speculatable instruction's operands are known to be zero. 
 
-The flaw occurs because the compiler uses the context of the *user* instruction (the subsequent truncation) to prove that the operands are within range. If the user instruction is protected by control flow conditions (such as a loop guard or branch) that do not apply to the division instruction itself, the operands may be guaranteed to be small at the use site but can be large at the definition site.
+The flaw occurs because the compiler incorrectly uses the context of the *later* truncation instruction to evaluate the operands. If the later instruction is guarded by control flow conditions (e.g., a branch that restricts the value range of the operands), the compiler might conclude that the upper bits are zero based on this restricted context. It then optimizes the code by truncating the operands *before* the non-speculatable instruction. 
 
-When the division instruction executes with a large value that is valid in the original bit-width, narrowing it based on the restricted range of the future context effectively truncates the value. If a non-zero divisor is truncated to zero (e.g., 256 becoming 0 in 8-bit), the transformation introduces a division-by-zero trap that did not exist in the original program.
+However, the non-speculatable instruction is executed in an earlier, less-restricted context where those control flow conditions have not yet been enforced. In this original context, the operands may actually contain non-zero upper bits. Truncating these operands prematurely can drastically change their values (e.g., truncating a larger number down to zero). When the non-speculatable instruction executes with these altered operands, it can introduce undefined behavior or a runtime trap, such as a division by zero, that did not exist in the original program.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8 @test(i16 %a, i16 %b) {
+define i8 @test(i16 %x, i16 %y) {
 entry:
-  %div = udiv i16 %a, %b
-  %cmp1 = icmp ult i16 %a, 256
-  %cmp2 = icmp ult i16 %b, 256
-  %cond = and i1 %cmp1, %cmp2
-  br i1 %cond, label %use, label %exit
+  %div = udiv i16 %x, %y
+  %or = or i16 %x, %y
+  %cmp = icmp ult i16 %or, 256
+  br i1 %cmp, label %if.then, label %if.end
 
-use:
-  %res = trunc i16 %div to i8
-  ret i8 %res
+if.then:
+  %trunc = trunc i16 %div to i8
+  ret i8 %trunc
 
-exit:
+if.end:
   ret i8 0
 }
 ```
 ### Optimized IR
 ```llvm
-define i8 @test(i16 %a, i16 %b) {
+define i8 @test(i16 %x, i16 %y) {
 entry:
-  %0 = trunc i16 %a to i8
-  %1 = trunc i16 %b to i8
+  %0 = trunc i16 %x to i8
+  %1 = trunc i16 %y to i8
   %div = udiv i8 %0, %1
-  %cmp1 = icmp ult i16 %a, 256
-  %cmp2 = icmp ult i16 %b, 256
-  %cond = and i1 %cmp1, %cmp2
-  br i1 %cond, label %use, label %exit
+  %or = or i16 %x, %y
+  %cmp = icmp ult i16 %or, 256
+  br i1 %cmp, label %if.then, label %if.end
 
-use:
+if.then:
   ret i8 %div
 
-exit:
+if.end:
   ret i8 0
+}
+```
+
+
+---
+
+# Issue 96857
+
+## Incorrect `disjoint` Flag Application in Masked Merge Transformation with `undef` Mask
+
+**Description**: 
+The bug is triggered by an optimization that converts a bitwise `xor` instruction representing a masked merge pattern—specifically `(A & M) ^ (B & ~M)`—into an `or` instruction with the `disjoint` flag. 
+
+The `disjoint` flag asserts that the two operands of the `or` instruction have no common bits set to 1. While this assumption holds true when the mask `M` is a well-defined, consistent value, it breaks down if `M` can be an `undef` value. Because `undef` can evaluate to different concrete values at each of its use sites, the two halves of the masked merge (`A & M` and `B & ~M`) can end up with overlapping bits set to 1. 
+
+When the compiler blindly applies the `disjoint` flag to the resulting `or` instruction without proving that the mask `M` is well-defined, it violates the semantics of the `disjoint` flag. This causes the instruction to produce a `poison` value when overlapping bits occur, leading to a miscompilation where the optimized IR is more poisonous than the original IR. 
+
+To trigger this issue, one needs to construct a masked merge pattern using bitwise `and`, `not` (often represented as `xor` with -1), and `xor` operations, ensuring that the shared mask value is capable of being `undef`.
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i8> @masked_merge_undef_mask(<2 x i8> %a, <2 x i8> %b) {
+  %and1 = and <2 x i8> %a, <i8 15, i8 undef>
+  %and2 = and <2 x i8> %b, <i8 -16, i8 undef>
+  %res = xor <2 x i8> %and1, %and2
+  ret <2 x i8> %res
+}
+```
+### Optimized IR
+```llvm
+define <2 x i8> @masked_merge_undef_mask(<2 x i8> %a, <2 x i8> %b) {
+  %and1 = and <2 x i8> %a, <i8 15, i8 undef>
+  %and2 = and <2 x i8> %b, <i8 -16, i8 undef>
+  %res = or disjoint <2 x i8> %and1, %and2
+  ret <2 x i8> %res
 }
 ```
 
@@ -1843,29 +2477,32 @@ exit:
 
 # Issue 97053
 
-## Unsafe Scalarization of Non-Speculatable Vector Binary Operations
+## Invalid Scalarization of Non-Speculatable Binary Operations with Unknown Extract Indices
 
-The bug is triggered when the compiler attempts to scalarize a vector binary operation followed by an `extractelement` instruction using a potentially out-of-bounds index. Specifically, the optimization transforms a sequence like `extractelement (binop vector_x, vector_y), index` into `binop (extractelement vector_x, index), (extractelement vector_y, index)`.
+**Description**: 
+The bug is triggered when the compiler attempts to scalarize a vector binary operation by hoisting an `extractelement` instruction above it. This transformation is unsafe if the binary operation is not safe to speculatively execute (such as integer division or remainder, which can trigger Undefined Behavior when operating on `poison` or zero) and the extraction index is not statically known to be within bounds.
 
-This transformation is incorrect when the binary operation is not safe to speculate (e.g., integer division or remainder, which can trigger Undefined Behavior) and the extraction index is not guaranteed to be within the vector's bounds. In the original code, if the index is out-of-bounds, the `extractelement` instruction yields a `poison` value, but the preceding vector operation executes safely (assuming valid vector operands). In the transformed code, the extraction occurs first. If the index is out-of-bounds, it produces a `poison` scalar. When this `poison` value is subsequently used as an operand (specifically the divisor) in a non-speculatable operation, it triggers immediate Undefined Behavior. Thus, the optimization incorrectly promotes a safe `poison` result to Undefined Behavior.
+In the original IR, the vector binary operation executes first. Assuming the vector operands are valid, the operation computes successfully. A subsequent `extractelement` with an out-of-bounds index simply evaluates to a `poison` value. 
+
+However, when the compiler optimizes the code by swapping the order of operations, the `extractelement` is performed first. If the index is out of bounds at runtime, the extraction produces `poison`. This `poison` value is then fed as an operand into the scalarized, non-speculatable binary operation. For operations like division, using a `poison` divisor results in immediate Undefined Behavior (UB). Consequently, the transformation incorrectly escalates a well-defined program that produces a `poison` result into one that triggers UB.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_unsafe_scalarization(<2 x i32> %x, <2 x i32> %y, i64 %idx) {
-  %binop = sdiv <2 x i32> %x, %y
-  %res = extractelement <2 x i32> %binop, i64 %idx
-  ret i32 %res
+define i32 @test(<4 x i32> %a, <4 x i32> %b, i32 %idx) {
+  %div = sdiv <4 x i32> %a, %b
+  %ext = extractelement <4 x i32> %div, i32 %idx
+  ret i32 %ext
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_unsafe_scalarization(<2 x i32> %x, <2 x i32> %y, i64 %idx) {
-  %1 = extractelement <2 x i32> %x, i64 %idx
-  %2 = extractelement <2 x i32> %y, i64 %idx
-  %res = sdiv i32 %1, %2
-  ret i32 %res
+define i32 @test(<4 x i32> %a, <4 x i32> %b, i32 %idx) {
+  %ext.a = extractelement <4 x i32> %a, i32 %idx
+  %ext.b = extractelement <4 x i32> %b, i32 %idx
+  %div = sdiv i32 %ext.a, %ext.b
+  ret i32 %div
 }
 ```
 
@@ -1874,55 +2511,66 @@ define i32 @test_unsafe_scalarization(<2 x i32> %x, <2 x i32> %y, i64 %idx) {
 
 # Issue 97330
 
-## **Summary Title**
-Incorrect Context Propagation in Multi-Use Demanded Bits Simplification
+## Incorrect Context Usage in Multi-Use Root Instruction Simplification
 
-## **Description**
-The bug is triggered when the optimizer attempts to simplify an instruction (the "root") that has multiple users, based on an analysis of demanded bits initiated by one specific user. When a value has multiple uses, the optimizer typically defaults to demanding all bits to ensure the value remains correct for all consumers. However, the issue arises because the analysis of the root instruction is performed using the **context of the specific user** that triggered the optimization, rather than the context of the root instruction's definition.
+**Description**:
+The bug occurs during the simplification of an instruction based on its demanded bits. It is triggered by the following high-level pattern:
 
-This use-site context allows the analysis (e.g., `computeKnownBits`) to incorporate control-flow sensitive information—such as `llvm.assume` directives, branch conditions, or dominating constraints—that is valid only at that specific user's location. If the root instruction is defined in a block that is not dominated by these constraints (e.g., a predecessor block), the optimizer may incorrectly deduce properties that do not hold globally. Consequently, the root instruction is simplified based on these local facts (e.g., replaced by a constant), causing a miscompilation for other users located on execution paths where those facts are not true.
+1. **Multi-Use Root Instruction**: An instruction (the "root" instruction, such as a `trunc` or a binary operator) is defined and has multiple uses across different basic blocks or execution paths.
+2. **Context-Specific Information**: One of the uses of this root instruction is located in a context where specific conditions hold true (e.g., due to an `llvm.assume` or dominating branch conditions). These conditions provide known information about the operands of the root instruction, but they are *only* valid for this specific use, not globally.
+3. **Simplification from a Specific Use**: A compiler optimization pass attempts to simplify the root instruction by analyzing its demanded bits, initiating the analysis from the specific use mentioned above.
+4. **Incorrect Context Propagation**: Because the instruction is the root of the demanded bits analysis, the compiler allows it to be simplified and modified in-place, even though it has multiple uses. However, the compiler incorrectly uses the context of the *specific use* (rather than the context of the root instruction itself) to query known bits and simplify the root instruction's operands.
+5. **Global Miscompilation**: As a result, the root instruction's operands are simplified based on facts that are only true at one specific use. Since the root instruction is modified in-place, this context-specific simplification leaks to all other uses of the instruction. The other uses will observe an incorrectly simplified value, leading to a miscompilation.
+
+To trigger this issue, one can construct an IR where a value has multiple uses, place an `llvm.assume` or conditional branch that constrains the value's operands near one of the uses, and ensure that another use exists outside the influence of this constraint. When the compiler optimizes the constrained use, it will erroneously apply the local constraints to globally rewrite the shared root instruction.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_incorrect_context_propagation(i32 %x) {
+define i32 @test(i32 %a, i32 %b, i1 %cond) {
 entry:
-  ; Root instruction with multiple uses
-  %root = add i32 %x, 10
+  %root = or i32 %a, %b
+  br i1 %cond, label %if.then, label %if.else
 
-  ; Condition that implies %x == 20, and thus %root == 30
-  %cond = icmp eq i32 %x, 20
-  br i1 %cond, label %taken, label %untaken
+if.then:
+  %cmp = icmp eq i32 %b, 0
+  call void @llvm.assume(i1 %cmp)
+  %use1 = trunc i32 %root to i16
+  %use1_ext = zext i16 %use1 to i32
+  br label %exit
 
-taken:
-  ; User 1: Located in a context where %x is known to be 20.
-  ; The optimizer analyzes %root using this context.
-  %use_in_context = add i32 %root, 0
-  ret i32 %use_in_context
+if.else:
+  %use2 = and i32 %root, 65535
+  br label %exit
 
-untaken:
-  ; User 2: Located in a context where %x is NOT necessarily 20.
-  ; If %root is simplified to 30 globally based on the 'taken' context, this returns incorrect results.
-  ret i32 %root
+exit:
+  %res = phi i32 [ %use1_ext, %if.then ], [ %use2, %if.else ]
+  ret i32 %res
 }
+
+declare void @llvm.assume(i1)
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_incorrect_context_propagation(i32 %x) {
+define i32 @test(i32 %a, i32 %b, i1 %cond) {
 entry:
-  ; The root instruction has been incorrectly replaced by a constant derived from the 'taken' context.
-  %cond = icmp eq i32 %x, 20
-  br i1 %cond, label %taken, label %untaken
+  %cmp = icmp eq i32 %b, 0
+  br i1 %cond, label %if.then, label %if.else
 
-taken:
-  ; Correct for this path
-  ret i32 30
+if.then:
+  call void @llvm.assume(i1 %cmp)
+  br label %exit
 
-untaken:
-  ; Incorrect for this path (e.g., if %x was 0, should return 10, but returns 30)
-  ret i32 30
+if.else:
+  br label %exit
+
+exit:
+  %res = and i32 %a, 65535
+  ret i32 %res
 }
+
+declare void @llvm.assume(i1)
 ```
 
 
@@ -1930,30 +2578,30 @@ untaken:
 
 # Issue 97475
 
-## Incorrect Simplification of Vector Selects with Lane-Crossing Operands
+## Incorrect Known Bits Simplification in Vector Selects with Lane-Crossing Operations
 
-**Description**
-The bug is triggered when the optimizer attempts to simplify the operands of a vector `select` instruction based on "known bits" or value constraints implied by the `select` condition. For example, if the condition is a vector comparison `icmp eq %x, 0`, the optimizer infers that `%x` must be zero in the lanes where the condition is true, and attempts to simplify the "true" value of the `select` accordingly.
+**Description**: 
+The bug is triggered when a vector `select` instruction uses an element-wise comparison (e.g., checking if a vector equals zero) as its condition, and one of the select arms is derived from the compared vector via a lane-crossing operation (such as a `shufflevector`). 
 
-The flaw occurs because the optimizer fails to account for lane-crossing operations (such as `shufflevector`) within the computation of the selected values. In a vector context, the condition in lane *i* only implies information about the input `%x` in lane *i*. However, if the value being selected in lane *i* is derived from a different lane *j* of `%x` (due to a shuffle), the constraint derived from lane *i* does not apply. The optimizer incorrectly propagates the constraint from the condition lane to the data source lane, leading to an invalid simplification (e.g., folding the result to zero) when the source lane actually contains a different value.
+During optimization, the compiler attempts to simplify the select arms by computing known bits implied by the condition. For scalar values, if a condition like `x == 0` is true, `x` can be safely assumed to be `0` in the true arm. However, for vectors, an element-wise condition being true for a specific lane only implies the known bits for that specific lane. 
+
+When a lane-crossing operation is present in the select arm, the value of a given lane depends on a different lane from the original vector. The compiler incorrectly propagates the known bits implied by the condition of one lane to the computation of the select arm, failing to account for the fact that the lane-crossing operation pulls data from other lanes whose bits are not constrained by the condition. This results in an invalid simplification, such as incorrectly folding the entire `select` instruction to a constant.
 
 ## Example
 
 ### Original IR
 ```llvm
 define <2 x i32> @test_vector_select_lane_crossing(<2 x i32> %x) {
-  %cond = icmp eq <2 x i32> %x, zeroinitializer
+  %cmp = icmp eq <2 x i32> %x, zeroinitializer
   %shuf = shufflevector <2 x i32> %x, <2 x i32> poison, <2 x i32> <i32 1, i32 0>
-  %res = select <2 x i1> %cond, <2 x i32> %shuf, <2 x i32> %x
-  ret <2 x i32> %res
+  %sel = select <2 x i1> %cmp, <2 x i32> %shuf, <2 x i32> zeroinitializer
+  ret <2 x i32> %sel
 }
 ```
 ### Optimized IR
 ```llvm
 define <2 x i32> @test_vector_select_lane_crossing(<2 x i32> %x) {
-  %cond = icmp eq <2 x i32> %x, zeroinitializer
-  %res = select <2 x i1> %cond, <2 x i32> zeroinitializer, <2 x i32> %x
-  ret <2 x i32> %res
+  ret <2 x i32> zeroinitializer
 }
 ```
 
@@ -1962,28 +2610,104 @@ define <2 x i32> @test_vector_select_lane_crossing(<2 x i32> %x) {
 
 # Issue 98139
 
-## Incorrect Known Bits Refinement for Select Instructions
+## Incorrect Context-Sensitive Known Bits Computation for Select Instructions
 
-**Description**:
-The bug is triggered during the analysis of `select` instructions in the `InstCombine` pass, specifically when the compiler attempts to compute the "known bits" (bits guaranteed to be zero or one) for the instruction's result. The optimization strategy involves refining the known bits for the "true" and "false" operands independently, using the condition to infer additional constraints (for example, analyzing the "false" operand under the assumption that the condition is false).
+**Description**: 
+The bug is triggered when the compiler attempts to simplify the demanded bits of a `select` instruction. During this process, the compiler computes the known bits of the `select` by analyzing its true and false arms. It tries to refine the known bits of each arm by assuming the `select` condition is true for the true arm and false for the false arm. 
 
-The issue arises because the analysis logic for the "false" operand incorrectly updates the data structure designated for the "true" operand's known bits. Instead of storing the "false" arm's analysis in its own container, the compiler overwrites or corrupts the "true" arm's analysis with information derived from the "false" arm. Consequently, the specific properties of the "true" operand are discarded. When the compiler subsequently intersects the known bits of both arms to determine the properties valid for the entire `select` instruction, the result is incorrectly biased towards the "false" operand. This leads the compiler to erroneously assume that the `select` instruction always satisfies the bitwise constraints of the "false" operand, resulting in miscompilation when the "true" path is taken and produces a value incompatible with those constraints.
+However, due to a logic error, the context-sensitive refinement intended for the false arm is mistakenly applied to the true arm's known bits. Consequently, the true arm's known bits are corrupted with assumptions derived from the condition being false, while the false arm's known bits remain unrefined. When the known bits of both arms are intersected to determine the overall known bits of the `select` instruction, the corrupted true arm leads to an incorrect known bits result. 
+
+To trigger this issue, the LLVM IR must contain a `select` instruction where the condition implies specific known bits for its operands, and the `select` instruction is targeted by demanded bits simplification. The incorrect known bits computation can lead to invalid optimizations, such as incorrectly folding the `select` or its users into constants or wrong values.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_bug(i1 %cond, i32 %x) {
-  %true_op = or i32 %x, 5
-  %false_op = and i32 %x, 3
-  %sel = select i1 %cond, i32 %true_op, i32 %false_op
-  %res = and i32 %sel, 4
+define i8 @test(i8 %x) {
+entry:
+  %cond = icmp slt i8 %x, 0
+  %sel = select i1 %cond, i8 %x, i8 0
+  %res = and i8 %sel, 128
+  ret i8 %res
+}
+```
+### Optimized IR
+```llvm
+define i8 @test(i8 %x) {
+entry:
+  ret i8 0
+}
+```
+
+
+---
+
+# Issue 98435
+
+## Incorrect Demanded Elements Analysis for Vector Select with Undef Condition
+
+**Description**:
+When analyzing the demanded elements of a vector `select` instruction, the compiler examines the constant vector condition to determine which elements of the true and false branches are needed. The optimization logic incorrectly assumes that any condition element that is not strictly zero (false) must be true. Consequently, for condition elements that are `undef` (or un-evaluable constant expressions), the compiler assumes they evaluate to true and stops demanding the corresponding elements from the false branch. 
+
+This triggers a miscompilation because an `undef` condition can dynamically evaluate to either true or false. By incorrectly assuming the false branch element is unneeded, the compiler may optimize it away or replace the result with `poison`. If the program execution actually evaluates the `undef` condition to false for that vector lane, it will yield an incorrect or more poisonous value than the original code. 
+
+To trigger this bug, one can construct a vector `select` instruction with a constant vector condition containing at least one `undef` element, while ensuring that the true and false branches provide different values (e.g., a constant and a variable) for that specific lane.
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i32> @test_select_undef_cond(<2 x i32> %a, i32 %b_elem) {
+entry:
+  %b = insertelement <2 x i32> poison, i32 %b_elem, i32 1
+  %sel = select <2 x i1> <i1 true, i1 undef>, <2 x i32> %a, <2 x i32> %b
+  ret <2 x i32> %sel
+}
+```
+### Optimized IR
+```llvm
+define <2 x i32> @test_select_undef_cond(<2 x i32> %a, i32 %b_elem) {
+entry:
+  %sel = select <2 x i1> <i1 true, i1 undef>, <2 x i32> %a, <2 x i32> poison
+  ret <2 x i32> %sel
+}
+```
+
+
+---
+
+# Issue 99436
+
+## Unsafe Operand Substitution in Speculatively Executed Instructions
+
+**Description**: 
+The bug is triggered when the compiler performs operand substitution on an instruction that is executed unconditionally (speculatively), but whose safety relies heavily on the properties of its original operands. 
+
+The strategy involves the following pattern:
+1. **Speculatively Safe Instruction**: An instruction (such as a memory load or a division) is safe to execute unconditionally because its variable operands possess certain guaranteed properties (e.g., a known valid, dereferenceable pointer, or a non-zero divisor).
+2. **Conditional Equivalence**: The result of this instruction is used in a conditional operation (like a `select` instruction). The condition checks if the variable operand is equal to a specific constant (e.g., checking if the pointer is `null`, or if the divisor is `0`).
+3. **Flawed Transformation**: The compiler attempts to optimize the instruction by replacing the variable operand with the constant, assuming the equivalence holds for that specific conditional path. 
+4. **Introduction of Undefined Behavior**: The compiler incorrectly verifies if the instruction is safe to speculatively execute *before* performing the substitution. Replacing the variable operand with the constant (e.g., substituting a valid pointer with `null`) invalidates the very properties that made the instruction safe in the first place. Because the instruction remains unconditionally executed outside the conditional construct, the newly substituted constant operand causes immediate undefined behavior (e.g., a null pointer dereference or division by zero) at runtime.
+
+## Example
+
+### Original IR
+```llvm
+define i32 @test(ptr dereferenceable(4) %p) {
+entry:
+  %val = load i32, ptr %p, align 4
+  %cmp = icmp eq ptr %p, null
+  %res = select i1 %cmp, i32 %val, i32 0
   ret i32 %res
 }
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_bug(i1 %cond, i32 %x) {
-  ret i32 0
+define i32 @test(ptr dereferenceable(4) %p) {
+entry:
+  %val = load i32, ptr null, align 4
+  %cmp = icmp eq ptr %p, null
+  %res = select i1 %cmp, i32 %val, i32 0
+  ret i32 %res
 }
 ```

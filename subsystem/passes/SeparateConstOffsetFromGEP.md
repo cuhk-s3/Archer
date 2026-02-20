@@ -1,26 +1,29 @@
 # Issue 154116
 
-## Incorrect Preservation of Poison-Generating Flags during Truncation Distribution
+## Improper Preservation of Poison-Generating Flags when Distributing Truncation over Arithmetic Operations
 
-The bug is triggered when the optimizer attempts to separate constant offsets by distributing a truncation instruction over binary operations, such as addition. When splitting an expression like `trunc nuw (Variable + Constant)` to operate on the components individually, the optimizer creates a new truncation instruction for the variable operand and incorrectly copies the `nuw` (No Unsigned Wrap) flag from the original instruction.
+**Description**: 
+The bug occurs when a truncation instruction (`trunc`) with poison-generating flags (such as `nuw` or `nsw`) is applied to the result of an arithmetic operation (e.g., `add`, `sub`, or `or`) that involves a constant offset. During optimization, the compiler attempts to separate the constant offset by distributing the truncation over the operands of the arithmetic operation. However, the optimization incorrectly preserves the poison-generating flags on the newly cloned truncation instructions. 
 
-This transformation is unsound because the `nuw` flag on the original expression only guarantees that the final sum fits within the destination type, not that the individual operands do. If the variable operand has bits set that are discarded during truncation (for example, if it is a negative value), the new `trunc nuw` instruction produces a poison value, whereas the original expression was well-defined. This results in the introduction of undefined behavior.
+Because the conditions required by the `nuw` or `nsw` flags might be satisfied by the final result of the arithmetic operation but not by its individual operands (for instance, an operand might have non-zero truncated bits that are later canceled out by the constant offset), the distributed truncation instructions can incorrectly evaluate to a poison value. This leads to a miscompilation where valid input IR is transformed into IR that produces poison. 
+
+To trigger this bug, one needs to construct a sequence where an arithmetic operation with a constant offset is followed by a `trunc` instruction with `nuw` or `nsw` flags, and ensure that the individual operands would violate the `nuw`/`nsw` constraints if truncated directly before the arithmetic operation takes place.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i8 @test(i32 %x) {
-  %add = add nuw i32 %x, 1
-  %trunc = trunc i32 %add to i8
+define i8 @test_add_nuw(i16 %x) {
+  %add = add i16 %x, 257
+  %trunc = trunc nuw i16 %add to i8
   ret i8 %trunc
 }
 ```
 ### Optimized IR
 ```llvm
-define i8 @test(i32 %x) {
-  %trunc = trunc i32 %x to i8
-  %add = add nuw i8 %trunc, 1
+define i8 @test_add_nuw(i16 %x) {
+  %trunc = trunc nuw i16 %x to i8
+  %add = add i8 %trunc, 1
   ret i8 %add
 }
 ```

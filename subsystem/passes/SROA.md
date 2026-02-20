@@ -1,44 +1,43 @@
 # Issue 64081
 
-## Incorrect Conversion of Memcpy to Typed Store for Types with Padding
+## Incorrect Replacement of Memory Copy with Typed Load/Store for Types with Padding
 
-**Description:**
-The bug is triggered when the Scalar Replacement of Aggregates (SROA) pass splits an aggregate `alloca` (typically representing a union) into smaller scalar components. The issue specifically arises when one of the resulting scalar types has a logical bit-width that is smaller than its physical storage size in memory (e.g., a non-standard integer type like `i6` which occupies a full byte).
+**Description**:
+The bug is triggered by a specific interaction between raw memory copy operations and types that contain padding bits. The strategy to trigger this issue at the LLVM IR level involves the following steps:
 
-When SROA processes a memory intrinsic (such as `memcpy`) that overlaps with this new scalar `alloca`, it attempts to optimize the intrinsic by converting the raw memory copy into a typed `store` instruction. However, a typed `store` only preserves the bits defined by the type's logical size; it does not guarantee the preservation of bits in the "padding" region (the difference between the type size and the store size). In the context of a union, these padding bits may contain valid data belonging to another member of the union. By replacing the bit-preserving `memcpy` with a typed `store`, the compiler inadvertently discards or corrupts the data residing in these padding bits, leading to a miscompilation.
+1. **Allocate Memory with Padding**: Create an `alloca` instruction using a type where the actual data size is smaller than the memory store size (i.e., the type contains padding bits). This often occurs with non-standard integer sizes (like `i6`) or structs containing bitfields, where the type does not fully occupy the bytes allocated for it.
+2. **Perform a Raw Memory Copy**: Use a memory copy intrinsic (such as `llvm.memcpy`) to copy data into or out of this allocated memory. The size of the copy should cover the full byte size of the memory region, meaning it explicitly copies the bits that the allocated type considers to be "padding".
+3. **Trigger the Optimization**: An optimization pass (like SROA) analyzes the memory copy and attempts to replace it with a direct, typed `load` and `store` of the allocated type to promote the memory to registers.
+4. **Data Loss**: Because the optimization replaces the raw byte-level copy with a typed load/store, the operation only preserves the valid value bits defined by the type. The padding bits, which were correctly copied by the original `memcpy`, are ignored and lost. 
+
+This leads to a miscompilation if the underlying memory is actually part of a union or is later accessed via a different type (like an array of bytes) where those "padding" bits contain semantically meaningful data.
 
 ## Example
 
 ### Original IR
 ```llvm
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define i8 @test_padding_loss() {
-entry:
-  %src = alloca i8, align 1
-  store i8 -1, i8* %src, align 1
-  %dst = alloca { i6 }, align 1
-  %dst.i8 = bitcast { i6 }* %dst to i8*
-  call void @llvm.memcpy.p0i8.p0i8.i64(i8* align 1 %dst.i8, i8* align 1 %src, i64 1, i1 false)
-  %val = load i8, i8* %dst.i8, align 1
-  ret i8 %val
-}
+declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)
 
-declare void @llvm.memcpy.p0i8.p0i8.i64(i8* noalias nocapture writeonly, i8* noalias nocapture readonly, i64, i1 immarg)
+define void @test_padding_memcpy(ptr %src, ptr %dst) {
+entry:
+  %a = alloca i6, align 1
+  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %a, ptr align 1 %src, i64 1, i1 false)
+  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %dst, ptr align 1 %a, i64 1, i1 false)
+  ret void
+}
 ```
 ### Optimized IR
 ```llvm
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define i8 @test_padding_loss() {
+define void @test_padding_memcpy(ptr %src, ptr %dst) {
 entry:
-  %src = alloca i8, align 1
-  store i8 -1, i8* %src, align 1
-  %src.cast = bitcast i8* %src to i6*
-  %src.load = load i6, i6* %src.cast, align 1
-  %val = zext i6 %src.load to i8
-  ret i8 %val
+  %0 = load i6, ptr %src, align 1
+  store i6 %0, ptr %dst, align 1
+  ret void
 }
 ```

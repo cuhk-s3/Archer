@@ -1,64 +1,92 @@
 # Issue 104422
 
-## Incorrect Bit-Width Demotion for Intermediate Reduction Nodes
+## Incorrect Bitwidth Reduction for Intermediate Vector Tree Nodes
 
-**Description:**
-The bug is triggered in the SLP vectorizer when optimizing a reduction pattern (such as a loop accumulation) by demoting the bit width of the operations (e.g., reducing 64-bit arithmetic to 32-bit). To perform this optimization safely, the compiler verifies that all users of the vectorized instructions can accept the reduced bit width.
+**Description**: 
+The bug is triggered during the vectorization of integer operations when the compiler attempts to optimize the code by reducing the bitwidth of the operations (a process known as bitwidth demotion or truncation). 
 
-The issue arises because the validation logic is overly permissive for "external" users (users not included in the vectorization tree). The compiler uses a list of users to ignore during this check, which is intended to handle the final result of the reduction (e.g., the value feeding a loop PHI node). However, the bug incorrectly extends this exemption to intermediate nodes within the vectorization tree, rather than restricting it to the root node. Consequently, the compiler erroneously determines that it is safe to truncate intermediate operations, even if they involve values—such as large integer constants—that require the full bit width. This results in the loss of significant bits and incorrect program execution.
+To determine if it is safe to demote the bitwidth of a sequence of operations, the vectorizer inspects the users of the scalar instructions. If all users can tolerate the smaller bitwidth, the reduction is permitted. During this analysis, certain external users (such as the final instruction in a reduction chain) are placed in an "ignore list" because their specific bitwidth requirements are managed separately by the vectorizer.
+
+The issue arises from a flaw in how this ignore list is applied. The vectorizer incorrectly allowed *any* node in the vectorization tree to bypass bitwidth checks if its user was in the ignore list. However, this bypass should only apply to the root or the immediate reduced value of the tree. 
+
+Because of this overly permissive check, if an intermediate operation in the vector tree has an external user that happens to be in the ignore list, the vectorizer incorrectly assumes it is safe to truncate the intermediate operation. This leads to the operation being performed at a smaller bitwidth than required (e.g., truncating a 64-bit addition involving a large constant down to 32 bits), resulting in data loss and a miscompiled program.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i64 @slp_reduction_bug(ptr %ptr) {
+target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define i64 @test(ptr %p) {
 entry:
-  %l0 = load i32, ptr %ptr, align 4
-  %conv0 = zext i32 %l0 to i64
-  %gep1 = getelementptr inbounds i32, ptr %ptr, i64 1
-  %l1 = load i32, ptr %gep1, align 4
-  %conv1 = zext i32 %l1 to i64
-  %gep2 = getelementptr inbounds i32, ptr %ptr, i64 2
-  %l2 = load i32, ptr %gep2, align 4
-  %conv2 = zext i32 %l2 to i64
-  %gep3 = getelementptr inbounds i32, ptr %ptr, i64 3
-  %l3 = load i32, ptr %gep3, align 4
-  %conv3 = zext i32 %l3 to i64
-  ; Intermediate reduction node
-  %add1 = add i64 %conv0, %conv1
-  %add2 = add i64 %conv2, %conv3
-  ; Root of reduction
-  %red = add i64 %add1, %add2
-  ; External user of intermediate node requiring full 64-bit width
-  ; 4294967296 is 1 << 32. If add1 is demoted to 32-bit, this bit is lost.
-  %check = and i64 %add1, 4294967296
-  %res = add i64 %red, %check
-  ret i64 %res
+  %p1 = getelementptr i64, ptr %p, i64 1
+  %p2 = getelementptr i64, ptr %p, i64 2
+  %p3 = getelementptr i64, ptr %p, i64 3
+  
+  %v0 = load i64, ptr %p, align 8
+  %v1 = load i64, ptr %p1, align 8
+  %v2 = load i64, ptr %p2, align 8
+  %v3 = load i64, ptr %p3, align 8
+  
+  ; 64-bit additions involving a large constant (2^32)
+  %a0 = add i64 %v0, 4294967296
+  %a1 = add i64 %v1, 4294967296
+  %a2 = add i64 %v2, 4294967296
+  %a3 = add i64 %v3, 4294967296
+  
+  ; Operations that only demand the lower 32 bits
+  %b0 = and i64 %a0, 4294967295
+  %b1 = and i64 %a1, 4294967295
+  %b2 = and i64 %a2, 4294967295
+  %b3 = and i64 %a3, 4294967295
+  
+  ; Reduction chain
+  %red.0 = add i64 %b0, %b1
+  %red.1 = add i64 %red.0, %b2
+  %red.2 = add i64 %red.1, %b3
+  
+  ; The reduction root is an external user of the intermediate node %a0.
+  ; Because it is in the ignore list, the vectorizer incorrectly assumes %a0 
+  ; can be safely truncated to 32 bits.
+  %red.3 = add i64 %red.2, %a0
+  
+  ret i64 %red.3
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i64 @slp_reduction_bug(ptr %ptr) {
+target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define i64 @test(ptr %p) {
 entry:
-  ; The vectorizer loads 4 i32 values
-  %0 = load <4 x i32>, ptr %ptr, align 4
-  ; It performs the first stage of reduction using 32-bit arithmetic (demotion)
-  %1 = shufflevector <4 x i32> %0, <4 x i32> poison, <2 x i32> <i32 0, i32 2>
-  %2 = shufflevector <4 x i32> %0, <4 x i32> poison, <2 x i32> <i32 1, i32 3>
-  %3 = add <2 x i32> %1, %2
-  ; It extracts the intermediate value (add1) which is now truncated to 32 bits
-  %4 = extractelement <2 x i32> %3, i32 0
-  %5 = zext i32 %4 to i64
-  ; It continues the reduction for the root
-  %6 = extractelement <2 x i32> %3, i32 1
-  %7 = add i32 %4, %6
-  %red = zext i32 %7 to i64
-  ; The bug: %5 is a zero-extended 32-bit value, so the 33rd bit is always 0.
-  ; The original logic required the carry bit from the 64-bit add.
-  %check = and i64 %5, 4294967296
-  %res = add i64 %red, %check
-  ret i64 %res
+  %p1 = getelementptr i64, ptr %p, i64 1
+  %p2 = getelementptr i64, ptr %p, i64 2
+  %p3 = getelementptr i64, ptr %p, i64 3
+  %0 = load <4 x i64>, ptr %p, align 8
+  
+  ; Incorrect bitwidth demotion: the 64-bit addition is truncated to 32 bits.
+  ; The constant 4294967296 becomes 0 in i32.
+  %1 = trunc <4 x i64> %0 to <4 x i32>
+  %2 = add <4 x i32> %1, zeroinitializer
+  %3 = and <4 x i32> %2, <i32 -1, i32 -1, i32 -1, i32 -1>
+  %4 = zext <4 x i32> %3 to <4 x i64>
+  
+  %5 = call i64 @llvm.vector.reduce.add.v4i64(<4 x i64> %4)
+  
+  ; The external user %red.3 now uses the incorrectly truncated and zero-extended 
+  ; value, resulting in the loss of the 4294967296 constant addition.
+  %6 = extractelement <4 x i32> %2, i32 0
+  %7 = zext i32 %6 to i64
+  %red.3 = add i64 %5, %7
+  
+  ret i64 %red.3
 }
+
+declare i64 @llvm.vector.reduce.add.v4i64(<4 x i64>)
+
 ```
 
 
@@ -66,153 +94,73 @@ entry:
 
 # Issue 105988
 
-## Summary Title
-Incorrect Bit Width Reduction for Integer Comparison Users in SLP Vectorizer
+## Incorrect Minimum Bitwidth Analysis for Nodes Used by Comparison Instructions
 
-## Description
-The bug is triggered when the SLP vectorizer attempts to optimize vector operations by reducing the bit width of elements (demanded bits analysis), specifically when those elements are used as operands in integer comparison instructions (`icmp`). 
+**Description**: 
+The bug is triggered when the vectorizer performs minimum bitwidth analysis on a vectorized node (such as a gather node) whose results are used by comparison instructions. During this analysis, the vectorizer attempts to determine the minimum required bitwidth for the node's elements by examining the type sizes of its user instructions. 
 
-The optimization logic determines the minimum required bit width for a vector node by examining the properties of its user instructions. A flaw exists where the analysis relies on the size of the user instruction's *return type* to decide if the operand's bit width can be reduced. The logic assumes that if a user instruction produces a result significantly smaller than the operand, the operation acts like a truncation, allowing the operand to be narrowed.
-
-However, an integer comparison instruction always produces a 1-bit result (`i1`), regardless of the size of the integers being compared. The analyzer incorrectly interprets this small result size as a signal that the operands can be safely truncated to a smaller width. Since comparisons actually require the full width of their operands to produce the correct result, this incorrect inference leads the compiler to generate code where the inputs to the comparison are truncated, resulting in incorrect comparison outcomes at runtime.
+However, comparison instructions inherently produce a boolean result, meaning their output type size is always 1 bit, regardless of the size of the operands being compared. The vectorizer incorrectly considers this 1-bit result size as a valid constraint for the operands' bitwidth. This flaw causes the analysis to erroneously conclude that the operands can be truncated or evaluated at a much smaller bitwidth (e.g., 1 bit). Consequently, this leads to an invalid type reduction and a miscompilation where the comparison operations are performed on incorrectly truncated values.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test_slp_bug(ptr %a, ptr %b, ptr %res) {
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @test_gather_cmp(ptr %a, ptr %b, ptr %res) {
 entry:
   %a0 = load i32, ptr %a, align 4
-  %b0 = load i32, ptr %b, align 4
-  %v0 = or i32 %a0, %b0
-  %c0 = icmp eq i32 %v0, 0
-  %z0 = zext i1 %c0 to i8
-  store i8 %z0, ptr %res, align 1
-
-  %a1_ptr = getelementptr inbounds i32, ptr %a, i64 1
-  %b1_ptr = getelementptr inbounds i32, ptr %b, i64 1
-  %res1_ptr = getelementptr inbounds i8, ptr %res, i64 1
+  %a1_ptr = getelementptr inbounds i32, ptr %a, i64 2
   %a1 = load i32, ptr %a1_ptr, align 4
+  
+  %b0 = load i32, ptr %b, align 4
+  %b1_ptr = getelementptr inbounds i32, ptr %b, i64 2
   %b1 = load i32, ptr %b1_ptr, align 4
-  %v1 = or i32 %a1, %b1
-  %c1 = icmp eq i32 %v1, 0
-  %z1 = zext i1 %c1 to i8
-  store i8 %z1, ptr %res1_ptr, align 1
-
-  %a2_ptr = getelementptr inbounds i32, ptr %a, i64 2
-  %b2_ptr = getelementptr inbounds i32, ptr %b, i64 2
-  %res2_ptr = getelementptr inbounds i8, ptr %res, i64 2
-  %a2 = load i32, ptr %a2_ptr, align 4
-  %b2 = load i32, ptr %b2_ptr, align 4
-  %v2 = or i32 %a2, %b2
-  %c2 = icmp eq i32 %v2, 0
-  %z2 = zext i1 %c2 to i8
-  store i8 %z2, ptr %res2_ptr, align 1
-
-  %a3_ptr = getelementptr inbounds i32, ptr %a, i64 3
-  %b3_ptr = getelementptr inbounds i32, ptr %b, i64 3
-  %res3_ptr = getelementptr inbounds i8, ptr %res, i64 3
-  %a3 = load i32, ptr %a3_ptr, align 4
-  %b3 = load i32, ptr %b3_ptr, align 4
-  %v3 = or i32 %a3, %b3
-  %c3 = icmp eq i32 %v3, 0
-  %z3 = zext i1 %c3 to i8
-  store i8 %z3, ptr %res3_ptr, align 1
-
+  
+  %cmp0 = icmp eq i32 %a0, %b0
+  %cmp1 = icmp eq i32 %a1, %b1
+  
+  %res0 = zext i1 %cmp0 to i8
+  %res1 = zext i1 %cmp1 to i8
+  
+  store i8 %res0, ptr %res, align 1
+  %res1_ptr = getelementptr inbounds i8, ptr %res, i64 1
+  store i8 %res1, ptr %res1_ptr, align 1
+  
   ret void
 }
-```
-### Optimized IR
-```llvm
-define void @test_slp_bug(ptr %a, ptr %b, ptr %res) {
-entry:
-  %0 = load <4 x i32>, ptr %a, align 4
-  %1 = load <4 x i32>, ptr %b, align 4
-  ; The bug: The vectorizer incorrectly truncates the operands to i8 (or i1)
-  ; because the user instruction (icmp) returns i1, ignoring that icmp requires full width.
-  %2 = trunc <4 x i32> %0 to <4 x i8>
-  %3 = trunc <4 x i32> %1 to <4 x i8>
-  %4 = or <4 x i8> %2, %3
-  ; The comparison is now performed on truncated values, potentially yielding incorrect results.
-  %5 = icmp eq <4 x i8> %4, zeroinitializer
-  %6 = zext <4 x i1> %5 to <4 x i8>
-  store <4 x i8> %6, ptr %res, align 1
-  ret void
-}
-```
 
-
----
-
-# Issue 108620
-
-## Summary Title
-Stale Reference to Transformed Values in Horizontal Reduction
-
-## Description
-The bug is triggered during the vectorization of horizontal reductions (e.g., summing a list of values) in the SLP Vectorizer. The compiler processes a list of candidate scalar values iteratively to build the vectorization tree and handle "external uses" (values computed in the reduction that are needed elsewhere).
-
-The issue arises because the logic fails to check if a candidate scalar has already been vectorized or transformed in a previous iteration of the reduction process. Instead of using the new, transformed value (which represents the current state of the computation), the compiler continues to inspect the original, stale scalar value.
-
-This stale reference causes the compiler to incorrectly assess the external uses of the instruction. It may fail to register that the value is used externally (because the uses have moved to the transformed value) or fail to generate the necessary fix-up code (like `extractelement` instructions) to satisfy those uses. Consequently, when the vectorizer attempts to clean up and delete the original scalar instructions—believing them to be fully redundant and unused—it crashes because those instructions still have active users that were not properly migrated to the new vector values.
-
-## Example
-
-### Original IR
-```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define i32 @horizontal_reduction_with_external_use(i32* %ptr, i32* %external_use_ptr) #0 {
-entry:
-  %gep0 = getelementptr inbounds i32, i32* %ptr, i64 0
-  %val0 = load i32, i32* %gep0, align 4
-  %gep1 = getelementptr inbounds i32, i32* %ptr, i64 1
-  %val1 = load i32, i32* %gep1, align 4
-  %gep2 = getelementptr inbounds i32, i32* %ptr, i64 2
-  %val2 = load i32, i32* %gep2, align 4
-  %gep3 = getelementptr inbounds i32, i32* %ptr, i64 3
-  %val3 = load i32, i32* %gep3, align 4
-
-  ; Horizontal reduction tree
-  %add0 = add i32 %val0, %val1
-  %add1 = add i32 %val2, %val3
-  %root = add i32 %add0, %add1
-
-  ; External use of an intermediate reduction value (%add0)
-  ; This triggers the bug if the vectorizer fails to track this use correctly
-  ; during the iterative reduction process.
-  store i32 %add0, i32* %external_use_ptr, align 4
-
-  ret i32 %root
-}
-
-attributes #0 = { "target-cpu"="skylake" }
 ```
 ### Optimized IR
 ```llvm
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define i32 @horizontal_reduction_with_external_use(i32* %ptr, i32* %external_use_ptr) #0 {
+define void @test_gather_cmp(ptr %a, ptr %b, ptr %res) {
 entry:
-  %0 = bitcast i32* %ptr to <4 x i32>*
-  %1 = load <4 x i32>, <4 x i32>* %0, align 4
-  ; The vectorizer performs a pairwise addition (horizontal reduction step)
-  %2 = shufflevector <4 x i32> %1, <4 x i32> poison, <4 x i32> <i32 0, i32 2, i32 poison, i32 poison>
-  %3 = shufflevector <4 x i32> %1, <4 x i32> poison, <4 x i32> <i32 1, i32 3, i32 poison, i32 poison>
-  %4 = add <4 x i32> %2, %3
-  ; Correctly handling the external use by extracting the value from the vector
-  %5 = extractelement <4 x i32> %4, i32 0
-  store i32 %5, i32* %external_use_ptr, align 4
-  ; Completing the reduction
-  %6 = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %4)
-  ret i32 %6
+  %0 = load i32, ptr %a, align 4
+  %a1_ptr = getelementptr inbounds i32, ptr %a, i64 2
+  %1 = load i32, ptr %a1_ptr, align 4
+  %2 = insertelement <2 x i32> poison, i32 %0, i32 0
+  %3 = insertelement <2 x i32> %2, i32 %1, i32 1
+  %4 = trunc <2 x i32> %3 to <2 x i1>
+  
+  %5 = load i32, ptr %b, align 4
+  %b1_ptr = getelementptr inbounds i32, ptr %b, i64 2
+  %6 = load i32, ptr %b1_ptr, align 4
+  %7 = insertelement <2 x i32> poison, i32 %5, i32 0
+  %8 = insertelement <2 x i32> %7, i32 %6, i32 1
+  %9 = trunc <2 x i32> %8 to <2 x i1>
+  
+  %10 = icmp eq <2 x i1> %4, %9
+  %11 = zext <2 x i1> %10 to <2 x i8>
+  
+  store <2 x i8> %11, ptr %res, align 1
+  
+  ret void
 }
 
-declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
-
-attributes #0 = { "target-cpu"="skylake" }
 ```
 
 
@@ -220,39 +168,50 @@ attributes #0 = { "target-cpu"="skylake" }
 
 # Issue 112460
 
-## Summary Title
-Incorrect Sign Extension when Vectorizing Freeze Instructions with Bit Width Reduction
+## Incorrect Bitwidth Reduction and Signedness Propagation for Freeze Instructions
 
-## Description
-The bug is triggered when the SLP vectorizer optimizes a sequence of instructions involving a `freeze` instruction applied to a value that was zero-extended from a smaller bit width (e.g., extending an `i1` boolean to an `i8` integer). 
+**Description**
+The bug is triggered by a sequence of vectorizable integer operations that are candidates for bitwidth reduction (demotion) by the SLP vectorizer. The triggering strategy involves the following pattern:
 
-The vectorizer's minimum bit width analysis correctly identifies that the operations can be performed on the smaller, underlying type to improve performance. However, the optimization logic fails to correctly preserve the "unsigned" property of the original zero-extension when processing the `freeze` instruction. As a result, when the vectorizer generates code to promote the frozen value back to the target bit width, it incorrectly emits a sign-extension (`sext`) instead of a zero-extension (`zext`). This transformation corrupts the value (e.g., turning a positive `1` into a negative `-1`), which leads to miscompilation when the value is subsequently used in operations sensitive to sign, such as unsigned comparisons.
+1. **Bitwidth Reduction Candidates**: The code contains a sequence of integer operations where the actual values can be represented in a smaller bitwidth than their declared types (e.g., boolean values that are zero-extended to a larger integer type like `i8` or `i32`).
+2. **Presence of a Freeze Instruction**: A `freeze` instruction is applied to the intermediate results of these operations.
+3. **Missing Analysis for Freeze**: The SLP vectorizer's minimum bitwidth analysis identifies that the operations can be safely demoted and performed at the smaller bitwidth. However, because the `freeze` instruction is not properly handled by the bitwidth reduction and signedness tracking logic, the signedness information (whether the value should be zero-extended or sign-extended) is lost or incorrectly propagated across the `freeze`.
+4. **Incorrect Code Emission**: During the vectorization and code emission phase, the vectorizer applies the `freeze` operation to the demoted (smaller) type. When the result needs to be extended back to the original larger type for subsequent operations, the lack of correct signedness information causes the vectorizer to emit the wrong type of extension (e.g., using a sign-extension instead of a zero-extension).
+5. **Miscompilation**: This incorrect extension alters the semantics of the values (for example, sign-extending a `1` in `i1` to all ones/`-1` in a larger type, instead of `1`), leading to incorrect results in downstream computations and an overall miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test(ptr %p, i1 %a, i1 %b) {
+define void @test(ptr %p, ptr %q) {
 entry:
-  %z1 = zext i1 %a to i8
-  %f1 = freeze i8 %z1
-  store i8 %f1, ptr %p, align 1
-  %p2 = getelementptr inbounds i8, ptr %p, i64 1
-  %z2 = zext i1 %b to i8
-  %f2 = freeze i8 %z2
-  store i8 %f2, ptr %p2, align 1
+  %p1 = getelementptr i8, ptr %p, i64 1
+  %v0 = load i8, ptr %p, align 1
+  %v1 = load i8, ptr %p1, align 1
+  %cmp0 = icmp eq i8 %v0, 0
+  %cmp1 = icmp eq i8 %v1, 0
+  %zext0 = zext i1 %cmp0 to i32
+  %zext1 = zext i1 %cmp1 to i32
+  %freeze0 = freeze i32 %zext0
+  %freeze1 = freeze i32 %zext1
+  %xor0 = xor i32 %freeze0, 1
+  %xor1 = xor i32 %freeze1, 1
+  %q1 = getelementptr i32, ptr %q, i64 1
+  store i32 %xor0, ptr %q, align 4
+  store i32 %xor1, ptr %q1, align 4
   ret void
 }
 ```
 ### Optimized IR
 ```llvm
-define void @test(ptr %p, i1 %a, i1 %b) {
+define void @test(ptr %p, ptr %q) {
 entry:
-  %0 = insertelement <2 x i1> poison, i1 %a, i32 0
-  %1 = insertelement <2 x i1> %0, i1 %b, i32 1
+  %0 = load <2 x i8>, ptr %p, align 1
+  %1 = icmp eq <2 x i8> %0, zeroinitializer
   %2 = freeze <2 x i1> %1
-  %3 = sext <2 x i1> %2 to <2 x i8>
-  store <2 x i8> %3, ptr %p, align 1
+  %3 = xor <2 x i1> %2, <i1 true, i1 true>
+  %4 = sext <2 x i1> %3 to <2 x i32>
+  store <2 x i32> %4, ptr %q, align 4
   ret void
 }
 ```
@@ -260,50 +219,40 @@ entry:
 
 ---
 
-# Issue 112577
+# Issue 113425
 
-## Incorrect Bit Width Demotion of `llvm.abs` Intrinsic
+## Incorrect Replacement of `undef` with Potentially `poison` Values During Vectorization
 
-## Description
-The bug is triggered when the SLP vectorizer applies a "minimum bit width" optimization to code containing the `llvm.abs` (absolute value) intrinsic. This optimization attempts to replace operations performed on wide integers (e.g., 64-bit) with narrower vector operations (e.g., 32-bit) when the inputs and outputs originate from or are truncated to the narrower width.
+**Description:**
+The bug is triggered when the SLP vectorizer attempts to vectorize a sequence of scalar instructions (such as binary operations) where one or more operands are `undef`. To construct the vector operands efficiently and avoid additional shuffle or `insertelement` instructions, the vectorizer may choose to reuse an existing vector that perfectly matches the non-`undef` operands in their respective lanes. 
 
-The flaw lies in the vectorizer's failure to validate the sign interpretation of the `abs` operand during this demotion. In the original wider bit width, an intermediate value might be positive (for instance, due to zero-extension or unsigned multiplication). However, when this value is implicitly truncated to the narrower bit width for the vectorized operation, its most significant bit may become set. This causes the value to be interpreted as negative in the narrower signed context. Consequently, the demoted `abs` instruction negates the value, whereas the original wide `abs` instruction would have treated it as positive and left it unchanged. This discrepancy leads to incorrect results in the vectorized code.
+For the lanes corresponding to the `undef` operands, the vectorizer implicitly substitutes them with the values present in the reused vector at those same lanes. The miscompilation occurs because the vectorizer fails to verify whether the substituted elements from the reused vector are guaranteed not to be `poison`. 
+
+If the reused vector contains `poison` (or can evaluate to `poison` at runtime) in those lanes, the transformation effectively replaces an `undef` value with a `poison` value. In LLVM IR semantics, `poison` is a stronger, more restrictive state than `undef`. For example, multiplying `undef` by zero can be optimized to yield zero, whereas multiplying `poison` by zero strictly yields `poison`. Consequently, this invalid substitution makes the resulting vectorized program more poisonous than the original scalar code, violating IR semantics and leading to incorrect execution results.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test(ptr %src, ptr %dst) {
+define <2 x i32> @test(i32 %x) {
 entry:
-  %l0 = load i8, ptr %src, align 1
-  %z0 = zext i8 %l0 to i32
-  %abs0 = call i32 @llvm.abs.i32(i32 %z0, i1 false)
-  %t0 = trunc i32 %abs0 to i8
-  store i8 %t0, ptr %dst, align 1
-
-  %src1 = getelementptr inbounds i8, ptr %src, i64 1
-  %l1 = load i8, ptr %src1, align 1
-  %z1 = zext i8 %l1 to i32
-  %abs1 = call i32 @llvm.abs.i32(i32 %z1, i1 false)
-  %t1 = trunc i32 %abs1 to i8
-  %dst1 = getelementptr inbounds i8, ptr %dst, i64 1
-  store i8 %t1, ptr %dst1, align 1
-  ret void
+  %v = insertelement <2 x i32> poison, i32 %x, i32 0
+  %v0 = extractelement <2 x i32> %v, i32 0
+  %m0 = mul i32 %v0, 0
+  %m1 = mul i32 undef, 0
+  %r0 = insertelement <2 x i32> poison, i32 %m0, i32 0
+  %r1 = insertelement <2 x i32> %r0, i32 %m1, i32 1
+  ret <2 x i32> %r1
 }
-
-declare i32 @llvm.abs.i32(i32, i1)
 ```
 ### Optimized IR
 ```llvm
-define void @test(ptr %src, ptr %dst) {
+define <2 x i32> @test(i32 %x) {
 entry:
-  %0 = load <2 x i8>, ptr %src, align 1
-  %1 = call <2 x i8> @llvm.abs.v2i8(<2 x i8> %0, i1 false)
-  store <2 x i8> %1, ptr %dst, align 1
-  ret void
+  %v = insertelement <2 x i32> poison, i32 %x, i32 0
+  %0 = mul <2 x i32> %v, zeroinitializer
+  ret <2 x i32> %0
 }
-
-declare <2 x i8> @llvm.abs.v2i8(<2 x i8>, i1)
 ```
 
 
@@ -311,86 +260,92 @@ declare <2 x i8> @llvm.abs.v2i8(<2 x i8>, i1)
 
 # Issue 113520
 
-## Incorrect Extension Logic for Externally Used Scalars in SLP Vectorization
-
-**Description**:
-The bug is triggered when the SLP vectorizer processes a group of instructions that includes mixed sign-extension and zero-extension operations (or operations with conflicting signedness requirements) and creates a vector node where some of the scalar values are used externally (outside the vectorized tree).
-
-When the compiler generates code to extract these scalars for their external users, it must cast the values back to their original bit width. The incorrect transformation occurs because the compiler relies on precomputed, aggregated signedness information for the entire vector node to decide whether to perform a sign-extension (`sext`) or a zero-extension (`zext`). In scenarios where the vector node represents a mix of operations (e.g., alternate `sext` and `zext`), this aggregated property may incorrectly mandate a sign-extension for a lane that originally required a zero-extension. This results in the generation of `sext` instructions instead of `zext`, causing miscompilation by interpreting large unsigned values as negative signed numbers.
-
-## Example
-
-### Original IR
-```llvm
-define i32 @test(ptr %a, ptr %b) {
-entry:
-  %a0_ptr = getelementptr inbounds i16, ptr %a, i64 0
-  %a0 = load i16, ptr %a0_ptr, align 2
-  %a1_ptr = getelementptr inbounds i16, ptr %a, i64 1
-  %a1 = load i16, ptr %a1_ptr, align 2
-  %z = zext i16 %a0 to i32
-  %s = sext i16 %a1 to i32
-  %op0 = add i32 %z, 0
-  %op1 = add i32 %s, 0
-  %t0 = trunc i32 %op0 to i16
-  %t1 = trunc i32 %op1 to i16
-  store i16 %t0, ptr %b, align 2
-  %b1_ptr = getelementptr inbounds i16, ptr %b, i64 1
-  store i16 %t1, ptr %b1_ptr, align 2
-  ret i32 %op0
-}
-```
-### Optimized IR
-```llvm
-define i32 @test(ptr %a, ptr %b) {
-entry:
-  %0 = load <2 x i16>, ptr %a, align 2
-  %1 = add <2 x i16> %0, zeroinitializer
-  store <2 x i16> %1, ptr %b, align 2
-  %2 = extractelement <2 x i16> %1, i32 0
-  %3 = sext i16 %2 to i32
-  ret i32 %3
-}
-```
-
-
----
-
-# Issue 114738
-
-## Incorrect Poison Handling in Vector Reductions of Boolean Logic
+## Incorrect Signedness Extension for Externally Used Scalars in Narrowed Vector Nodes
 
 **Description:**
-The bug is triggered when the vectorizer transforms a sequence of scalar boolean logic operations (such as logical ORs or ANDs, often implemented using `select` instructions or bitwise operators on boolean values) into a vector reduction. In the original scalar code, the structure of the operations allows for poison suppression; for example, a logical OR operation where one operand is `true` will evaluate to `true` even if the other operand is `poison`.
+The bug is triggered by a specific sequence of vectorization and type-narrowing optimizations involving externally used scalars with mixed signedness:
 
-However, the vectorizer replaces this sequence with a vector reduction intrinsic (e.g., a reduction OR). Standard vector reduction intrinsics do not possess this poison-suppressing property; they propagate poison if any single element within the input vector is poison. As a result, if the inputs contain a poison value that was originally masked by the scalar logic (e.g., by a `true` value in an OR chain), the vectorized reduction yields a `poison` result instead of the correct defined value. This leads to a miscompilation where the target IR is more poisonous than the source IR.
+1. **Mixed Signedness in Vector Node:** The vectorizer groups scalar instructions that have mixed signedness semantics (e.g., a combination of zero-extensions and sign-extensions) into a single vector node (often as an alternate sequence).
+2. **Minimum Bitwidth Optimization:** Through minimum bitwidth or demanded bits analysis, the vectorizer determines that the vector node's operations can be safely evaluated at a narrower integer type than the original scalars, resulting in a vector of narrower elements.
+3. **External Uses of Narrowed Scalars:** Some of the original, wider scalar values are used externally (i.e., outside the vectorized tree). To satisfy these external uses, the vectorizer must extract the narrower elements from the newly formed vector and cast (extend) them back to their original wider types.
+4. **Uniform Signedness Assumption:** When generating the extension instructions for these extracted elements, the vectorizer incorrectly relies on a single, precomputed signedness flag for the entire vector node, rather than analyzing the specific signedness requirement of each individual scalar.
+5. **Incorrect Extension and Miscompilation:** Because the node contains a mix of signed and unsigned operations, the uniform signedness flag is incorrect for some elements. The vectorizer applies the wrong type of extension (e.g., emitting a sign-extension instead of a zero-extension). This alters the numerical value of the extended scalar, leading to miscompilations—especially when the incorrectly extended value is subsequently used in operations with strict overflow flags (like `nsw`/`nuw`), which can result in unexpected poison generation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test_poison_suppression(<4 x i1> %vec) {
-  %v0 = extractelement <4 x i1> %vec, i32 0
-  %v1 = extractelement <4 x i1> %vec, i32 1
-  %v2 = extractelement <4 x i1> %vec, i32 2
-  %v3 = extractelement <4 x i1> %vec, i32 3
-  ; Logical OR implemented as select allows poison suppression (e.g., true || poison -> true)
-  %or1 = select i1 %v0, i1 true, i1 %v1
-  %or2 = select i1 %or1, i1 true, i1 %v2
-  %or3 = select i1 %or2, i1 true, i1 %v3
-  ret i1 %or3
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @test(ptr %p, ptr %out1, ptr %out2, ptr %out3, ptr %out4, ptr %out5) {
+entry:
+  %v0 = load i8, ptr %p, align 1
+  %p1 = getelementptr inbounds i8, ptr %p, i64 1
+  %v1 = load i8, ptr %p1, align 1
+  %p2 = getelementptr inbounds i8, ptr %p, i64 2
+  %v2 = load i8, ptr %p2, align 1
+  %p3 = getelementptr inbounds i8, ptr %p, i64 3
+  %v3 = load i8, ptr %p3, align 1
+  
+  %z0 = zext i8 %v0 to i32
+  %s1 = sext i8 %v1 to i32
+  %z2 = zext i8 %v2 to i32
+  %s3 = sext i8 %v3 to i32
+  
+  %add_z0 = add nsw i32 %z0, 1
+  %add_s1 = add nsw i32 %s1, 1
+  %add_z2 = add nsw i32 %z2, 1
+  %add_s3 = add nsw i32 %s3, 1
+  
+  store i32 %add_z0, ptr %out1, align 4
+  store i32 %add_s1, ptr %out2, align 4
+  store i32 %add_z2, ptr %out4, align 4
+  store i32 %add_s3, ptr %out5, align 4
+  
+  %t0 = trunc i32 %z0 to i8
+  %t1 = trunc i32 %s1 to i8
+  %t2 = trunc i32 %z2 to i8
+  %t3 = trunc i32 %s3 to i8
+  
+  store i8 %t0, ptr %out3, align 1
+  %out3_1 = getelementptr inbounds i8, ptr %out3, i64 1
+  store i8 %t1, ptr %out3_1, align 1
+  %out3_2 = getelementptr inbounds i8, ptr %out3, i64 2
+  store i8 %t2, ptr %out3_2, align 1
+  %out3_3 = getelementptr inbounds i8, ptr %out3, i64 3
+  store i8 %t3, ptr %out3_3, align 1
+  
+  ret void
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test_poison_suppression(<4 x i1> %vec) {
-  ; The vectorizer replaces the select chain with a reduction intrinsic.
-  ; This intrinsic propagates poison if any element is poison, unlike the scalar code.
-  %res = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %vec)
-  ret i1 %res
-}
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
 
-declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)
+define void @test(ptr %p, ptr %out1, ptr %out2, ptr %out3, ptr %out4, ptr %out5) {
+entry:
+  %0 = load <4 x i8>, ptr %p, align 1
+  %1 = extractelement <4 x i8> %0, i32 0
+  %2 = zext i8 %1 to i32
+  %add_z0 = add nsw i32 %2, 1
+  store i32 %add_z0, ptr %out1, align 4
+  %3 = extractelement <4 x i8> %0, i32 1
+  %4 = zext i8 %3 to i32
+  %add_s1 = add nsw i32 %4, 1
+  store i32 %add_s1, ptr %out2, align 4
+  %5 = extractelement <4 x i8> %0, i32 2
+  %6 = zext i8 %5 to i32
+  %add_z2 = add nsw i32 %6, 1
+  store i32 %add_z2, ptr %out4, align 4
+  %7 = extractelement <4 x i8> %0, i32 3
+  %8 = zext i8 %7 to i32
+  %add_s3 = add nsw i32 %8, 1
+  store i32 %add_s3, ptr %out5, align 4
+  store <4 x i8> %0, ptr %out3, align 1
+  ret void
+}
 ```
 
 
@@ -398,149 +353,49 @@ declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)
 
 # Issue 114905
 
-## Reassociation of Logical Reductions Exposing Poison Values
-
-**Description**
-The bug is triggered when the SLP vectorizer optimizes a reduction sequence involving logical operations (such as chains of boolean AND/OR implemented via `select` instructions). In the original Intermediate Representation (IR), the specific nesting or order of these operations may ensure that a `poison` operand is effectively masked by a controlling value (e.g., `false` in a logical AND chain causes the result to be `false` regardless of a subsequent `poison` operand).
-
-When the vectorizer processes this sequence, it may reassociate or reorder the operands to construct a balanced reduction tree. This transformation can change the pairing of operands such that the `poison` value is combined with a value that does not suppress it (e.g., pairing `poison` with `true` in a logical AND). Consequently, the `poison` value propagates to the final result, causing the transformed code to yield `poison` (undefined behavior) where the original code produced a well-defined value. The issue stems from the optimizer's failure to freeze potentially poisonous values before altering the operation order, which breaks the implicit poison-masking semantics of the original chain.
-
-## Example
-
-### Original IR
-```llvm
-define i1 @test_poison_masking(ptr %ptr) {
-entry:
-  %p0 = getelementptr inbounds i1, ptr %ptr, i64 0
-  %v0 = load i1, ptr %p0, align 1
-  %p1 = getelementptr inbounds i1, ptr %ptr, i64 1
-  %v1 = load i1, ptr %p1, align 1
-  %p2 = getelementptr inbounds i1, ptr %ptr, i64 2
-  %v2 = load i1, ptr %p2, align 1
-  %p3 = getelementptr inbounds i1, ptr %ptr, i64 3
-  %v3 = load i1, ptr %p3, align 1
-  ; Logical AND chain implemented via selects to ensure poison masking.
-  ; If %v0 is false, the result is false regardless of %v3 being poison.
-  %op1 = select i1 %v0, i1 %v1, i1 false
-  %op2 = select i1 %op1, i1 %v2, i1 false
-  %op3 = select i1 %op2, i1 %v3, i1 false
-  ret i1 %op3
-}
-```
-### Optimized IR
-```llvm
-define i1 @test_poison_masking(ptr %ptr) {
-entry:
-  ; The SLP vectorizer transforms the select chain into a vector reduction.
-  ; This introduces a bug because the 'and' reduction propagates poison.
-  ; If %v0 is false and %v3 is poison, the original code returns false,
-  ; but this optimized code returns poison.
-  %0 = load <4 x i1>, ptr %ptr, align 1
-  %1 = call i1 @llvm.vector.reduce.and.v4i1(<4 x i1> %0)
-  ret i1 %1
-}
-
-declare i1 @llvm.vector.reduce.and.v4i1(<4 x i1>)
-```
-
-
----
-
-# Issue 116691
-
-## Out-of-Bounds Access in SLP Vectorizer for Gathered Loads
+## Reordering of Short-Circuiting Boolean Reductions Causing Poison Propagation
 
 **Description**: 
-The bug is triggered during the SLP vectorization of gathered load instructions. When the vectorizer identifies candidates for vectorization, it attempts to group consecutive load instructions into vectors of a specific width. The issue arises because the logic assumes that a full vector's worth of elements is always available starting from a selected index. If the number of remaining load instructions in the candidate list is less than the target vector width (for instance, when the total number of loads is not a multiple of the vector size), the compiler attempts to extract a slice of instructions that extends beyond the bounds of the container. This out-of-bounds access leads to a compiler crash.
+The bug is triggered by a sequence of boolean logical operations (such as logical AND or OR, often represented using `select` instructions) that form a reduction chain. In the original LLVM IR, the operations are ordered such that a short-circuiting value (e.g., `false` for a logical AND) is evaluated before an operand that evaluates to `poison` (e.g., resulting from an out-of-bounds vector extraction). Because of the short-circuiting nature of the `select` instruction, the `poison` value is safely masked, and the final result is well-defined.
+
+During vectorization, the compiler recognizes the chain as a reduction and reorders the operands to optimize the reduction tree. However, the reordering logic fails to properly account for the poison-masking behavior of the original sequence. As a result, the `poison` operand may be evaluated as the condition of a `select` instruction before the short-circuiting value can mask it. This causes the `poison` to propagate through the reduction, resulting in a miscompilation where the optimized code returns `poison` instead of the original well-defined value.
 
 ## Example
 
 ### Original IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_slp_gather_crash(ptr %src, ptr %dst) {
+define i1 @test_reduction(i1 %a, i1 %b, i1 %c) {
 entry:
-  ; Load 5 elements with stride 2 (non-consecutive, candidates for gathered loads)
-  %s0 = getelementptr i32, ptr %src, i64 0
-  %l0 = load i32, ptr %s0
-  %s1 = getelementptr i32, ptr %src, i64 2
-  %l1 = load i32, ptr %s1
-  %s2 = getelementptr i32, ptr %src, i64 4
-  %l2 = load i32, ptr %s2
-  %s3 = getelementptr i32, ptr %src, i64 6
-  %l3 = load i32, ptr %s3
-  %s4 = getelementptr i32, ptr %src, i64 8
-  %l4 = load i32, ptr %s4
-
-  ; Store 5 elements to consecutive memory (seeds SLP vectorizer)
-  ; The vectorizer will attempt to vectorize these stores and look up the definition tree.
-  ; It will find the 5 loads. With VF=4, it processes the first 4.
-  ; The bug triggers when it attempts to process the remaining 1 load using a slice of size 4.
-  %d0 = getelementptr i32, ptr %dst, i64 0
-  store i32 %l0, ptr %d0
-  %d1 = getelementptr i32, ptr %dst, i64 1
-  store i32 %l1, ptr %d1
-  %d2 = getelementptr i32, ptr %dst, i64 2
-  store i32 %l2, ptr %d2
-  %d3 = getelementptr i32, ptr %dst, i64 3
-  store i32 %l3, ptr %d3
-  %d4 = getelementptr i32, ptr %dst, i64 4
-  store i32 %l4, ptr %d4
-
-  ret void
+  %p = extractelement <4 x i1> zeroinitializer, i32 4
+  %and1 = select i1 %a, i1 %b, i1 false
+  %and2 = select i1 %and1, i1 %c, i1 false
+  %and3 = select i1 %and2, i1 %p, i1 false
+  ret i1 %and3
 }
 ```
 ### Optimized IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_slp_gather_crash(ptr %src, ptr %dst) {
+define i1 @test_reduction(i1 %a, i1 %b, i1 %c) {
 entry:
-  ; The first 4 loads are gathered into a vector
-  %s0 = getelementptr i32, ptr %src, i64 0
-  %l0 = load i32, ptr %s0
-  %s1 = getelementptr i32, ptr %src, i64 2
-  %l1 = load i32, ptr %s1
-  %s2 = getelementptr i32, ptr %src, i64 4
-  %l2 = load i32, ptr %s2
-  %s3 = getelementptr i32, ptr %src, i64 6
-  %l3 = load i32, ptr %s3
-  
-  %vec0 = insertelement <4 x i32> poison, i32 %l0, i32 0
-  %vec1 = insertelement <4 x i32> %vec0, i32 %l1, i32 1
-  %vec2 = insertelement <4 x i32> %vec1, i32 %l2, i32 2
-  %vec3 = insertelement <4 x i32> %vec2, i32 %l3, i32 3
-
-  ; The first 4 stores are vectorized
-  %d0 = getelementptr i32, ptr %dst, i64 0
-  store <4 x i32> %vec3, ptr %d0, align 4
-
-  ; The 5th element remains scalar (correct behavior after fix)
-  %s4 = getelementptr i32, ptr %src, i64 8
-  %l4 = load i32, ptr %s4
-  %d4 = getelementptr i32, ptr %dst, i64 4
-  store i32 %l4, ptr %d4, align 4
-
-  ret void
+  %p = extractelement <4 x i1> zeroinitializer, i32 4
+  %and1 = select i1 %p, i1 %a, i1 false
+  %and2 = select i1 %b, i1 %c, i1 false
+  %and3 = select i1 %and1, i1 %and2, i1 false
+  ret i1 %and3
 }
 ```
 
 
 ---
 
-# Issue 119393
+# Issue 117170
 
-## Incorrect Shuffle Mask Indexing for Multi-Part Vector Nodes with Poison Values
+## Incorrect Shuffle Mask Generation for Vectors of Different Sizes in SLP Vectorization
 
-**Description**
-The bug is triggered when the SLP vectorizer processes a vectorization tree node that spans multiple vector registers (parts) and contains undefined (`poison`) scalar values. This scenario typically arises during the analysis of gathered nodes or reductions where the resulting vector is large enough to be split into multiple hardware registers.
+**Description**: 
+The bug is triggered when the SLP vectorizer attempts to vectorize a sequence of scalar operations (such as load-math-store chains) that require shuffling elements from multiple source vectors to form the vectorized operands. The issue arises when the source vectors being shuffled have sizes (vector factors) that differ from the size of the resulting shuffle mask. 
 
-When the compiler constructs the shuffle mask to estimate the cost of these operations, it iterates through the scalar elements of each vector part to identify `poison` values and mark the corresponding mask indices as unused. However, the incorrect transformation logic failed to account for the offset of the current vector part. Instead of applying the mask updates to the indices corresponding to the specific register being processed (e.g., the second or third part), it erroneously updated the indices corresponding to the first vector part.
-
-This resulted in a corrupted shuffle mask where `poison` elements in higher-order vector parts were not correctly marked, and valid elements in the first part might have been incorrectly marked as poison. This inconsistency leads to an assertion failure in the shuffle cost estimator, which validates that the mask correctly represents the expected subvector usage.
+During the generation of the shuffle mask, the vectorizer must adjust the indices for elements originating from the second source vector by adding an offset. However, the vectorizer incorrectly uses the size of the resulting mask as this offset, rather than the actual vector factor of the input vectors. Consequently, the generated `shufflevector` instruction contains incorrect mask indices. This causes the shuffle operation to extract the wrong elements—such as erroneously referencing elements from the first vector instead of the second, or picking elements from incorrect positions—ultimately leading to a miscompilation of the vectorized code.
 
 ## Example
 
@@ -549,23 +404,15 @@ This resulted in a corrupted shuffle mask where `poison` elements in higher-orde
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define void @test(ptr %p) {
+define void @test(<4 x i32> %v1, <4 x i32> %v2, ptr %out) {
 entry:
-  store i32 0, ptr %p, align 4
-  %p1 = getelementptr inbounds i32, ptr %p, i64 1
-  store i32 1, ptr %p1, align 4
-  %p2 = getelementptr inbounds i32, ptr %p, i64 2
-  store i32 2, ptr %p2, align 4
-  %p3 = getelementptr inbounds i32, ptr %p, i64 3
-  store i32 3, ptr %p3, align 4
-  %p4 = getelementptr inbounds i32, ptr %p, i64 4
-  store i32 4, ptr %p4, align 4
-  %p5 = getelementptr inbounds i32, ptr %p, i64 5
-  store i32 poison, ptr %p5, align 4
-  %p6 = getelementptr inbounds i32, ptr %p, i64 6
-  store i32 6, ptr %p6, align 4
-  %p7 = getelementptr inbounds i32, ptr %p, i64 7
-  store i32 7, ptr %p7, align 4
+  %e1 = extractelement <4 x i32> %v1, i32 0
+  %e2 = extractelement <4 x i32> %v2, i32 0
+  %add1 = add i32 %e1, 1
+  %add2 = add i32 %e2, 1
+  store i32 %add1, ptr %out, align 4
+  %out1 = getelementptr inbounds i32, ptr %out, i64 1
+  store i32 %add2, ptr %out1, align 4
   ret void
 }
 ```
@@ -574,11 +421,11 @@ entry:
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define void @test(ptr %p) {
+define void @test(<4 x i32> %v1, <4 x i32> %v2, ptr %out) {
 entry:
-  ; The bug causes the element at index 1 (corresponding to the offset of poison in the second part)
-  ; to be incorrectly marked as poison/undef in the first part.
-  store <8 x i32> <i32 0, i32 poison, i32 2, i32 3, i32 4, i32 poison, i32 6, i32 7>, ptr %p, align 4
+  %0 = shufflevector <4 x i32> %v1, <4 x i32> %v2, <2 x i32> <i32 0, i32 2>
+  %1 = add <2 x i32> %0, <i32 1, i32 1>
+  store <2 x i32> %1, ptr %out, align 4
   ret void
 }
 ```
@@ -588,70 +435,82 @@ entry:
 
 # Issue 120076
 
-## Incorrect Bitwidth Demotion of Sign-Sensitive Operations in SLP Vectorizer
+## Incorrect Bitwidth Demotion of Shared Nodes Across Multiple Contexts
 
 **Description**:
-The bug is triggered when the SLP vectorizer attempts to reduce the bitwidth of a sequence of integer operations involving type promotions and comparisons. Specifically, the issue arises in patterns where a value is zero-extended from a narrow type to a wider type and subsequently used in a signed comparison (e.g., `zext` followed by `icmp slt`). In such cases, the wider bitwidth is essential to treat the value as a large positive number, whereas the narrow type might interpret the same bit pattern as a negative number.
+The bug is triggered during the bitwidth reduction (demotion) optimization in the vectorizer, where it attempts to narrow the types of vectorized instructions to generate more efficient code. 
 
-The miscompilation occurs because the vectorizer's analysis of minimum bitwidths does not consistently persist "do not demote" decisions across the entire vectorization graph. If the vectorizer analyzes a set of nodes and determines they must keep their original bitwidth to preserve correctness, this constraint may be ignored if the nodes are re-analyzed as part of a different reduction chain or subgraph. Consequently, the compiler incorrectly decides to demote the operations to the narrower bitwidth, transforming a true comparison (unsigned/positive in wide type) into a false comparison (signed/negative in narrow type), resulting in incorrect program behavior.
+The issue arises when a vectorized value (or node) is shared across multiple different expression trees or use contexts that have conflicting bitwidth requirements:
+1. **Strict Context**: One use context requires the shared value to maintain its original, wider bitwidth to preserve program semantics. For example, a signed comparison (e.g., `icmp slt`) where truncating the operands might change a positive value into a negative one by altering the sign bit, thereby flipping the comparison result.
+2. **Permissive Context**: Another use context allows the shared value to be safely demoted. For example, an equality comparison (e.g., `icmp eq`) or a bitwise operation where the upper bits are known to be zero and do not affect the outcome.
+
+The vectorizer analyzes these contexts independently. When evaluating the strict context, it correctly determines that demotion is invalid and aborts the reduction for that specific tree. However, because it does not globally record this constraint, a subsequent analysis of the permissive context evaluates the same shared value, concludes that demotion is safe, and proceeds to truncate it. 
+
+Consequently, the shared value is incorrectly demoted based on the permissive context, forcing the strict context to operate on truncated data. This violates the semantic requirements of the strict context and leads to a miscompilation (e.g., evaluating a comparison incorrectly). The underlying pattern is the failure to propagate and respect the "must keep original bitwidth" constraint for shared nodes across independent analysis chains.
 
 ## Example
 
 ### Original IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define i1 @test_slp_demotion_bug(ptr %p) {
+define void @test_shared_node_demotion(i32* %a, i1* %out_eq, i1* %out_slt) {
 entry:
-  %0 = load i8, ptr %p, align 1
-  %arrayidx1 = getelementptr inbounds i8, ptr %p, i64 1
-  %1 = load i8, ptr %arrayidx1, align 1
-  %arrayidx2 = getelementptr inbounds i8, ptr %p, i64 2
-  %2 = load i8, ptr %arrayidx2, align 1
-  %arrayidx3 = getelementptr inbounds i8, ptr %p, i64 3
-  %3 = load i8, ptr %arrayidx3, align 1
-  
-  ; Zero-extend i8 to i32. This makes all values positive in i32.
-  %conv0 = zext i8 %0 to i32
-  %conv1 = zext i8 %1 to i32
-  %conv2 = zext i8 %2 to i32
-  %conv3 = zext i8 %3 to i32
-  
-  ; Signed comparison on the wide type.
-  ; If the input is 255 (0xFF), zext makes it 255.
-  ; 255 < 10 is false.
-  ; If demoted to i8, 0xFF is -1.
-  ; -1 < 10 is true.
-  %cmp0 = icmp slt i32 %conv0, 10
-  %cmp1 = icmp slt i32 %conv1, 10
-  %cmp2 = icmp slt i32 %conv2, 10
-  %cmp3 = icmp slt i32 %conv3, 10
-  
-  ; Reduction tree to trigger SLP
-  %or1 = or i1 %cmp0, %cmp1
-  %or2 = or i1 %cmp2, %cmp3
-  %res = or i1 %or1, %or2
-  
-  ret i1 %res
+  %a0.ptr = getelementptr inbounds i32, i32* %a, i64 0
+  %a1.ptr = getelementptr inbounds i32, i32* %a, i64 1
+  %a0 = load i32, i32* %a0.ptr, align 4
+  %a1 = load i32, i32* %a1.ptr, align 4
+
+  ; Permissive context: only lower 8 bits are relevant
+  %and0 = and i32 %a0, 255
+  %and1 = and i32 %a1, 255
+  %cmp.eq0 = icmp eq i32 %and0, 255
+  %cmp.eq1 = icmp eq i32 %and1, 255
+
+  ; Strict context: sign bit of the original 32-bit value is required
+  %cmp.slt0 = icmp slt i32 %a0, 0
+  %cmp.slt1 = icmp slt i32 %a1, 0
+
+  %out_eq0.ptr = getelementptr inbounds i1, i1* %out_eq, i64 0
+  %out_eq1.ptr = getelementptr inbounds i1, i1* %out_eq, i64 1
+  store i1 %cmp.eq0, i1* %out_eq0.ptr, align 1
+  store i1 %cmp.eq1, i1* %out_eq1.ptr, align 1
+
+  %out_slt0.ptr = getelementptr inbounds i1, i1* %out_slt, i64 0
+  %out_slt1.ptr = getelementptr inbounds i1, i1* %out_slt, i64 1
+  store i1 %cmp.slt0, i1* %out_slt0.ptr, align 1
+  store i1 %cmp.slt1, i1* %out_slt1.ptr, align 1
+
+  ret void
 }
 ```
 ### Optimized IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define i1 @test_slp_demotion_bug(ptr %p) {
+define void @test_shared_node_demotion(i32* %a, i1* %out_eq, i1* %out_slt) {
 entry:
-  %0 = load <4 x i8>, ptr %p, align 1
-  ; BUG: The zext was removed, and the comparison was demoted to i8.
-  ; This changes the semantics for inputs in range [128, 255] which are negative in i8 but positive in i32.
-  %1 = icmp slt <4 x i8> %0, <i8 10, i8 10, i8 10, i8 10>
-  %2 = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %1)
-  ret i1 %2
+  %0 = bitcast i32* %a to <2 x i32>*
+  %1 = load <2 x i32>, <2 x i32>* %0, align 4
+  
+  ; Incorrect transformation: shared value is demoted to i8 based on the permissive context
+  %2 = trunc <2 x i32> %1 to <2 x i8>
+  
+  ; Permissive context operates correctly on demoted data
+  %3 = icmp eq <2 x i8> %2, <i8 -1, i8 -1>
+  %4 = bitcast i1* %out_eq to <2 x i1>*
+  store <2 x i1> %3, <2 x i1>* %4, align 1
+  
+  ; Strict context is forced to operate on truncated data, causing a miscompilation
+  ; (e.g., if original value was 255, it is now -1, flipping the slt result)
+  %5 = icmp slt <2 x i8> %2, zeroinitializer
+  %6 = bitcast i1* %out_slt to <2 x i1>*
+  store <2 x i1> %5, <2 x i1>* %6, align 1
+  
+  ret void
 }
-
-declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)
 ```
 
 
@@ -659,42 +518,185 @@ declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)
 
 # Issue 120823
 
-## Incorrect Propagation of `samesign` Flag During Vectorization with Bitwidth Reduction
+## Incorrect Preservation of `samesign` Flag on `icmp` Instructions with Reduced Operand Bitwidths
 
-**Description**
-The bug is triggered when the SLP vectorizer optimizes integer comparison instructions (`icmp`) that are annotated with the `samesign` flag. During the vectorization process, the compiler performs an analysis to determine if the operands can be represented using a smaller bitwidth (e.g., truncating 32-bit integers to 1-bit or 8-bit vectors) without losing significant data.
+**Description:**
+The bug occurs when the compiler vectorizes integer comparison (`icmp`) instructions that possess the `samesign` flag, while simultaneously reducing the bitwidth of their operands. 
 
-When this bitwidth reduction occurs, the vectorizer correctly generates the truncated vector operations but incorrectly propagates the `samesign` flag from the original instruction to the new, narrower comparison. The `samesign` flag asserts that both operands share the same sign bit. However, truncating a value can change its sign interpretation; for instance, a value that is positive in a wider type (e.g., `1` in `i32`) may be interpreted as negative in a narrower type (e.g., `1` in `i1`, where the single bit is the sign bit). If the truncation results in operands having different sign bits in the narrower type, the preserved `samesign` flag causes the instruction to produce a `poison` value (undefined behavior), leading to a miscompilation.
+1. **Initial State**: The original IR contains scalar `icmp` instructions with the `samesign` flag. This flag indicates an optimization assumption that both operands are known to have the same sign (either both non-negative or both negative) in their original bitwidth.
+2. **Bitwidth Reduction**: During vectorization, the compiler's minimum bitwidth analysis determines that the operands of the comparisons can be safely represented using a narrower integer type (e.g., truncating from `i32` to `i1`).
+3. **Incorrect Transformation**: The vectorizer generates the vectorized `icmp` instruction with the truncated operands but incorrectly propagates the `samesign` flag from the original scalar instructions.
+4. **Consequence**: Truncating the operands can alter their sign bits in the context of the narrower type. For example, a positive value like `1` in `i32` becomes `-1` (negative) when truncated to `i1`, while `0` remains `0` (positive). This violates the `samesign` condition in the reduced bitwidth, causing the comparison to evaluate to `poison` and leading to a miscompilation. 
+
+To maintain correctness, the compiler must drop the `samesign` flag from the vectorized `icmp` instruction whenever the bitwidth of its operands is reduced.
 
 ## Example
 
 ### Original IR
 ```llvm
-define <2 x i1> @test_samesign_trunc_bug(i32 %a, i32 %b, i32 %c, i32 %d) {
+define void @test_samesign_bitwidth_reduction(ptr %a, ptr %b, ptr %dst) {
 entry:
-  %mask.a = and i32 %a, 1
-  %mask.b = and i32 %b, 1
-  %mask.c = and i32 %c, 1
-  %mask.d = and i32 %d, 1
-  %cmp0 = icmp samesign ult i32 %mask.a, %mask.b
-  %cmp1 = icmp samesign ult i32 %mask.c, %mask.d
-  %ins0 = insertelement <2 x i1> poison, i1 %cmp0, i32 0
-  %ins1 = insertelement <2 x i1> %ins0, i1 %cmp1, i32 1
-  ret <2 x i1> %ins1
+  %a0 = getelementptr i32, ptr %a, i64 0
+  %l.a0 = load i32, ptr %a0, align 4
+  %and.a0 = and i32 %l.a0, 1
+  %b0 = getelementptr i32, ptr %b, i64 0
+  %l.b0 = load i32, ptr %b0, align 4
+  %and.b0 = and i32 %l.b0, 1
+  %cmp0 = icmp samesign ult i32 %and.a0, %and.b0
+  %dst0 = getelementptr i8, ptr %dst, i64 0
+  %z0 = zext i1 %cmp0 to i8
+  store i8 %z0, ptr %dst0, align 1
+
+  %a1 = getelementptr i32, ptr %a, i64 1
+  %l.a1 = load i32, ptr %a1, align 4
+  %and.a1 = and i32 %l.a1, 1
+  %b1 = getelementptr i32, ptr %b, i64 1
+  %l.b1 = load i32, ptr %b1, align 4
+  %and.b1 = and i32 %l.b1, 1
+  %cmp1 = icmp samesign ult i32 %and.a1, %and.b1
+  %dst1 = getelementptr i8, ptr %dst, i64 1
+  %z1 = zext i1 %cmp1 to i8
+  store i8 %z1, ptr %dst1, align 1
+
+  %a2 = getelementptr i32, ptr %a, i64 2
+  %l.a2 = load i32, ptr %a2, align 4
+  %and.a2 = and i32 %l.a2, 1
+  %b2 = getelementptr i32, ptr %b, i64 2
+  %l.b2 = load i32, ptr %b2, align 4
+  %and.b2 = and i32 %l.b2, 1
+  %cmp2 = icmp samesign ult i32 %and.a2, %and.b2
+  %dst2 = getelementptr i8, ptr %dst, i64 2
+  %z2 = zext i1 %cmp2 to i8
+  store i8 %z2, ptr %dst2, align 1
+
+  %a3 = getelementptr i32, ptr %a, i64 3
+  %l.a3 = load i32, ptr %a3, align 4
+  %and.a3 = and i32 %l.a3, 1
+  %b3 = getelementptr i32, ptr %b, i64 3
+  %l.b3 = load i32, ptr %b3, align 4
+  %and.b3 = and i32 %l.b3, 1
+  %cmp3 = icmp samesign ult i32 %and.a3, %and.b3
+  %dst3 = getelementptr i8, ptr %dst, i64 3
+  %z3 = zext i1 %cmp3 to i8
+  store i8 %z3, ptr %dst3, align 1
+
+  ret void
+}
+
+```
+### Optimized IR
+```llvm
+define void @test_samesign_bitwidth_reduction(ptr %a, ptr %b, ptr %dst) {
+entry:
+  %0 = load <4 x i32>, ptr %a, align 4
+  %1 = trunc <4 x i32> %0 to <4 x i1>
+  %2 = load <4 x i32>, ptr %b, align 4
+  %3 = trunc <4 x i32> %2 to <4 x i1>
+  %4 = icmp samesign ult <4 x i1> %1, %3
+  %5 = zext <4 x i1> %4 to <4 x i8>
+  store <4 x i8> %5, ptr %dst, align 1
+  ret void
+}
+
+```
+
+
+---
+
+# Issue 122324
+
+## Incorrect Shuffle Mask Composition for Reused Gathered Scalars in SLP Vectorization
+
+**Description**:
+The bug is triggered during the vectorization of scalar operations when the vectorizer gathers scalar values into a vector, and some of these scalar values are reused (i.e., the same scalar appears in multiple lanes of the gathered vector). 
+
+To correctly position these reused scalars, the vectorizer generates shuffle masks. When these masks are subsequently combined with other masks (for example, when extending or further rearranging the vector elements), the logic responsible for composing the masks fails to correctly map the indices of the reused scalars. 
+
+This incorrect mask composition results in the emission of a `shufflevector` instruction with a flawed mask. Consequently, incorrect values are placed into the vector lanes, leading to a miscompilation where the vectorized code produces different results compared to the original scalar code.
+
+## Example
+
+### Original IR
+```llvm
+define void @test(ptr %src, ptr %dst) {
+entry:
+  %a = load i16, ptr %src, align 2
+  %src1 = getelementptr inbounds i16, ptr %src, i64 1
+  %b = load i16, ptr %src1, align 2
+  %src2 = getelementptr inbounds i16, ptr %src, i64 2
+  %c = load i16, ptr %src2, align 2
+  %src3 = getelementptr inbounds i16, ptr %src, i64 3
+  %d = load i16, ptr %src3, align 2
+
+  %e0 = zext i16 %a to i32
+  %e1 = zext i16 %b to i32
+  %e2 = zext i16 %c to i32
+  %e3 = zext i16 %a to i32
+
+  store i32 %e0, ptr %dst, align 4
+  %dst1 = getelementptr inbounds i32, ptr %dst, i64 1
+  store i32 %e1, ptr %dst1, align 4
+  %dst2 = getelementptr inbounds i32, ptr %dst, i64 2
+  store i32 %e2, ptr %dst2, align 4
+  %dst3 = getelementptr inbounds i32, ptr %dst, i64 3
+  store i32 %e3, ptr %dst3, align 4
+
+  ret void
 }
 ```
 ### Optimized IR
 ```llvm
-define <2 x i1> @test_samesign_trunc_bug(i32 %a, i32 %b, i32 %c, i32 %d) {
+define void @test(ptr %src, ptr %dst) {
 entry:
-  %0 = insertelement <2 x i32> poison, i32 %a, i32 0
-  %1 = insertelement <2 x i32> %0, i32 %c, i32 1
-  %2 = trunc <2 x i32> %1 to <2 x i1>
-  %3 = insertelement <2 x i32> poison, i32 %b, i32 0
-  %4 = insertelement <2 x i32> %3, i32 %d, i32 1
-  %5 = trunc <2 x i32> %4 to <2 x i1>
-  %6 = icmp samesign ult <2 x i1> %2, %5
-  ret <2 x i1> %6
+  %0 = load <4 x i16>, ptr %src, align 2
+  ; Flawed mask composition: should be <0, 1, 2, 0> to reuse '%a', but the bug emits <0, 1, 2, 3>
+  %1 = shufflevector <4 x i16> %0, <4 x i16> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %2 = zext <4 x i16> %1 to <4 x i32>
+  store <4 x i32> %2, ptr %dst, align 4
+  ret void
+}
+```
+
+
+---
+
+# Issue 122430
+
+## Incorrect Shuffle Mask Generation for Gather/BuildVector with Subregisters in SLP Vectorizer
+
+**Description**:
+The miscompilation is triggered when the SLP vectorizer attempts to optimize a gather or buildvector sequence where the scalar elements can be sourced from existing vector registers. 
+
+1. **Gather to Shuffle Optimization**: When building a vector from scalar elements, the vectorizer checks if these elements originate from already vectorized registers. If so, it tries to replace the costly gather operation with a more efficient `shufflevector` instruction.
+2. **Subregister Cost Estimation**: If the source vector registers are larger than the vector being built (i.e., the operation involves extracting subregisters), the vectorizer generates a temporary submask. This submask adjusts the element indices (e.g., using modulo arithmetic) to accurately estimate the cost of extracting from the smaller subregister.
+3. **Corrupted Mask Application**: The bug occurs because the vectorizer incorrectly takes this temporary, adjusted submask—which was strictly intended for cost estimation—and applies it as the actual mask for the final `shufflevector` instruction. 
+4. **Resulting Miscompilation**: Because the submask's indices were mathematically altered for the cost model, copying them directly into the IR produces a `shufflevector` instruction with corrupted indices. This causes the compiled code to extract and operate on the wrong vector elements, leading to a runtime value mismatch.
+
+## Example
+
+### Original IR
+```llvm
+define <2 x i32> @test(<4 x i32> %v1, <4 x i32> %v2) {
+entry:
+  %e1_0 = extractelement <4 x i32> %v1, i32 2
+  %e1_1 = extractelement <4 x i32> %v1, i32 3
+  %e2_0 = extractelement <4 x i32> %v2, i32 2
+  %e2_1 = extractelement <4 x i32> %v2, i32 3
+  %add0 = add i32 %e1_0, %e2_0
+  %add1 = add i32 %e1_1, %e2_1
+  %i0 = insertelement <2 x i32> poison, i32 %add0, i32 0
+  %i1 = insertelement <2 x i32> %i0, i32 %add1, i32 1
+  ret <2 x i32> %i1
+}
+```
+### Optimized IR
+```llvm
+define <2 x i32> @test(<4 x i32> %v1, <4 x i32> %v2) {
+entry:
+  %0 = shufflevector <4 x i32> %v1, <4 x i32> poison, <2 x i32> <i32 0, i32 1>
+  %1 = shufflevector <4 x i32> %v2, <4 x i32> poison, <2 x i32> <i32 0, i32 1>
+  %2 = add <2 x i32> %0, %1
+  ret <2 x i32> %2
 }
 ```
 
@@ -703,115 +705,45 @@ entry:
 
 # Issue 122583
 
-## Summary Title
-Incorrect Operand Resolution for Poison Lanes in Extract Bundles Leads to Poison Propagation
+## Incorrect Handling of Poison Lanes in Vectorized Extract Instructions
 
-## Description
-The bug is triggered when the SLP vectorizer processes a bundle of instructions that contains both extract instructions (such as `extractelement` or `extractvalue`) and `poison` values, where the `poison` values typically represent unused lanes or padding in the vectorization factor. 
+**Description**: 
+When the SLP vectorizer processes a bundle of extract instructions (such as `extractelement` or `extractvalue`), it may encounter lanes within the vectorization list that are represented as `poison` values (e.g., due to unused lanes or padding). During the operand gathering phase, if a lane is identified as `poison`, the vectorizer incorrectly assigned a `poison` value as the source operand (i.e., the underlying vector or aggregate being extracted from) for that specific lane. 
 
-When the vectorizer analyzes the operands of this bundle to determine if it can be optimized into a single shuffle of a common source vector, it incorrectly identifies the source operand for the `poison` lanes as a `poison` value, rather than the source vector used by the valid extract instructions. This mismatch leads the vectorizer to conclude that the instructions do not share a common source, preventing the transformation into a `shufflevector` instruction. 
+Because the vectorization of extract instructions heavily relies on analyzing their source operands to generate correct shuffle masks or vector combinations, replacing the source operand with `poison` disrupts this logic. It prevents the vectorizer from correctly identifying and matching the common source vector or aggregate across all lanes. Consequently, this leads to malformed vector transformations, such as generating incorrect shuffle masks or improperly propagating `poison` values into the final vectorized instructions. This ultimately causes miscompilations where the compiled program evaluates to a `poison` or undefined result. 
 
-A `shufflevector` with undefined mask indices would produce `undef` values for the unused lanes, which are generally benign (e.g., can be resolved to 0). However, because the shuffle optimization is rejected, the vectorizer falls back to an alternative strategy, such as gathering scalar values, which explicitly inserts `poison` values into the resulting vector. When this vector is subsequently used in operations that propagate poison (such as a horizontal reduction), the `poison` value corrupts the final result, causing Undefined Behavior (UB) in cases where the optimized code should have been valid.
-
-## Example
-
-### Original IR
-```llvm
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define i32 @test(<4 x i32> %v) {
-entry:
-  %e0 = extractelement <4 x i32> %v, i32 0
-  %e1 = extractelement <4 x i32> %v, i32 1
-  %add0 = add i32 %e0, 1
-  %add1 = add i32 %e1, 2
-  %vec0 = insertelement <4 x i32> undef, i32 %add0, i32 0
-  %vec1 = insertelement <4 x i32> %vec0, i32 %add1, i32 1
-  %res = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %vec1)
-  ret i32 %res
-}
-
-declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
-```
-### Optimized IR
-```llvm
-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define i32 @test(<4 x i32> %v) {
-entry:
-  %e0 = extractelement <4 x i32> %v, i32 0
-  %e1 = extractelement <4 x i32> %v, i32 1
-  %0 = insertelement <4 x i32> poison, i32 %e0, i32 0
-  %1 = insertelement <4 x i32> %0, i32 %e1, i32 1
-  %2 = add <4 x i32> %1, <i32 1, i32 2, i32 poison, i32 poison>
-  %res = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %2)
-  ret i32 %res
-}
-
-declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)
-```
-
-
----
-
-# Issue 122691
-
-Based on the provided bug report and patch, here is the summary of the bug triggering strategy.
-
-## Crash due to PoisonValues in Division/Remainder Vectorization Analysis
-
-**Description**
-The bug is triggered when the SLP vectorizer processes a sequence of division or remainder instructions (such as `sdiv` or `urem`). In certain scenarios, such as when handling non-unique values or resizing the scalar list to match a specific vector width, the vectorizer pads the bundle of scalar values with `PoisonValue` elements.
-
-The issue arises during a subsequent analysis phase known as "value demotion," which checks if the vectorized values can be truncated to a smaller bit width. This analysis iterates over the scalar elements of the vector node and expects each element to be a valid instruction. However, when the analysis encounters the `PoisonValue` elements (which are constants) mixed with the division/remainder instructions, it attempts to treat them as instructions (e.g., by casting them). This results in a type mismatch assertion failure, causing the compiler to crash.
+To ensure correct vectorization, the source operand for these `poison` lanes should be set to match the source operand of the primary extract instruction in the bundle, maintaining consistency and allowing the vectorizer to generate the correct extraction or shuffle logic.
 
 ## Example
 
 ### Original IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test(ptr %src, ptr %dst) {
+define <4 x i32> @test(<4 x i32> %v1, <4 x i32> %v2) {
 entry:
-  %src1 = getelementptr inbounds i32, ptr %src, i64 1
-  %src2 = getelementptr inbounds i32, ptr %src, i64 2
-  %l0 = load i32, ptr %src, align 4
-  %l1 = load i32, ptr %src1, align 4
-  %l2 = load i32, ptr %src2, align 4
-  ; Masking to trigger value demotion analysis (checking if values fit in smaller bitwidth)
-  %t0 = and i32 %l0, 65535
-  %t1 = and i32 %l1, 65535
-  %t2 = and i32 %l2, 65535
-  ; Division instructions that will be vectorized with padding
-  %d0 = sdiv i32 %t0, 10
-  %d1 = sdiv i32 %t1, 10
-  %d2 = sdiv i32 %t2, 10
-  %dst1 = getelementptr inbounds i32, ptr %dst, i64 1
-  %dst2 = getelementptr inbounds i32, ptr %dst, i64 2
-  store i32 %d0, ptr %dst, align 4
-  store i32 %d1, ptr %dst1, align 4
-  store i32 %d2, ptr %dst2, align 4
-  ret void
+  %e0 = extractelement <4 x i32> %v1, i32 0
+  %e1 = extractelement <4 x i32> %v1, i32 1
+  %e3 = extractelement <4 x i32> %v1, i32 3
+  %f0 = extractelement <4 x i32> %v2, i32 0
+  %f1 = extractelement <4 x i32> %v2, i32 1
+  %f3 = extractelement <4 x i32> %v2, i32 3
+  %add0 = add i32 %e0, %f0
+  %add1 = add i32 %e1, %f1
+  %add3 = add i32 %e3, %f3
+  %i0 = insertelement <4 x i32> poison, i32 %add0, i32 0
+  %i1 = insertelement <4 x i32> %i0, i32 %add1, i32 1
+  %i2 = insertelement <4 x i32> %i1, i32 poison, i32 2
+  %i3 = insertelement <4 x i32> %i2, i32 %add3, i32 3
+  ret <4 x i32> %i3
 }
 ```
 ### Optimized IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test(ptr %src, ptr %dst) {
+define <4 x i32> @test(<4 x i32> %v1, <4 x i32> %v2) {
 entry:
-  ; The vectorizer loads 4 elements (or masks) and pads the operations with poison
-  %0 = load <4 x i32>, ptr %src, align 4
-  %1 = and <4 x i32> %0, <i32 65535, i32 65535, i32 65535, i32 poison>
-  ; The sdiv is vectorized with a poison element in the 4th lane
-  %2 = sdiv <4 x i32> %1, <i32 10, i32 10, i32 10, i32 poison>
-  %3 = shufflevector <4 x i32> %2, <4 x i32> poison, <3 x i32> <i32 0, i32 1, i32 2>
-  store <3 x i32> %3, ptr %dst, align 4
-  ret void
+  %0 = shufflevector <4 x i32> poison, <4 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 3>
+  %1 = shufflevector <4 x i32> %v2, <4 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 3>
+  %2 = add <4 x i32> %0, %1
+  ret <4 x i32> %2
 }
 ```
 
@@ -820,82 +752,107 @@ entry:
 
 # Issue 123639
 
-## Incorrect Shuffle Mask Offset for Reused Vector Nodes
+## Incorrect Shuffle Mask Generation for BuildVector with Mixed-Length Input Vectors
 
-**Description**: 
-The bug is triggered when the SLP Vectorizer attempts to optimize a sequence of scalar operations into a `BuildVector` node by reusing elements from previously vectorized instructions. When generating the shuffle mask to combine these existing vector nodes, the compiler incorrectly calculates the index offsets for the subsequent vector operands. Specifically, the logic determines the offset based solely on the vector factor (size) of the first input vector. In scenarios where the `BuildVector` node combines multiple vectors or reuses nodes in a way that requires alignment to the maximum vector size among inputs, this assumption fails. This results in a shuffle instruction with incorrect indices that selects the wrong elements from the source vectors, leading to a miscompilation.
+**Description**
+The bug is triggered when the SLP Vectorizer attempts to optimize a gather or buildvector operation that combines elements from multiple existing vector values. 
+
+1. **Triggering Pattern**: The code contains a sequence of operations (such as a loop with cross-iteration dependencies or repeated scalar patterns) that the SLP vectorizer attempts to group into a gather or buildvector operation. This operation reuses elements from multiple source vectors, and crucially, these source vectors have varying lengths (vector factors).
+2. **Incorrect Transformation Logic**: To optimize the gather operation, the vectorizer generates a `shufflevector` instruction to combine the elements from the source vectors. When constructing the combined shuffle mask, the vectorizer calculates the index offsets for elements of subsequent source vectors based solely on the length of the *first* source vector, rather than the maximum length across all input vectors. 
+3. **Resulting Miscompilation**: If the first source vector has a smaller length than the other input vectors, the calculated index offsets are incorrect. This results in a `shufflevector` instruction with an invalid mask that extracts the wrong elements from the source vectors, ultimately leading to incorrect runtime computations. Additionally, instability in detecting reused entries can cause mismatches between cost estimation and actual code generation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test(<2 x float> %a, <4 x float> %b, <4 x float>* %out) {
-  %a0 = extractelement <2 x float> %a, i32 0
-  %a1 = extractelement <2 x float> %a, i32 1
-  %b0 = extractelement <4 x float> %b, i32 0
-  %b1 = extractelement <4 x float> %b, i32 1
-  %i0 = insertelement <4 x float> poison, float %a0, i32 0
-  %i1 = insertelement <4 x float> %i0, float %b0, i32 1
-  %i2 = insertelement <4 x float> %i1, float %a1, i32 2
-  %i3 = insertelement <4 x float> %i2, float %b1, i32 3
-  store <4 x float> %i3, <4 x float>* %out
-  ret void
+define <4 x i32> @test(<2 x i32> %v1, <4 x i32> %v2) {
+entry:
+  %e0 = extractelement <2 x i32> %v1, i32 0
+  %e1 = extractelement <2 x i32> %v1, i32 1
+  %e2 = extractelement <4 x i32> %v2, i32 2
+  %e3 = extractelement <4 x i32> %v2, i32 3
+  %i0 = insertelement <4 x i32> poison, i32 %e0, i32 0
+  %i1 = insertelement <4 x i32> %i0, i32 %e1, i32 1
+  %i2 = insertelement <4 x i32> %i1, i32 %e2, i32 2
+  %i3 = insertelement <4 x i32> %i2, i32 %e3, i32 3
+  ret <4 x i32> %i3
 }
 ```
 ### Optimized IR
 ```llvm
-define void @test(<2 x float> %a, <4 x float> %b, <4 x float>* %out) {
-  %1 = shufflevector <2 x float> %a, <2 x float> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
-  %2 = shufflevector <4 x float> %1, <4 x float> %b, <4 x i32> <i32 0, i32 2, i32 1, i32 3>
-  store <4 x float> %2, <4 x float>* %out
-  ret void
+define <4 x i32> @test(<2 x i32> %v1, <4 x i32> %v2) {
+entry:
+  %0 = shufflevector <2 x i32> %v1, <2 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
+  %1 = shufflevector <4 x i32> %0, <4 x i32> %v2, <4 x i32> <i32 0, i32 1, i32 4, i32 5>
+  ret <4 x i32> %1
 }
 ```
 
 
 ---
 
-# Issue 125357
+# Issue 125259
 
-## Incorrect Reordering Reset for Reused Root Nodes in SLP Vectorization
+## Incorrect Slice Size Calculation for Gathered Scalars in SLP Vectorization
 
-**Description**
-The bug is triggered when the SLP vectorizer constructs a vectorization graph—typically involving horizontal reductions—where the root node of the graph is also reused as an operand within the same tree structure. During the vectorization process, the compiler performs a reordering pass to optimize the arrangement of vector elements, aiming to minimize shuffle costs or align with memory access patterns.
+**Description:**
+The bug is triggered during Superword-Level Parallelism (SLP) vectorization when the compiler attempts to construct a vector from a collection of independent scalar values (often referred to as a gather or build-vector operation). 
 
-The error occurs because the compiler unconditionally discards the calculated reordering for the root node, operating under the assumption that the specific lane order of the root is irrelevant to the rest of the tree. However, if the root node is reused as an input for another operation inside the graph, that internal operation relies on the root node maintaining the specific reordering determined during the optimization pass. Resetting the root node's order creates an inconsistency: the internal use expects the reordered state, while the node definition has been reverted to the original scalar order. This mismatch leads to an assertion failure when the compiler attempts to validate that the scalar values in the vectorization tree entry match the expected operands.
+During this process, the vectorizer divides the elements into parts or slices to generate the appropriate vector shuffle instructions. However, the logic incorrectly calculates the size of these slices based on the *original* number of scalar elements in the vectorization tree entry, rather than the *actual* number of gathered scalars. The number of gathered scalars can differ from the original count if elements are modified, deduplicated, or optimized away while building the vector shuffles.
+
+Because of this size mismatch, the compiler generates incorrect shuffle masks. This causes the resulting vector to be incorrectly sized or aligned, leaving portions of the vector unintentionally populated with `poison` values. When these partially poisoned vectors are subsequently used in downstream operations—such as comparisons, extensions, or memory stores—it results in undefined behavior and a miscompilation of the program. 
+
+To trigger this issue at the LLVM IR level, the code must contain a pattern of scalar operations that the SLP vectorizer decides to group into a gather/build-vector sequence, specifically under conditions where the final number of gathered scalars diverges from the initial scalar count considered by the vectorization tree.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test(ptr %p) {
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @test_slice_size(ptr %out, i32 %x, i32 %y) {
 entry:
-  %p0 = getelementptr inbounds i32, ptr %p, i64 0
-  %l0 = load i32, ptr %p0, align 4
-  %p1 = getelementptr inbounds i32, ptr %p, i64 1
-  %l1 = load i32, ptr %p1, align 4
-  %v0 = add i32 %l1, 10
-  %v1 = add i32 %l0, %v0
-  %out0 = getelementptr inbounds i32, ptr %p, i64 2
-  store i32 %v0, ptr %out0, align 4
-  %out1 = getelementptr inbounds i32, ptr %p, i64 3
-  store i32 %v1, ptr %out1, align 4
+  %add.x = add i32 %x, 1
+  %add.y = add i32 %y, 2
+  
+  %arrayidx0 = getelementptr inbounds i32, ptr %out, i64 0
+  store i32 %add.x, ptr %arrayidx0, align 4
+  
+  %arrayidx1 = getelementptr inbounds i32, ptr %out, i64 1
+  store i32 %add.y, ptr %arrayidx1, align 4
+  
+  %arrayidx2 = getelementptr inbounds i32, ptr %out, i64 2
+  store i32 %add.x, ptr %arrayidx2, align 4
+  
+  %arrayidx3 = getelementptr inbounds i32, ptr %out, i64 3
+  store i32 %add.y, ptr %arrayidx3, align 4
+  
   ret void
 }
+
 ```
 ### Optimized IR
 ```llvm
-define void @test(ptr %p) {
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @test_slice_size(ptr %out, i32 %x, i32 %y) {
 entry:
-  %p0 = getelementptr inbounds i32, ptr %p, i64 0
-  %0 = load <2 x i32>, ptr %p0, align 4
-  %1 = insertelement <2 x i32> poison, i32 10, i32 1
-  %2 = shufflevector <2 x i32> %0, <2 x i32> poison, <2 x i32> <i32 1, i32 0>
-  %3 = add <2 x i32> %0, %1
-  %out0 = getelementptr inbounds i32, ptr %p, i64 2
-  store <2 x i32> %3, ptr %out0, align 4
+  %add.x = add i32 %x, 1
+  %add.y = add i32 %y, 2
+  
+  %0 = insertelement <2 x i32> poison, i32 %add.x, i32 0
+  %1 = insertelement <2 x i32> %0, i32 %add.y, i32 1
+  
+  ; The bug: Incorrect slice size calculation leads to a shuffle mask that fails to 
+  ; duplicate the gathered scalars, leaving the upper half of the vector as poison.
+  %2 = shufflevector <2 x i32> %1, <2 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
+  
+  store <4 x i32> %2, ptr %out, align 4
   ret void
 }
+
 ```
 
 
@@ -903,133 +860,166 @@ entry:
 
 # Issue 129057
 
-## Unsafe Bitwidth Demotion of Multi-Use Values in SLP Vectorizer
+## Incorrect Truncation of Multi-Use Scalars During Vectorization Demotion
 
-**Description**:
-The bug occurs in the SLP vectorizer's bitwidth reduction (demotion) optimization. The compiler analyzes chains of instructions that ultimately feed into a truncation instruction (e.g., truncating a 32-bit value to 8 bits). To improve vectorization efficiency, the compiler attempts to perform the entire sequence of operations using the narrower bit width (e.g., 8-bit operations) instead of the original width.
+**Description:**
+The bug occurs during vectorization when the compiler attempts to optimize the vector tree by demoting (truncating) values to a narrower bitwidth. The triggering pattern involves the following sequence:
 
-The issue arises when an intermediate value within this chain has multiple uses:
-1.  One use is part of the chain being demoted, where the high bits are eventually discarded by the final truncation.
-2.  Another use is external to the demotion logic or requires the full bit width (e.g., an integer comparison against a large constant).
-
-The compiler incorrectly assumes that because the value is part of a demotable chain, it can be safely truncated to the narrower width. It proceeds to narrow the value, stripping away significant high bits. However, the second user (such as the comparison) depends on these high bits. When the truncated value is used by this second instruction (even if zero- or sign-extended back to the original width), the necessary information is lost, leading to incorrect evaluation and miscompilation. The fix involves verifying that values with multiple uses are only demoted if they naturally fit within the narrower type, ensuring no significant bits are lost for other users.
+1. A scalar value within the operations targeted for vectorization has multiple uses.
+2. The vectorizer analyzes the value and decides to truncate it to a narrower bitwidth to optimize the vectorized operations.
+3. However, the compiler fails to verify if this truncation is safe for *all* uses of the scalar. While the use within the immediate vectorized chain might tolerate the narrower bitwidth, another use of the same scalar requires the original, wider bitwidth (e.g., an arithmetic operation or a comparison against a large constant that exceeds the capacity of the narrower type).
+4. Because the safety check for multi-use scalars is missing, the value is prematurely truncated, leading to the irreversible loss of significant upper bits.
+5. When the truncated value is later extended back to its original width to satisfy the other uses, the lost bits alter the semantics of the program (such as flipping the result of a comparison), ultimately causing a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(ptr %A, ptr %B, ptr %C) {
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @test_demote_multi_use(i32 %x, i32 %y, ptr %p) {
 entry:
-  %l1 = load i32, ptr %A
-  %gepA = getelementptr i32, ptr %A, i64 1
-  %l2 = load i32, ptr %gepA
-  %l3 = load i32, ptr %B
-  %gepB = getelementptr i32, ptr %B, i64 1
-  %l4 = load i32, ptr %gepB
-  %add1 = add i32 %l1, %l3
-  %add2 = add i32 %l2, %l4
-  %t1 = trunc i32 %add1 to i8
-  %t2 = trunc i32 %add2 to i8
-  store i8 %t1, ptr %C
-  %gepC = getelementptr i8, ptr %C, i64 1
-  store i8 %t2, ptr %gepC
-  %cmp = icmp ugt i32 %add1, 255
-  ret i1 %cmp
+  %add1 = add i32 %x, 100000
+  %add2 = add i32 %y, 100000
+  %trunc1 = trunc i32 %add1 to i16
+  %trunc2 = trunc i32 %add2 to i16
+  store i16 %trunc1, ptr %p, align 2
+  %p2 = getelementptr inbounds i16, ptr %p, i64 1
+  store i16 %trunc2, ptr %p2, align 2
+  %cmp = icmp ugt i32 %add1, 65535
+  %res = zext i1 %cmp to i32
+  ret i32 %res
+}
+
+```
+### Optimized IR
+```llvm
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @test_demote_multi_use(i32 %x, i32 %y, ptr %p) {
+entry:
+  %0 = insertelement <2 x i32> poison, i32 %x, i32 0
+  %1 = insertelement <2 x i32> %0, i32 %y, i32 1
+  %2 = trunc <2 x i32> %1 to <2 x i16>
+  %3 = add <2 x i16> %2, <i16 -31072, i16 -31072>
+  store <2 x i16> %3, ptr %p, align 2
+  %4 = extractelement <2 x i16> %3, i32 0
+  %5 = zext i16 %4 to i32
+  %cmp = icmp ugt i32 %5, 65535
+  %res = zext i1 %cmp to i32
+  ret i32 %res
+}
+
+```
+
+
+---
+
+# Issue 135113
+
+## Incorrect Reuse of Splat Shufflevector with Poison Mask Elements
+
+**Description**: 
+The bug is triggered by a flaw in how the SLP vectorizer reuses existing vector instructions when broadcasting (splatting) a scalar value across a vector. The strategy to trigger this issue involves the following sequence:
+
+1. **Splat Requirement**: The compiler attempts to vectorize a sequence of operations that share a common scalar operand, which requires creating a vector by splatting (broadcasting) this scalar into multiple lanes.
+2. **Instruction Reuse**: To optimize the generated code, the vectorizer searches for existing `shufflevector` instructions in the program that already perform the same zero-element splat operation.
+3. **Mismatched Poison Lanes**: The compiler finds an existing splat `shufflevector`, but its shuffle mask contains `poison` (or undefined) elements in certain lanes. Meanwhile, the newly requested splat operation demands valid, well-defined values in some of those exact same lanes.
+4. **Flawed Matching Logic**: The vectorizer's matching logic incorrectly identifies the existing `shufflevector` as a perfect substitute because both are broadly classified as "zero-element splats." It fails to check if the existing instruction's mask is at least as defined as the requested mask.
+5. **Poison Propagation**: By reusing the existing, less-defined `shufflevector`, `poison` values are inadvertently injected into lanes that strictly require valid data. 
+6. **Miscompilation**: These `poison` values propagate through subsequent vectorized operations (such as a horizontal vector reduction), ultimately corrupting the final result and causing the program to return `poison` or exhibit undefined behavior.
+
+## Example
+
+### Original IR
+```llvm
+define i32 @test(i32 %val, <2 x i32> %x, ptr %p) {
+entry:
+  %ins = insertelement <2 x i32> poison, i32 %val, i32 0
+  %shuf1 = shufflevector <2 x i32> %ins, <2 x i32> poison, <2 x i32> <i32 0, i32 poison>
+  store <2 x i32> %shuf1, ptr %p
+  
+  %x0 = extractelement <2 x i32> %x, i32 0
+  %x1 = extractelement <2 x i32> %x, i32 1
+  
+  %add0 = add i32 %val, %x0
+  %add1 = add i32 %val, %x1
+  
+  %red = add i32 %add0, %add1
+  
+  ret i32 %red
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(ptr %A, ptr %B, ptr %C) {
+declare i32 @llvm.vector.reduce.add.v2i32(<2 x i32>)
+
+define i32 @test(i32 %val, <2 x i32> %x, ptr %p) {
 entry:
-  %0 = load <2 x i32>, ptr %A, align 4
-  %1 = load <2 x i32>, ptr %B, align 4
-  %2 = trunc <2 x i32> %0 to <2 x i8>
-  %3 = trunc <2 x i32> %1 to <2 x i8>
-  %4 = add <2 x i8> %2, %3
-  store <2 x i8> %4, ptr %C, align 1
-  %5 = extractelement <2 x i8> %4, i64 0
-  %6 = zext i8 %5 to i32
-  %cmp = icmp ugt i32 %6, 255
-  ret i1 %cmp
+  %ins = insertelement <2 x i32> poison, i32 %val, i32 0
+  %shuf1 = shufflevector <2 x i32> %ins, <2 x i32> poison, <2 x i32> <i32 0, i32 poison>
+  store <2 x i32> %shuf1, ptr %p
+  
+  %0 = add <2 x i32> %shuf1, %x
+  %red = call i32 @llvm.vector.reduce.add.v2i32(<2 x i32> %0)
+  
+  ret i32 %red
 }
 ```
 
 
 ---
 
-# Issue 134013
+# Issue 138923
 
-## Incorrect Vector Size Calculation for Comparison Clusters
+## Incorrect Vectorization of Strided Loads Requiring Reordering
 
 **Description**: 
-The bug is triggered when the SLP vectorizer processes a bundle of scalar comparison instructions (such as `fcmp` or `icmp`). During the vector tree construction, the compiler attempts to determine the optimal number of elements required to form "full" vector registers, based on the underlying data type and the operands involved. 
+The bug is triggered when the vectorizer attempts to vectorize a sequence of strided, unmasked memory loads that require reordering. 
 
-The issue occurs because the logic fails to ensure that this calculated optimal vector size does not exceed the actual number of scalar instructions currently being vectorized. If the estimated size for a full vector register is larger than the number of available scalars in the bundle, the compiler proceeds with an invalid size assumption. This mismatch causes the vectorizer to access out-of-bounds elements or generate invalid shuffle masks, leading to a crash.
+When the order of the scalar loads in the source code does not match their sequential memory addresses, the vectorizer must reorder the elements to form the correct vector. However, the transformation logic incorrectly attempts to optimize these accesses by generating a widened or interleaved load sequence without properly accounting for the required reordering. This results in a load and shuffle sequence that fails to place the loaded values into the correct vector lanes, leading to a miscompilation. 
+
+Furthermore, the vectorizer may widen the load to cover the entire strided memory range without verifying if it is safe to unconditionally load from the extended addresses. This can potentially lead to unsafe memory accesses if the widened load reads past valid memory boundaries.
 
 ## Example
 
 ### Original IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_slp_vector_size_mismatch(ptr %a, ptr %b, ptr %res) #0 {
+define <4 x i32> @test_strided_reorder(ptr %p) {
 entry:
-  %a0 = load double, ptr %a, align 8
-  %a1_gep = getelementptr inbounds double, ptr %a, i64 1
-  %a1 = load double, ptr %a1_gep, align 8
-  %a2_gep = getelementptr inbounds double, ptr %a, i64 2
-  %a2 = load double, ptr %a2_gep, align 8
+  %p0 = getelementptr inbounds i32, ptr %p, i64 0
+  %p1 = getelementptr inbounds i32, ptr %p, i64 2
+  %p2 = getelementptr inbounds i32, ptr %p, i64 4
+  %p3 = getelementptr inbounds i32, ptr %p, i64 6
 
-  %b0 = load double, ptr %b, align 8
-  %b1_gep = getelementptr inbounds double, ptr %b, i64 1
-  %b1 = load double, ptr %b1_gep, align 8
-  %b2_gep = getelementptr inbounds double, ptr %b, i64 2
-  %b2 = load double, ptr %b2_gep, align 8
+  ; Out of order scalar loads
+  %v1 = load i32, ptr %p1, align 4
+  %v0 = load i32, ptr %p0, align 4
+  %v3 = load i32, ptr %p3, align 4
+  %v2 = load i32, ptr %p2, align 4
 
-  %c0 = fcmp ogt double %a0, %b0
-  %c1 = fcmp ogt double %a1, %b1
-  %c2 = fcmp ogt double %a2, %b2
+  ; Insert into vector in sequential lane order
+  %i0 = insertelement <4 x i32> poison, i32 %v1, i32 0
+  %i1 = insertelement <4 x i32> %i0, i32 %v0, i32 1
+  %i2 = insertelement <4 x i32> %i1, i32 %v3, i32 2
+  %i3 = insertelement <4 x i32> %i2, i32 %v2, i32 3
 
-  %z0 = zext i1 %c0 to i32
-  %z1 = zext i1 %c1 to i32
-  %z2 = zext i1 %c2 to i32
-
-  store i32 %z0, ptr %res, align 4
-  %res1_gep = getelementptr inbounds i32, ptr %res, i64 1
-  store i32 %z1, ptr %res1_gep, align 4
-  %res2_gep = getelementptr inbounds i32, ptr %res, i64 2
-  store i32 %z2, ptr %res2_gep, align 4
-
-  ret void
+  ret <4 x i32> %i3
 }
-
-attributes #0 = { "min-legal-vector-width"="256" "target-cpu"="skylake" }
 ```
 ### Optimized IR
 ```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_slp_vector_size_mismatch(ptr %a, ptr %b, ptr %res) #0 {
+define <4 x i32> @test_strided_reorder(ptr %p) {
 entry:
-  %0 = load <2 x double>, ptr %a, align 8
-  %1 = load <2 x double>, ptr %b, align 8
-  %2 = fcmp ogt <2 x double> %0, %1
-  %3 = zext <2 x i1> %2 to <2 x i32>
-  store <2 x i32> %3, ptr %res, align 4
-  %a2_gep = getelementptr inbounds double, ptr %a, i64 2
-  %a2 = load double, ptr %a2_gep, align 8
-  %b2_gep = getelementptr inbounds double, ptr %b, i64 2
-  %b2 = load double, ptr %b2_gep, align 8
-  %c2 = fcmp ogt double %a2, %b2
-  %z2 = zext i1 %c2 to i32
-  %res2_gep = getelementptr inbounds i32, ptr %res, i64 2
-  store i32 %z2, ptr %res2_gep, align 4
-  ret void
+  ; Widened load covering the entire strided range (potentially unsafe)
+  %0 = load <8 x i32>, ptr %p, align 4
+  ; Incorrect shuffle mask that fails to account for the required reordering
+  ; Correct mask should be <i32 2, i32 0, i32 6, i32 4>
+  %1 = shufflevector <8 x i32> %0, <8 x i32> poison, <4 x i32> <i32 0, i32 2, i32 4, i32 6>
+  ret <4 x i32> %1
 }
-
-attributes #0 = { "min-legal-vector-width"="256" "target-cpu"="skylake" }
 ```
 
 
@@ -1037,12 +1027,14 @@ attributes #0 = { "min-legal-vector-width"="256" "target-cpu"="skylake" }
 
 # Issue 139202
 
-## Incorrect Vectorization of Distant Memory Accesses due to Offset Truncation
+## Incorrect Vectorization due to 32-bit Truncation of 64-bit Pointer Offsets
 
-**Description**
-The bug is triggered when the compiler's vectorization analysis attempts to determine if separate memory accesses (such as loads or stores) are consecutive in memory and thus eligible to be merged into a single vector instruction. To make this determination, the compiler calculates the byte offset or distance between the pointers of the candidate instructions.
+**Description**:
+The bug is triggered by a sequence of memory operations (such as loads or stores) that access memory using large offsets from a common base pointer. These offsets are large enough to require a 64-bit representation, exceeding the capacity of a standard 32-bit integer. 
 
-The issue arises because the logic responsible for calculating this distance stores the result in a narrow integer type (typically 32-bit) instead of a type sufficient to hold the full pointer difference (typically 64-bit). When the actual distance between two pointers is very large (e.g., exceeding 4GB), the value is truncated to fit the narrow type. If the lower bits of this large, truncated offset happen to match the size of the elements being accessed, the compiler incorrectly perceives the widely separated pointers as being adjacent. Consequently, the vectorizer erroneously combines these non-consecutive accesses into a single vector operation, leading to incorrect memory accesses at runtime.
+To trigger the miscompilation, the offsets are constructed such that their lower 32 bits form a contiguous sequence of memory addresses, spaced exactly by the size of the accessed elements (e.g., 0, 8, 16, 24 for 8-byte elements). However, the upper 32 bits of some offsets are non-zero, meaning the actual memory locations are widely separated and strictly non-contiguous.
+
+When the compiler's vectorization analysis calculates the distances between these pointers to check for consecutive accesses, it incorrectly truncates the 64-bit pointer differences into 32-bit integers. Because of this truncation, the large, non-contiguous offsets are masked, and the compiler only sees the contiguous lower 32 bits. Deceived into believing that the memory accesses are strictly adjacent, the compiler erroneously combines the separate scalar memory operations into a single vector memory operation (e.g., a contiguous vector load or store). This results in a miscompilation where data is read from or written to incorrect memory locations.
 
 ## Example
 
@@ -1051,211 +1043,85 @@ The issue arises because the logic responsible for calculating this distance sto
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define void @test_offset_truncation(ptr %base, i32 %v1, i32 %v2) {
+define void @test_vectorize_truncation_bug(ptr %base, <4 x i64> %val) {
 entry:
-  ; Store the first value at the base address
-  store i32 %v1, ptr %base, align 4
+  ; Offsets: 0, 8, 4294967312 (0x100000010), 4294967320 (0x100000018)
+  ; Lower 32 bits are 0, 8, 16, 24 (contiguous for 8-byte elements)
+  %ptr0 = getelementptr i8, ptr %base, i64 0
+  %ptr1 = getelementptr i8, ptr %base, i64 8
+  %ptr2 = getelementptr i8, ptr %base, i64 4294967312
+  %ptr3 = getelementptr i8, ptr %base, i64 4294967320
 
-  ; Calculate a pointer at an offset of (2^30 + 1) elements.
-  ; In bytes: (1073741825 * 4) = 4294967300 = 0x100000004 bytes.
-  ; If the compiler truncates the offset difference to 32 bits, it sees 0x00000004.
-  ; This matches sizeof(i32), causing the compiler to think this store is adjacent to the first.
-  %p2 = getelementptr i32, ptr %base, i64 1073741825
-  store i32 %v2, ptr %p2, align 4
+  %v0 = extractelement <4 x i64> %val, i32 0
+  %v1 = extractelement <4 x i64> %val, i32 1
+  %v2 = extractelement <4 x i64> %val, i32 2
+  %v3 = extractelement <4 x i64> %val, i32 3
+
+  store i64 %v0, ptr %ptr0, align 8
+  store i64 %v1, ptr %ptr1, align 8
+  store i64 %v2, ptr %ptr2, align 8
+  store i64 %v3, ptr %ptr3, align 8
 
   ret void
 }
+
 ```
 ### Optimized IR
 ```llvm
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
 
-define void @test_offset_truncation(ptr %base, i32 %v1, i32 %v2) {
+define void @test_vectorize_truncation_bug(ptr %base, <4 x i64> %val) {
 entry:
-  ; The compiler incorrectly merged the two distant stores into a single vector store
-  ; at the base address, overwriting memory at base+4 instead of base+4GB+4.
-  %0 = insertelement <2 x i32> poison, i32 %v1, i32 0
-  %1 = insertelement <2 x i32> %0, i32 %v2, i32 1
-  store <2 x i32> %1, ptr %base, align 4
+  %ptr0 = getelementptr i8, ptr %base, i64 0
+  ; The compiler incorrectly assumes the pointers are contiguous due to 32-bit truncation
+  ; of the pointer differences, erroneously combining the scalar stores into a vector store.
+  store <4 x i64> %val, ptr %ptr0, align 8
   ret void
 }
+
 ```
 
 
 ---
 
-# Issue 151699
+# Issue 161140
 
-## Incorrect Opcode Validation for Alternate Instruction Sequences
+## Incorrect Unification of Bitwise and Arithmetic Identity Operations in SLP Vectorizer
 
-**Description**
-The bug is triggered when the SLP vectorizer attempts to vectorize a sequence of instructions containing mixed binary operations (e.g., a mix of shifts, additions, or multiplications). In such scenarios, the vectorizer designates a "main" opcode and an "alternate" opcode to handle the diversity of operations within a single vector lane.
+The bug is triggered by a flaw in how the SLP vectorizer unifies instructions with different opcodes during vectorization, specifically when dealing with identity operations. 
 
-The issue arises during the compatibility check for a candidate instruction. The compiler validates the instruction against the "main" operation but fails to handle the specific case where the instruction is structurally compatible with the bundle but does not support the "main" opcode itself. When this mismatch occurs, the compiler neglects to perform a fallback verification to check if the instruction is instead compatible with the "alternate" opcode. This oversight leads to an incorrect classification of the instruction (potentially treating an "alternate" operation as a "main" one or failing to identify the correct leader), which subsequently causes a crash during the vector tree construction or operand analysis phase.
+When the SLP vectorizer encounters isomorphic chains of instructions with differing opcodes, it attempts to vectorize them by finding a common opcode and blending their constants. Identity operations (e.g., `add X, 0`, `mul X, 1`, `xor X, 0`) are often treated as highly interchangeable because they do not alter the value of their operands. 
 
-## Example
-
-### Original IR
-```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_slp_bug(i32* %a, i32* %b, i32* %c) {
-entry:
-  ; Load 4 consecutive integers from %a
-  %a0 = load i32, i32* %a, align 4
-  %a1_ptr = getelementptr inbounds i32, i32* %a, i64 1
-  %a1 = load i32, i32* %a1_ptr, align 4
-  %a2_ptr = getelementptr inbounds i32, i32* %a, i64 2
-  %a2 = load i32, i32* %a2_ptr, align 4
-  %a3_ptr = getelementptr inbounds i32, i32* %a, i64 3
-  %a3 = load i32, i32* %a3_ptr, align 4
-
-  ; Load 4 consecutive integers from %b
-  %b0 = load i32, i32* %b, align 4
-  %b1_ptr = getelementptr inbounds i32, i32* %b, i64 1
-  %b1 = load i32, i32* %b1_ptr, align 4
-  %b2_ptr = getelementptr inbounds i32, i32* %b, i64 2
-  %b2 = load i32, i32* %b2_ptr, align 4
-  %b3_ptr = getelementptr inbounds i32, i32* %b, i64 3
-  %b3 = load i32, i32* %b3_ptr, align 4
-
-  ; Mixed operations sequence designed to trigger the bug
-  ; Lane 0: shl (Main Opcode)
-  ; Lane 1: lshr (Alternate Opcode)
-  ; Lane 2: ashr (Third Opcode - should fail vectorization or be handled explicitly, but bug treats as Alternate)
-  ; Lane 3: lshr (Alternate Opcode)
-  %op0 = shl i32 %a0, %b0
-  %op1 = lshr i32 %a1, %b1
-  %op2 = ashr i32 %a2, %b2
-  %op3 = lshr i32 %a3, %b3
-
-  ; Store results to %c
-  store i32 %op0, i32* %c, align 4
-  %c1_ptr = getelementptr inbounds i32, i32* %c, i64 1
-  store i32 %op1, i32* %c1_ptr, align 4
-  %c2_ptr = getelementptr inbounds i32, i32* %c, i64 2
-  store i32 %op2, i32* %c2_ptr, align 4
-  %c3_ptr = getelementptr inbounds i32, i32* %c, i64 3
-  store i32 %op3, i32* %c3_ptr, align 4
-
-  ret void
-}
-```
-### Optimized IR
-```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @test_slp_bug(i32* %a, i32* %b, i32* %c) {
-entry:
-  %0 = bitcast i32* %a to <4 x i32>*
-  %1 = load <4 x i32>, <4 x i32>* %0, align 4
-  %2 = bitcast i32* %b to <4 x i32>*
-  %3 = load <4 x i32>, <4 x i32>* %2, align 4
-  ; The vectorizer incorrectly identifies 'ashr' as compatible with the alternate opcode 'lshr'
-  ; It generates vector 'shl' and 'lshr' instructions and shuffles them.
-  %4 = shl <4 x i32> %1, %3
-  %5 = lshr <4 x i32> %1, %3
-  ; The shuffle mask <0, 5, 6, 7> selects:
-  ; Lane 0: shl (index 0)
-  ; Lane 1: lshr (index 5)
-  ; Lane 2: lshr (index 6) -> INCORRECT: Original was ashr
-  ; Lane 3: lshr (index 7)
-  %6 = shufflevector <4 x i32> %4, <4 x i32> %5, <4 x i32> <i32 0, i32 5, i32 6, i32 7>
-  %7 = bitcast i32* %c to <4 x i32>*
-  store <4 x i32> %6, <4 x i32>* %7, align 4
-  ret void
-}
-```
-
-
----
-
-# Issue 158293
-
-## Incorrect Commutativity Check When Vectorizing Mixed Commutative and Non-Commutative Operations
-
-## Description
-The bug is triggered when the SLP vectorizer attempts to vectorize a bundle of instructions that mixes commutative operations (such as `add`) with non-commutative operations (such as `sub`). This scenario typically occurs when a commutative instruction acts as an identity operation (e.g., `add x, 0`) and is assimilated into a vector node defined by a non-commutative opcode (e.g., treating it as `sub x, 0`).
-
-The issue arises during the analysis phase when the compiler determines whether the operands of an instruction can be reordered (commutativity). The incorrect logic evaluates commutativity based solely on the properties of the representative vector operation (the non-commutative one) or its relationship to the instruction bundle, failing to check if the original scalar instruction itself is commutative. Consequently, the compiler incorrectly treats the operands of the commutative instruction as fixed. This misidentification leads to errors in handling operand dependencies and "copyable" values, resulting in a crash during the scheduling phase of the vectorization process.
+The miscompilation occurs through the following sequence of events:
+1. **Simplification to Identity**: The code contains a bitwise operation that acts as an identity function. This often results from internal simplifications during analysis. For example, a double negation like `xor (xor X, 1), 1` can be logically simplified and represented internally as an identity operation `xor X, 0`.
+2. **Incorrect Interchangeability**: This bitwise identity operation is paired with an arithmetic identity operation, such as `mul X, 1`. Before the fix, bitwise identity operations were assigned a universal "can be anything" interchangeability mask. This incorrectly marked them as fully compatible with any other binary operation, including fundamentally different arithmetic operations like multiplication.
+3. **Common Opcode Selection**: Believing the two instructions to be compatible, the vectorizer proceeds to unify them and selects the arithmetic opcode (e.g., `mul`) as the common opcode for the new vector instruction.
+4. **Flawed Constant Conversion**: The vectorizer then attempts to convert the bitwise operation (`xor X, 0`) into the arithmetic one (`mul X, C`). However, because there is no valid semantic translation between these incompatible operations, the constant conversion logic fails to adjust the constant correctly. Instead of changing the constant to `1` (which is required for `mul` to act as an identity operation), it incorrectly defaults to or retains `0`.
+5. **Miscompilation**: As a result, the vectorized instruction performs a multiplication by zero (`mul X, 0`) for that specific vector lane. Instead of preserving the operand's value, it incorrectly zeroes it out, fundamentally changing the semantics of the program and leading to incorrect execution results.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test(ptr %p) {
+define <2 x i32> @test(i32 %x, i32 %y) {
 entry:
-  %p1 = getelementptr i32, ptr %p, i64 1
-  %a = load i32, ptr %p
-  %b = load i32, ptr %p1
-  %sub = sub i32 %a, %b
-  %add = add i32 0, %a
-  store i32 %sub, ptr %p
-  store i32 %add, ptr %p1
-  ret void
+  %mul = mul i32 %x, 1
+  %xor1 = xor i32 %y, 1
+  %xor2 = xor i32 %xor1, 1
+  %vec1 = insertelement <2 x i32> poison, i32 %mul, i32 0
+  %vec2 = insertelement <2 x i32> %vec1, i32 %xor2, i32 1
+  ret <2 x i32> %vec2
 }
 ```
 ### Optimized IR
 ```llvm
-define void @test(ptr %p) {
+define <2 x i32> @test(i32 %x, i32 %y) {
 entry:
-  %p1 = getelementptr i32, ptr %p, i64 1
-  %a = load i32, ptr %p
-  %b = load i32, ptr %p1
-  %0 = insertelement <2 x i32> poison, i32 %a, i32 0
-  %1 = insertelement <2 x i32> %0, i32 0, i32 1
-  %2 = insertelement <2 x i32> poison, i32 %b, i32 0
-  %3 = insertelement <2 x i32> %2, i32 %a, i32 1
-  %4 = sub <2 x i32> %1, %3
-  store <2 x i32> %4, ptr %p, align 4
-  ret void
-}
-```
-
-
----
-
-# Issue 162663
-
-## Crash due to Undef Values in Vectorized Division/Remainder Nodes
-
-**Description:**
-The bug is triggered when the SLP vectorizer attempts to vectorize a sequence of scalar values that includes a mix of division/remainder instructions (or function calls) and `undef` values. The vectorizer initially groups these values into a vector node. However, during a subsequent analysis phase intended to compute minimum value sizes for potential demotion, the compiler iterates over the scalar elements of this node. The logic incorrectly assumes that all scalar elements within a node representing a division or remainder operation are valid `Instruction` objects. When the compiler encounters an `undef` value (which is a `Constant` in LLVM IR, not an `Instruction`), it attempts to cast it to an `Instruction`, resulting in an assertion failure and a compiler crash.
-
-## Example
-
-### Original IR
-```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @slp_crash_undef_div(ptr %p, i16 %a, i16 %b) {
-entry:
-  %ext.a = zext i16 %a to i32
-  %ext.b = zext i16 %b to i32
-  %div = sdiv i32 %ext.a, %ext.b
-  store i32 %div, ptr %p, align 4
-  %p.1 = getelementptr inbounds i32, ptr %p, i64 1
-  store i32 undef, ptr %p.1, align 4
-  ret void
-}
-```
-### Optimized IR
-```llvm
-target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-unknown-linux-gnu"
-
-define void @slp_crash_undef_div(ptr %p, i16 %a, i16 %b) {
-entry:
-  %ext.a = zext i16 %a to i32
-  %ext.b = zext i16 %b to i32
-  %div = sdiv i32 %ext.a, %ext.b
-  %0 = insertelement <2 x i32> poison, i32 %div, i32 0
-  store <2 x i32> %0, ptr %p, align 4
-  ret void
+  %0 = insertelement <2 x i32> poison, i32 %x, i32 0
+  %1 = insertelement <2 x i32> %0, i32 %y, i32 1
+  %2 = mul <2 x i32> %1, <i32 1, i32 0>
+  ret <2 x i32> %2
 }
 ```
 
@@ -1264,53 +1130,44 @@ entry:
 
 # Issue 165878
 
-## Incorrect Bit-Width Demotion for Alternate Opcodes
+## Incorrect Type Demotion in Alternate Opcode Vectorization Involving Bitwidth-Sensitive Operations
 
-**Description**
-The bug is triggered when the SLP vectorizer attempts to optimize a sequence of instructions by reducing their bit width (demotion) while simultaneously handling nodes with different opcodes (alternate opcodes). When the vectorizer groups instructions with differing operations (e.g., mixing arithmetic operations with shifts) into a single vector node, it analyzes the values to determine if they can be computed using a narrower type (e.g., converting `i32` to `i16`).
+**Description**: 
+The bug is triggered when the vectorizer groups two different operations into an alternate opcode vectorization sequence (e.g., a multiplication and a logical shift) and attempts to demote their types based on minimum bitwidth analysis. 
 
-The issue arises because the analysis for the minimum safe bit width may not strictly validate the constraints of the "alternate" opcode. Certain operations, such as shifts, divisions, and remainders, have strict validity requirements relative to the bit width (for example, a shift amount must be strictly less than the bit width). If the optimizer demotes the type based on the values of the primary operation but ignores that the alternate operation's operands (like a shift count) exceed the capacity of the new narrower type, the resulting vector instruction performs an undefined operation (poison), leading to a miscompilation.
+If the operations operate on a wider integer type but their inputs are extended from a narrower type, the vectorizer may decide to shrink the bitwidth of the vectorized operations to optimize the code. However, if the alternate operation is bitwidth-sensitive (such as a shift, division, or remainder) and uses an operand that is only valid for the wider type (e.g., a constant shift amount that is greater than or equal to the narrower bitwidth), the demotion becomes unsafe. 
+
+The vectorizer incorrectly relies on the analysis of the main operation and applies the type demotion to both operations. This results in the bitwidth-sensitive operation becoming invalid in the narrower type (e.g., producing poison or undefined behavior due to an out-of-bounds shift amount), ultimately leading to a miscompilation. 
+
+To trigger this issue, one must construct a pattern where a bitwidth-sensitive operation and a regular operation are vectorized together as alternate opcodes, with inputs that encourage type demotion, and an operand in the sensitive operation that exceeds the bounds of the newly demoted type.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test_slp_demotion_bug(ptr %src, ptr %dst) {
+define <2 x i8> @test(<2 x i8> %x) {
 entry:
-  %l0 = load i32, ptr %src, align 4
-  %gep1 = getelementptr inbounds i32, ptr %src, i64 1
-  %l1 = load i32, ptr %gep1, align 4
-  ; Mask inputs to simulate values that fit in i8
-  %v0 = and i32 %l0, 255
-  %v1 = and i32 %l1, 255
-  ; Lane 0: Arithmetic operation (add)
-  %op0 = add i32 %v0, 10
-  ; Lane 1: Shift operation (shl)
-  ; The shift amount 20 is valid for i32 but invalid (poison) if demoted to i8
-  %op1 = shl i32 %v1, 20
-  store i32 %op0, ptr %dst, align 4
-  %gep_dst1 = getelementptr inbounds i32, ptr %dst, i64 1
-  store i32 %op1, ptr %gep_dst1, align 4
-  ret void
+  %0 = extractelement <2 x i8> %x, i32 0
+  %1 = zext i8 %0 to i32
+  %2 = mul i32 %1, 5
+  %3 = trunc i32 %2 to i8
+  %4 = extractelement <2 x i8> %x, i32 1
+  %5 = zext i8 %4 to i32
+  %6 = shl i32 %5, 8
+  %7 = trunc i32 %6 to i8
+  %8 = insertelement <2 x i8> poison, i8 %3, i32 0
+  %9 = insertelement <2 x i8> %8, i8 %7, i32 1
+  ret <2 x i8> %9
 }
 ```
 ### Optimized IR
 ```llvm
-define void @test_slp_demotion_bug(ptr %src, ptr %dst) {
+define <2 x i8> @test(<2 x i8> %x) {
 entry:
-  %0 = load <2 x i32>, ptr %src, align 4
-  ; The vectorizer incorrectly demotes the vector to <2 x i8>
-  %1 = trunc <2 x i32> %0 to <2 x i8>
-  ; It performs the operations on i8
-  %2 = add <2 x i8> %1, <i8 10, i8 10>
-  ; BUG: shl on i8 with shift amount 20 is poison (undefined behavior)
-  %3 = shl <2 x i8> %1, <i8 20, i8 20>
-  ; Shuffle to combine the alternate opcodes
-  %4 = shufflevector <2 x i8> %2, <2 x i8> %3, <2 x i32> <i32 0, i32 3>
-  ; Extend back to i32, propagating the poison
-  %5 = zext <2 x i8> %4 to <2 x i32>
-  store <2 x i32> %5, ptr %dst, align 4
-  ret void
+  %0 = mul <2 x i8> %x, <i8 5, i8 8>
+  %1 = shl <2 x i8> %x, <i8 5, i8 8>
+  %2 = shufflevector <2 x i8> %0, <2 x i8> %1, <2 x i32> <i32 0, i32 3>
+  ret <2 x i8> %2
 }
 ```
 
@@ -1319,40 +1176,42 @@ entry:
 
 # Issue 173784
 
-## Poison Propagation in Vectorized Boolean Logical Reductions
+## Vectorization of Short-Circuiting Boolean Logic into Eager Reductions Introducing Poison
 
-**Description**:
-The bug is triggered when the SLP vectorizer transforms a chain of boolean logical operations (typically represented by `select` instructions implementing logical OR or AND) into a vector reduction. In the original scalar IR, these operations effectively support short-circuiting or masking semantics: if one operand determines the result (e.g., a `true` value in a logical OR), the other operand is not observed. This allows the unobserved operand to safely be `poison` without affecting the program's correctness.
+**Description**: 
+The bug is triggered when a chain of scalar boolean logical operations (such as logical OR or AND, often represented by `select` instructions) is vectorized into a horizontal vector reduction. 
 
-The vectorizer lowers this pattern into a vector reduction intrinsic (such as `llvm.vector.reduce.or`) or a sequence of bitwise operations. Unlike the scalar `select` chain, vector reductions are eager and evaluate all lanes. If the constructed vector contains a lane with a determining value (e.g., `true`) and another lane with `poison`, the reduction operation combines them to produce a `poison` result. This transformation introduces undefined behavior in cases where the scalar code produced a well-defined result, as the compiler fails to `freeze` the potentially poisonous operands before performing the reduction.
+In the original scalar IR, these operations exhibit short-circuiting behavior: if the final result can be determined by the first operand (e.g., a `true` in a logical OR chain), the subsequent operands are not evaluated. This short-circuiting is crucial for correctness when the unevaluated operands might be `poison` or `undef`, as it prevents the undefined behavior from affecting the final result.
+
+During vectorization, the compiler groups these scalar operands into a vector and replaces the logical chain with a vector reduction intrinsic (e.g., `llvm.vector.reduce.or`). However, unlike scalar short-circuiting logic, vector reductions evaluate all lanes eagerly. If any of the vector lanes contain a `poison` value that would have been safely bypassed in the scalar version, the eager evaluation of the reduction observes it and propagates the `poison` to the final result. 
+
+This transformation breaks the original semantics by introducing `poison` into the program in cases where the scalar code would have safely produced a well-defined value, leading to a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(ptr %p) {
-  %v0 = load i1, ptr %p, align 1
-  %p1 = getelementptr i1, ptr %p, i64 1
-  %v1 = load i1, ptr %p1, align 1
-  %p2 = getelementptr i1, ptr %p, i64 2
-  %v2 = load i1, ptr %p2, align 1
-  %p3 = getelementptr i1, ptr %p, i64 3
-  %v3 = load i1, ptr %p3, align 1
-  %op1 = select i1 %v0, i1 true, i1 %v1
-  %op2 = select i1 %op1, i1 true, i1 %v2
-  %op3 = select i1 %op2, i1 true, i1 %v3
-  ret i1 %op3
+define i1 @test(<4 x i1> %v) {
+entry:
+  %e0 = extractelement <4 x i1> %v, i32 0
+  %e1 = extractelement <4 x i1> %v, i32 1
+  %s1 = select i1 %e0, i1 true, i1 %e1
+  %e2 = extractelement <4 x i1> %v, i32 2
+  %s2 = select i1 %s1, i1 true, i1 %e2
+  %e3 = extractelement <4 x i1> %v, i32 3
+  %s3 = select i1 %s2, i1 true, i1 %e3
+  ret i1 %s3
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(ptr %p) {
-  %1 = load <4 x i1>, ptr %p, align 1
-  %2 = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %1)
-  ret i1 %2
-}
-
 declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)
+
+define i1 @test(<4 x i1> %v) {
+entry:
+  %0 = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %v)
+  ret i1 %0
+}
 ```
 
 
@@ -1360,45 +1219,39 @@ declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)
 
 # Issue 173796
 
-## Incorrect Poison Handling in Boolean Reduction with Mixed Operand Usage
+## Miscompilation in Boolean Reduction Trees with Mixed-Position Poison Operands
 
-**Description**
-The bug is triggered during the SLP vectorization of boolean reduction trees, where chains of `select` instructions (representing logical AND/OR) are converted into vector bitwise operations. The issue arises when a specific intermediate value is used in "mixed positions" within the reduction graph: it serves as a **condition operand** in one instruction and as a **value (data) operand** in another (or the instruction using it as a condition is itself used as a value operand).
+**Description**: 
+The bug is triggered when an optimization pass processes boolean reduction chains (such as logical AND/OR operations represented by `select` instructions) that contain a shared, potentially poison value used in mixed positions within the same reduction tree. 
 
-When analyzing whether to insert `freeze` instructions to prevent poison propagation, the compiler incorrectly classifies the shared value. It observes the value's usage as a condition and assumes that this usage pattern allows it to skip freezing (likely assuming the condition determines control flow and poison safety). However, this logic fails to account for the value's simultaneous participation as a data operand in the reduction tree. 
+Specifically, the pattern involves an intermediate value that is used in two different roles:
+1. **As a first operand (e.g., a condition)**: In this position, the operand is poison-propagating.
+2. **As a second operand (e.g., a value)**: In this position, the operand's poison state can be semantically suppressed by short-circuiting logic (e.g., if the condition evaluates to a dominating constant that skips the evaluation of the second operand).
 
-In the scalar code, `select` instructions can suppress poison from unused operands (e.g., `select false, poison, ...` evaluates to a defined value). In the vectorized code, `select`s are replaced with bitwise operations (like `and`/`or`) which do not short-circuit and propagate poison if any operand is poison (e.g., `false & poison` evaluates to `poison`). By skipping the necessary `freeze` on the shared value, the vectorized code allows poison to propagate through the reduction tree in scenarios where the original scalar semantics would have safely masked it, leading to a miscompilation.
+The optimization logic incorrectly classifies this shared intermediate value as strictly poison-propagating based solely on its use as a first operand. It fails to account for the fact that the value is also used as a second operand where its poison could be suppressed. 
+
+Because of this incomplete classification, the pass performs unsafe transformations—such as incorrectly reordering operands or omitting necessary `freeze` instructions. This breaks the original short-circuiting semantics of the scalar IR, allowing poison to incorrectly propagate to the final result when it should have been suppressed.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @test(i1 %a, i1 %b) {
-  ; Logical AND: a && b. If a is false, b (poison) is suppressed.
-  %1 = select i1 %a, i1 %b, i1 false
-  ; Logical AND: b && a. If b is poison, result is poison.
-  %2 = select i1 %b, i1 %a, i1 false
-  ; Reduction: (a && b) && (b && a)
-  %3 = select i1 %1, i1 %2, i1 false
-  ret i1 %3
+define i1 @test(i1 %c1, i1 %v, i1 %c2) {
+entry:
+  %and1 = select i1 %c1, i1 %v, i1 false
+  %and2 = select i1 %v, i1 %c2, i1 false
+  %res = select i1 %and1, i1 %and2, i1 false
+  ret i1 %res
 }
 ```
 ### Optimized IR
 ```llvm
-define i1 @test(i1 %a, i1 %b) {
-  ; The optimizer incorrectly vectorizes the selects into bitwise ANDs without freezing inputs.
-  ; Lane 0: a (cond) vs b (val). Lane 1: b (cond) vs a (val).
-  %1 = insertelement <2 x i1> poison, i1 %a, i32 0
-  %2 = insertelement <2 x i1> %1, i1 %b, i32 1
-  %3 = insertelement <2 x i1> poison, i1 %b, i32 0
-  %4 = insertelement <2 x i1> %3, i1 %a, i32 1
-  ; Bitwise AND propagates poison even if one operand is false (unlike select).
-  %5 = and <2 x i1> %2, %4
-  %6 = call i1 @llvm.vector.reduce.and.v2i1(<2 x i1> %5)
-  ret i1 %6
+define i1 @test(i1 %c1, i1 %v, i1 %c2) {
+entry:
+  %0 = and i1 %c1, %v
+  %res = and i1 %0, %c2
+  ret i1 %res
 }
-
-declare i1 @llvm.vector.reduce.and.v2i1(<2 x i1>)
 ```
 
 
@@ -1406,46 +1259,34 @@ declare i1 @llvm.vector.reduce.and.v2i1(<2 x i1>)
 
 # Issue 174041
 
-## Incorrect Vectorization of Incompatible Identity Operations
+## Incorrect Vectorization of Interchangeable Identity Operations
 
-**Description**
-The bug is triggered when the vectorizer attempts to combine different scalar bitwise instructions that act as identity operations (no-ops) into a single vector instruction. Specifically, this occurs when mixing a `xor` instruction with a constant zero (which preserves the value) and an `and` instruction with a constant -1 (which also preserves the value). The compiler incorrectly assumes these operations are compatible and selects the `and` opcode for the resulting vector instruction. Consequently, the constant `0` from the `xor` operation is used in the vector constant mask. Since `0` is not an identity element for `and` but rather a zeroing element, the lane corresponding to the original `xor` operation computes `value & 0` instead of preserving the value, leading to data corruption.
+**Description**: 
+The bug is triggered by presenting the vectorizer with a sequence of different scalar binary operations that each act as an identity operation due to their specific constant operands (for example, a bitwise XOR with zero and a bitwise AND with all-ones). The vectorizer incorrectly identifies these distinct operations as interchangeable and attempts to combine them into a single vector instruction. 
+
+To achieve this, it selects one of the opcodes (e.g., the AND operation) and applies it across a mixed vector of the original constants. However, the chosen opcode may not maintain its identity semantics when paired with the constant from the other operation (for instance, applying an AND operation with a zero constant evaluates to zero, rather than preserving the original value). This invalid unification alters the semantics of the original scalar operations, leading to a miscompilation where specific vector lanes are incorrectly computed instead of retaining their original values.
 
 ## Example
 
 ### Original IR
 ```llvm
-define void @test(ptr %p, i32 %a, i32 %b) {
+define <2 x i32> @test(<2 x i32> %v) {
 entry:
-  ; Operation 1: xor with 0 (identity operation, result is %a)
-  %op1 = xor i32 %a, 0
-  
-  ; Operation 2: and with -1 (identity operation, result is %b)
-  %op2 = and i32 %b, -1
-  
-  ; Store to adjacent memory locations to trigger SLP vectorization
-  store i32 %op1, ptr %p, align 4
-  %p.1 = getelementptr inbounds i32, ptr %p, i64 1
-  store i32 %op2, ptr %p.1, align 4
-  ret void
+  %v0 = extractelement <2 x i32> %v, i32 0
+  %v1 = extractelement <2 x i32> %v, i32 1
+  %op0 = xor i32 %v0, 0
+  %op1 = and i32 %v1, -1
+  %r0 = insertelement <2 x i32> poison, i32 %op0, i32 0
+  %r1 = insertelement <2 x i32> %r0, i32 %op1, i32 1
+  ret <2 x i32> %r1
 }
 ```
 ### Optimized IR
 ```llvm
-define void @test(ptr %p, i32 %a, i32 %b) {
+define <2 x i32> @test(<2 x i32> %v) {
 entry:
-  ; The vectorizer packs the inputs %a and %b
-  %0 = insertelement <2 x i32> poison, i32 %a, i32 0
-  %1 = insertelement <2 x i32> %0, i32 %b, i32 1
-  
-  ; BUG: The compiler incorrectly combines 'xor %a, 0' and 'and %b, -1' into a vector 'and'.
-  ; It uses the constants from the original instructions: 0 and -1.
-  ; Lane 0 computes: %a & 0 = 0 (Incorrect, should be %a)
-  ; Lane 1 computes: %b & -1 = %b (Correct)
-  %2 = and <2 x i32> %1, <i32 0, i32 -1>
-  
-  store <2 x i32> %2, ptr %p, align 4
-  ret void
+  %0 = and <2 x i32> %v, <i32 0, i32 -1>
+  ret <2 x i32> %0
 }
 ```
 
@@ -1454,86 +1295,34 @@ entry:
 
 # Issue 75437
 
-## Misinterpretation of Dynamic Vector Insertions as Undef in SLP Vectorization
+## Incorrect Handling of Dynamic Indices in Vector Element Tracking
 
 **Description**: 
-The bug is triggered when the SLP vectorizer analyzes the construction of a vector to identify which of its elements are `poison` or `undef`. This analysis traverses the chain of `insertelement` instructions used to build the vector. The flaw occurs when the analysis encounters an `insertelement` instruction where the insertion index is a runtime variable (non-constant) rather than a compile-time constant.
+The bug is triggered when a vector is modified using an insertion operation with a non-constant (dynamic) index, whose exact position is unknown at compile time. 
 
-Instead of conservatively assuming that the dynamic insertion defines an element (making the vector state partially or fully defined), the logic ignores the instruction. If the base vector was `poison`, the optimizer incorrectly concludes that the vector elements remain `poison` effectively acting as if the dynamic insertion never happened. This leads to the incorrect removal of the `insertelement` instruction and the loss of the inserted value in the generated code.
+When the vectorizer attempts to parallelize operations involving this vector, it analyzes the chain of insertion instructions to determine which elements of the resulting vector are undefined or poison. This information is used to optimize the merging of the original vector with newly vectorized elements (e.g., using shuffle operations). 
 
-## Example
-
-### Original IR
-```llvm
-define <2 x float> @test_slp_dynamic_insert_bug(float %val, i32 %idx) {
-  %vec = insertelement <2 x float> poison, float %val, i32 %idx
-  %e0 = extractelement <2 x float> %vec, i32 0
-  %e1 = extractelement <2 x float> %vec, i32 1
-  %r0 = insertelement <2 x float> poison, float %e0, i32 0
-  %r1 = insertelement <2 x float> %r0, float %e1, i32 1
-  ret <2 x float> %r1
-}
-```
-### Optimized IR
-```llvm
-define <2 x float> @test_slp_dynamic_insert_bug(float %val, i32 %idx) {
-  ret <2 x float> poison
-}
-```
-
-
----
-
-# Issue 98838
-
-## Incorrect Poison Replacement in Logical Select Reductions
-
-**Description**
-The bug is triggered during the cleanup phase of the SLP vectorizer, where the compiler removes original scalar instructions that have been vectorized. To facilitate this removal and break dependency chains within the scalar code, the compiler replaces the uses of these instructions with `poison` values.
-
-The issue arises when the scalar instruction being replaced is used as the **condition operand** of a `select` instruction that implements a logical operation (such as a logical AND or OR). In LLVM IR, a `select` instruction with a `poison` condition evaluates to `poison` regardless of its other operands. Consequently, replacing the condition with `poison` causes the entire logical operation to produce a `poison` value. This `poison` value can then propagate to subsequent instructions in the reduction chain or to other users that are not immediately eliminated. If the logic relies on the operation yielding a defined value (e.g., `false` or the value of the other operand), the unexpected `poison` leads to undefined behavior and miscompilation. The correct strategy requires replacing the condition with a non-poison constant (such as `false`) to ensure the `select` instruction resolves to a valid, defined value, thereby preventing the propagation of poison.
+However, when the vectorizer encounters an insertion with a dynamic index, it simply ignores it instead of conservatively assuming that the insertion could affect any element in the vector. As a result, the vectorizer incorrectly marks elements as undefined. This flawed analysis leads the vectorizer to discard the dynamically inserted elements during the transformation, completely removing the insertion operation and resulting in a miscompilation.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i1 @bug_trigger(ptr %p) {
+define <4 x i32> @test(i32 %val, i32 %idx, i32 %a, i32 %b) {
 entry:
-  %p0 = getelementptr inbounds i8, ptr %p, i64 0
-  %l0 = load i8, ptr %p0, align 1
-  %p1 = getelementptr inbounds i8, ptr %p, i64 1
-  %l1 = load i8, ptr %p1, align 1
-  %p2 = getelementptr inbounds i8, ptr %p, i64 2
-  %l2 = load i8, ptr %p2, align 1
-  %p3 = getelementptr inbounds i8, ptr %p, i64 3
-  %l3 = load i8, ptr %p3, align 1
-  %c0 = icmp ne i8 %l0, 0
-  %c1 = icmp ne i8 %l1, 0
-  %c2 = icmp ne i8 %l2, 0
-  %c3 = icmp ne i8 %l3, 0
-  %or1 = select i1 %c0, i1 true, i1 %c1
-  call void @use(i1 %or1)
-  %or2 = select i1 %or1, i1 true, i1 %c2
-  %or3 = select i1 %or2, i1 true, i1 %c3
-  ret i1 %or3
+  %v1 = insertelement <4 x i32> poison, i32 %val, i32 %idx
+  %v2 = insertelement <4 x i32> %v1, i32 %a, i32 0
+  %v3 = insertelement <4 x i32> %v2, i32 %b, i32 1
+  ret <4 x i32> %v3
 }
-
-declare void @use(i1)
 ```
 ### Optimized IR
 ```llvm
-define i1 @bug_trigger(ptr %p) {
+define <4 x i32> @test(i32 %val, i32 %idx, i32 %a, i32 %b) {
 entry:
-  %0 = load <4 x i8>, ptr %p, align 1
-  %1 = icmp ne <4 x i8> %0, zeroinitializer
-  %2 = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %1)
-  ; The bug: %or1 uses poison operands because scalar %c0 was replaced by poison
-  ; resulting in %or1 being poison, which propagates to the external use.
-  %or1 = select i1 poison, i1 true, i1 poison
-  call void @use(i1 %or1)
-  ret i1 %2
+  %0 = insertelement <2 x i32> poison, i32 %a, i32 0
+  %1 = insertelement <2 x i32> %0, i32 %b, i32 1
+  %2 = shufflevector <2 x i32> %1, <2 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
+  ret <4 x i32> %2
 }
-
-declare void @use(i1)
-declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)
 ```

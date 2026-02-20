@@ -1,66 +1,59 @@
 # Issue 79175
 
-## Stale Dominator Tree Usage in Alias Analysis during Jump Threading
+## Incorrect Load Elimination Due to Stale Dominator Tree in Alias Analysis
 
-**Description**
-The bug is triggered during the Jump Threading optimization pass, which actively modifies the Control Flow Graph (CFG) to simplify control flow. As part of its operation, the pass attempts to eliminate partially redundant load instructions by checking if the loaded value is already available from a dominating definition (such as a previous store or load).
+**Description:**
 
-To safely perform this replacement, the pass queries Alias Analysis (AA) to ensure that no intervening instructions clobber (write to) the memory location being loaded. The Alias Analysis logic relies on the Dominator Tree to reason about pointer validity, object lifetimes, and potential aliasing relationships.
+The bug is triggered by an unsafe interaction between control flow transformations and memory optimization queries relying on outdated analysis data. The strategy unfolds as follows:
 
-The issue arises because the Jump Threading pass updates the Dominator Tree lazily or leaves it in a stale state while performing these queries on the modified CFG. Consequently, Alias Analysis uses incorrect dominance information, leading it to erroneously conclude that a clobbering store does not alias the load or that the memory dependency is preserved. This causes the optimizer to incorrectly replace a load instruction with a stale value, ignoring a necessary reload from memory after a store to the same location.
+1. **Control Flow Modification:** A compiler pass (such as jump threading) performs transformations that alter the Control Flow Graph (CFG). These changes can leave the Dominator Tree temporarily stale or out of sync with the actual CFG.
+2. **Redundant Load Optimization:** While the Dominator Tree is in this stale state, the pass attempts to optimize memory accesses, specifically looking to eliminate partially redundant loads by reusing previously loaded values.
+3. **Flawed Alias Analysis Query:** To ensure the optimization is safe, the pass queries Alias Analysis to check if any intervening memory writes (e.g., stores) clobber the memory location before the load occurs. 
+4. **Incorrect Non-Aliasing Deduction:** Alias Analysis internally utilizes the Dominator Tree to make advanced aliasing deductions (such as evaluating contextual assumptions, checking cycles, or decomposing pointer expressions). Because the Dominator Tree is outdated, Alias Analysis evaluates the dominance relationships incorrectly. This leads it to mistakenly conclude that an intervening memory write does *not* alias the load's target address (`NoAlias`), when in reality, it does.
+5. **Miscompilation:** Trusting the incorrect Alias Analysis result, the optimization pass assumes the previously loaded value is still valid. It incorrectly eliminates the load instruction, replacing it with a stale value (often by routing an older value through a PHI node). This bypasses the actual memory update performed by the clobbering write, resulting in a miscompilation where the program uses an outdated value.
 
 ## Example
 
 ### Original IR
 ```llvm
-define i32 @test_jump_threading_clobber(i32* %ptr, i32* %clobber, i1 %cond) {
+define i8 @test(i8* %p, i8* %q, i1 %c1) {
 entry:
-  store i32 42, i32* %ptr
-  br i1 %cond, label %mid, label %other
+  %load1 = load i8, i8* %p
+  br i1 %c1, label %bb1, label %bb2
 
-other:
-  br label %mid
+bb1:
+  store i8 42, i8* %q
+  br label %bb3
 
-mid:
-  %p = phi i32 [ 0, %entry ], [ 1, %other ]
-  ; This store may clobber %ptr. If AA uses a stale Dominator Tree,
-  ; it might incorrectly determine NoAlias between %clobber and %ptr.
-  store i32 99, i32* %clobber
-  %check = icmp eq i32 %p, 0
-  br i1 %check, label %dest, label %exit
+bb2:
+  br label %bb3
 
-dest:
-  ; If threaded from entry, %ptr should contain 99 (if aliased) or 42 (if not).
-  ; The bug causes this load to be replaced by 42 unconditionally.
-  %val = load i32, i32* %ptr
-  ret i32 %val
+bb3:
+  %phi = phi i1 [ true, %bb1 ], [ false, %bb2 ]
+  br i1 %phi, label %bb4, label %bb5
 
-exit:
-  ret i32 0
+bb4:
+  %load2 = load i8, i8* %p
+  ret i8 %load2
+
+bb5:
+  ret i8 0
 }
+
 ```
 ### Optimized IR
 ```llvm
-define i32 @test_jump_threading_clobber(i32* %ptr, i32* %clobber, i1 %cond) {
+define i8 @test(i8* %p, i8* %q, i1 %c1) {
 entry:
-  store i32 42, i32* %ptr
-  br i1 %cond, label %mid.thread, label %other
+  %load1 = load i8, i8* %p
+  br i1 %c1, label %bb1, label %bb5
 
-other:
-  br label %mid
+bb1:
+  store i8 42, i8* %q
+  ret i8 %load1
 
-mid.thread:
-  ; Threaded path from entry -> mid -> dest
-  store i32 99, i32* %clobber
-  ; BUG: The load was replaced by 42, ignoring the potential clobber above.
-  ret i32 42
-
-mid:
-  ; Path from other -> mid -> exit
-  store i32 99, i32* %clobber
-  br label %exit
-
-exit:
-  ret i32 0
+bb5:
+  ret i8 0
 }
+
 ```
