@@ -1,0 +1,80 @@
+{
+  "base_commit": "6222c8f0305de1fdc5ff39f5f1d87fcfeebfa646",
+  "bug_id": "97702",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/PromoteMemoryToRegister.cpp": [
+        "rewriteSingleStoreAlloca"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/PromoteMemoryToRegister.cpp": [
+        [
+          525,
+          531
+        ],
+        [
+          565,
+          571
+        ]
+      ]
+    },
+    "components": [
+      "PromoteMemoryToRegister"
+    ],
+    "fix_commit": "f58930f705884dfac3bd8c481c827d027a6068cb"
+  },
+  "issue": {
+    "author": "nikic",
+    "body": "```llvm\r\n; RUN: opt -S -passes=sroa < %a\r\n\r\ndefine i8 @test(i1 %cond) {\r\nstart:\r\n  %a = alloca i8, align 1\r\n  br i1 %cond, label %bb1, label %bb2\r\n\r\nbb1:\r\n  store i8 poison, ptr %a, align 1\r\n  br label %exit\r\n\r\nbb2:\r\n  br label %exit\r\n\r\nexit:\r\n  %5 = load i8, ptr %a, align 1\r\n  ret i8 %5\r\n}\r\n```\r\nResults in:\r\n```llvm\r\ndefine i8 @test(i1 %cond) {\r\n  br i1 %cond, label %bb1, label %bb2\r\n\r\nbb1:                                              ; preds = %start\r\n  br label %exit\r\n\r\nbb2:                                              ; preds = %start\r\n  br label %exit\r\n\r\nexit:                                             ; preds = %bb2, %bb1\r\n  ret i8 poison\r\n}\r\n```\r\n\r\nThis is incorrect. If `%cond` is false, then the result must be undef, not poison.\r\n\r\nThe original test case is more along these lines (not sure yet whether the root cause is always the same):\r\n```llvm\r\ndefine i24 @test(i1 %cond) {\r\nstart:\r\n  %a = alloca [3 x i8], align 1\r\n  %b = alloca [1 x i8], align 1\r\n  %a.1 = getelementptr inbounds i8, ptr %a, i64 1\r\n  store i8 1, ptr %a, align 1\r\n  store i8 1, ptr %a.1, align 1\r\n  br i1 %cond, label %bb1, label %bb2\r\n\r\nbb1:\r\n  %b.1 = getelementptr inbounds i8, ptr %b, i64 1\r\n  %oob = load i8, ptr %b.1, align 1\r\n  %a.2 = getelementptr inbounds i8, ptr %a, i64 2\r\n  store i8 %oob, ptr %a.2, align 1\r\n  br label %exit\r\n\r\nbb2:\r\n  br label %exit\r\n\r\nexit:\r\n  %5 = load i24, ptr %a, align 1\r\n  ret i24 %5\r\n}\r\n```",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "It looks like just mem2reg is sufficient for this."
+      },
+      {
+        "author": "nikic",
+        "body": "Looks like mem2reg calls InstSimplify on phi nodes here: https://github.com/llvm/llvm-project/blob/f99746f30a125324500cc7a46829fcfd44bed3dc/llvm/lib/Transforms/Utils/PromoteMemoryToRegister.cpp#L913\r\n\r\nSo it looks like we have found the first real-world instance of the https://github.com/llvm/llvm-project/pull/96631 miscompile."
+      },
+      {
+        "author": "nikic",
+        "body": "After looking a bit closer, my guess in the previous comment wasn't right. The actual root cause is the \"single store\" optimization in mem2reg, which is not correct if the stored value may be poison."
+      },
+      {
+        "author": "nikic",
+        "body": "Adding a isGuaranteedNotToBePoison() check to rewriteSingleStoreAlloca() does fix the issue."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "title": "[Mem2Reg] Incorrect poison propagation"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/97702",
+  "knowledge_cutoff": "2024-07-04T09:30:41Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/Mem2Reg"
+  ],
+  "patch": "commit f58930f705884dfac3bd8c481c827d027a6068cb\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Thu Jul 4 14:41:12 2024 +0200\n\n    [Mem2Reg] Don't use single store optimization for potentially poison value (#97711)\n    \n    If there is a single store, then loads must either load the stored value\n    or uninitialized memory (undef). If the stored value may be poison, then\n    replacing an uninitialized memory load with it would be incorrect. Fall\n    back to the generic code in that case.\n    \n    This PR only fixes the case where there is a literal poison store -- the\n    case where the value is non-trivially poison will still get miscompiled\n    by phi simplification later, see #96631.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/97702.\n\ndiff --git a/llvm/lib/Transforms/Utils/PromoteMemoryToRegister.cpp b/llvm/lib/Transforms/Utils/PromoteMemoryToRegister.cpp\nindex 6e021a5e2d05..cd5ab55c2122 100644\n--- a/llvm/lib/Transforms/Utils/PromoteMemoryToRegister.cpp\n+++ b/llvm/lib/Transforms/Utils/PromoteMemoryToRegister.cpp\n@@ -525,7 +525,14 @@ rewriteSingleStoreAlloca(AllocaInst *AI, AllocaInfo &Info, LargeBlockInfo &LBI,\n                          SmallSet<DbgAssignIntrinsic *, 8> *DbgAssignsToDelete,\n                          SmallSet<DbgVariableRecord *, 8> *DVRAssignsToDelete) {\n   StoreInst *OnlyStore = Info.OnlyStore;\n-  bool StoringGlobalVal = !isa<Instruction>(OnlyStore->getOperand(0));\n+  Value *ReplVal = OnlyStore->getOperand(0);\n+  // Loads may either load the stored value or uninitialized memory (undef).\n+  // If the stored value may be poison, then replacing an uninitialized memory\n+  // load with it would be incorrect.\n+  if (!isGuaranteedNotToBePoison(ReplVal))\n+    return false;\n+\n+  bool StoringGlobalVal = !isa<Instruction>(ReplVal);\n   BasicBlock *StoreBB = OnlyStore->getParent();\n   int StoreIndex = -1;\n \n@@ -565,7 +572,6 @@ rewriteSingleStoreAlloca(AllocaInst *AI, AllocaInfo &Info, LargeBlockInfo &LBI,\n     }\n \n     // Otherwise, we *can* safely rewrite this load.\n-    Value *ReplVal = OnlyStore->getOperand(0);\n     // If the replacement value is the load, this must occur in unreachable\n     // code.\n     if (ReplVal == LI)\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=mem2reg < %s"
+      ],
+      "file": "llvm/test/Transforms/Mem2Reg/single-store.ll",
+      "tests": [
+        {
+          "test_body": "define i8 @single_store_literal_poison(i1 %cond) {\n  %a = alloca i8, align 1\n  br i1 %cond, label %if, label %exit\n\nif:                                               ; preds = %0\n  store i8 poison, ptr %a, align 1\n  br label %exit\n\nexit:                                             ; preds = %if, %0\n  %v = load i8, ptr %a, align 1\n  ret i8 %v\n}\n",
+          "test_name": "single_store_literal_poison"
+        }
+      ]
+    }
+  ]
+}

@@ -1,17 +1,13 @@
 {
-  "bug_id": "91957",
-  "issue_url": "https://github.com/llvm/llvm-project/issues/91957",
-  "bug_type": "miscompilation",
   "base_commit": "c2a9a974ca85e4ac4509e368d4b9acae7e67bf71",
-  "knowledge_cutoff": "2024-05-13T13:05:21Z",
-  "lit_test_dir": [
-    "llvm/test/Transforms/LICM"
-  ],
+  "bug_id": "91957",
+  "bug_type": "miscompilation",
   "hints": {
-    "fix_commit": "70091dc943ade280d75cea1e5ea5e93d9a8f934a",
-    "components": [
-      "LICM"
-    ],
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/LICM.cpp": [
+        "hoistMulAddAssociation"
+      ]
+    },
     "bug_location_lineno": {
       "llvm/lib/Transforms/Scalar/LICM.cpp": [
         [
@@ -24,36 +20,14 @@
         ]
       ]
     },
-    "bug_location_funcname": {
-      "llvm/lib/Transforms/Scalar/LICM.cpp": [
-        "hoistMulAddAssociation"
-      ]
-    }
-  },
-  "patch": "commit 70091dc943ade280d75cea1e5ea5e93d9a8f934a\nAuthor: Antonio Frighetto <me@antoniofrighetto.com>\nDate:   Sat May 18 16:52:17 2024 +0200\n\n    [LICM] Invalidate cached SCEV results in `hoistMulAddAssociation`\n    \n    While reassociating expressions, LICM is required to invalidate SCEV\n    results, as otherwise subsequent passes in the pipeline that leverage\n    LICM foldings (e.g. IndVars), may reason on invalid expressions; thus\n    miscompiling. This is achieved by rewriting the reassociable\n    instruction from scratch.\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/91957.\n\ndiff --git a/llvm/lib/Transforms/Scalar/LICM.cpp b/llvm/lib/Transforms/Scalar/LICM.cpp\nindex 6aa4188d1cc4..5eccf7b4adb6 100644\n--- a/llvm/lib/Transforms/Scalar/LICM.cpp\n+++ b/llvm/lib/Transforms/Scalar/LICM.cpp\n@@ -2751,7 +2751,7 @@ static bool hoistMulAddAssociation(Instruction &I, Loop &L,\n   IRBuilder<> Builder(Preheader->getTerminator());\n   for (auto *U : Changes) {\n     assert(L.isLoopInvariant(U->get()));\n-    Instruction *Ins = cast<Instruction>(U->getUser());\n+    auto *Ins = cast<BinaryOperator>(U->getUser());\n     Value *Mul;\n     if (I.getType()->isIntOrIntVectorTy()) {\n       Mul = Builder.CreateMul(U->get(), Factor, \"factor.op.mul\");\n@@ -2759,8 +2759,20 @@ static bool hoistMulAddAssociation(Instruction &I, Loop &L,\n       Ins->dropPoisonGeneratingFlags();\n     } else\n       Mul = Builder.CreateFMulFMF(U->get(), Factor, Ins, \"factor.op.fmul\");\n-    U->set(Mul);\n+\n+    // Rewrite the reassociable instruction.\n+    unsigned OpIdx = U->getOperandNo();\n+    auto *LHS = OpIdx == 0 ? Mul : Ins->getOperand(0);\n+    auto *RHS = OpIdx == 1 ? Mul : Ins->getOperand(1);\n+    auto *NewBO = BinaryOperator::Create(Ins->getOpcode(), LHS, RHS,\n+                                         Ins->getName() + \".reass\", Ins);\n+    NewBO->copyIRFlags(Ins);\n+    if (VariantOp == Ins)\n+      VariantOp = NewBO;\n+    Ins->replaceAllUsesWith(NewBO);\n+    eraseInstruction(*Ins, SafetyInfo, MSSAU);\n   }\n+\n   I.replaceAllUsesWith(VariantOp);\n   eraseInstruction(I, SafetyInfo, MSSAU);\n   return true;\n",
-  "tests": [
-    {
-      "file": "llvm/test/Transforms/LICM/update-scev-after-hoist.ll",
-      "commands": [
-        "opt -S -passes='loop-unroll,loop-mssa(licm,indvars)' -unroll-count=4 < %s 2>&1"
-      ],
-      "tests": [
-        {
-          "test_name": "main",
-          "test_body": "define i16 @main() {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %mul = phi i16 [ 1, %entry ], [ %mul.n, %loop ]\n  %div = phi i16 [ 32767, %entry ], [ %div.n, %loop ]\n  %mul.n = mul i16 %mul, 2\n  %div.n = sdiv i16 %div, 2\n  %cmp = icmp sgt i16 %div, 0\n  br i1 %cmp, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i16 %mul\n}\n",
-          "additional_args": "-src-unroll=16 -tgt-unroll=16"
-        }
-      ]
-    }
-  ],
-  "issue": {
-    "title": "Miscompile with opt -passes=\"loop-unroll,loop-mssa(licm,indvars)\" -unroll-count=4 ",
-    "body": "llvm commit: e76b257483e6c\r\nReproduce with:\r\n```opt -passes=\"loop-unroll,loop-mssa(licm,indvars)\" -unroll-count=4 bbi-95405.ll -S -o -```\r\n\r\nThe input function returns 32768, but after running the passes as above we get\r\n```\r\ndefine i16 @foo() {\r\nentry:\r\n  br label %loop\r\n\r\nloop:                                             ; preds = %loop, %entry\r\n  br i1 false, label %loop, label %end, !llvm.loop !0\r\n\r\nend:                                              ; preds = %loop\r\n  ret i16 8192\r\n}\r\n\r\n!0 = distinct !{!0, !1}\r\n!1 = !{!\"llvm.loop.unroll.disable\"}\r\n```\r\nSo now the function returns 8192 instead.\r\n\r\nIf I extract the IR after loop-unroll or licm and run the rest of the passes instead I get the correct result.\r\n\r\n[bbi-95405.ll.gz](https://github.com/llvm/llvm-project/files/15294896/bbi-95405.ll.gz)\r\n",
-    "author": "mikaelholmen",
-    "labels": [
-      "miscompilation",
-      "llvm:transforms"
+    "components": [
+      "LICM"
     ],
+    "fix_commit": "70091dc943ade280d75cea1e5ea5e93d9a8f934a"
+  },
+  "issue": {
+    "author": "mikaelholmen",
+    "body": "llvm commit: e76b257483e6c\r\nReproduce with:\r\n```opt -passes=\"loop-unroll,loop-mssa(licm,indvars)\" -unroll-count=4 bbi-95405.ll -S -o -```\r\n\r\nThe input function returns 32768, but after running the passes as above we get\r\n```\r\ndefine i16 @foo() {\r\nentry:\r\n  br label %loop\r\n\r\nloop:                                             ; preds = %loop, %entry\r\n  br i1 false, label %loop, label %end, !llvm.loop !0\r\n\r\nend:                                              ; preds = %loop\r\n  ret i16 8192\r\n}\r\n\r\n!0 = distinct !{!0, !1}\r\n!1 = !{!\"llvm.loop.unroll.disable\"}\r\n```\r\nSo now the function returns 8192 instead.\r\n\r\nIf I extract the IR after loop-unroll or licm and run the rest of the passes instead I get the correct result.\r\n\r\n[bbi-95405.ll.gz](https://github.com/llvm/llvm-project/files/15294896/bbi-95405.ll.gz)\r\n",
     "comments": [
       {
         "author": "mikaelholmen",
@@ -73,18 +47,42 @@
       },
       {
         "author": "antoniofrighetto",
-        "body": "@mikaelholmen This is a bit inconvenient indeed, GH doesn’t seem to send notifications wrt that :( Closed this, thanks for reporting!"
+        "body": "@mikaelholmen This is a bit inconvenient indeed, GH doesn\u2019t seem to send notifications wrt that :( Closed this, thanks for reporting!"
       },
       {
         "author": "mikaelholmen",
-        "body": "> @mikaelholmen This is a bit inconvenient indeed, GH doesn’t seem to send notifications wrt that :( Closed this, thanks for reporting!\r\n\r\nThank you!"
+        "body": "> @mikaelholmen This is a bit inconvenient indeed, GH doesn\u2019t seem to send notifications wrt that :( Closed this, thanks for reporting!\r\n\r\nThank you!"
       }
-    ]
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "title": "Miscompile with opt -passes=\"loop-unroll,loop-mssa(licm,indvars)\" -unroll-count=4 "
   },
-  "verified": true,
+  "issue_url": "https://github.com/llvm/llvm-project/issues/91957",
+  "knowledge_cutoff": "2024-05-13T13:05:21Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LICM"
+  ],
+  "patch": "commit 70091dc943ade280d75cea1e5ea5e93d9a8f934a\nAuthor: Antonio Frighetto <me@antoniofrighetto.com>\nDate:   Sat May 18 16:52:17 2024 +0200\n\n    [LICM] Invalidate cached SCEV results in `hoistMulAddAssociation`\n    \n    While reassociating expressions, LICM is required to invalidate SCEV\n    results, as otherwise subsequent passes in the pipeline that leverage\n    LICM foldings (e.g. IndVars), may reason on invalid expressions; thus\n    miscompiling. This is achieved by rewriting the reassociable\n    instruction from scratch.\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/91957.\n\ndiff --git a/llvm/lib/Transforms/Scalar/LICM.cpp b/llvm/lib/Transforms/Scalar/LICM.cpp\nindex 6aa4188d1cc4..5eccf7b4adb6 100644\n--- a/llvm/lib/Transforms/Scalar/LICM.cpp\n+++ b/llvm/lib/Transforms/Scalar/LICM.cpp\n@@ -2751,7 +2751,7 @@ static bool hoistMulAddAssociation(Instruction &I, Loop &L,\n   IRBuilder<> Builder(Preheader->getTerminator());\n   for (auto *U : Changes) {\n     assert(L.isLoopInvariant(U->get()));\n-    Instruction *Ins = cast<Instruction>(U->getUser());\n+    auto *Ins = cast<BinaryOperator>(U->getUser());\n     Value *Mul;\n     if (I.getType()->isIntOrIntVectorTy()) {\n       Mul = Builder.CreateMul(U->get(), Factor, \"factor.op.mul\");\n@@ -2759,8 +2759,20 @@ static bool hoistMulAddAssociation(Instruction &I, Loop &L,\n       Ins->dropPoisonGeneratingFlags();\n     } else\n       Mul = Builder.CreateFMulFMF(U->get(), Factor, Ins, \"factor.op.fmul\");\n-    U->set(Mul);\n+\n+    // Rewrite the reassociable instruction.\n+    unsigned OpIdx = U->getOperandNo();\n+    auto *LHS = OpIdx == 0 ? Mul : Ins->getOperand(0);\n+    auto *RHS = OpIdx == 1 ? Mul : Ins->getOperand(1);\n+    auto *NewBO = BinaryOperator::Create(Ins->getOpcode(), LHS, RHS,\n+                                         Ins->getName() + \".reass\", Ins);\n+    NewBO->copyIRFlags(Ins);\n+    if (VariantOp == Ins)\n+      VariantOp = NewBO;\n+    Ins->replaceAllUsesWith(NewBO);\n+    eraseInstruction(*Ins, SafetyInfo, MSSAU);\n   }\n+\n   I.replaceAllUsesWith(VariantOp);\n   eraseInstruction(I, SafetyInfo, MSSAU);\n   return true;\n",
   "properties": {
+    "difficulty": "easy",
     "is_single_file_fix": true,
     "is_single_func_fix": true
   },
-  "bisect": "2dd52046816ac706a25d588efac77705793d8778"
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes='loop-unroll,loop-mssa(licm),print<scalar-evolution>' -unroll-count=4 -disable-output < %s 2>&1"
+      ],
+      "file": "llvm/test/Transforms/LICM/update-scev-after-hoist.ll",
+      "tests": [
+        {
+          "test_body": "define i16 @main() {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %mul = phi i16 [ 1, %entry ], [ %mul.n, %loop ]\n  %div = phi i16 [ 32767, %entry ], [ %div.n, %loop ]\n  %mul.n = mul i16 %mul, 2\n  %div.n = sdiv i16 %div, 2\n  %cmp = icmp sgt i16 %div, 0\n  br i1 %cmp, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i16 %mul\n}\n",
+          "test_name": "main"
+        }
+      ]
+    }
+  ]
 }

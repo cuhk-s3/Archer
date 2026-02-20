@@ -1,17 +1,13 @@
 {
-  "bug_id": "98838",
-  "issue_url": "https://github.com/llvm/llvm-project/issues/98838",
-  "bug_type": "miscompilation",
   "base_commit": "9ba9e480fa4ef1f37a2b6b51603ac8e446cca5ff",
-  "knowledge_cutoff": "2024-07-14T21:26:59Z",
-  "lit_test_dir": [
-    "llvm/test/Transforms/SLPVectorizer"
-  ],
+  "bug_id": "98838",
+  "bug_type": "miscompilation",
   "hints": {
-    "fix_commit": "beccecaacde405a3b50891c67594eccbcd1c8b08",
-    "components": [
-      "SLPVectorizer"
-    ],
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::vectorizeTree"
+      ]
+    },
     "bug_location_lineno": {
       "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
         [
@@ -20,47 +16,50 @@
         ]
       ]
     },
-    "bug_location_funcname": {
-      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
-        "BoUpSLP::vectorizeTree"
-      ]
-    }
-  },
-  "patch": "commit beccecaacde405a3b50891c67594eccbcd1c8b08\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Mon Jul 15 07:03:22 2024 -0700\n\n    [SLP]Fix PR98838: do no replace condition of select-based logical op by poison.\n    \n    If the reduction operation is a select-based logical op, the condition\n    should be replaced by the poison, better to replace by the non-poisoning\n    constant to prevent poison propagation in the vector code.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/98838\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 5c2fc0b9320e..74a16d3fbcad 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -14201,9 +14201,23 @@ Value *BoUpSLP::vectorizeTree(\n     for (Instruction *I : RemovedInsts) {\n       if (getTreeEntry(I)->Idx != 0)\n         continue;\n+      SmallVector<SelectInst *> LogicalOpSelects;\n       I->replaceUsesWithIf(PoisonValue::get(I->getType()), [&](Use &U) {\n+        // Do not replace condition of the logical op in form select <cond>.\n+        bool IsPoisoningLogicalOp = isa<SelectInst>(U.getUser()) &&\n+                                    (match(U.getUser(), m_LogicalAnd()) ||\n+                                     match(U.getUser(), m_LogicalOr())) &&\n+                                    U.getOperandNo() == 0;\n+        if (IsPoisoningLogicalOp) {\n+          LogicalOpSelects.push_back(cast<SelectInst>(U.getUser()));\n+          return false;\n+        }\n         return UserIgnoreList->contains(U.getUser());\n       });\n+      // Replace conditions of the poisoning logical ops with the non-poison\n+      // constant value.\n+      for (SelectInst *SI : LogicalOpSelects)\n+        SI->setCondition(Constant::getNullValue(SI->getCondition()->getType()));\n     }\n   }\n   // Retain to-be-deleted instructions for some debug-info bookkeeping and alias\n",
-  "tests": [
-    {
-      "file": "llvm/test/Transforms/SLPVectorizer/X86/select-reduction-op.ll",
-      "commands": [
-        "opt -S --passes=slp-vectorizer < %s"
-      ],
-      "tests": [
-        {
-          "test_name": "src",
-          "test_body": "define i1 @src(i1 %cmp4.118.i) {\n  %cmp4.118.i.not = xor i1 %cmp4.118.i, true\n  %brmerge = select i1 %cmp4.118.i.not, i1 true, i1 poison\n  %.not = xor i1 poison, true\n  %brmerge2 = select i1 %brmerge, i1 true, i1 %.not\n  %.not3 = xor i1 poison, true\n  %brmerge4 = select i1 %brmerge2, i1 true, i1 %.not3\n  %.not5 = xor i1 poison, true\n  %brmerge6 = select i1 %brmerge4, i1 true, i1 %.not5\n  %.not7 = xor i1 poison, true\n  %brmerge8 = select i1 %brmerge6, i1 true, i1 %.not7\n  ret i1 %brmerge8\n}\n"
-        }
-      ]
-    }
-  ],
-  "issue": {
-    "title": "wrong code at -O3 on x86_64-linux-gnu",
-    "body": "It appears to be a recent regression as it doesn't reproduce with 18.1.0 and earlier. \r\n\r\nCompiler Explorer: https://godbolt.org/z/fzsqjEPWW\r\n\r\n```\r\n[562] % clangtk -v\r\nclang version 19.0.0git (https://github.com/llvm/llvm-project.git 52139d8f9a4e3f595ca552393d62ba06b0bc082c)\r\nTarget: x86_64-unknown-linux-gnu\r\nThread model: posix\r\nInstalledDir: /local/suz-local/software/local/clang-trunk/bin\r\nBuild config: +assertions\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/10\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/9\r\nSelected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11\r\nCandidate multilib: .;@m64\r\nSelected multilib: .;@m64\r\n[563] % \r\n[563] % clangtk -O2 -w small.c\r\n[564] % ./a.out\r\n0\r\n[565] % clangtk -O3 -w small.c\r\n[566] % ./a.out\r\n[567] % \r\n[567] % cat small.c\r\nint printf(const char *, ...);\r\nint a, b, e, g;\r\nvolatile int c;\r\nstatic int d[1] = {1}, f;\r\nint h() {\r\n  for (b = 0; b < 4; b++) {\r\n    for (e = 0; e < 4; e++)\r\n      while (b) {\r\n        if (c > 0 && d[1])\r\n          break;\r\n        return f;\r\n      }\r\n  }\r\n  return 0;\r\n}\r\nvoid i() {\r\n  int *j[1];\r\n  j[g] = &d[0];\r\n}\r\nint main() {\r\n  h();\r\n  printf(\"%d\\n\", a);\r\n  return 0;\r\n}\r\n```\r\n\r\n",
-    "author": "zhendongsu",
-    "labels": [
-      "miscompilation",
-      "llvm:SLPVectorizer",
-      "confirmed"
+    "components": [
+      "SLPVectorizer"
     ],
+    "fix_commit": "beccecaacde405a3b50891c67594eccbcd1c8b08"
+  },
+  "issue": {
+    "author": "zhendongsu",
+    "body": "It appears to be a recent regression as it doesn't reproduce with 18.1.0 and earlier. \r\n\r\nCompiler Explorer: https://godbolt.org/z/fzsqjEPWW\r\n\r\n```\r\n[562] % clangtk -v\r\nclang version 19.0.0git (https://github.com/llvm/llvm-project.git 52139d8f9a4e3f595ca552393d62ba06b0bc082c)\r\nTarget: x86_64-unknown-linux-gnu\r\nThread model: posix\r\nInstalledDir: /local/suz-local/software/local/clang-trunk/bin\r\nBuild config: +assertions\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/10\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11\r\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/9\r\nSelected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11\r\nCandidate multilib: .;@m64\r\nSelected multilib: .;@m64\r\n[563] % \r\n[563] % clangtk -O2 -w small.c\r\n[564] % ./a.out\r\n0\r\n[565] % clangtk -O3 -w small.c\r\n[566] % ./a.out\r\n[567] % \r\n[567] % cat small.c\r\nint printf(const char *, ...);\r\nint a, b, e, g;\r\nvolatile int c;\r\nstatic int d[1] = {1}, f;\r\nint h() {\r\n  for (b = 0; b < 4; b++) {\r\n    for (e = 0; e < 4; e++)\r\n      while (b) {\r\n        if (c > 0 && d[1])\r\n          break;\r\n        return f;\r\n      }\r\n  }\r\n  return 0;\r\n}\r\nvoid i() {\r\n  int *j[1];\r\n  j[g] = &d[0];\r\n}\r\nint main() {\r\n  h();\r\n  printf(\"%d\\n\", a);\r\n  return 0;\r\n}\r\n```\r\n\r\n",
     "comments": [
       {
         "author": "dtcxzyw",
         "body": "Reproducer: https://alive2.llvm.org/ce/z/Whfr_a\r\n```\r\n; bin/opt -passes=slp-vectorizer -S test.ll\r\ndefine i1 @src(i1 %cmp4.118.i) {\r\n  %cmp4.118.i.not = xor i1 %cmp4.118.i, true\r\n  %brmerge = select i1 %cmp4.118.i.not, i1 true, i1 poison\r\n  %.not = xor i1 poison, true\r\n  %brmerge2 = select i1 %brmerge, i1 true, i1 %.not\r\n  %.not3 = xor i1 poison, true\r\n  %brmerge4 = select i1 %brmerge2, i1 true, i1 %.not3\r\n  %.not5 = xor i1 poison, true\r\n  %brmerge6 = select i1 %brmerge4, i1 true, i1 %.not5\r\n  %.not7 = xor i1 poison, true\r\n  %brmerge8 = select i1 %brmerge6, i1 true, i1 %.not7\r\n  ret i1 %brmerge8\r\n}\r\n```\r\n```\r\ndefine i1 @tgt(i1 %cmp4.118.i) {\r\n  %1 = insertelement <4 x i1> <i1 poison, i1 true, i1 true, i1 true>, i1 %cmp4.118.i, i32 0\r\n  %2 = xor <4 x i1> %1, <i1 true, i1 poison, i1 poison, i1 poison>\r\n  %.not7 = xor i1 poison, true\r\n  %3 = freeze <4 x i1> %2\r\n  %4 = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %3)\r\n  %op.rdx = select i1 %4, i1 true, i1 %.not7\r\n  %op.rdx1 = select i1 poison, i1 true, i1 %op.rdx\r\n  ret i1 %op.rdx1\r\n}\r\n```\r\ncc @alexey-bataev "
       }
-    ]
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:SLPVectorizer",
+      "confirmed"
+    ],
+    "title": "wrong code at -O3 on x86_64-linux-gnu"
   },
-  "verified": true,
+  "issue_url": "https://github.com/llvm/llvm-project/issues/98838",
+  "knowledge_cutoff": "2024-07-14T21:26:59Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "patch": "commit beccecaacde405a3b50891c67594eccbcd1c8b08\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Mon Jul 15 07:03:22 2024 -0700\n\n    [SLP]Fix PR98838: do no replace condition of select-based logical op by poison.\n    \n    If the reduction operation is a select-based logical op, the condition\n    should be replaced by the poison, better to replace by the non-poisoning\n    constant to prevent poison propagation in the vector code.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/98838\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 5c2fc0b9320e..74a16d3fbcad 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -14201,9 +14201,23 @@ Value *BoUpSLP::vectorizeTree(\n     for (Instruction *I : RemovedInsts) {\n       if (getTreeEntry(I)->Idx != 0)\n         continue;\n+      SmallVector<SelectInst *> LogicalOpSelects;\n       I->replaceUsesWithIf(PoisonValue::get(I->getType()), [&](Use &U) {\n+        // Do not replace condition of the logical op in form select <cond>.\n+        bool IsPoisoningLogicalOp = isa<SelectInst>(U.getUser()) &&\n+                                    (match(U.getUser(), m_LogicalAnd()) ||\n+                                     match(U.getUser(), m_LogicalOr())) &&\n+                                    U.getOperandNo() == 0;\n+        if (IsPoisoningLogicalOp) {\n+          LogicalOpSelects.push_back(cast<SelectInst>(U.getUser()));\n+          return false;\n+        }\n         return UserIgnoreList->contains(U.getUser());\n       });\n+      // Replace conditions of the poisoning logical ops with the non-poison\n+      // constant value.\n+      for (SelectInst *SI : LogicalOpSelects)\n+        SI->setCondition(Constant::getNullValue(SI->getCondition()->getType()));\n     }\n   }\n   // Retain to-be-deleted instructions for some debug-info bookkeeping and alias\n",
   "properties": {
+    "difficulty": "easy",
     "is_single_file_fix": true,
     "is_single_func_fix": true
   },
-  "bisect": "385118644ccabe27a634804c7db60734746c170f"
+  "tests": [
+    {
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux < %s"
+      ],
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/select-reduction-op.ll",
+      "tests": [
+        {
+          "test_body": "define i1 @src(i1 %cmp4.118.i) {\n  %cmp4.118.i.not = xor i1 %cmp4.118.i, true\n  %brmerge = select i1 %cmp4.118.i.not, i1 true, i1 poison\n  %.not = xor i1 poison, true\n  %brmerge2 = select i1 %brmerge, i1 true, i1 %.not\n  %.not3 = xor i1 poison, true\n  %brmerge4 = select i1 %brmerge2, i1 true, i1 %.not3\n  %.not5 = xor i1 poison, true\n  %brmerge6 = select i1 %brmerge4, i1 true, i1 %.not5\n  %.not7 = xor i1 poison, true\n  %brmerge8 = select i1 %brmerge6, i1 true, i1 %.not7\n  ret i1 %brmerge8\n}\n",
+          "test_name": "src"
+        }
+      ]
+    }
+  ]
 }

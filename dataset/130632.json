@@ -1,0 +1,89 @@
+{
+  "base_commit": "72ee9b82151f17d6bd37abc501124d46c1cb63c3",
+  "bug_id": "130632",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+        "MemCpyOptPass::processStoreOfLoad"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+        [
+          638,
+          654
+        ]
+      ]
+    },
+    "components": [
+      "MemCpyOptimizer"
+    ],
+    "fix_commit": "5da9044c40840187330526ca888290a95927a629"
+  },
+  "issue": {
+    "author": "HertzDevil",
+    "body": "The following LLVM IR, which is already partially optimized from earlier passes, allocates two `{ i64, i32, i64 }`s and swaps their contents using a non-default allocator function: (for less minimal reproductions see https://github.com/crystal-lang/crystal/issues/15543)\n\n```llvm\ntarget datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @main() {\nalloca:\n  %0 = call ptr @GC_malloc(i64 8)\n  %1 = call ptr @GC_malloc(i64 48)\n  store ptr %1, ptr %0, align 8\n  %2 = getelementptr inbounds nuw i8, ptr %1, i64 24\n  call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(24) %1, i8 18, i64 24, i1 false)\n  call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(24) %2, i8 52, i64 24, i1 false)\n  %3 = load ptr, ptr %0, align 8\n  %4 = load i64, ptr %3, align 8\n  %5 = getelementptr inbounds nuw i8, ptr %3, i64 8\n  %6 = load { i32, i64 }, ptr %5, align 8\n  %7 = getelementptr inbounds nuw i8, ptr %1, i64 32\n  %8 = load { i32, i64 }, ptr %7, align 8\n  store i64 3761688987579986996, ptr %1, align 8\n  %9 = getelementptr inbounds nuw i8, ptr %1, i64 8\n  store { i32, i64 } %8, ptr %9, align 8\n  store i64 %4, ptr %2, align 8\n  store { i32, i64 } %6, ptr %7, align 8\n  ret void\n}\n\ndeclare ptr @GC_malloc(i64)\n\ndeclare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n```\n\nRunning just the `memcpyopt` pass used to produce the following:\n\n```llvm\n  %0 = call ptr @GC_malloc(i64 8)\n  %1 = call ptr @GC_malloc(i64 48)\n  store ptr %1, ptr %0, align 8\n  %2 = getelementptr inbounds nuw i8, ptr %1, i64 24\n  call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(24) %1, i8 18, i64 24, i1 false)\n  call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(24) %2, i8 52, i64 24, i1 false)\n  %3 = load ptr, ptr %0, align 8\n  %4 = load i64, ptr %3, align 8\n  %5 = getelementptr inbounds nuw i8, ptr %3, i64 8\n  %6 = load { i32, i64 }, ptr %5, align 8\n  %7 = getelementptr inbounds nuw i8, ptr %1, i64 32\n  store i64 3761688987579986996, ptr %1, align 8\n  %8 = getelementptr inbounds nuw i8, ptr %1, i64 8\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %8, ptr align 8 %7, i64 16, i1 false)\n  store i64 %4, ptr %2, align 8\n  store { i32, i64 } %6, ptr %7, align 8\n  ret void\n```\n\nSince LLVM 20 this becomes:\n\n```llvm\n  %0 = call ptr @GC_malloc(i64 8)\n  %1 = call ptr @GC_malloc(i64 48)\n  store ptr %1, ptr %0, align 8\n  %2 = getelementptr inbounds nuw i8, ptr %1, i64 24\n  call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(24) %1, i8 18, i64 24, i1 false)\n  call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(24) %2, i8 52, i64 24, i1 false)\n  %3 = load ptr, ptr %0, align 8\n  %4 = load i64, ptr %3, align 8\n  %5 = getelementptr inbounds nuw i8, ptr %3, i64 8\n  %6 = getelementptr inbounds nuw i8, ptr %1, i64 32\n  store i64 3761688987579986996, ptr %1, align 8\n  %7 = getelementptr inbounds nuw i8, ptr %1, i64 8\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %7, ptr align 8 %6, i64 16, i1 false)\n  call void @llvm.memmove.p0.p0.i64(ptr align 8 %6, ptr align 8 %5, i64 16, i1 false)\n  store i64 %4, ptr %2, align 8\n  ret void\n```\n\nThe new call to `llvm.memmove.p0.p0.i64` seems to assume that `%5` and `%7` can never alias, when they should be identical here. Adding `noalias` to `GC_malloc` does not appear to help, and I doubt this attribute is necessary.\n\nThe first PR that broke this was #108535.\n\n[Compiler Explorer link](https://godbolt.org/z/Gfeja4M6c)",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Slightly reduced and using named values:\n```llvm\ndefine void @main(ptr %ptr, ptr %ptr.copy) {\n  %ptr.8 = getelementptr inbounds nuw i8, ptr %ptr, i64 8\n  %ptr.24 = getelementptr inbounds nuw i8, ptr %ptr, i64 24\n  %ptr.32 = getelementptr inbounds nuw i8, ptr %ptr, i64 32\n  %ptr.copy.8 = getelementptr inbounds nuw i8, ptr %ptr.copy, i64 8\n  %struct1 = load { i32, i64 }, ptr %ptr.copy.8, align 8\n  %struct2 = load { i32, i64 }, ptr %ptr.32, align 8\n  store { i32, i64 } %struct2, ptr %ptr.8, align 8\n  store i64 1, ptr %ptr.24, align 8\n  store { i32, i64 } %struct1, ptr %ptr.32, align 8\n  ret void\n}\n```"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "llvm:transforms"
+    ],
+    "title": "[llvm][opt][regression] `memcpyopt` pass inserts incorrect `memmove` call"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/130632",
+  "knowledge_cutoff": "2025-03-10T16:21:09Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/MemCpyOpt"
+  ],
+  "patch": "commit 5da9044c40840187330526ca888290a95927a629\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Wed Mar 12 14:52:01 2025 +0100\n\n    [MemCpyOpt] Fix clobber check in fca2memcpy optimization\n    \n    This effectively reverts #108535. The old AA code was looking for\n    the *first* clobber between the load and store and then trying to\n    move all the way up there. The new MSSA based code instead found\n    the *last* clobber. There might still be an earlier clobber that\n    has not been accounted for.\n    \n    Fixes #130632.\n\ndiff --git a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\nindex ff3c93661c9e..ce13f87d601a 100644\n--- a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n+++ b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n@@ -638,17 +638,19 @@ bool MemCpyOptPass::processStoreOfLoad(StoreInst *SI, LoadInst *LI,\n       (EnableMemCpyOptWithoutLibcalls ||\n        (TLI->has(LibFunc_memcpy) && TLI->has(LibFunc_memmove)))) {\n     MemoryLocation LoadLoc = MemoryLocation::get(LI);\n-    MemoryUseOrDef *LoadAccess = MSSA->getMemoryAccess(LI),\n-                   *StoreAccess = MSSA->getMemoryAccess(SI);\n-\n-    // We use MSSA to check if an instruction may store to the memory we load\n-    // from in between the load and the store. If such an instruction is found,\n-    // we try to promote there instead of at the store position.\n-    auto *Clobber = MSSA->getWalker()->getClobberingMemoryAccess(\n-        StoreAccess->getDefiningAccess(), LoadLoc, BAA);\n-    Instruction *P = MSSA->dominates(LoadAccess, Clobber)\n-                         ? cast<MemoryUseOrDef>(Clobber)->getMemoryInst()\n-                         : SI;\n+\n+    // We use alias analysis to check if an instruction may store to\n+    // the memory we load from in between the load and the store. If\n+    // such an instruction is found, we try to promote there instead\n+    // of at the store position.\n+    // TODO: Can use MSSA for this.\n+    Instruction *P = SI;\n+    for (auto &I : make_range(++LI->getIterator(), SI->getIterator())) {\n+      if (isModSet(BAA.getModRefInfo(&I, LoadLoc))) {\n+        P = &I;\n+        break;\n+      }\n+    }\n \n     // If we found an instruction that may write to the loaded memory,\n     // we can try to promote at this position instead of the store\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=memcpyopt -S < %s -verify-memoryssa"
+      ],
+      "file": "llvm/test/Transforms/MemCpyOpt/fca2memcpy.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-i64:64-f80:128-n8:16:32:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%S = type { ptr, i8, i32 }\n\ndefine void @noaliasaddrproducer(ptr %src, ptr noalias %dst, ptr noalias %dstidptr) {\n  %1 = load %S, ptr %src, align 8\n  store %S undef, ptr %src, align 8\n  %2 = load i32, ptr %dstidptr, align 4\n  %dstindex = or i32 %2, 1\n  %dst2 = getelementptr %S, ptr %dst, i32 %dstindex\n  store %S %1, ptr %dst2, align 8\n  ret void\n}\n",
+          "test_name": "noaliasaddrproducer"
+        },
+        {
+          "test_body": "target datalayout = \"e-i64:64-f80:128-n8:16:32:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @multiple_clobbering(ptr %ptr, ptr %ptr.copy) {\n  %ptr.8 = getelementptr inbounds nuw i8, ptr %ptr, i64 8\n  %ptr.24 = getelementptr inbounds nuw i8, ptr %ptr, i64 24\n  %ptr.32 = getelementptr inbounds nuw i8, ptr %ptr, i64 32\n  %ptr.copy.8 = getelementptr inbounds nuw i8, ptr %ptr.copy, i64 8\n  %struct = load { i32, i64 }, ptr %ptr.copy.8, align 8\n  call void @llvm.memcpy.p0.p0.i64(ptr %ptr.8, ptr %ptr.32, i64 12, i1 false)\n  store i64 1, ptr %ptr.24, align 8\n  store { i32, i64 } %struct, ptr %ptr.32, align 8\n  ret void\n}\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\n",
+          "test_name": "multiple_clobbering"
+        },
+        {
+          "test_body": "target datalayout = \"e-i64:64-f80:128-n8:16:32:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%S = type { ptr, i8, i32 }\n\ndefine void @destroysrc(ptr %src, ptr %dst) {\n  %1 = load %S, ptr %src, align 8\n  store %S zeroinitializer, ptr %src, align 8\n  store %S %1, ptr %dst, align 8\n  ret void\n}\n",
+          "test_name": "destroysrc"
+        },
+        {
+          "test_body": "target datalayout = \"e-i64:64-f80:128-n8:16:32:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%S = type { ptr, i8, i32 }\n\ndefine void @copyalias(ptr %src, ptr %dst) {\n  %1 = load %S, ptr %src, align 8\n  %2 = load %S, ptr %src, align 8\n  store %S %1, ptr %dst, align 8\n  store %S %2, ptr %dst, align 8\n  ret void\n}\n",
+          "test_name": "copyalias"
+        },
+        {
+          "test_body": "target datalayout = \"e-i64:64-f80:128-n8:16:32:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%S = type { ptr, i8, i32 }\n\ndefine void @throwing_call(ptr noalias %src, ptr %dst) {\n  %1 = load %S, ptr %src, align 8\n  store %S zeroinitializer, ptr %src, align 8\n  call void @call() #0\n  store %S %1, ptr %dst, align 8\n  ret void\n}\n\ndeclare void @call()\n\nattributes #0 = { memory(none) }\n",
+          "test_name": "throwing_call"
+        },
+        {
+          "test_body": "target datalayout = \"e-i64:64-f80:128-n8:16:32:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%S = type { ptr, i8, i32 }\n\ndefine void @destroynoaliassrc(ptr noalias %src, ptr %dst) {\n  %1 = load %S, ptr %src, align 8\n  store %S zeroinitializer, ptr %src, align 8\n  store %S %1, ptr %dst, align 8\n  ret void\n}\n",
+          "test_name": "destroynoaliassrc"
+        },
+        {
+          "test_body": "target datalayout = \"e-i64:64-f80:128-n8:16:32:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%S = type { ptr, i8, i32 }\n\ndefine void @addrproducer(ptr %src, ptr %dst) {\n  %1 = load %S, ptr %src, align 8\n  store %S undef, ptr %dst, align 8\n  %dst2 = getelementptr %S, ptr %dst, i64 1\n  store %S %1, ptr %dst2, align 8\n  ret void\n}\n",
+          "test_name": "addrproducer"
+        }
+      ]
+    }
+  ]
+}

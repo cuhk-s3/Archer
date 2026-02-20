@@ -1,0 +1,63 @@
+{
+  "base_commit": "21c878e72dddaa1495cb71ea636f69ddcab5e0f4",
+  "bug_id": "140215",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        "InstCombinerImpl::visitVAEndInst"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+        [
+          816,
+          824
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "8d0ebd823c6d91527e00a92bbe7ca148de0241f5"
+  },
+  "issue": {
+    "author": "hongjia",
+    "body": "Test program:\n\n``` C\ntypedef __builtin_va_list va_list;\n#define va_start(ap, param) __builtin_va_start(ap, param)\n#define va_end(ap) __builtin_va_end(ap)\n#define va_arg(ap, type) __builtin_va_arg(ap, type)\n#define va_copy(d, s) __builtin_va_copy(d, s)\n\nint foo(int n, ...)\n{\n  va_list ap, aq;\n  int x;\n\n  va_start(ap, n);\n  va_copy(aq, ap);\n  va_end(ap);\n\n  x = va_arg(aq, int);\n  va_end(aq);\n\n  return x + n;\n}\n```\n\nCompile it with -O1:\n\n```\nclang -S -emit-llvm -O1 ic-va.c -mllvm --debug-only=instcombine\n\n...\nIC: Visiting:   call void @llvm.va_copy.p0(ptr nonnull %aq, ptr nonnull %ap)\nIC: Visiting:   call void @llvm.va_end.p0(ptr %ap)\nIC: ERASE   call void @llvm.va_start.p0(ptr nonnull %ap)\nADD DEFERRED:   %ap = alloca ptr, align 2\nIC: ERASE   call void @llvm.va_end.p0(ptr %ap)\n...\n```\n\nThe resulting IR:\n\n```\n...\n; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn\ndefine dso_local i32 @foo(i32 noundef %n, ...) local_unnamed_addr #0 {\nentry:\n  %ap = alloca ptr, align 2\n  %aq = alloca ptr, align 2\n  call void @llvm.lifetime.start.p0(i64 2, ptr nonnull %ap) #3\n  call void @llvm.lifetime.start.p0(i64 2, ptr nonnull %aq) #3\n  call void @llvm.va_copy.p0(ptr nonnull %aq, ptr nonnull %ap)\n  %0 = va_arg ptr %aq, i32\n  call void @llvm.va_end.p0(ptr %aq)\n  %add = add nsw i32 %0, %n\n  call void @llvm.lifetime.end.p0(i64 2, ptr nonnull %aq) #3\n  call void @llvm.lifetime.end.p0(i64 2, ptr nonnull %ap) #3\n  ret i32 %add\n}\n...\n```\n\n%ap is used in va_copy() without being initialized.\n\nFor now I use the following ugly patch to fix this:\n\n```\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex c88710214e7e..d83228ae4b7e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -808,7 +808,10 @@ removeTriviallyEmptyRange(IntrinsicInst &EndI, InstCombinerImpl &IC,\n           IC.eraseInstFromFunction(*I);\n           IC.eraseInstFromFunction(EndI);\n           return true;\n-        }\n+        } else if (EndI.getIntrinsicID() == Intrinsic::vaend &&\n+                   I->getIntrinsicID() == Intrinsic::vacopy &&\n+                   I->getArgOperand(1) == EndI.getArgOperand(0))\n+          break;\n         // Skip start intrinsics that don't pair with this end intrinsic.\n         continue;\n       }\n```",
+    "comments": [],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "InstCombine pass wrongly removes va_start/va_end"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/140215",
+  "knowledge_cutoff": "2025-05-16T07:52:06Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 8d0ebd823c6d91527e00a92bbe7ca148de0241f5\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sat May 17 16:04:03 2025 +0800\n\n    [InstCombine] Special handle `va_copy(dst, src) + va_end(src)` (#140250)\n    \n    Closes https://github.com/llvm/llvm-project/issues/140215.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 3d35bf753c40..12e08c09ea67 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -816,9 +816,12 @@ removeTriviallyEmptyRange(IntrinsicInst &EndI, InstCombinerImpl &IC,\n }\n \n Instruction *InstCombinerImpl::visitVAEndInst(VAEndInst &I) {\n-  removeTriviallyEmptyRange(I, *this, [](const IntrinsicInst &I) {\n-    return I.getIntrinsicID() == Intrinsic::vastart ||\n-           I.getIntrinsicID() == Intrinsic::vacopy;\n+  removeTriviallyEmptyRange(I, *this, [&I](const IntrinsicInst &II) {\n+    // Bail out on the case where the source va_list of a va_copy is destroyed\n+    // immediately by a follow-up va_end.\n+    return II.getIntrinsicID() == Intrinsic::vastart ||\n+           (II.getIntrinsicID() == Intrinsic::vacopy &&\n+            I.getArgOperand(0) != II.getArgOperand(1));\n   });\n   return nullptr;\n }\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/vararg.ll",
+      "tests": [
+        {
+          "test_body": "%struct.__va_list = type { ptr, ptr, ptr, i32, i32 }\n\ndeclare void @callee(ptr)\n\ndefine void @func_destroy_copy_src(ptr nocapture readnone %fmt, ...) {\nentry:\n  %va0 = alloca %struct.__va_list, align 8\n  %va1 = alloca %struct.__va_list, align 8\n  call void @llvm.lifetime.start.p0(i64 32, ptr %va0)\n  call void @llvm.lifetime.start.p0(i64 32, ptr %va1)\n  call void @llvm.va_start.p0(ptr %va0)\n  call void @llvm.va_copy.p0(ptr %va1, ptr %va0)\n  call void @llvm.va_end.p0(ptr %va0)\n  call void @callee(ptr %va1)\n  call void @llvm.va_end.p0(ptr %va1)\n  call void @llvm.lifetime.end.p0(i64 32, ptr %va1)\n  call void @llvm.lifetime.end.p0(i64 32, ptr %va0)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn\ndeclare void @llvm.va_copy.p0(ptr, ptr) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn\ndeclare void @llvm.va_end.p0(ptr) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn\ndeclare void @llvm.va_start.p0(ptr) #1\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn }\n",
+          "test_name": "func_destroy_copy_src"
+        },
+        {
+          "test_body": "%struct.__va_list = type { ptr, ptr, ptr, i32, i32 }\n\ndefine void @func(ptr nocapture readnone %fmt, ...) {\nentry:\n  %va0 = alloca %struct.__va_list, align 8\n  %va1 = alloca %struct.__va_list, align 8\n  call void @llvm.lifetime.start.p0(i64 32, ptr %va0)\n  call void @llvm.va_start.p0(ptr %va0)\n  call void @llvm.lifetime.start.p0(i64 32, ptr %va1)\n  call void @llvm.va_copy.p0(ptr %va1, ptr %va0)\n  call void @llvm.va_end.p0(ptr %va1)\n  call void @llvm.lifetime.end.p0(i64 32, ptr %va1)\n  call void @llvm.va_end.p0(ptr %va0)\n  call void @llvm.lifetime.end.p0(i64 32, ptr %va0)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn\ndeclare void @llvm.va_copy.p0(ptr, ptr) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn\ndeclare void @llvm.va_end.p0(ptr) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn\ndeclare void @llvm.va_start.p0(ptr) #1\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn }\n",
+          "test_name": "func"
+        }
+      ]
+    }
+  ]
+}

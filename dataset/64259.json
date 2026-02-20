@@ -1,17 +1,13 @@
 {
-  "bug_id": "64259",
-  "issue_url": "https://github.com/llvm/llvm-project/issues/64259",
-  "bug_type": "miscompilation",
   "base_commit": "2cb6d0c70bff616cce4dbd4cbdffc085175c739f",
-  "knowledge_cutoff": "2023-07-31T12:03:13Z",
-  "lit_test_dir": [
-    "llvm/test/Transforms/InstCombine"
-  ],
+  "bug_id": "64259",
+  "bug_type": "miscompilation",
   "hints": {
-    "fix_commit": "72ec2c007e4c5f46995c8f633a946cfa43da6bfb",
-    "components": [
-      "InstCombine"
-    ],
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::prepareWorklist"
+      ]
+    },
     "bug_location_lineno": {
       "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
         [
@@ -24,62 +20,58 @@
         ]
       ]
     },
-    "bug_location_funcname": {
-      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
-        "InstCombinerImpl::prepareWorklist"
-      ]
-    }
-  },
-  "patch": "commit 72ec2c007e4c5f46995c8f633a946cfa43da6bfb\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Mon Jul 31 15:19:21 2023 +0200\n\n    [InstCombine] Fix handling of irreducible loops (PR64259)\n    \n    Fixes a regression introduced by D75362 for irreducible control\n    flow. In that case, we may visit the predecessor that renders\n    the current block live only later, and incorrectly determine\n    that a block is dead.\n    \n    Instead, switch to using the same DeadEdges based implementation\n    we also use during the main InstCombine iteration.\n    \n    This temporarily regresses some cases that need replacement of\n    dead phi operands with poison, which is currently only done during\n    the main run, but not worklist population. This will be addressed\n    in a followup, to keep it separate from the correctness fix here.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/64259.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex d2915bcc8c37..beea3dd259a8 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -4122,15 +4122,24 @@ bool InstCombinerImpl::prepareWorklist(\n     Function &F, ReversePostOrderTraversal<BasicBlock *> &RPOT) {\n   bool MadeIRChange = false;\n   SmallPtrSet<BasicBlock *, 32> LiveBlocks;\n-  LiveBlocks.insert(&F.front());\n-\n   SmallVector<Instruction *, 128> InstrsForInstructionWorklist;\n   DenseMap<Constant *, Constant *> FoldedConstants;\n   AliasScopeTracker SeenAliasScopes;\n \n+  auto HandleOnlyLiveSuccessor = [&](BasicBlock *BB, BasicBlock *LiveSucc) {\n+    for (BasicBlock *Succ : successors(BB))\n+      if (Succ != LiveSucc)\n+        DeadEdges.insert({BB, Succ});\n+  };\n+\n   for (BasicBlock *BB : RPOT) {\n-    if (!LiveBlocks.count(BB))\n+    if (!BB->isEntryBlock() && all_of(predecessors(BB), [&](BasicBlock *Pred) {\n+          return DeadEdges.contains({Pred, BB}) || DT.dominates(BB, Pred);\n+        })) {\n+      HandleOnlyLiveSuccessor(BB, nullptr);\n       continue;\n+    }\n+    LiveBlocks.insert(BB);\n \n     for (Instruction &Inst : llvm::make_early_inc_range(*BB)) {\n       // ConstantProp instruction if trivially constant.\n@@ -4179,27 +4188,28 @@ bool InstCombinerImpl::prepareWorklist(\n     // live successor. Otherwise assume all successors are live.\n     Instruction *TI = BB->getTerminator();\n     if (BranchInst *BI = dyn_cast<BranchInst>(TI); BI && BI->isConditional()) {\n-      if (isa<UndefValue>(BI->getCondition()))\n+      if (isa<UndefValue>(BI->getCondition())) {\n         // Branch on undef is UB.\n+        HandleOnlyLiveSuccessor(BB, nullptr);\n         continue;\n+      }\n       if (auto *Cond = dyn_cast<ConstantInt>(BI->getCondition())) {\n         bool CondVal = Cond->getZExtValue();\n-        BasicBlock *ReachableBB = BI->getSuccessor(!CondVal);\n-        LiveBlocks.insert(ReachableBB);\n+        HandleOnlyLiveSuccessor(BB, BI->getSuccessor(!CondVal));\n         continue;\n       }\n     } else if (SwitchInst *SI = dyn_cast<SwitchInst>(TI)) {\n-      if (isa<UndefValue>(SI->getCondition()))\n+      if (isa<UndefValue>(SI->getCondition())) {\n         // Switch on undef is UB.\n+        HandleOnlyLiveSuccessor(BB, nullptr);\n         continue;\n+      }\n       if (auto *Cond = dyn_cast<ConstantInt>(SI->getCondition())) {\n-        LiveBlocks.insert(SI->findCaseValue(Cond)->getCaseSuccessor());\n+        HandleOnlyLiveSuccessor(BB,\n+                                SI->findCaseValue(Cond)->getCaseSuccessor());\n         continue;\n       }\n     }\n-\n-    for (BasicBlock *SuccBB : successors(TI))\n-      LiveBlocks.insert(SuccBB);\n   }\n \n   // Remove instructions inside unreachable blocks. This prevents the\n",
-  "tests": [
-    {
-      "file": "llvm/test/Transforms/InstCombine/unreachable-code.ll",
-      "commands": [
-        [
-          "opt -S -passes=instcombine -instcombine-infinite-loop-threshold=2 < %s",
-          "FileCheck %s --check-prefixes=CHECK,DEFAULT_ITER,MAX1"
-        ],
-        [
-          "opt -S -passes='instcombine<max-iterations=1>' < %s",
-          "FileCheck %s --check-prefixes=CHECK,DEFAULT_ITER,MAX1"
-        ]
-      ],
-      "tests": [
-        {
-          "test_name": "irreducible",
-          "test_body": "declare void @dummy()\n\ndefine void @irreducible() {\n; CHECK-LABEL: define void @irreducible() {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    br i1 false, label [[LOOP2:%.*]], label [[LOOP1:%.*]]\n; CHECK:       loop1:\n; CHECK-NEXT:    call void @dummy()\n; CHECK-NEXT:    br label [[LOOP2]]\n; CHECK:       loop2:\n; CHECK-NEXT:    call void @dummy()\n; CHECK-NEXT:    br i1 true, label [[EXIT:%.*]], label [[LOOP1]]\n; CHECK:       exit:\n; CHECK-NEXT:    call void @dummy()\n; CHECK-NEXT:    ret void\nentry:\n  br i1 false, label %loop2, label %loop1\n\nloop1:                                            ; preds = %loop2, %entry\n  call void @dummy()\n  br label %loop2\n\nloop2:                                            ; preds = %loop1, %entry\n  call void @dummy()\n  br i1 true, label %exit, label %loop1\n\nexit:                                             ; preds = %loop2\n  call void @dummy()\n  ret void\n}",
-          "source_program": "declare void @dummy()\n\ndefine void @irreducible() {\nentry:\n  br i1 false, label %loop2, label %loop1\n\nloop1:                                            ; preds = %loop2, %entry\n  call void @dummy()\n  br label %loop2\n\nloop2:                                            ; preds = %loop1, %entry\n  call void @dummy()\n  br i1 true, label %exit, label %loop1\n\nexit:                                             ; preds = %loop2\n  call void @dummy()\n  ret void\n}\n"
-        },
-        {
-          "test_name": "really_unreachable",
-          "test_body": "declare void @dummy()\n\ndefine void @really_unreachable() {\n; CHECK-LABEL: define void @really_unreachable() {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    ret void\n; CHECK:       unreachable:\n; CHECK-NEXT:    ret void\nentry:\n  ret void\n\nunreachable:                                      ; No predecessors!\n  call void @dummy()\n  ret void\n}",
-          "source_program": "declare void @dummy()\n\ndefine void @really_unreachable() {\nentry:\n  ret void\n\nunreachable:                                      ; No predecessors!\n  call void @dummy()\n  ret void\n}\n"
-        },
-        {
-          "test_name": "really_unreachable_predecessor",
-          "test_body": "declare void @dummy()\n\ndefine void @really_unreachable_predecessor() {\n; CHECK-LABEL: define void @really_unreachable_predecessor() {\n; CHECK-NEXT:  entry:\n; CHECK-NEXT:    br i1 false, label [[BB:%.*]], label [[EXIT:%.*]]\n; CHECK:       unreachable:\n; CHECK-NEXT:    br label [[BB]]\n; CHECK:       bb:\n; CHECK-NEXT:    ret void\n; CHECK:       exit:\n; CHECK-NEXT:    call void @dummy()\n; CHECK-NEXT:    ret void\nentry:\n  br i1 false, label %bb, label %exit\n\nunreachable:                                      ; No predecessors!\n  call void @dummy()\n  br label %bb\n\nbb:                                               ; preds = %unreachable, %entry\n  call void @dummy()\n  ret void\n\nexit:                                             ; preds = %entry\n  call void @dummy()\n  ret void\n}",
-          "source_program": "declare void @dummy()\n\ndefine void @really_unreachable_predecessor() {\nentry:\n  br i1 false, label %bb, label %exit\n\nunreachable:                                      ; No predecessors!\n  call void @dummy()\n  br label %bb\n\nbb:                                               ; preds = %unreachable, %entry\n  call void @dummy()\n  ret void\n\nexit:                                             ; preds = %entry\n  call void @dummy()\n  ret void\n}\n"
-        }
-      ]
-    }
-  ],
-  "issue": {
-    "title": "Wrong code at -O1 on x86_64-linux_gnu (InstComine)",
-    "body": "This is a recent regression. Clang at -O1 produces the wrong code.\r\n\r\nBisect to https://github.com/llvm/llvm-project/commit/ad7f02010f32bff28fec139e103ad0240e160aa9, which was committed by @nikic \r\n\r\nCompiler explorer: https://godbolt.org/z/ze8b3KcKs\r\n\r\n```console\r\n% cat a.c\r\nint printf(const char *, ...);\r\nint a, b, d, f, h;\r\nstatic int c = 8;\r\nstatic int e = 1;\r\nchar g;\r\nvoid l(int *m) {\r\n  if (f) {\r\n    e = 0;\r\n    for (;;) {\r\n      h = 0;\r\n      for (; h;)\r\n        ;\r\n    }\r\n  }\r\n}\r\nint main() {\r\n  int *i = &c;\r\n  l(i);\r\n  if (c)\r\n  j:\r\n  k:;\r\n    else {\r\n      ;\r\n      if (e)\r\n        goto j;\r\n    }\r\n  g = b;\r\n  if (b)\r\n    goto k;\r\n  printf(\"%d\\n\", a);\r\n}\r\n%\r\n% clang -O0 a.c &&./a.out\r\n0\r\n% clang -O1 a.c &&./a.out\r\n%\r\n```",
-    "author": "shao-hua-li",
-    "labels": [
-      "miscompilation",
-      "llvm:instcombine"
+    "components": [
+      "InstCombine"
     ],
+    "fix_commit": "72ec2c007e4c5f46995c8f633a946cfa43da6bfb"
+  },
+  "issue": {
+    "author": "shao-hua-li",
+    "body": "This is a recent regression. Clang at -O1 produces the wrong code.\r\n\r\nBisect to https://github.com/llvm/llvm-project/commit/ad7f02010f32bff28fec139e103ad0240e160aa9, which was committed by @nikic \r\n\r\nCompiler explorer: https://godbolt.org/z/ze8b3KcKs\r\n\r\n```console\r\n% cat a.c\r\nint printf(const char *, ...);\r\nint a, b, d, f, h;\r\nstatic int c = 8;\r\nstatic int e = 1;\r\nchar g;\r\nvoid l(int *m) {\r\n  if (f) {\r\n    e = 0;\r\n    for (;;) {\r\n      h = 0;\r\n      for (; h;)\r\n        ;\r\n    }\r\n  }\r\n}\r\nint main() {\r\n  int *i = &c;\r\n  l(i);\r\n  if (c)\r\n  j:\r\n  k:;\r\n    else {\r\n      ;\r\n      if (e)\r\n        goto j;\r\n    }\r\n  g = b;\r\n  if (b)\r\n    goto k;\r\n  printf(\"%d\\n\", a);\r\n}\r\n%\r\n% clang -O0 a.c &&./a.out\r\n0\r\n% clang -O1 a.c &&./a.out\r\n%\r\n```",
     "comments": [
       {
         "author": "nikic",
         "body": "Reduced:\r\n```llvm\r\ndefine void @test() {\r\nentry:\r\n  br i1 false, label %loop2, label %loop1\r\n\r\nloop1:\r\n  br label %loop2\r\n\r\nloop2:\r\n  br i1 true, label %exit, label %loop1\r\n\r\nexit:\r\n  call void @dummy()\r\n  ret void\r\n}\r\n\r\ndeclare void @dummy()\r\n```\r\n\r\nPresumably the LiveBlocks logic isn't correct for irreducable loops."
       }
-    ]
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "Wrong code at -O1 on x86_64-linux_gnu (InstComine)"
   },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/64259",
+  "knowledge_cutoff": "2023-07-31T12:03:13Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 72ec2c007e4c5f46995c8f633a946cfa43da6bfb\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Mon Jul 31 15:19:21 2023 +0200\n\n    [InstCombine] Fix handling of irreducible loops (PR64259)\n    \n    Fixes a regression introduced by D75362 for irreducible control\n    flow. In that case, we may visit the predecessor that renders\n    the current block live only later, and incorrectly determine\n    that a block is dead.\n    \n    Instead, switch to using the same DeadEdges based implementation\n    we also use during the main InstCombine iteration.\n    \n    This temporarily regresses some cases that need replacement of\n    dead phi operands with poison, which is currently only done during\n    the main run, but not worklist population. This will be addressed\n    in a followup, to keep it separate from the correctness fix here.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/64259.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex d2915bcc8c37..beea3dd259a8 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -4122,15 +4122,24 @@ bool InstCombinerImpl::prepareWorklist(\n     Function &F, ReversePostOrderTraversal<BasicBlock *> &RPOT) {\n   bool MadeIRChange = false;\n   SmallPtrSet<BasicBlock *, 32> LiveBlocks;\n-  LiveBlocks.insert(&F.front());\n-\n   SmallVector<Instruction *, 128> InstrsForInstructionWorklist;\n   DenseMap<Constant *, Constant *> FoldedConstants;\n   AliasScopeTracker SeenAliasScopes;\n \n+  auto HandleOnlyLiveSuccessor = [&](BasicBlock *BB, BasicBlock *LiveSucc) {\n+    for (BasicBlock *Succ : successors(BB))\n+      if (Succ != LiveSucc)\n+        DeadEdges.insert({BB, Succ});\n+  };\n+\n   for (BasicBlock *BB : RPOT) {\n-    if (!LiveBlocks.count(BB))\n+    if (!BB->isEntryBlock() && all_of(predecessors(BB), [&](BasicBlock *Pred) {\n+          return DeadEdges.contains({Pred, BB}) || DT.dominates(BB, Pred);\n+        })) {\n+      HandleOnlyLiveSuccessor(BB, nullptr);\n       continue;\n+    }\n+    LiveBlocks.insert(BB);\n \n     for (Instruction &Inst : llvm::make_early_inc_range(*BB)) {\n       // ConstantProp instruction if trivially constant.\n@@ -4179,27 +4188,28 @@ bool InstCombinerImpl::prepareWorklist(\n     // live successor. Otherwise assume all successors are live.\n     Instruction *TI = BB->getTerminator();\n     if (BranchInst *BI = dyn_cast<BranchInst>(TI); BI && BI->isConditional()) {\n-      if (isa<UndefValue>(BI->getCondition()))\n+      if (isa<UndefValue>(BI->getCondition())) {\n         // Branch on undef is UB.\n+        HandleOnlyLiveSuccessor(BB, nullptr);\n         continue;\n+      }\n       if (auto *Cond = dyn_cast<ConstantInt>(BI->getCondition())) {\n         bool CondVal = Cond->getZExtValue();\n-        BasicBlock *ReachableBB = BI->getSuccessor(!CondVal);\n-        LiveBlocks.insert(ReachableBB);\n+        HandleOnlyLiveSuccessor(BB, BI->getSuccessor(!CondVal));\n         continue;\n       }\n     } else if (SwitchInst *SI = dyn_cast<SwitchInst>(TI)) {\n-      if (isa<UndefValue>(SI->getCondition()))\n+      if (isa<UndefValue>(SI->getCondition())) {\n         // Switch on undef is UB.\n+        HandleOnlyLiveSuccessor(BB, nullptr);\n         continue;\n+      }\n       if (auto *Cond = dyn_cast<ConstantInt>(SI->getCondition())) {\n-        LiveBlocks.insert(SI->findCaseValue(Cond)->getCaseSuccessor());\n+        HandleOnlyLiveSuccessor(BB,\n+                                SI->findCaseValue(Cond)->getCaseSuccessor());\n         continue;\n       }\n     }\n-\n-    for (BasicBlock *SuccBB : successors(TI))\n-      LiveBlocks.insert(SuccBB);\n   }\n \n   // Remove instructions inside unreachable blocks. This prevents the\n",
   "properties": {
+    "difficulty": "easy",
     "is_single_file_fix": true,
     "is_single_func_fix": true
-  }
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=instcombine -instcombine-infinite-loop-threshold=2 < %s",
+        "opt -S -passes='instcombine<max-iterations=1>' < %s"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/unreachable-code.ll",
+      "tests": [
+        {
+          "test_body": "declare void @dummy()\n\ndefine void @really_unreachable_predecessor() {\nentry:\n  br i1 false, label %bb, label %exit\n\nunreachable:                                      ; No predecessors!\n  call void @dummy()\n  br label %bb\n\nbb:                                               ; preds = %unreachable, %entry\n  call void @dummy()\n  ret void\n\nexit:                                             ; preds = %entry\n  call void @dummy()\n  ret void\n}\n",
+          "test_name": "really_unreachable_predecessor"
+        },
+        {
+          "test_body": "declare void @dummy()\n\ndefine void @irreducible() {\nentry:\n  br i1 false, label %loop2, label %loop1\n\nloop1:                                            ; preds = %loop2, %entry\n  call void @dummy()\n  br label %loop2\n\nloop2:                                            ; preds = %loop1, %entry\n  call void @dummy()\n  br i1 true, label %exit, label %loop1\n\nexit:                                             ; preds = %loop2\n  call void @dummy()\n  ret void\n}\n",
+          "test_name": "irreducible"
+        },
+        {
+          "test_body": "declare void @dummy()\n\ndefine void @really_unreachable() {\nentry:\n  ret void\n\nunreachable:                                      ; No predecessors!\n  call void @dummy()\n  ret void\n}\n",
+          "test_name": "really_unreachable"
+        }
+      ]
+    }
+  ]
 }

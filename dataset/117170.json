@@ -1,0 +1,90 @@
+{
+  "base_commit": "ba668eb99c5dc37d3c5cf2775079562460fd7619",
+  "bug_id": "117170",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "add",
+        "estimateNodesPermuteCost"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          10130,
+          10135
+        ],
+        [
+          10147,
+          10154
+        ],
+        [
+          14007,
+          14015
+        ]
+      ]
+    },
+    "components": [
+      "SLPVectorizer"
+    ],
+    "fix_commit": "07507cb5919cae0ae880bfee538ebc993b97dd6c"
+  },
+  "issue": {
+    "author": "wjschmidt",
+    "body": "[slp-shuffle-bug.ll.txt](https://github.com/user-attachments/files/17847373/slp-shuffle-bug.ll.txt)\r\n[slp-shuffle-output.ll.txt](https://github.com/user-attachments/files/17847374/slp-shuffle-output.ll.txt)\r\n\r\nopt -passes=slp-vectorizer slp-shuffle-bug.ll -o slp-shuffle-output.ll\r\n\r\nThe attached reduced test case slp-shuffle-bug.ll.txt contains a number of scalar load-multiply-store chains that SLP vectorizes.  However, something goes wrong with generating two of the shuffles in the vectorized sequence, shown in slp-shuffle-output.ll.\r\n\r\nThe shuffle\r\n\r\n`  %14 = shufflevector <16 x float> %13, <16 x float> %12, <16 x i32> <i32 1, i32 1, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 0>`\r\n\r\nproduces wrong code, as all of the 0 indices should have referenced indices from the second operand %12 instead.  Also, the shuffle\r\n\r\n`  %12 = shufflevector <2 x float> %11, <2 x float> %8, <16 x i32> <i32 poison, i32 0, i32 2, i32 1, i32 0, i32 3, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison>`\r\n\r\nis suspect, as the first four indices are never used and the fifth entry is incorrect (0 instead of 2).\r\n\r\nThe test case loads from two areas of array GLOB, performs multiplications, and stores the result in a third area of GLOB.  The expected behavior is:\r\n\r\n[2928:2956] = [1612] * [1208:1236]\r\n[2960:2996] = [1616] * [1240:1276]\r\n[3000:3036] = [1620] * [1280:1316]\r\n[3040:3052] = [1624] * [1320:1332]\r\n\r\nwhere [X] references dereference of the location at offset X of GLOB, and [X:Y] references a sequence of such dereferences.  The vectorized code produces correct values for locations [2928:2996], but due to the bad shuffles the rest of the values are:\r\n\r\n[3000:3004] = [1612] * [1280:1284]\r\n[3008] = [1612] * [1620]\r\n[3012:3052] = [1612] * [1292:1332]",
+    "comments": [
+      {
+        "author": "wjschmidt",
+        "body": "Tagging @alexey-bataev for information."
+      },
+      {
+        "author": "wjschmidt",
+        "body": "Thank you for the quick fix!"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:SLPVectorizer"
+    ],
+    "title": "SLP vectorizer produces bad shuffles"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/117170",
+  "knowledge_cutoff": "2024-11-21T14:50:14Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "patch": "commit 07507cb5919cae0ae880bfee538ebc993b97dd6c\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Thu Nov 21 13:00:58 2024 -0800\n\n    [SLP]Fix shuffling of entries of the different sizes\n    \n    Need to choose the size of vector factor for mask based on the entries\n    vector factors, not mask size, to generate correct code.\n    \n    Fixes #117170\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex a9481c44e44b..c0cb9f04de6c 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -10130,6 +10130,9 @@ class BoUpSLP::ShuffleCostEstimator : public BaseShuffleAnalysis {\n                             InVectors.size() == 1 ? nullptr : InVectors.back(),\n                             CommonMask);\n       transformMaskAfterShuffle(CommonMask, CommonMask);\n+    } else if (InVectors.size() == 2) {\n+      Cost += createShuffle(InVectors.front(), InVectors.back(), CommonMask);\n+      transformMaskAfterShuffle(CommonMask, CommonMask);\n     }\n     SameNodesEstimated = false;\n     if (!E2 && InVectors.size() == 1) {\n@@ -10147,8 +10150,14 @@ class BoUpSLP::ShuffleCostEstimator : public BaseShuffleAnalysis {\n       Cost += createShuffle(InVectors.front(), &E1, CommonMask);\n       transformMaskAfterShuffle(CommonMask, CommonMask);\n     } else {\n+      auto P = InVectors.front();\n       Cost += createShuffle(&E1, E2, Mask);\n-      transformMaskAfterShuffle(CommonMask, Mask);\n+      unsigned VF = std::max(E1.getVectorFactor(), E2->getVectorFactor());\n+      for (unsigned Idx = 0, Sz = CommonMask.size(); Idx < Sz; ++Idx)\n+        if (Mask[Idx] != PoisonMaskElem)\n+          CommonMask[Idx] = Idx + (InVectors.empty() ? 0 : VF);\n+      Cost += createShuffle(P, InVectors.front(), CommonMask);\n+      transformMaskAfterShuffle(CommonMask, CommonMask);\n     }\n   }\n \n@@ -14007,9 +14016,10 @@ public:\n       transformMaskAfterShuffle(CommonMask, CommonMask);\n     }\n     V1 = createShuffle(V1, V2, Mask);\n+    unsigned VF = std::max(getVF(V1), getVF(Vec));\n     for (unsigned Idx = 0, Sz = CommonMask.size(); Idx < Sz; ++Idx)\n       if (Mask[Idx] != PoisonMaskElem)\n-        CommonMask[Idx] = Idx + Sz;\n+        CommonMask[Idx] = Idx + VF;\n     InVectors.front() = Vec;\n     if (InVectors.size() == 2)\n       InVectors.back() = V1;\n",
+  "properties": {
+    "difficulty": "medium",
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux -mattr=+avx512vl < %s"
+      ],
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/entries-shuffled-diff-sizes.ll",
+      "tests": [
+        {
+          "test_body": "@GLOB = external global [16000 x i8], align 32\n\ndefine void @test() {\nalloca_0:\n  %gepload1208 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1208), align 4\n  %gepload1212 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1212), align 4\n  %gepload1216 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1216), align 4\n  %gepload1220 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1220), align 4\n  %gepload1224 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1224), align 4\n  %gepload1228 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1228), align 4\n  %gepload1232 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1232), align 4\n  %gepload1236 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1236), align 4\n  %gepload1612 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1612), align 4\n  %0 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1208\n  %1 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1208\n  store float %1, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2928), align 16\n  %2 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1212\n  store float %2, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2932), align 4\n  %3 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1216\n  store float %3, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2936), align 8\n  %4 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1220\n  store float %4, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2940), align 4\n  %5 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1224\n  store float %5, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2944), align 32\n  %6 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1228\n  store float %6, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2948), align 4\n  %7 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1232\n  store float %7, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2952), align 8\n  %8 = fmul reassoc ninf nsz arcp contract afn float %gepload1612, %gepload1236\n  store float %8, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2956), align 4\n  %gepload1240 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1240), align 16\n  %gepload1244 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1244), align 16\n  %gepload1248 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1248), align 16\n  %gepload1252 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1252), align 16\n  %gepload1256 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1256), align 16\n  %gepload1260 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1260), align 16\n  %gepload1264 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1264), align 16\n  %gepload1268 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1268), align 16\n  %gepload1272 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1272), align 16\n  %gepload1276 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1276), align 16\n  %gepload1616 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1616), align 16\n  %9 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1240\n  store float %9, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2960), align 16\n  %10 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1244\n  store float %10, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2964), align 4\n  %11 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1248\n  store float %11, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2968), align 8\n  %12 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1252\n  store float %12, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2972), align 4\n  %13 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1256\n  store float %13, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2976), align 32\n  %14 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1260\n  store float %14, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2980), align 4\n  %15 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1264\n  store float %15, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2984), align 8\n  %16 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1268\n  store float %16, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2988), align 4\n  %17 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1272\n  store float %17, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2992), align 16\n  %18 = fmul reassoc ninf nsz arcp contract afn float %gepload1616, %gepload1276\n  store float %18, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 2996), align 4\n  %gepload1280 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1280), align 16\n  %gepload1284 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1284), align 16\n  %gepload1288 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1288), align 16\n  %gepload1292 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1292), align 16\n  %gepload1296 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1296), align 16\n  %gepload1300 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1300), align 16\n  %gepload1304 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1304), align 16\n  %gepload1308 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1308), align 16\n  %gepload1312 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1312), align 16\n  %gepload1316 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1316), align 16\n  %gepload1620 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1620), align 4\n  %19 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1280\n  store float %19, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3000), align 8\n  %20 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1284\n  store float %20, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3004), align 4\n  %21 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1288\n  store float %21, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3008), align 32\n  %22 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1292\n  store float %22, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3012), align 4\n  %23 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1296\n  store float %23, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3016), align 8\n  %24 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1300\n  store float %24, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3020), align 4\n  %25 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1304\n  store float %25, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3024), align 16\n  %26 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1308\n  store float %26, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3028), align 4\n  %27 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1312\n  store float %27, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3032), align 8\n  %28 = fmul reassoc ninf nsz arcp contract afn float %gepload1620, %gepload1316\n  store float %28, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3036), align 4\n  %gepload1320 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1320), align 16\n  %gepload1324 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1324), align 16\n  %gepload1328 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1328), align 16\n  %gepload1332 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1332), align 16\n  %gepload1624 = load float, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 1624), align 8\n  %29 = fmul reassoc ninf nsz arcp contract afn float %gepload1624, %gepload1320\n  store float %29, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3040), align 32\n  %30 = fmul reassoc ninf nsz arcp contract afn float %gepload1624, %gepload1324\n  store float %30, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3044), align 4\n  %31 = fmul reassoc ninf nsz arcp contract afn float %gepload1624, %gepload1328\n  store float %31, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3048), align 8\n  %32 = fmul reassoc ninf nsz arcp contract afn float %gepload1624, %gepload1332\n  store float %32, ptr getelementptr ([16000 x i8], ptr @GLOB, i64 0, i64 3052), align 4\n  ret void\n}\n",
+          "test_name": "test"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "%if x86-registered-target %{ opt -passes=slp-vectorizer -S < %s -mtriple=x86_64-unknown-linux -slp-threshold=-165",
+        "%if aarch64-registered-target %{ opt -passes=slp-vectorizer -S < %s -mtriple=aarch64-unknown-linux -slp-threshold=-165"
+      ],
+      "file": "llvm/test/Transforms/SLPVectorizer/shuffle-multivector.ll",
+      "tests": [
+        {
+          "test_body": "define void @test1(i128 %p0, i128 %p1, i128 %p2, i128 %p3, <4 x i128> %vec) {\nentry:\n  %t1 = trunc i128 %p0 to i32\n  %t2 = trunc i128 %p1 to i32\n  %t3 = trunc i128 %p2 to i32\n  %t4 = trunc i128 %p3 to i32\n  %t5 = trunc i128 %p1 to i32\n  %t6 = trunc i128 %p0 to i32\n  %t7 = trunc i128 %p3 to i32\n  %t8 = trunc i128 %p2 to i32\n  %m0 = sdiv i32 %t1, %t3\n  %m1 = sdiv i32 %t2, %t4\n  %m2 = sdiv i32 %t1, %t3\n  %m3 = sdiv i32 %t2, %t4\n  %e0 = extractelement <4 x i128> %vec, i32 0\n  %t9 = trunc i128 %e0 to i32\n  %d0 = sdiv i32 %m0, %t9\n  %d1 = sdiv i32 %m1, %t6\n  %d2 = sdiv i32 %m2, %t7\n  %d3 = sdiv i32 %m3, %t8\n  br label %bb\n\nbb:                                               ; preds = %entry\n  %phi0 = phi i32 [ %d0, %entry ]\n  %phi1 = phi i32 [ %d1, %entry ]\n  %phi2 = phi i32 [ %d2, %entry ]\n  %phi3 = phi i32 [ %d3, %entry ]\n  ret void\n}\n",
+          "test_name": "test1"
+        }
+      ]
+    }
+  ]
+}

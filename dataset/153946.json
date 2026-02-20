@@ -1,0 +1,434 @@
+{
+  "base_commit": "d12829de2eb87726edc344abadf23982e5142f21",
+  "bug_id": "153946",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        "VPInstruction::generate"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlan.h": [
+        [
+          1014,
+          1020
+        ]
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        [
+          875,
+          883
+        ]
+      ]
+    },
+    "components": [
+      "LoopVectorize"
+    ],
+    "fix_commit": "f492eb9509dea311d4e5a5ebbebbf58eb2e7e877"
+  },
+  "issue": {
+    "author": "zhendongsu",
+    "body": "Compiler Explorer: https://godbolt.org/z/KdM7Pao71 \n\nNote:\n- works: 20.1.0 and earlier\n- fails: trunk, only at -Os\n\n```\n[522] % clangtk -v\nclang version 22.0.0git (https://github.com/llvm/llvm-project.git 1d73b2c10d3bb1a2caf91f44847b9759ed252b21)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /local/home/suz/suz-local/software/local/clang-trunk/bin\nBuild config: +assertions\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/11\nFound candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/12\nSelected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/12\nCandidate multilib: .;@m64\nSelected multilib: .;@m64\nFound CUDA installation: /usr/local/cuda, version 12.1\nclangtk: warning: argument unused during compilation: '-I /usr/local/include' [-Wunused-command-line-argument]\nclangtk: warning: argument unused during compilation: '-I /local/suz-local/software/local/include' [-Wunused-command-line-argument]\n[523] % \n[523] % clangtk -Os small.c; ./a.out\n[524] % clangtk -Os -mllvm -force-vector-width=4 -mllvm -force-vector-interleave=2 small.c\n[525] % ./a.out\nFloating point exception\n[526] % \n[526] % cat small.c\nint a, b, c, d, e, h, i;\nint f(int g) {\n  a = 0;\n  for (; a < 8; a++) {\n    b = g >> a * 8;\n    if (b)\n      return 0;\n  }\n  return 0;\n}\nint main() {\n  int j = 1 << c;\n  while (e)\n    ;\n  if (!i)\n    h = 1 / (f(j) + j);\n  d = 1 % h;\n  return 0;\n}\n```\n\n",
+    "comments": [
+      {
+        "author": "fhahn",
+        "body": "Taking a look."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "vectorizers"
+    ],
+    "title": "wrong code at -Os with \"-mllvm -force-vector-width=4 -mllvm -force-vector-interleave=2\" on x86_64-linux-gnu"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/153946",
+  "knowledge_cutoff": "2025-08-16T10:57:45Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize",
+    "llvm/test/Transforms/PhaseOrdering"
+  ],
+  "patch": "commit f492eb9509dea311d4e5a5ebbebbf58eb2e7e877\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Mon Aug 25 18:55:23 2025 +0100\n\n    [VPlan] Make VPInstruction::AnyOf poison-safe. (#154156)\n    \n    AnyOf reduces multiple input vectors to a single boolean value. When\n    used for early-exit vectorization, we need to consider any lane after\n    the early exit being poison. Any poison lane would result in poison\n    after the AnyOf reduction. To prevent this, freeze all inputs to AnyOf.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/153946.\n    Fixes https://github.com/llvm/llvm-project/issues/155162.\n    \n    https://alive2.llvm.org/ce/z/FD-XxA\n    \n    PR: https://github.com/llvm/llvm-project/pull/154156\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex d6bc462a0dfa..33bcb49b8174 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -1014,7 +1014,8 @@ public:\n     // Returns a scalar boolean value, which is true if any lane of its\n     // (boolean) vector operands is true. It produces the reduced value across\n     // all unrolled iterations. Unrolling will add all copies of its original\n-    // operand as additional operands.\n+    // operand as additional operands. AnyOf is poison-safe as all operands\n+    // will be frozen.\n     AnyOf,\n     // Calculates the first active lane index of the vector predicate operands.\n     // It produces the lane index across all unrolled iterations. Unrolling will\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 0368f9b8dbb0..2f3ee1ff61d2 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -875,9 +875,9 @@ Value *VPInstruction::generate(VPTransformState &State) {\n     return Builder.CreatePtrAdd(Ptr, Addend, Name, getGEPNoWrapFlags());\n   }\n   case VPInstruction::AnyOf: {\n-    Value *Res = State.get(getOperand(0));\n+    Value *Res = Builder.CreateFreeze(State.get(getOperand(0)));\n     for (VPValue *Op : drop_begin(operands()))\n-      Res = Builder.CreateOr(Res, State.get(Op));\n+      Res = Builder.CreateOr(Res, Builder.CreateFreeze(State.get(Op)));\n     return State.VF.isScalar() ? Res : Builder.CreateOrReduce(Res);\n   }\n   case VPInstruction::ExtractLane: {\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -p loop-vectorize -mtriple=arm64-apple-macosx -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/fmax-without-fast-math-flags.ll",
+      "tests": [
+        {
+          "test_body": "define float @fmaxnum(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ -1.000000e+07, %entry ], [ %max.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %max.next = call float @llvm.maxnum.f32(float %max, float %l)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %max.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fmaxnum"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -mtriple=arm64-apple-macosx -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/fmin-without-fast-math-flags.ll",
+      "tests": [
+        {
+          "test_body": "define float @fminnum(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi float [ -1.000000e+07, %entry ], [ %min.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %min.next = call float @llvm.minnum.f32(float %min, float %l)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %min.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fminnum"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S < %s -p loop-vectorize"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/simple_early_exit.ll",
+      "tests": [
+        {
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\n; Function Attrs: vscale_range(1,16)\ndefine i64 @same_exit_block_pre_inc_use1() #0 {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n",
+          "test_name": "same_exit_block_pre_inc_use1"
+        },
+        {
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use4() {\nentry:\n  %p1 = alloca [1024 x i64], align 8\n  %p2 = alloca [1024 x i64], align 8\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i64, ptr %p1, i64 %index\n  %ld1 = load i64, ptr %arrayidx, align 1\n  %cmp3 = icmp ult i64 %index, %ld1\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use4"
+        },
+        {
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\ndefine i64 @loop_contains_load_after_early_exit(ptr align 8 dereferenceable(1024) %p2) {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i32, ptr %p1, i64 %index\n  %ld1 = load i32, ptr %arrayidx, align 1\n  %cmp = icmp eq i32 %ld1, 1\n  br i1 %cmp, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %arrayidx2 = getelementptr inbounds i64, ptr %p2, i64 %index\n  %ld2 = load i64, ptr %arrayidx2, align 8\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ %ld2, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "loop_contains_load_after_early_exit"
+        },
+        {
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\n; Function Attrs: vscale_range(1,16)\ndefine i64 @loop_contains_safe_call() #0 {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds float, ptr %p1, i64 %index\n  %ld1 = load float, ptr %arrayidx, align 1\n  %sqrt = tail call fast float @llvm.sqrt.f32(float %ld1)\n  %cmp = fcmp fast ult float %sqrt, 3.000000e+00\n  br i1 %cmp, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.sqrt.f32(float) #1\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "loop_contains_safe_call"
+        },
+        {
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\n; Function Attrs: vscale_range(1,16)\ndefine i64 @loop_contains_safe_div() #0 {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i32, ptr %p1, i64 %index\n  %ld1 = load i32, ptr %arrayidx, align 1\n  %div = udiv i32 %ld1, 20000\n  %cmp = icmp eq i32 %div, 1\n  br i1 %cmp, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n",
+          "test_name": "loop_contains_safe_div"
+        },
+        {
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\ndefine i32 @diff_exit_block_needs_scev_check(i32 %end) {\nentry:\n  %p1 = alloca [1024 x i32], align 4\n  %p2 = alloca [1024 x i32], align 4\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  %end.clamped = and i32 %end, 1023\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %ind = phi i8 [ %ind.next, %for.inc ], [ 0, %entry ]\n  %gep.ind = phi i64 [ %gep.ind.next, %for.inc ], [ 0, %entry ]\n  %arrayidx1 = getelementptr inbounds i32, ptr %p1, i64 %gep.ind\n  %0 = load i32, ptr %arrayidx1, align 4\n  %arrayidx2 = getelementptr inbounds i32, ptr %p2, i64 %gep.ind\n  %1 = load i32, ptr %arrayidx2, align 4\n  %cmp.early = icmp eq i32 %0, %1\n  br i1 %cmp.early, label %found, label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %ind.next = add i8 %ind, 1\n  %conv = zext i8 %ind.next to i32\n  %gep.ind.next = add i64 %gep.ind, 1\n  %cmp = icmp ult i32 %conv, %end.clamped\n  br i1 %cmp, label %for.body, label %exit\n\nfound:                                            ; preds = %for.body\n  ret i32 1\n\nexit:                                             ; preds = %for.inc\n  ret i32 0\n}\n",
+          "test_name": "diff_exit_block_needs_scev_check"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-interleave=4 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/single-early-exit-interleave.ll",
+      "tests": [
+        {
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\n; Function Attrs: vscale_range(1,16)\ndefine i64 @same_exit_block_pre_inc_use1() #0 {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 513\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n",
+          "test_name": "same_exit_block_pre_inc_use1"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=2 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/fmax-without-fast-math-flags-interleave.ll",
+      "tests": [
+        {
+          "test_body": "define float @fmaxnum(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ -1.000000e+07, %entry ], [ %max.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %max.next = call float @llvm.maxnum.f32(float %max, float %l)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %max.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fmaxnum"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/fmax-without-fast-math-flags.ll",
+      "tests": [
+        {
+          "test_body": "define float @fmaxnum_1(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ -1.000000e+07, %entry ], [ %max.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %max.next = call float @llvm.maxnum.f32(float %l, float %max)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %max.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fmaxnum_1"
+        },
+        {
+          "test_body": "define float @fmaxnum_induction_starts_at_10(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 10, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ -1.000000e+07, %entry ], [ %max.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %max.next = call float @llvm.maxnum.f32(float %l, float %max)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %max.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fmaxnum_induction_starts_at_10"
+        },
+        {
+          "test_body": "define float @fmaxnum_2(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ -1.000000e+07, %entry ], [ %max.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %max.next = call float @llvm.maxnum.f32(float %max, float %l)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %max.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fmaxnum_2"
+        },
+        {
+          "test_body": "define float @fmaxnum_induction_starts_at_value(ptr %src, i64 %start, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %start, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ -1.000000e+07, %entry ], [ %max.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %max.next = call float @llvm.maxnum.f32(float %l, float %max)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %max.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fmaxnum_induction_starts_at_value"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/fmin-without-fast-math-flags.ll",
+      "tests": [
+        {
+          "test_body": "define float @fminnum_2(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi float [ -1.000000e+07, %entry ], [ %min.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %min.next = call float @llvm.minnum.f32(float %min, float %l)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %min.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fminnum_2"
+        },
+        {
+          "test_body": "define float @fminnum_1(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi float [ -1.000000e+07, %entry ], [ %min.next, %loop ]\n  %gep.src = getelementptr inbounds nuw float, ptr %src, i64 %iv\n  %l = load float, ptr %gep.src, align 4\n  %min.next = call float @llvm.minnum.f32(float %l, float %min)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %min.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fminnum_1"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=2 -S %s",
+        "opt -p loop-vectorize -force-vector-width=8 -force-vector-interleave=1 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/single-early-exit-cond-poison.ll",
+      "tests": [
+        {
+          "test_body": "define noundef i32 @f(i32 noundef %g) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %mul = shl nuw nsw i32 %iv, 3\n  %shr = ashr i32 %g, %mul\n  %early.cond = icmp eq i32 %shr, 0\n  br i1 %early.cond, label %loop.latch, label %return\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add nuw nsw i32 %iv, 1\n  %ec = icmp eq i32 %iv.next, 8\n  br i1 %ec, label %return, label %loop.header\n\nreturn:                                           ; preds = %loop.latch, %loop.header\n  %res = phi i32 [ %shr, %loop.latch ], [ %iv, %loop.header ]\n  ret i32 %res\n}\n",
+          "test_name": "f"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -enable-early-exit-vectorization -force-vector-width=4 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/single-early-exit-interleave-hint.ll",
+      "tests": [
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @multi_exiting_to_different_exits_live_in_exit_values() {\nentry:\n  %src = alloca [128 x i32], align 4\n  call void @init_mem(ptr %src)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %inc, %loop.latch ], [ 0, %entry ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %l = load i32, ptr %gep.src, align 4\n  %c.1 = icmp eq i32 %l, 10\n  br i1 %c.1, label %e1, label %loop.latch\n\nloop.latch:                                       ; preds = %loop.header\n  %inc = add nuw i64 %iv, 1\n  %c.2 = icmp eq i64 %inc, 128\n  br i1 %c.2, label %e2, label %loop.header, !llvm.loop !0\n\ne1:                                               ; preds = %loop.header\n  %p1 = phi i64 [ 0, %loop.header ]\n  ret i64 %p1\n\ne2:                                               ; preds = %loop.latch\n  %p2 = phi i64 [ 1, %loop.latch ]\n  ret i64 %p2\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.interleave.count\", i32 4}\n",
+          "test_name": "multi_exiting_to_different_exits_live_in_exit_values"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=1 -force-vector-interleave=2 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/single-early-exit-interleave-only.ll",
+      "tests": [
+        {
+          "test_body": "define i8 @iv_used_in_exit_with_math(i8 noundef %g) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i8 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %s = shl nuw i8 1, %iv\n  %a = and i8 %s, %g\n  %c = icmp eq i8 %a, 0\n  br i1 %c, label %loop.latch, label %return\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add nuw nsw i8 %iv, 1\n  %ec = icmp eq i8 %iv.next, 4\n  br i1 %ec, label %return, label %loop.header\n\nreturn:                                           ; preds = %loop.latch, %loop.header\n  %res.iv1 = phi i8 [ 32, %loop.latch ], [ %iv, %loop.header ]\n  %res.iv2 = phi i8 [ 0, %loop.latch ], [ %iv, %loop.header ]\n  %res = add i8 %res.iv1, %res.iv2\n  ret i8 %res\n}\n",
+          "test_name": "iv_used_in_exit_with_math"
+        },
+        {
+          "test_body": "define i32 @iv_used_in_exit_with_loads(ptr align 4 dereferenceable(128) %src) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %src, i32 %iv\n  %l = load i32, ptr %gep, align 4\n  %c = icmp eq i32 %l, 0\n  br i1 %c, label %loop.latch, label %return\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add nuw nsw i32 %iv, 1\n  %ec = icmp eq i32 %iv.next, 32\n  br i1 %ec, label %return, label %loop.header\n\nreturn:                                           ; preds = %loop.latch, %loop.header\n  %res.iv1 = phi i32 [ 32, %loop.latch ], [ %iv, %loop.header ]\n  %res.iv2 = phi i32 [ 0, %loop.latch ], [ %iv, %loop.header ]\n  %res = add i32 %res.iv1, %res.iv2\n  ret i32 %res\n}\n",
+          "test_name": "iv_used_in_exit_with_loads"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=4 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/single-early-exit-interleave.ll",
+      "tests": [
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_post_inc_use1() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %iv = phi i64 [ %iv.next, %loop.inc ], [ 3, %entry ]\n  %gep.p1 = getelementptr inbounds i8, ptr %p1, i64 %iv\n  %ld1 = load i8, ptr %gep.p1, align 1\n  %gep.p2 = getelementptr inbounds i8, ptr %p2, i64 %iv\n  %ld2 = load i8, ptr %gep.p2, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %iv.next = add i64 %iv, 1\n  %exitcond = icmp ne i64 %iv.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  %retval1 = phi i64 [ %iv, %loop ]\n  ret i64 %retval1\n\nloop.end:                                         ; preds = %loop.inc\n  %retval2 = phi i64 [ %iv.next, %loop.inc ]\n  ret i64 %retval2\n}\n",
+          "test_name": "diff_exit_block_post_inc_use1"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_post_inc_use() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %iv = phi i64 [ %iv.next, %loop.inc ], [ 3, %entry ]\n  %gep.p1 = getelementptr inbounds i8, ptr %p1, i64 %iv\n  %ld1 = load i8, ptr %gep.p1, align 1\n  %gep.p2 = getelementptr inbounds i8, ptr %p2, i64 %iv\n  %ld2 = load i8, ptr %gep.p2, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %iv.next = add i64 %iv, 1\n  %exitcond = icmp ne i64 %iv.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %iv, %loop ], [ %iv.next, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_post_inc_use"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use1() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %iv = phi i64 [ %iv.next, %loop.inc ], [ 3, %entry ]\n  %gep.p1 = getelementptr inbounds i8, ptr %p1, i64 %iv\n  %ld1 = load i8, ptr %gep.p1, align 1\n  %gep.p2 = getelementptr inbounds i8, ptr %p2, i64 %iv\n  %ld2 = load i8, ptr %gep.p2, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %iv.next = add i64 %iv, 1\n  %exitcond = icmp ne i64 %iv.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %iv, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_pre_inc_use1() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %iv = phi i64 [ %iv.next, %loop.inc ], [ 3, %entry ]\n  %gep.p1 = getelementptr inbounds i8, ptr %p1, i64 %iv\n  %ld1 = load i8, ptr %gep.p1, align 1\n  %gep.p2 = getelementptr inbounds i8, ptr %p2, i64 %iv\n  %ld2 = load i8, ptr %gep.p2, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %iv.next = add i64 %iv, 1\n  %exitcond = icmp ne i64 %iv.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  %retval1 = phi i64 [ %iv, %loop ]\n  ret i64 %retval1\n\nloop.end:                                         ; preds = %loop.inc\n  %retval2 = phi i64 [ 67, %loop.inc ]\n  ret i64 %retval2\n}\n",
+          "test_name": "diff_exit_block_pre_inc_use1"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine ptr @same_exit_block_pre_inc_use1_ivptr() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  %ptrend = getelementptr i8, ptr %p1, i64 1024\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %ptr = phi ptr [ %ptr.next, %loop.inc ], [ %p1, %entry ]\n  %ld1 = load i8, ptr %ptr, align 1\n  %cmp3 = icmp eq i8 %ld1, 72\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %ptr.next = getelementptr inbounds i8, ptr %ptr, i64 1\n  %exitcond = icmp ne ptr %ptr.next, %ptrend\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi ptr [ %ptr, %loop ], [ %ptrend, %loop.inc ]\n  ret ptr %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_ivptr"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use1_reverse() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %iv = phi i64 [ %iv.next, %loop.inc ], [ 1023, %entry ]\n  %gep.p1 = getelementptr inbounds i8, ptr %p1, i64 %iv\n  %ld1 = load i8, ptr %gep.p1, align 1\n  %gep.p2 = getelementptr inbounds i8, ptr %p2, i64 %iv\n  %ld2 = load i8, ptr %gep.p2, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %iv.next = add i64 %iv, -1\n  %exitcond = icmp eq i64 %iv.next, 0\n  br i1 %exitcond, label %loop.end, label %loop\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %iv, %loop ], [ 1024, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_reverse"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i8 @same_exit_block_use_loaded_value() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %iv = phi i64 [ %iv.next, %loop.inc ], [ 0, %entry ]\n  %gep.p1 = getelementptr inbounds i8, ptr %p1, i64 %iv\n  %ld1 = load i8, ptr %gep.p1, align 1\n  %gep.p2 = getelementptr inbounds i8, ptr %p2, i64 %iv\n  %ld2 = load i8, ptr %gep.p2, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %iv.next = add i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, 1024\n  br i1 %exitcond, label %loop.end, label %loop\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i8 [ %ld1, %loop ], [ -1, %loop.inc ]\n  ret i8 %retval\n}\n",
+          "test_name": "same_exit_block_use_loaded_value"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @multi_exiting_to_different_exits_live_in_exit_values() {\nentry:\n  %src = alloca [128 x i32], align 4\n  call void @init_mem(ptr %src)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %inc, %loop.latch ], [ 0, %entry ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %l = load i32, ptr %gep.src, align 4\n  %c.1 = icmp eq i32 %l, 10\n  br i1 %c.1, label %e1, label %loop.latch\n\nloop.latch:                                       ; preds = %loop.header\n  %inc = add nuw i64 %iv, 1\n  %c.2 = icmp eq i64 %inc, 128\n  br i1 %c.2, label %e2, label %loop.header\n\ne1:                                               ; preds = %loop.header\n  %p1 = phi i64 [ 0, %loop.header ]\n  ret i64 %p1\n\ne2:                                               ; preds = %loop.latch\n  %p2 = phi i64 [ 1, %loop.latch ]\n  ret i64 %p2\n}\n",
+          "test_name": "multi_exiting_to_different_exits_live_in_exit_values"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i8 @same_exit_block_reverse_use_loaded_value() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %iv = phi i64 [ %iv.next, %loop.inc ], [ 1023, %entry ]\n  %gep.p1 = getelementptr inbounds i8, ptr %p1, i64 %iv\n  %ld1 = load i8, ptr %gep.p1, align 1\n  %gep.p2 = getelementptr inbounds i8, ptr %p2, i64 %iv\n  %ld2 = load i8, ptr %gep.p2, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %iv.next = add i64 %iv, -1\n  %exitcond = icmp eq i64 %iv.next, 0\n  br i1 %exitcond, label %loop.end, label %loop\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i8 [ %ld1, %loop ], [ -1, %loop.inc ]\n  ret i8 %retval\n}\n",
+          "test_name": "same_exit_block_reverse_use_loaded_value"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S < %s -p loop-vectorize -force-vector-width=4"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/single_early_exit.ll",
+      "tests": [
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_phi_of_consts() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ 0, %loop ], [ 1, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_phi_of_consts"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_phi_of_consts() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  ret i64 0\n\nloop.end:                                         ; preds = %loop.inc\n  ret i64 1\n}\n",
+          "test_name": "diff_exit_block_phi_of_consts"
+        },
+        {
+          "test_body": "declare void @abort()\n\ndefine i32 @diff_blocks_invariant_early_exit_cond(ptr %s) {\nentry:\n  %sval = load i32, ptr %s, align 4\n  %cond = icmp eq i32 %sval, 0\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %ind = phi i32 [ -10, %entry ], [ %ind.next, %for.inc ]\n  br i1 %cond, label %for.inc, label %early.exit\n\nfor.inc:                                          ; preds = %for.body\n  %ind.next = add nsw i32 %ind, 1\n  %exitcond.not = icmp eq i32 %ind.next, 266\n  br i1 %exitcond.not, label %for.end, label %for.body\n\nearly.exit:                                       ; preds = %for.body\n  tail call void @abort()\n  unreachable\n\nfor.end:                                          ; preds = %for.inc\n  ret i32 0\n}\n",
+          "test_name": "diff_blocks_invariant_early_exit_cond"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i32 @diff_exit_block_needs_scev_check(i32 %end) {\nentry:\n  %p1 = alloca [1024 x i32], align 4\n  %p2 = alloca [1024 x i32], align 4\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  %end.clamped = and i32 %end, 1023\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %ind = phi i8 [ %ind.next, %for.inc ], [ 0, %entry ]\n  %gep.ind = phi i64 [ %gep.ind.next, %for.inc ], [ 0, %entry ]\n  %arrayidx1 = getelementptr inbounds i32, ptr %p1, i64 %gep.ind\n  %0 = load i32, ptr %arrayidx1, align 4\n  %arrayidx2 = getelementptr inbounds i32, ptr %p2, i64 %gep.ind\n  %1 = load i32, ptr %arrayidx2, align 4\n  %cmp.early = icmp eq i32 %0, %1\n  br i1 %cmp.early, label %found, label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %ind.next = add i8 %ind, 1\n  %conv = zext i8 %ind.next to i32\n  %gep.ind.next = add i64 %gep.ind, 1\n  %cmp = icmp ult i32 %conv, %end.clamped\n  br i1 %cmp, label %for.body, label %exit\n\nfound:                                            ; preds = %for.body\n  ret i32 1\n\nexit:                                             ; preds = %for.inc\n  ret i32 0\n}\n",
+          "test_name": "diff_exit_block_needs_scev_check"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S < %s -p loop-vectorize -force-vector-width=4"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/single_early_exit_live_outs.ll",
+      "tests": [
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_pre_inc_use1() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  %retval1 = phi i64 [ %index, %loop ]\n  ret i64 %retval1\n\nloop.end:                                         ; preds = %loop.inc\n  %retval2 = phi i64 [ 67, %loop.inc ]\n  ret i64 %retval2\n}\n",
+          "test_name": "diff_exit_block_pre_inc_use1"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i32 @same_exit_block_pre_inc_use1_iv64_endi32_step2() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %index2 = phi i32 [ %index2.next, %loop.inc ], [ 9, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %index2.next = add i32 %index2, 2\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i32 [ %index2, %loop ], [ 67, %loop.inc ]\n  ret i32 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_iv64_endi32_step2"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine float @same_exit_block_pre_inc_use1_iv64_endf32() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %index2 = phi float [ %index2.next, %loop.inc ], [ 9.000000e+00, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %index2.next = fadd fast float %index2, 1.000000e+00\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi float [ %index2, %loop ], [ 1.230000e+02, %loop.inc ]\n  ret float %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_iv64_endf32"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use2() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ 67, %loop ], [ %index, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use2"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_post_inc_use1() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  %retval1 = phi i64 [ %index, %loop ]\n  ret i64 %retval1\n\nloop.end:                                         ; preds = %loop.inc\n  %retval2 = phi i64 [ %index.next, %loop.inc ]\n  ret i64 %retval2\n}\n",
+          "test_name": "diff_exit_block_post_inc_use1"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use1() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_post_inc_use() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ %index.next, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_post_inc_use"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use1_gep_two_indices() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds [1024 x i8], ptr %p1, i64 0, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds [1024 x i8], ptr %p2, i64 0, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_gep_two_indices"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine ptr @same_exit_block_pre_inc_use1_ivptr() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  %ptrend = getelementptr i8, ptr %p1, i64 1024\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %ptr = phi ptr [ %ptr.next, %loop.inc ], [ %p1, %entry ]\n  %ld1 = load i8, ptr %ptr, align 1\n  %cmp3 = icmp eq i8 %ld1, 72\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %ptr.next = getelementptr inbounds i8, ptr %ptr, i64 1\n  %exitcond = icmp ne ptr %ptr.next, %ptrend\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi ptr [ %ptr, %loop ], [ %ptrend, %loop.inc ]\n  ret ptr %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_ivptr"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_post_inc_use2() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %index.next = add i64 %index, 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index.next, %loop ], [ %index, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_post_inc_use2"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_pre_inc_use3() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  ret i64 %index\n\nloop.end:                                         ; preds = %loop.inc\n  ret i64 %index\n}\n",
+          "test_name": "diff_exit_block_pre_inc_use3"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_pre_inc_use2() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  %retval1 = phi i64 [ 67, %loop ]\n  ret i64 %retval1\n\nloop.end:                                         ; preds = %loop.inc\n  %retval2 = phi i64 [ %index, %loop.inc ]\n  ret i64 %retval2\n}\n",
+          "test_name": "diff_exit_block_pre_inc_use2"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use4() {\nentry:\n  %p1 = alloca [1024 x i64], align 8\n  %p2 = alloca [1024 x i64], align 8\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i64, ptr %p1, i64 %index\n  %ld1 = load i64, ptr %arrayidx, align 1\n  %cmp3 = icmp ult i64 %index, %ld1\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use4"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @loop_contains_load_after_early_exit(ptr align 8 dereferenceable(1024) %p2) {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i32, ptr %p1, i64 %index\n  %ld1 = load i32, ptr %arrayidx, align 1\n  %cmp = icmp eq i32 %ld1, 1\n  br i1 %cmp, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %arrayidx2 = getelementptr inbounds i64, ptr %p2, i64 %index\n  %ld2 = load i64, ptr %arrayidx2, align 8\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ %ld2, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "loop_contains_load_after_early_exit"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use3() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  ret i64 %index\n}\n",
+          "test_name": "same_exit_block_pre_inc_use3"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @loop_contains_safe_call() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds float, ptr %p1, i64 %index\n  %ld1 = load float, ptr %arrayidx, align 1\n  %sqrt = tail call fast float @llvm.sqrt.f32(float %ld1)\n  %cmp = fcmp fast ult float %sqrt, 3.000000e+00\n  br i1 %cmp, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.sqrt.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "loop_contains_safe_call"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use1_reverse() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 1023, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, -1\n  %exitcond = icmp eq i64 %index.next, 0\n  br i1 %exitcond, label %loop.end, label %loop\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 1024, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_reverse"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine ptr @same_exit_block_pre_inc_use1_iv64_endptr() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %index2 = phi ptr [ %index2.next, %loop.inc ], [ %p2, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %index2.next = getelementptr i8, ptr %index2, i64 5\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi ptr [ %index2, %loop ], [ %p1, %loop.inc ]\n  ret ptr %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_iv64_endptr"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine ptr @same_exit_block_post_inc_use1_ivptr() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  %ptrend = getelementptr i8, ptr %p1, i64 1024\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %ptr = phi ptr [ %ptr.next, %loop.inc ], [ %p1, %entry ]\n  %ld1 = load i8, ptr %ptr, align 1\n  %ptr.next = getelementptr inbounds i8, ptr %ptr, i64 1\n  %cmp3 = icmp eq i8 %ld1, 72\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %exitcond = icmp ne ptr %ptr.next, %ptrend\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi ptr [ %ptr.next, %loop ], [ %ptrend, %loop.inc ]\n  ret ptr %retval\n}\n",
+          "test_name": "same_exit_block_post_inc_use1_ivptr"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc1_use_inv_cond(i1 %cond) {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  %cmp4 = select i1 %cond, i1 %cmp3, i1 false\n  br i1 %cmp4, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc1_use_inv_cond"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use1_alloca_diff_type() {\nentry:\n  %p1 = alloca [40 x i32], align 4\n  %p2 = alloca [40 x i32], align 4\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_alloca_diff_type"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @loop_contains_safe_div() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i32, ptr %p1, i64 %index\n  %ld1 = load i32, ptr %arrayidx, align 1\n  %div = udiv i32 %ld1, 20000\n  %cmp = icmp eq i32 %div, 1\n  br i1 %cmp, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "loop_contains_safe_div"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i32 @same_exit_block_pre_inc_use1_iv128_endi32_step2() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i128 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %index2 = phi i32 [ %index2.next, %loop.inc ], [ 9, %entry ]\n  %ptr = phi ptr [ %ptr.next, %loop.inc ], [ %p1, %entry ]\n  %ld1 = load i8, ptr %ptr, align 1\n  %cmp3 = icmp eq i8 %ld1, 3\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i128 %index, 1\n  %index2.next = add i32 %index2, 2\n  %ptr.next = getelementptr inbounds i8, ptr %ptr, i64 1\n  %exitcond = icmp ne i128 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i32 [ %index2, %loop ], [ 67, %loop.inc ]\n  ret i32 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_iv128_endi32_step2"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_post_inc_use3(i64 %start) {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %index2 = phi i64 [ %index2.next, %loop.inc ], [ %start, %entry ]\n  %index.next = add i64 %index, 1\n  %index2.next = add i64 %index2, 1\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  %retval1 = phi i64 [ %index2.next, %loop ]\n  ret i64 %retval1\n\nloop.end:                                         ; preds = %loop.inc\n  %retval2 = phi i64 [ %index2, %loop.inc ]\n  ret i64 %retval2\n}\n",
+          "test_name": "diff_exit_block_post_inc_use3"
+        },
+        {
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @diff_exit_block_post_inc_use2() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %index.next = add i64 %index, 1\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.early.exit\n\nloop.inc:                                         ; preds = %loop\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.early.exit:                                  ; preds = %loop\n  %retval1 = phi i64 [ %index.next, %loop ]\n  ret i64 %retval1\n\nloop.end:                                         ; preds = %loop.inc\n  %retval2 = phi i64 [ %index, %loop.inc ]\n  ret i64 %retval2\n}\n",
+          "test_name": "diff_exit_block_post_inc_use2"
+        },
+        {
+          "test_body": "define i64 @same_exit_block_pre_inc_use1_deref_ptrs(ptr dereferenceable(1024) %p1, ptr dereferenceable(1024) %p2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %retval = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  ret i64 %retval\n}\n",
+          "test_name": "same_exit_block_pre_inc_use1_deref_ptrs"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -passes='loop-vectorize,verify<loops>' -force-vector-width=8 -force-vector-interleave=1 -S %s",
+        "opt -passes='loop-vectorize,verify<loops>' -force-vector-width=8 -force-vector-interleave=2 -S %s",
+        "opt -passes='loop-vectorize,verify<loops>' -force-vector-width=16 -force-vector-interleave=1 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/vector-loop-backedge-elimination-early-exit.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\n\n; Function Attrs: nofree nosync\ndefine i8 @test_early_exit_max_tc_less_than_16(ptr dereferenceable(16) %A) #0 {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %p.src = getelementptr inbounds i8, ptr %A, i64 %iv\n  %l = load i8, ptr %p.src, align 1\n  %c = icmp eq i8 %l, 0\n  br i1 %c, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add nsw i64 %iv, 1\n  %cmp = icmp eq i64 %iv.next, 16\n  br i1 %cmp, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %res = phi i8 [ 0, %loop.header ], [ 1, %loop.latch ]\n  ret i8 %res\n}\n\nattributes #0 = { nofree nosync }\n",
+          "test_name": "test_early_exit_max_tc_less_than_16"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\n\n; Function Attrs: nofree nosync\ndefine i64 @test_early_exit_max_tc_less_than_16_with_iv_used_outside(ptr dereferenceable(16) %A) #0 {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %p.src = getelementptr inbounds i8, ptr %A, i64 %iv\n  %l = load i8, ptr %p.src, align 1\n  %c = icmp eq i8 %l, 0\n  br i1 %c, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add nsw i64 %iv, 1\n  %cmp = icmp eq i64 %iv.next, 16\n  br i1 %cmp, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %res = phi i64 [ %iv, %loop.header ], [ 1, %loop.latch ]\n  ret i64 %res\n}\n\nattributes #0 = { nofree nosync }\n",
+          "test_name": "test_early_exit_max_tc_less_than_16_with_iv_used_outside"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\n\n; Function Attrs: nofree nosync\ndefine i8 @test_early_exit_max_vector_tc_eq_16(ptr dereferenceable(17) %A) #0 {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %p.src = getelementptr inbounds i8, ptr %A, i64 %iv\n  %l = load i8, ptr %p.src, align 1\n  %c = icmp eq i8 %l, 0\n  br i1 %c, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add nsw i64 %iv, 1\n  %cmp = icmp eq i64 %iv.next, 17\n  br i1 %cmp, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %res = phi i8 [ 0, %loop.header ], [ 1, %loop.latch ]\n  ret i8 %res\n}\n\nattributes #0 = { nofree nosync }\n",
+          "test_name": "test_early_exit_max_vector_tc_eq_16"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -O3 -S %s"
+      ],
+      "file": "llvm/test/Transforms/PhaseOrdering/AArch64/std-find.ll",
+      "tests": [
+        {
+          "test_body": "target triple = \"arm64-apple-macosx15.0.0\"\n\n; Function Attrs: nofree nosync\ndefine i64 @std_find_i16_constant_offset_with_assumptions(ptr %first.coerce, i16 noundef signext %s) #0 {\nentry:\n  %first = alloca { ptr }, align 8\n  %s.addr = alloca i16, align 2\n  store ptr %first.coerce, ptr %first, align 8\n  store i16 %s, ptr %s.addr, align 2\n  %0 = load ptr, ptr %first, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %0, i64 2) ]\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %0, i64 256) ]\n  %start.ptr = load ptr, ptr %first, align 8\n  %1 = load i64, ptr %first, align 8\n  %coerce.val.pi.i = add i64 %1, 256\n  %coerce.val.ip = inttoptr i64 %coerce.val.pi.i to ptr\n  %cmp.not6.i.i = icmp eq ptr %start.ptr, %coerce.val.ip\n  br i1 %cmp.not6.i.i, label %return, label %loop.ph\n\nloop.ph:                                          ; preds = %entry\n  %2 = load i16, ptr %s.addr, align 2\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %loop.ph\n  %ptr.iv = phi ptr [ %start.ptr, %loop.ph ], [ %ptr.iv.next, %loop.latch ]\n  %3 = load i16, ptr %ptr.iv, align 2\n  %cmp2.i.i = icmp eq i16 %3, %2\n  br i1 %cmp2.i.i, label %return, label %loop.latch\n\nloop.latch:                                       ; preds = %loop.header\n  %ptr.iv.next = getelementptr inbounds nuw i8, ptr %ptr.iv, i64 2\n  %cmp.not.i.i = icmp eq ptr %ptr.iv.next, %coerce.val.ip\n  br i1 %cmp.not.i.i, label %return, label %loop.header\n\nreturn:                                           ; preds = %loop.latch, %loop.header, %entry\n  %merge = phi ptr [ %start.ptr, %entry ], [ %coerce.val.ip, %loop.latch ], [ %ptr.iv, %loop.header ]\n  %res = ptrtoint ptr %merge to i64\n  ret i64 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\nattributes #0 = { nofree nosync }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "test_name": "std_find_i16_constant_offset_with_assumptions"
+        }
+      ]
+    }
+  ]
+}

@@ -1,17 +1,20 @@
 {
-  "bug_id": "89500",
-  "issue_url": "https://github.com/llvm/llvm-project/issues/89500",
-  "bug_type": "miscompilation",
   "base_commit": "a1b1c4a6d1d52916c5d885170a5f54632d579cdc",
-  "knowledge_cutoff": "2024-04-20T12:43:21Z",
-  "lit_test_dir": [
-    "llvm/test/Transforms/InstCombine"
-  ],
+  "bug_id": "89500",
+  "bug_type": "miscompilation",
   "hints": {
-    "fix_commit": "7339f7ba3053db7595ece1ca5f49bd2e4c3c8305",
-    "components": [
-      "InstCombine"
-    ],
+    "bug_location_funcname": {
+      "llvm/include/llvm/IR/PatternMatch.h": [
+        "isValue",
+        "m_AllOnes",
+        "m_Not",
+        "m_c_SMin",
+        "match"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "foldSelectICmpEq"
+      ]
+    },
     "bug_location_lineno": {
       "llvm/include/llvm/IR/PatternMatch.h": [
         [
@@ -42,42 +45,14 @@
         ]
       ]
     },
-    "bug_location_funcname": {
-      "llvm/include/llvm/IR/PatternMatch.h": [
-        "isValue",
-        "m_AllOnes",
-        "m_Not",
-        "m_c_SMin",
-        "match"
-      ],
-      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
-        "foldSelectICmpEq"
-      ]
-    }
-  },
-  "patch": "commit 7339f7ba3053db7595ece1ca5f49bd2e4c3c8305\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Wed Apr 24 10:57:17 2024 +0900\n\n    [InstCombine] Fix poison propagation in select of bitwise fold (#89701)\n    \n    We're replacing the select with the false value here, but it may be more\n    poisonous if m_Not contains poison elements. Fix this by introducing a\n    m_NotForbidPoison matcher and using it here.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/89500.\n\ndiff --git a/llvm/include/llvm/IR/PatternMatch.h b/llvm/include/llvm/IR/PatternMatch.h\nindex 1fee1901fabb..0b13b4aad9c3 100644\n--- a/llvm/include/llvm/IR/PatternMatch.h\n+++ b/llvm/include/llvm/IR/PatternMatch.h\n@@ -350,8 +350,9 @@ template <int64_t Val> inline constantint_match<Val> m_ConstantInt() {\n \n /// This helper class is used to match constant scalars, vector splats,\n /// and fixed width vectors that satisfy a specified predicate.\n-/// For fixed width vector constants, poison elements are ignored.\n-template <typename Predicate, typename ConstantVal>\n+/// For fixed width vector constants, poison elements are ignored if AllowPoison\n+/// is true.\n+template <typename Predicate, typename ConstantVal, bool AllowPoison>\n struct cstval_pred_ty : public Predicate {\n   template <typename ITy> bool match(ITy *V) {\n     if (const auto *CV = dyn_cast<ConstantVal>(V))\n@@ -374,7 +375,7 @@ struct cstval_pred_ty : public Predicate {\n           Constant *Elt = C->getAggregateElement(i);\n           if (!Elt)\n             return false;\n-          if (isa<PoisonValue>(Elt))\n+          if (AllowPoison && isa<PoisonValue>(Elt))\n             continue;\n           auto *CV = dyn_cast<ConstantVal>(Elt);\n           if (!CV || !this->isValue(CV->getValue()))\n@@ -389,12 +390,13 @@ struct cstval_pred_ty : public Predicate {\n };\n \n /// specialization of cstval_pred_ty for ConstantInt\n-template <typename Predicate>\n-using cst_pred_ty = cstval_pred_ty<Predicate, ConstantInt>;\n+template <typename Predicate, bool AllowPoison = true>\n+using cst_pred_ty = cstval_pred_ty<Predicate, ConstantInt, AllowPoison>;\n \n /// specialization of cstval_pred_ty for ConstantFP\n template <typename Predicate>\n-using cstfp_pred_ty = cstval_pred_ty<Predicate, ConstantFP>;\n+using cstfp_pred_ty = cstval_pred_ty<Predicate, ConstantFP,\n+                                     /*AllowPoison=*/true>;\n \n /// This helper class is used to match scalar and vector constants that\n /// satisfy a specified predicate, and bind them to an APInt.\n@@ -484,6 +486,10 @@ inline cst_pred_ty<is_all_ones> m_AllOnes() {\n   return cst_pred_ty<is_all_ones>();\n }\n \n+inline cst_pred_ty<is_all_ones, false> m_AllOnesForbidPoison() {\n+  return cst_pred_ty<is_all_ones, false>();\n+}\n+\n struct is_maxsignedvalue {\n   bool isValue(const APInt &C) { return C.isMaxSignedValue(); }\n };\n@@ -2596,6 +2602,13 @@ m_Not(const ValTy &V) {\n   return m_c_Xor(m_AllOnes(), V);\n }\n \n+template <typename ValTy>\n+inline BinaryOp_match<cst_pred_ty<is_all_ones, false>, ValTy, Instruction::Xor,\n+                      true>\n+m_NotForbidPoison(const ValTy &V) {\n+  return m_c_Xor(m_AllOnesForbidPoison(), V);\n+}\n+\n /// Matches an SMin with LHS and RHS in either order.\n template <typename LHS, typename RHS>\n inline MaxMin_match<ICmpInst, LHS, RHS, smin_pred_ty, true>\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 73600206a55c..117eb7a1dcc9 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -1722,11 +1722,11 @@ static Instruction *foldSelectICmpEq(SelectInst &SI, ICmpInst *ICI,\n       return match(CmpRHS, m_Zero()) && match(FalseVal, matchInner);\n \n     if (NotMask == NotInner) {\n-      return match(FalseVal,\n-                   m_c_BinOp(OuterOpc, m_Not(matchInner), m_Specific(CmpRHS)));\n+      return match(FalseVal, m_c_BinOp(OuterOpc, m_NotForbidPoison(matchInner),\n+                                       m_Specific(CmpRHS)));\n     } else if (NotMask == NotRHS) {\n-      return match(FalseVal,\n-                   m_c_BinOp(OuterOpc, matchInner, m_Not(m_Specific(CmpRHS))));\n+      return match(FalseVal, m_c_BinOp(OuterOpc, matchInner,\n+                                       m_NotForbidPoison(m_Specific(CmpRHS))));\n     } else {\n       return match(FalseVal,\n                    m_c_BinOp(OuterOpc, matchInner, m_Specific(CmpRHS)));\n",
-  "tests": [
-    {
-      "file": "llvm/test/Transforms/InstCombine/select.ll",
-      "commands": [
-        "opt < %s -passes=instcombine -S"
-      ],
-      "tests": [
-        {
-          "test_name": "src_and_eq_C_xor_OrAndNotC_vec_poison",
-          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine <2 x i32> @src_and_eq_C_xor_OrAndNotC_vec_poison(<2 x i32> %0, <2 x i32> %1, <2 x i32> %2) {\nentry:\n  %and = and <2 x i32> %1, %0\n  %cmp = icmp eq <2 x i32> %and, %2\n  %xor = xor <2 x i32> %1, %0\n  %or = or <2 x i32> %1, %0\n  %not = xor <2 x i32> %2, <i32 -1, i32 poison>\n  %and1 = and <2 x i32> %or, %not\n  %cond = select <2 x i1> %cmp, <2 x i32> %xor, <2 x i32> %and1\n  ret <2 x i32> %cond\n}\n"
-        }
-      ]
-    }
-  ],
-  "issue": {
-    "title": "[InstCombine] Miscompilation with poison vectors in `src_and_eq_C_xor_OrAndNotC` ",
-    "body": "Alive2: https://alive2.llvm.org/ce/z/yB3oAx\r\n```ll\r\ndefine <2 x i32> @src_and_eq_C_xor_OrAndNotC(<2 x i32> %0, <2 x i32> %1, <2 x i32> %2) {\r\nentry:\r\n  %and = and <2 x i32> %1, %0\r\n  %cmp = icmp eq <2 x i32> %and, %2\r\n  %xor = xor <2 x i32> %1, %0\r\n  %or = or <2 x i32> %1, %0\r\n  %not = xor <2 x i32> %2, <i32 -1, i32 poison>\r\n  %and1 = and <2 x i32> %or, %not\r\n  %cond = select <2 x i1> %cmp, <2 x i32> %xor, <2 x i32> %and1\r\n  ret <2 x i32> %cond\r\n}\r\n```\r\n```ll\r\n\r\n----------------------------------------\r\ndefine <2 x i32> @src_and_eq_C_xor_OrAndNotC(<2 x i32> %#0, <2 x i32> %#1, <2 x i32> %#2) {\r\nentry:\r\n  %and = and <2 x i32> %#1, %#0\r\n  %cmp = icmp eq <2 x i32> %and, %#2\r\n  %xor = xor <2 x i32> %#1, %#0\r\n  %or = or <2 x i32> %#1, %#0\r\n  %not = xor <2 x i32> %#2, { 4294967295, poison }\r\n  %and1 = and <2 x i32> %or, %not\r\n  %cond = select <2 x i1> %cmp, <2 x i32> %xor, <2 x i32> %and1\r\n  ret <2 x i32> %cond\r\n}\r\n=>\r\ndefine <2 x i32> @src_and_eq_C_xor_OrAndNotC(<2 x i32> %#0, <2 x i32> %#1, <2 x i32> %#2) nofree willreturn memory(none) {\r\nentry:\r\n  %or = or <2 x i32> %#1, %#0\r\n  %not = xor <2 x i32> %#2, { 4294967295, poison }\r\n  %and1 = and <2 x i32> %or, %not\r\n  ret <2 x i32> %and1\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nExample:\r\n<2 x i32> %#0 = < poison, #x00000000 (0) >\r\n<2 x i32> %#1 = < poison, #x00000000 (0) >\r\n<2 x i32> %#2 = < poison, #x00000000 (0) >\r\n\r\nSource:\r\n<2 x i32> %and = < poison, #x00000000 (0) >\r\n<2 x i1> %cmp = < poison, #x1 (1) >\r\n<2 x i32> %xor = < poison, #x00000000 (0) >\r\n<2 x i32> %or = < poison, #x00000000 (0) >\r\n<2 x i32> %not = < poison, poison >\r\n<2 x i32> %and1 = < poison, poison >\r\n<2 x i32> %cond = < poison, #x00000000 (0) >\r\n\r\nTarget:\r\n<2 x i32> %or = < poison, #x00000000 (0) >\r\n<2 x i32> %not = < poison, poison >\r\n<2 x i32> %and1 = < poison, poison >\r\nSource value: < poison, #x00000000 (0) >\r\nTarget value: < poison, poison >\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```\r\n\r\nFound with https://github.com/dtcxzyw/llvm-tools.\r\ncc @nikic",
-    "author": "dtcxzyw",
-    "labels": [
-      "miscompilation",
-      "llvm:instcombine"
+    "components": [
+      "InstCombine"
     ],
+    "fix_commit": "7339f7ba3053db7595ece1ca5f49bd2e4c3c8305"
+  },
+  "issue": {
+    "author": "dtcxzyw",
+    "body": "Alive2: https://alive2.llvm.org/ce/z/yB3oAx\r\n```ll\r\ndefine <2 x i32> @src_and_eq_C_xor_OrAndNotC(<2 x i32> %0, <2 x i32> %1, <2 x i32> %2) {\r\nentry:\r\n  %and = and <2 x i32> %1, %0\r\n  %cmp = icmp eq <2 x i32> %and, %2\r\n  %xor = xor <2 x i32> %1, %0\r\n  %or = or <2 x i32> %1, %0\r\n  %not = xor <2 x i32> %2, <i32 -1, i32 poison>\r\n  %and1 = and <2 x i32> %or, %not\r\n  %cond = select <2 x i1> %cmp, <2 x i32> %xor, <2 x i32> %and1\r\n  ret <2 x i32> %cond\r\n}\r\n```\r\n```ll\r\n\r\n----------------------------------------\r\ndefine <2 x i32> @src_and_eq_C_xor_OrAndNotC(<2 x i32> %#0, <2 x i32> %#1, <2 x i32> %#2) {\r\nentry:\r\n  %and = and <2 x i32> %#1, %#0\r\n  %cmp = icmp eq <2 x i32> %and, %#2\r\n  %xor = xor <2 x i32> %#1, %#0\r\n  %or = or <2 x i32> %#1, %#0\r\n  %not = xor <2 x i32> %#2, { 4294967295, poison }\r\n  %and1 = and <2 x i32> %or, %not\r\n  %cond = select <2 x i1> %cmp, <2 x i32> %xor, <2 x i32> %and1\r\n  ret <2 x i32> %cond\r\n}\r\n=>\r\ndefine <2 x i32> @src_and_eq_C_xor_OrAndNotC(<2 x i32> %#0, <2 x i32> %#1, <2 x i32> %#2) nofree willreturn memory(none) {\r\nentry:\r\n  %or = or <2 x i32> %#1, %#0\r\n  %not = xor <2 x i32> %#2, { 4294967295, poison }\r\n  %and1 = and <2 x i32> %or, %not\r\n  ret <2 x i32> %and1\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nExample:\r\n<2 x i32> %#0 = < poison, #x00000000 (0) >\r\n<2 x i32> %#1 = < poison, #x00000000 (0) >\r\n<2 x i32> %#2 = < poison, #x00000000 (0) >\r\n\r\nSource:\r\n<2 x i32> %and = < poison, #x00000000 (0) >\r\n<2 x i1> %cmp = < poison, #x1 (1) >\r\n<2 x i32> %xor = < poison, #x00000000 (0) >\r\n<2 x i32> %or = < poison, #x00000000 (0) >\r\n<2 x i32> %not = < poison, poison >\r\n<2 x i32> %and1 = < poison, poison >\r\n<2 x i32> %cond = < poison, #x00000000 (0) >\r\n\r\nTarget:\r\n<2 x i32> %or = < poison, #x00000000 (0) >\r\n<2 x i32> %not = < poison, poison >\r\n<2 x i32> %and1 = < poison, poison >\r\nSource value: < poison, #x00000000 (0) >\r\nTarget value: < poison, poison >\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```\r\n\r\nFound with https://github.com/dtcxzyw/llvm-tools.\r\ncc @nikic",
     "comments": [
       {
         "author": "nikic",
@@ -87,12 +62,23 @@
         "author": "ParkHanbum",
         "body": "I'll not forget to create a testcase with poison.\r\n"
       }
-    ]
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "[InstCombine] Miscompilation with poison vectors in `src_and_eq_C_xor_OrAndNotC` "
   },
-  "verified": true,
+  "issue_url": "https://github.com/llvm/llvm-project/issues/89500",
+  "knowledge_cutoff": "2024-04-20T12:43:21Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 7339f7ba3053db7595ece1ca5f49bd2e4c3c8305\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Wed Apr 24 10:57:17 2024 +0900\n\n    [InstCombine] Fix poison propagation in select of bitwise fold (#89701)\n    \n    We're replacing the select with the false value here, but it may be more\n    poisonous if m_Not contains poison elements. Fix this by introducing a\n    m_NotForbidPoison matcher and using it here.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/89500.\n\ndiff --git a/llvm/include/llvm/IR/PatternMatch.h b/llvm/include/llvm/IR/PatternMatch.h\nindex 1fee1901fabb..0b13b4aad9c3 100644\n--- a/llvm/include/llvm/IR/PatternMatch.h\n+++ b/llvm/include/llvm/IR/PatternMatch.h\n@@ -350,8 +350,9 @@ template <int64_t Val> inline constantint_match<Val> m_ConstantInt() {\n \n /// This helper class is used to match constant scalars, vector splats,\n /// and fixed width vectors that satisfy a specified predicate.\n-/// For fixed width vector constants, poison elements are ignored.\n-template <typename Predicate, typename ConstantVal>\n+/// For fixed width vector constants, poison elements are ignored if AllowPoison\n+/// is true.\n+template <typename Predicate, typename ConstantVal, bool AllowPoison>\n struct cstval_pred_ty : public Predicate {\n   template <typename ITy> bool match(ITy *V) {\n     if (const auto *CV = dyn_cast<ConstantVal>(V))\n@@ -374,7 +375,7 @@ struct cstval_pred_ty : public Predicate {\n           Constant *Elt = C->getAggregateElement(i);\n           if (!Elt)\n             return false;\n-          if (isa<PoisonValue>(Elt))\n+          if (AllowPoison && isa<PoisonValue>(Elt))\n             continue;\n           auto *CV = dyn_cast<ConstantVal>(Elt);\n           if (!CV || !this->isValue(CV->getValue()))\n@@ -389,12 +390,13 @@ struct cstval_pred_ty : public Predicate {\n };\n \n /// specialization of cstval_pred_ty for ConstantInt\n-template <typename Predicate>\n-using cst_pred_ty = cstval_pred_ty<Predicate, ConstantInt>;\n+template <typename Predicate, bool AllowPoison = true>\n+using cst_pred_ty = cstval_pred_ty<Predicate, ConstantInt, AllowPoison>;\n \n /// specialization of cstval_pred_ty for ConstantFP\n template <typename Predicate>\n-using cstfp_pred_ty = cstval_pred_ty<Predicate, ConstantFP>;\n+using cstfp_pred_ty = cstval_pred_ty<Predicate, ConstantFP,\n+                                     /*AllowPoison=*/true>;\n \n /// This helper class is used to match scalar and vector constants that\n /// satisfy a specified predicate, and bind them to an APInt.\n@@ -484,6 +486,10 @@ inline cst_pred_ty<is_all_ones> m_AllOnes() {\n   return cst_pred_ty<is_all_ones>();\n }\n \n+inline cst_pred_ty<is_all_ones, false> m_AllOnesForbidPoison() {\n+  return cst_pred_ty<is_all_ones, false>();\n+}\n+\n struct is_maxsignedvalue {\n   bool isValue(const APInt &C) { return C.isMaxSignedValue(); }\n };\n@@ -2596,6 +2602,13 @@ m_Not(const ValTy &V) {\n   return m_c_Xor(m_AllOnes(), V);\n }\n \n+template <typename ValTy>\n+inline BinaryOp_match<cst_pred_ty<is_all_ones, false>, ValTy, Instruction::Xor,\n+                      true>\n+m_NotForbidPoison(const ValTy &V) {\n+  return m_c_Xor(m_AllOnesForbidPoison(), V);\n+}\n+\n /// Matches an SMin with LHS and RHS in either order.\n template <typename LHS, typename RHS>\n inline MaxMin_match<ICmpInst, LHS, RHS, smin_pred_ty, true>\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 73600206a55c..117eb7a1dcc9 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -1722,11 +1722,11 @@ static Instruction *foldSelectICmpEq(SelectInst &SI, ICmpInst *ICI,\n       return match(CmpRHS, m_Zero()) && match(FalseVal, matchInner);\n \n     if (NotMask == NotInner) {\n-      return match(FalseVal,\n-                   m_c_BinOp(OuterOpc, m_Not(matchInner), m_Specific(CmpRHS)));\n+      return match(FalseVal, m_c_BinOp(OuterOpc, m_NotForbidPoison(matchInner),\n+                                       m_Specific(CmpRHS)));\n     } else if (NotMask == NotRHS) {\n-      return match(FalseVal,\n-                   m_c_BinOp(OuterOpc, matchInner, m_Not(m_Specific(CmpRHS))));\n+      return match(FalseVal, m_c_BinOp(OuterOpc, matchInner,\n+                                       m_NotForbidPoison(m_Specific(CmpRHS))));\n     } else {\n       return match(FalseVal,\n                    m_c_BinOp(OuterOpc, matchInner, m_Specific(CmpRHS)));\n",
   "properties": {
+    "difficulty": "hard",
     "is_single_file_fix": false,
     "is_single_func_fix": false
   },
-  "bisect": "4ef22fce8208b9fc08da60c5e4f014ca09811b96"
+  "tests": []
 }

@@ -1,17 +1,15 @@
 {
-  "bug_id": "89958",
-  "issue_url": "https://github.com/llvm/llvm-project/issues/89958",
-  "bug_type": "miscompilation",
   "base_commit": "e913a33fcfbd667e4e3a35919b6bd9c5876a90a3",
-  "knowledge_cutoff": "2024-04-24T17:36:34Z",
-  "lit_test_dir": [
-    "llvm/test/Transforms/LoopVectorize"
-  ],
+  "bug_id": "89958",
+  "bug_type": "miscompilation",
   "hints": {
-    "fix_commit": "b060661da8b3b53db55644e5e358bb2dca8b56d7",
-    "components": [
-      "ScalarEvolution"
-    ],
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        "SCEVExpander::expandMinMaxExpr",
+        "SCEVExpander::visitSMaxExpr",
+        "SCEVExpander::visitUDivExpr"
+      ]
+    },
     "bug_location_lineno": {
       "llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h": [
         [
@@ -34,48 +32,81 @@
         ]
       ]
     },
-    "bug_location_funcname": {
-      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
-        "SCEVExpander::expandMinMaxExpr",
-        "SCEVExpander::visitSMaxExpr",
-        "SCEVExpander::visitUDivExpr"
-      ]
-    }
-  },
-  "patch": "commit b060661da8b3b53db55644e5e358bb2dca8b56d7\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Thu Oct 17 13:55:20 2024 -0700\n\n    [SCEVExpander] Expand UDiv avoiding UB when in seq_min/max. (#92177)\n    \n    Update SCEVExpander to introduce an SafeUDivMode, which is set\n    when expanding operands of SCEVSequentialMinMaxExpr. In this mode,\n    the expander will make sure that the divisor of the expanded UDiv is\n    neither 0 nor poison.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/89958.\n    \n    \n    PR https://github.com/llvm/llvm-project/pull/92177\n\ndiff --git a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\nindex 5697d983c9ad..7dd754a2bc0d 100644\n--- a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n+++ b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n@@ -126,6 +126,11 @@ class SCEVExpander : public SCEVVisitor<SCEVExpander, Value *> {\n   /// \"expanded\" form.\n   bool LSRMode;\n \n+  /// When true, rewrite any divisors of UDiv expressions that may be 0 to\n+  /// umax(Divisor, 1) to avoid introducing UB. If the divisor may be poison,\n+  /// freeze it first.\n+  bool SafeUDivMode = false;\n+\n   typedef IRBuilder<InstSimplifyFolder, IRBuilderCallbackInserter> BuilderType;\n   BuilderType Builder;\n \ndiff --git a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\nindex c412d0398b95..39da38e49181 100644\n--- a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n+++ b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n@@ -681,7 +681,21 @@ Value *SCEVExpander::visitUDivExpr(const SCEVUDivExpr *S) {\n                          SCEV::FlagAnyWrap, /*IsSafeToHoist*/ true);\n   }\n \n-  Value *RHS = expand(S->getRHS());\n+  const SCEV *RHSExpr = S->getRHS();\n+  Value *RHS = expand(RHSExpr);\n+  if (SafeUDivMode) {\n+    bool GuaranteedNotPoison =\n+        ScalarEvolution::isGuaranteedNotToBePoison(RHSExpr);\n+    if (!GuaranteedNotPoison)\n+      RHS = Builder.CreateFreeze(RHS);\n+\n+    // We need an umax if either RHSExpr is not known to be zero, or if it is\n+    // not guaranteed to be non-poison. In the later case, the frozen poison may\n+    // be 0.\n+    if (!SE.isKnownNonZero(RHSExpr) || !GuaranteedNotPoison)\n+      RHS = Builder.CreateIntrinsic(RHS->getType(), Intrinsic::umax,\n+                                    {RHS, ConstantInt::get(RHS->getType(), 1)});\n+  }\n   return InsertBinop(Instruction::UDiv, LHS, RHS, SCEV::FlagAnyWrap,\n                      /*IsSafeToHoist*/ SE.isKnownNonZero(S->getRHS()));\n }\n@@ -1376,11 +1390,14 @@ Value *SCEVExpander::visitSignExtendExpr(const SCEVSignExtendExpr *S) {\n Value *SCEVExpander::expandMinMaxExpr(const SCEVNAryExpr *S,\n                                       Intrinsic::ID IntrinID, Twine Name,\n                                       bool IsSequential) {\n+  bool PrevSafeMode = SafeUDivMode;\n+  SafeUDivMode |= IsSequential;\n   Value *LHS = expand(S->getOperand(S->getNumOperands() - 1));\n   Type *Ty = LHS->getType();\n   if (IsSequential)\n     LHS = Builder.CreateFreeze(LHS);\n   for (int i = S->getNumOperands() - 2; i >= 0; --i) {\n+    SafeUDivMode = (IsSequential && i != 0) || PrevSafeMode;\n     Value *RHS = expand(S->getOperand(i));\n     if (IsSequential && i != 0)\n       RHS = Builder.CreateFreeze(RHS);\n@@ -1395,6 +1412,7 @@ Value *SCEVExpander::expandMinMaxExpr(const SCEVNAryExpr *S,\n     }\n     LHS = Sel;\n   }\n+  SafeUDivMode = PrevSafeMode;\n   return LHS;\n }\n \n",
-  "tests": [
-    {
-      "file": "<issue>",
-      "commands": [
-        "opt -p loop-vectorize -force-vector-width=4 -S %s"
-      ],
-      "tests": [
-        {
-          "test_name": "f",
-          "test_body": "define i64 @f(i64 %0) {\n  br label %2\n\n2:                                                ; preds = %5, %1\n  %3 = phi i64 [ 0, %1 ], [ %6, %5 ]\n  %4 = icmp slt i64 %3, %0\n  br i1 %4, label %5, label %9\n\n5:                                                ; preds = %2\n  %6 = add i64 %3, 1\n  %7 = udiv i64 42, %0\n  %8 = icmp slt i64 %3, %7\n  br i1 %8, label %2, label %9\n\n9:                                                ; preds = %5, %2\n  %10 = phi i64 [ 1, %2 ], [ 0, %5 ]\n  ret i64 %10\n}"
-        }
-      ]
-    }
-  ],
-  "issue": {
-    "title": "miscompilation due to LoopVectorize making a function vulnerable to integer divide-by-zero",
-    "body": "https://alive2.llvm.org/ce/z/Kx2anL\r\n\r\nthis function:\r\n```llvm\r\ndefine i64 @f(i64 %0) {\r\n  br label %2\r\n\r\n2:                                                ; preds = %5, %1\r\n  %3 = phi i64 [ 0, %1 ], [ %6, %5 ]\r\n  %4 = icmp slt i64 %3, %0\r\n  br i1 %4, label %5, label %9\r\n\r\n5:                                                ; preds = %2\r\n  %6 = add i64 %3, 1\r\n  %7 = udiv i64 42, %0\r\n  %8 = icmp slt i64 %3, %7\r\n  br i1 %8, label %2, label %9\r\n\r\n9:                                                ; preds = %5, %2\r\n  %10 = phi i64 [ 1, %2 ], [ 0, %5 ]\r\n  ret i64 %10\r\n}\r\n```\r\nis getting optimized to:\r\n```lllvm\r\ndefine noundef i64 @f(i64 %0) local_unnamed_addr #0 {\r\n  %smax = tail call i64 @llvm.smax.i64(i64 %0, i64 0)\r\n  %2 = udiv i64 42, %0\r\n  %umin = tail call i64 @llvm.umin.i64(i64 %smax, i64 %2)\r\n  %min.iters.check = icmp ult i64 %umin, 4\r\n  br i1 %min.iters.check, label %scalar.ph.preheader, label %vector.ph\r\n\r\nvector.ph:                                        ; preds = %1\r\n  %3 = add nuw nsw i64 %umin, 1\r\n  %n.mod.vf = and i64 %3, 3\r\n  %4 = icmp eq i64 %n.mod.vf, 0\r\n  %5 = select i1 %4, i64 4, i64 %n.mod.vf\r\n  %n.vec = sub nsw i64 %3, %5\r\n  br label %vector.body\r\n\r\nvector.body:                                      ; preds = %vector.body, %vector.ph\r\n  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]\r\n  %index.next = add nuw i64 %index, 4\r\n  %6 = icmp eq i64 %index.next, %n.vec\r\n  br i1 %6, label %scalar.ph.preheader, label %vector.body, !llvm.loop !0\r\n\r\nscalar.ph.preheader:                              ; preds = %vector.body, %1\r\n  %.ph = phi i64 [ 0, %1 ], [ %n.vec, %vector.body ]\r\n  br label %scalar.ph\r\n\r\nscalar.ph:                                        ; preds = %scalar.ph.preheader, %9\r\n  %7 = phi i64 [ %10, %9 ], [ %.ph, %scalar.ph.preheader ]\r\n  %8 = icmp slt i64 %7, %0\r\n  br i1 %8, label %9, label %13\r\n\r\n9:                                                ; preds = %scalar.ph\r\n  %10 = add nuw nsw i64 %7, 1\r\n  %11 = udiv i64 42, %0\r\n  %12 = icmp ult i64 %7, %11\r\n  br i1 %12, label %scalar.ph, label %13, !llvm.loop !3\r\n\r\n13:                                               ; preds = %9, %scalar.ph\r\n  %14 = phi i64 [ 1, %scalar.ph ], [ 0, %9 ]\r\n  ret i64 %14\r\n}\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i64 @llvm.smax.i64(i64, i64) #1\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i64 @llvm.umin.i64(i64, i64) #1\r\n\r\nattributes #0 = { nofree norecurse nosync nounwind memory(none) }\r\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\r\n\r\n!0 = distinct !{!0, !1, !2}\r\n!1 = !{!\"llvm.loop.isvectorized\", i32 1}\r\n!2 = !{!\"llvm.loop.unroll.runtime.disable\"}\r\n!3 = distinct !{!3, !2, !1}\r\n```\r\n\r\nthe problem is that the optimized code can divide by zero even when the original code doesn't. to see this, pass 0 as an argument to `f`. I also independently verified on an x64-64 that the optimized code traps out with an FPE while the original code does not. it's LoopVectorize that's the culprit.\r\n\r\ncc @nunoplopes @hatsunespica\r\n",
-    "author": "regehr",
-    "labels": [
-      "miscompilation",
-      "llvm:SCEV"
+    "components": [
+      "ScalarEvolution"
     ],
+    "fix_commit": "b060661da8b3b53db55644e5e358bb2dca8b56d7"
+  },
+  "issue": {
+    "author": "regehr",
+    "body": "https://alive2.llvm.org/ce/z/Kx2anL\r\n\r\nthis function:\r\n```llvm\r\ndefine i64 @f(i64 %0) {\r\n  br label %2\r\n\r\n2:                                                ; preds = %5, %1\r\n  %3 = phi i64 [ 0, %1 ], [ %6, %5 ]\r\n  %4 = icmp slt i64 %3, %0\r\n  br i1 %4, label %5, label %9\r\n\r\n5:                                                ; preds = %2\r\n  %6 = add i64 %3, 1\r\n  %7 = udiv i64 42, %0\r\n  %8 = icmp slt i64 %3, %7\r\n  br i1 %8, label %2, label %9\r\n\r\n9:                                                ; preds = %5, %2\r\n  %10 = phi i64 [ 1, %2 ], [ 0, %5 ]\r\n  ret i64 %10\r\n}\r\n```\r\nis getting optimized to:\r\n```lllvm\r\ndefine noundef i64 @f(i64 %0) local_unnamed_addr #0 {\r\n  %smax = tail call i64 @llvm.smax.i64(i64 %0, i64 0)\r\n  %2 = udiv i64 42, %0\r\n  %umin = tail call i64 @llvm.umin.i64(i64 %smax, i64 %2)\r\n  %min.iters.check = icmp ult i64 %umin, 4\r\n  br i1 %min.iters.check, label %scalar.ph.preheader, label %vector.ph\r\n\r\nvector.ph:                                        ; preds = %1\r\n  %3 = add nuw nsw i64 %umin, 1\r\n  %n.mod.vf = and i64 %3, 3\r\n  %4 = icmp eq i64 %n.mod.vf, 0\r\n  %5 = select i1 %4, i64 4, i64 %n.mod.vf\r\n  %n.vec = sub nsw i64 %3, %5\r\n  br label %vector.body\r\n\r\nvector.body:                                      ; preds = %vector.body, %vector.ph\r\n  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]\r\n  %index.next = add nuw i64 %index, 4\r\n  %6 = icmp eq i64 %index.next, %n.vec\r\n  br i1 %6, label %scalar.ph.preheader, label %vector.body, !llvm.loop !0\r\n\r\nscalar.ph.preheader:                              ; preds = %vector.body, %1\r\n  %.ph = phi i64 [ 0, %1 ], [ %n.vec, %vector.body ]\r\n  br label %scalar.ph\r\n\r\nscalar.ph:                                        ; preds = %scalar.ph.preheader, %9\r\n  %7 = phi i64 [ %10, %9 ], [ %.ph, %scalar.ph.preheader ]\r\n  %8 = icmp slt i64 %7, %0\r\n  br i1 %8, label %9, label %13\r\n\r\n9:                                                ; preds = %scalar.ph\r\n  %10 = add nuw nsw i64 %7, 1\r\n  %11 = udiv i64 42, %0\r\n  %12 = icmp ult i64 %7, %11\r\n  br i1 %12, label %scalar.ph, label %13, !llvm.loop !3\r\n\r\n13:                                               ; preds = %9, %scalar.ph\r\n  %14 = phi i64 [ 1, %scalar.ph ], [ 0, %9 ]\r\n  ret i64 %14\r\n}\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i64 @llvm.smax.i64(i64, i64) #1\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i64 @llvm.umin.i64(i64, i64) #1\r\n\r\nattributes #0 = { nofree norecurse nosync nounwind memory(none) }\r\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\r\n\r\n!0 = distinct !{!0, !1, !2}\r\n!1 = !{!\"llvm.loop.isvectorized\", i32 1}\r\n!2 = !{!\"llvm.loop.unroll.runtime.disable\"}\r\n!3 = distinct !{!3, !2, !1}\r\n```\r\n\r\nthe problem is that the optimized code can divide by zero even when the original code doesn't. to see this, pass 0 as an argument to `f`. I also independently verified on an x64-64 that the optimized code traps out with an FPE while the original code does not. it's LoopVectorize that's the culprit.\r\n\r\ncc @nunoplopes @hatsunespica\r\n",
     "comments": [
       {
         "author": "dtcxzyw",
         "body": "cc @fhahn "
       }
-    ]
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:SCEV"
+    ],
+    "title": "miscompilation due to LoopVectorize making a function vulnerable to integer divide-by-zero"
   },
-  "verified": true,
+  "issue_url": "https://github.com/llvm/llvm-project/issues/89958",
+  "knowledge_cutoff": "2024-04-24T17:36:34Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "patch": "commit b060661da8b3b53db55644e5e358bb2dca8b56d7\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Thu Oct 17 13:55:20 2024 -0700\n\n    [SCEVExpander] Expand UDiv avoiding UB when in seq_min/max. (#92177)\n    \n    Update SCEVExpander to introduce an SafeUDivMode, which is set\n    when expanding operands of SCEVSequentialMinMaxExpr. In this mode,\n    the expander will make sure that the divisor of the expanded UDiv is\n    neither 0 nor poison.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/89958.\n    \n    \n    PR https://github.com/llvm/llvm-project/pull/92177\n\ndiff --git a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\nindex 5697d983c9ad..7dd754a2bc0d 100644\n--- a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n+++ b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n@@ -126,6 +126,11 @@ class SCEVExpander : public SCEVVisitor<SCEVExpander, Value *> {\n   /// \"expanded\" form.\n   bool LSRMode;\n \n+  /// When true, rewrite any divisors of UDiv expressions that may be 0 to\n+  /// umax(Divisor, 1) to avoid introducing UB. If the divisor may be poison,\n+  /// freeze it first.\n+  bool SafeUDivMode = false;\n+\n   typedef IRBuilder<InstSimplifyFolder, IRBuilderCallbackInserter> BuilderType;\n   BuilderType Builder;\n \ndiff --git a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\nindex c412d0398b95..39da38e49181 100644\n--- a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n+++ b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n@@ -681,7 +681,21 @@ Value *SCEVExpander::visitUDivExpr(const SCEVUDivExpr *S) {\n                          SCEV::FlagAnyWrap, /*IsSafeToHoist*/ true);\n   }\n \n-  Value *RHS = expand(S->getRHS());\n+  const SCEV *RHSExpr = S->getRHS();\n+  Value *RHS = expand(RHSExpr);\n+  if (SafeUDivMode) {\n+    bool GuaranteedNotPoison =\n+        ScalarEvolution::isGuaranteedNotToBePoison(RHSExpr);\n+    if (!GuaranteedNotPoison)\n+      RHS = Builder.CreateFreeze(RHS);\n+\n+    // We need an umax if either RHSExpr is not known to be zero, or if it is\n+    // not guaranteed to be non-poison. In the later case, the frozen poison may\n+    // be 0.\n+    if (!SE.isKnownNonZero(RHSExpr) || !GuaranteedNotPoison)\n+      RHS = Builder.CreateIntrinsic(RHS->getType(), Intrinsic::umax,\n+                                    {RHS, ConstantInt::get(RHS->getType(), 1)});\n+  }\n   return InsertBinop(Instruction::UDiv, LHS, RHS, SCEV::FlagAnyWrap,\n                      /*IsSafeToHoist*/ SE.isKnownNonZero(S->getRHS()));\n }\n@@ -1376,11 +1390,14 @@ Value *SCEVExpander::visitSignExtendExpr(const SCEVSignExtendExpr *S) {\n Value *SCEVExpander::expandMinMaxExpr(const SCEVNAryExpr *S,\n                                       Intrinsic::ID IntrinID, Twine Name,\n                                       bool IsSequential) {\n+  bool PrevSafeMode = SafeUDivMode;\n+  SafeUDivMode |= IsSequential;\n   Value *LHS = expand(S->getOperand(S->getNumOperands() - 1));\n   Type *Ty = LHS->getType();\n   if (IsSequential)\n     LHS = Builder.CreateFreeze(LHS);\n   for (int i = S->getNumOperands() - 2; i >= 0; --i) {\n+    SafeUDivMode = (IsSequential && i != 0) || PrevSafeMode;\n     Value *RHS = expand(S->getOperand(i));\n     if (IsSequential && i != 0)\n       RHS = Builder.CreateFreeze(RHS);\n@@ -1395,6 +1412,7 @@ Value *SCEVExpander::expandMinMaxExpr(const SCEVNAryExpr *S,\n     }\n     LHS = Sel;\n   }\n+  SafeUDivMode = PrevSafeMode;\n   return LHS;\n }\n \n",
   "properties": {
-    "is_single_file_fix": true,
+    "difficulty": "hard",
+    "is_single_file_fix": false,
     "is_single_func_fix": false
   },
-  "bisect": "Cannot find a good commit"
+  "tests": [
+    {
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/trip-count-expansion-may-introduce-ub.ll",
+      "tests": [
+        {
+          "test_body": "declare void @foo()\n\ndefine i64 @multi_exit_4_exit_count_with_udiv_by_value_in_latch_call_before_loop(ptr %dst, i64 %N) {\nentry:\n  call void @foo()\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = udiv i64 42, %N\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_udiv_by_value_in_latch_call_before_loop"
+        },
+        {
+          "test_body": "define i64 @multi_exit_4_exit_count_with_udiv_by_value_in_latch(ptr %dst, i64 %N) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = udiv i64 42, %N\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_udiv_by_value_in_latch"
+        },
+        {
+          "test_body": "define i64 @multi_exit_4_exit_count_with_urem_by_constant_in_latch(ptr %dst, i64 %N) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = urem i64 %N, 42\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_urem_by_constant_in_latch"
+        },
+        {
+          "test_body": "define i64 @multi_exit_4_exit_count_with_udiv_by_value_in_latch_loop_may_not_execute(ptr %dst, i64 %N, i1 %c) {\nentry:\n  br i1 %c, label %loop.header, label %exit\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = udiv i64 42, %N\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header, %entry\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ], [ 2, %entry ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_udiv_by_value_in_latch_loop_may_not_execute"
+        },
+        {
+          "test_body": "define i64 @multi_exit_count_with_udiv_by_value_in_latch_different_bounds_divisor_non_zero_may_be_poison(ptr %dst, i64 %N, i64 %M) {\nentry:\n  %M.1 = call i64 @llvm.umax.i64(i64 %M, i64 1)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = udiv i64 42, %M.1\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.umax.i64(i64, i64) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "multi_exit_count_with_udiv_by_value_in_latch_different_bounds_divisor_non_zero_may_be_poison"
+        },
+        {
+          "test_body": "define i64 @multi_exit_4_exit_count_with_urem_by_value_in_latch(ptr %dst, i64 %N) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = urem i64 42, %N\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_urem_by_value_in_latch"
+        },
+        {
+          "test_body": "define i64 @multi_exit_4_exit_count_with_udiv_by_frozen_value_in_latch(ptr %dst, i64 %N) {\nentry:\n  %fr.N = freeze i64 %N\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = udiv i64 42, %fr.N\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_udiv_by_frozen_value_in_latch"
+        },
+        {
+          "test_body": "define i64 @multi_exit_4_exit_count_with_udiv_by_value_in_latch1(ptr %dst, i64 %N) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = udiv i64 42, %N\n  %x = sub i64 100, %d\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_udiv_by_value_in_latch1"
+        },
+        {
+          "test_body": "define i64 @multi_exit_4_exit_count_with_udiv_by_value_in_latch_different_bounds(ptr %dst, i64 %N, i64 %M) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 1, ptr %gep, align 4\n  %c.0 = icmp slt i64 %iv, %N\n  br i1 %c.0, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %d = udiv i64 42, %M\n  %c.1 = icmp slt i64 %iv, %d\n  br i1 %c.1, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop.header\n  %p = phi i64 [ 1, %loop.header ], [ 0, %loop.latch ]\n  ret i64 %p\n}\n",
+          "test_name": "multi_exit_4_exit_count_with_udiv_by_value_in_latch_different_bounds"
+        }
+      ]
+    }
+  ]
 }

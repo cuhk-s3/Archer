@@ -1,0 +1,115 @@
+{
+  "base_commit": "76321b9f08ef31a2b8ca26f7522aee511a05f7a8",
+  "bug_id": "99436",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        "isSafeToSpeculativelyExecute"
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        "llvm::isSafeToSpeculativelyExecuteWithOpcode"
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "InstCombinerImpl::foldSelectValueEquivalence",
+        "InstCombinerImpl::replaceInInstruction"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ValueTracking.h": [
+        [
+          822,
+          836
+        ],
+        [
+          853,
+          859
+        ]
+      ],
+      "llvm/lib/Analysis/ValueTracking.cpp": [
+        [
+          6771,
+          6785
+        ],
+        [
+          6831,
+          6836
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          1247,
+          1254
+        ],
+        [
+          1331,
+          1337
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine",
+      "ValueTracking"
+    ],
+    "fix_commit": "248fcab2fc9b3fc1bde5cd5b1fe8615791225c9e"
+  },
+  "issue": {
+    "author": "dtcxzyw",
+    "body": "Reproducer: https://godbolt.org/z/dzn8c8eYj\r\n```\r\n; bin/opt -passes=instcombine test.ll -S\r\n; ModuleID = 'test.c'\r\nsource_filename = \"test.c\"\r\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\r\ntarget triple = \"x86_64-unknown-linux-gnu\"\r\n\r\n@f = dso_local global [2 x i32] zeroinitializer, align 4\r\n@__const.g.n = private unnamed_addr constant [1 x ptr] [ptr getelementptr (i8, ptr @f, i64 4)]\r\n\r\ndefine void @g() {\r\nentry:\r\n  %n = alloca [1 x ptr], align 8\r\n  call void @llvm.lifetime.start.p0(i64 8, ptr %n) #4\r\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %n, ptr align 8 @__const.g.n, i64 8, i1 false)\r\n  %0 = load ptr, ptr %n, align 8\r\n  %cmp3 = icmp eq ptr %0, null\r\n  %1 = load i32, ptr %0, align 4\r\n  %and = select i1 %cmp3, i32 %1, i32 0\r\n  store i32 %and, ptr %0, align 4\r\n  call void @llvm.lifetime.end.p0(i64 8, ptr %n) #4\r\n  ret void\r\n}\r\n```\r\n```\r\ndefine void @g() {\r\n  store i1 true, ptr poison, align 1\r\n  ret void\r\n}\r\n```\r\n```\r\nIC: Visiting:   %cmp3 = icmp eq ptr getelementptr (i8, ptr @f, i64 4), null\r\nIC: Visiting:   %0 = load i32, ptr getelementptr (i8, ptr @f, i64 4), align 4\r\nIC: Visiting:   %and = select i1 %cmp3, i32 %0, i32 0\r\nADD DEFERRED:   %0 = load i32, ptr null, align 4\r\nIC: Mod =   %and = select i1 %cmp3, i32 %0, i32 0\r\n    New =   %and = select i1 %cmp3, i32 %0, i32 0\r\n```\r\n",
+    "comments": [],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "[InstCombine] Miscompilation in `InstCombinerImpl::foldSelectValueEquivalence`"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/99436",
+  "knowledge_cutoff": "2024-07-18T06:16:15Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 248fcab2fc9b3fc1bde5cd5b1fe8615791225c9e\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Mon Jul 22 11:59:54 2024 +0800\n\n     [InstCombine] Do not use operand info in `replaceInInstruction` (#99492)\n    \n    Consider the following case:\n    ```\n    %cmp = icmp eq ptr %p, null\n    %load = load i32, ptr %p, align 4\n    %sel = select i1 %cmp, i32 %load, i32 0\n    ```\n    `foldSelectValueEquivalence` converts `load i32, ptr %p, align 4` into\n    `load i32, ptr null, align 4`, which causes immediate UB. `%load` is\n    speculatable, but it doesn't hold after operand substitution.\n    \n    This patch introduces a new helper\n    `isSafeToSpeculativelyExecuteWithVariableReplaced`. It ignores operand\n    info in these instructions since their operands will be replaced later.\n    \n    Fixes #99436.\n    \n    ---------\n    \n    Co-authored-by: Nikita Popov <github@npopov.com>\n\ndiff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex 2c2f965a3cd6..44e27234aa90 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -822,15 +822,25 @@ bool isSafeToSpeculativelyExecute(const Instruction *I,\n                                   const Instruction *CtxI = nullptr,\n                                   AssumptionCache *AC = nullptr,\n                                   const DominatorTree *DT = nullptr,\n-                                  const TargetLibraryInfo *TLI = nullptr);\n+                                  const TargetLibraryInfo *TLI = nullptr,\n+                                  bool UseVariableInfo = true);\n+\n+inline bool isSafeToSpeculativelyExecute(const Instruction *I,\n+                                         BasicBlock::iterator CtxI,\n+                                         AssumptionCache *AC = nullptr,\n+                                         const DominatorTree *DT = nullptr,\n+                                         const TargetLibraryInfo *TLI = nullptr,\n+                                         bool UseVariableInfo = true) {\n+  // Take an iterator, and unwrap it into an Instruction *.\n+  return isSafeToSpeculativelyExecute(I, &*CtxI, AC, DT, TLI, UseVariableInfo);\n+}\n \n+/// Don't use information from its non-constant operands. This helper is used\n+/// when its operands are going to be replaced.\n inline bool\n-isSafeToSpeculativelyExecute(const Instruction *I, BasicBlock::iterator CtxI,\n-                             AssumptionCache *AC = nullptr,\n-                             const DominatorTree *DT = nullptr,\n-                             const TargetLibraryInfo *TLI = nullptr) {\n-  // Take an iterator, and unwrap it into an Instruction *.\n-  return isSafeToSpeculativelyExecute(I, &*CtxI, AC, DT, TLI);\n+isSafeToSpeculativelyExecuteWithVariableReplaced(const Instruction *I) {\n+  return isSafeToSpeculativelyExecute(I, nullptr, nullptr, nullptr, nullptr,\n+                                      /*UseVariableInfo=*/false);\n }\n \n /// This returns the same result as isSafeToSpeculativelyExecute if Opcode is\n@@ -853,7 +863,7 @@ isSafeToSpeculativelyExecute(const Instruction *I, BasicBlock::iterator CtxI,\n bool isSafeToSpeculativelyExecuteWithOpcode(\n     unsigned Opcode, const Instruction *Inst, const Instruction *CtxI = nullptr,\n     AssumptionCache *AC = nullptr, const DominatorTree *DT = nullptr,\n-    const TargetLibraryInfo *TLI = nullptr);\n+    const TargetLibraryInfo *TLI = nullptr, bool UseVariableInfo = true);\n \n /// Returns true if the result or effects of the given instructions \\p I\n /// depend values not reachable through the def use graph.\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 03eb6ef42b0f..5c56654246ea 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -6771,15 +6771,16 @@ bool llvm::isSafeToSpeculativelyExecute(const Instruction *Inst,\n                                         const Instruction *CtxI,\n                                         AssumptionCache *AC,\n                                         const DominatorTree *DT,\n-                                        const TargetLibraryInfo *TLI) {\n+                                        const TargetLibraryInfo *TLI,\n+                                        bool UseVariableInfo) {\n   return isSafeToSpeculativelyExecuteWithOpcode(Inst->getOpcode(), Inst, CtxI,\n-                                                AC, DT, TLI);\n+                                                AC, DT, TLI, UseVariableInfo);\n }\n \n bool llvm::isSafeToSpeculativelyExecuteWithOpcode(\n     unsigned Opcode, const Instruction *Inst, const Instruction *CtxI,\n-    AssumptionCache *AC, const DominatorTree *DT,\n-    const TargetLibraryInfo *TLI) {\n+    AssumptionCache *AC, const DominatorTree *DT, const TargetLibraryInfo *TLI,\n+    bool UseVariableInfo) {\n #ifndef NDEBUG\n   if (Inst->getOpcode() != Opcode) {\n     // Check that the operands are actually compatible with the Opcode override.\n@@ -6831,6 +6832,9 @@ bool llvm::isSafeToSpeculativelyExecuteWithOpcode(\n     return false;\n   }\n   case Instruction::Load: {\n+    if (!UseVariableInfo)\n+      return false;\n+\n     const LoadInst *LI = dyn_cast<LoadInst>(Inst);\n     if (!LI)\n       return false;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex e387034110df..aaf4ece3249a 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -1247,8 +1247,11 @@ bool InstCombinerImpl::replaceInInstruction(Value *V, Value *Old, Value *New,\n   if (Depth == 2)\n     return false;\n \n+  assert(!isa<Constant>(Old) && \"Only replace non-constant values\");\n+\n   auto *I = dyn_cast<Instruction>(V);\n-  if (!I || !I->hasOneUse() || !isSafeToSpeculativelyExecute(I))\n+  if (!I || !I->hasOneUse() ||\n+      !isSafeToSpeculativelyExecuteWithVariableReplaced(I))\n     return false;\n \n   bool Changed = false;\n@@ -1331,7 +1334,7 @@ Instruction *InstCombinerImpl::foldSelectValueEquivalence(SelectInst &Sel,\n     // profitability is not clear for other cases.\n     // FIXME: Support vectors.\n     if (OldOp == CmpLHS && match(NewOp, m_ImmConstant()) &&\n-        !match(OldOp, m_ImmConstant()) && !Cmp.getType()->isVectorTy() &&\n+        !match(OldOp, m_Constant()) && !Cmp.getType()->isVectorTy() &&\n         isGuaranteedNotToBeUndef(NewOp, SQ.AC, &Sel, &DT))\n       if (replaceInInstruction(TrueVal, OldOp, NewOp))\n         return &Sel;\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/select-binop-cmp.ll",
+      "tests": [
+        {
+          "test_body": "define i32 @select_replace_call_non_speculatable(i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, 0\n  %call = call i32 @call_non_speculatable(i32 %x, i32 %x)\n  %s = select i1 %c, i32 %call, i32 %y\n  ret i32 %s\n}\n\ndeclare i32 @call_non_speculatable(i32, i32)\n",
+          "test_name": "select_replace_call_non_speculatable"
+        },
+        {
+          "test_body": "define i32 @select_replace_call_speculatable(i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, 0\n  %call = call i32 @call_speculatable(i32 %x, i32 %x)\n  %s = select i1 %c, i32 %call, i32 %y\n  ret i32 %s\n}\n\n; Function Attrs: speculatable\ndeclare i32 @call_speculatable(i32, i32) #0\n\nattributes #0 = { speculatable }\n",
+          "test_name": "select_replace_call_speculatable"
+        },
+        {
+          "test_body": "define i32 @select_replace_call_speculatable_intrinsic(i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, 0\n  %call = call i32 @llvm.smax.i32(i32 %x, i32 %y)\n  %s = select i1 %c, i32 %call, i32 %y\n  ret i32 %s\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "select_replace_call_speculatable_intrinsic"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/select.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i8 @select_knownbits_simplify_missing_noundef(i8 %x) {\n  %x.lo = and i8 %x, 1\n  %cmp = icmp eq i8 %x.lo, 0\n  %and = and i8 %x, -2\n  %res = select i1 %cmp, i8 %and, i8 0\n  ret i8 %res\n}\n",
+          "test_name": "select_knownbits_simplify_missing_noundef"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\n@g_ext = external global i8\n\ndefine i32 @pr99436(ptr align 4 dereferenceable(4) %ptr) {\n  %cmp = icmp eq ptr %ptr, @g_ext\n  %val = load i32, ptr %ptr, align 4\n  %ret = select i1 %cmp, i32 %val, i32 0\n  ret i32 %ret\n}\n",
+          "test_name": "pr99436"
+        }
+      ]
+    }
+  ]
+}

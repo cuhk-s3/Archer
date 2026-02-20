@@ -1,17 +1,14 @@
 {
-  "bug_id": "53645",
-  "issue_url": "https://github.com/llvm/llvm-project/issues/53645",
-  "bug_type": "miscompilation",
   "base_commit": "6baaad740a5abb4bfcff022a8114abb4eea66a2d",
-  "knowledge_cutoff": "2022-02-08T00:21:02Z",
-  "lit_test_dir": [
-    "llvm/test/Transforms/InstCombine"
-  ],
+  "bug_id": "53645",
+  "bug_type": "miscompilation",
   "hints": {
-    "fix_commit": "c167c0a4dcdb998affb2756ce76903a12f7d8ca5",
-    "components": [
-      "BuildLibCalls"
-    ],
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/BuildLibCalls.cpp": [
+        "llvm::getOrInsertLibFunc",
+        "setArgExtAttr"
+      ]
+    },
     "bug_location_lineno": {
       "llvm/lib/Transforms/Utils/BuildLibCalls.cpp": [
         [
@@ -28,57 +25,14 @@
         ]
       ]
     },
-    "bug_location_funcname": {
-      "llvm/lib/Transforms/Utils/BuildLibCalls.cpp": [
-        "llvm::getOrInsertLibFunc",
-        "setArgExtAttr"
-      ]
-    }
-  },
-  "patch": "commit c167c0a4dcdb998affb2756ce76903a12f7d8ca5\nAuthor: Nick Desaulniers <ndesaulniers@google.com>\nDate:   Tue May 10 16:21:17 2022 -0700\n\n    [BuildLibCalls] infer inreg param attrs from NumRegisterParameters\n    \n    We're having a hard time booting the ARCH=i386 Linux kernel with clang\n    after removing -ffreestanding because instcombine was dropping inreg\n    from callers during libcall simplification, but not the callees defined\n    in different translation units. This led the callers and callees to have\n    wildly different calling conventions, which (predictably) blew up at\n    runtime.\n    \n    Infer the inreg param attrs on function declarations from the module\n    metadata \"NumRegisterParameters.\" This allows us to boot the ARCH=i386\n    Linux kernel (w/ -ffreestanding removed).\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/53645\n    \n    Reviewed By: efriedma\n    \n    Differential Revision: https://reviews.llvm.org/D125285\n\ndiff --git a/llvm/lib/Transforms/Utils/BuildLibCalls.cpp b/llvm/lib/Transforms/Utils/BuildLibCalls.cpp\nindex 75dbf7aa2372..1caddfad2086 100644\n--- a/llvm/lib/Transforms/Utils/BuildLibCalls.cpp\n+++ b/llvm/lib/Transforms/Utils/BuildLibCalls.cpp\n@@ -15,12 +15,15 @@\n #include \"llvm/ADT/Statistic.h\"\n #include \"llvm/Analysis/MemoryBuiltins.h\"\n #include \"llvm/Analysis/TargetLibraryInfo.h\"\n+#include \"llvm/IR/Argument.h\"\n+#include \"llvm/IR/CallingConv.h\"\n #include \"llvm/IR/Constants.h\"\n #include \"llvm/IR/DataLayout.h\"\n #include \"llvm/IR/Function.h\"\n #include \"llvm/IR/IRBuilder.h\"\n #include \"llvm/IR/Module.h\"\n #include \"llvm/IR/Type.h\"\n+#include \"llvm/Support/TypeSize.h\"\n \n using namespace llvm;\n \n@@ -1224,6 +1227,41 @@ static void setArgExtAttr(Function &F, unsigned ArgNo,\n     F.addParamAttr(ArgNo, ExtAttr);\n }\n \n+// Modeled after X86TargetLowering::markLibCallAttributes.\n+static void markRegisterParameterAttributes(Function *F) {\n+  if (!F->arg_size() || F->isVarArg())\n+    return;\n+\n+  const CallingConv::ID CC = F->getCallingConv();\n+  if (CC != CallingConv::C && CC != CallingConv::X86_StdCall)\n+    return;\n+\n+  const Module *M = F->getParent();\n+  unsigned N = M->getNumberRegisterParameters();\n+  if (!N)\n+    return;\n+\n+  const DataLayout &DL = M->getDataLayout();\n+\n+  for (Argument &A : F->args()) {\n+    Type *T = A.getType();\n+    if (!T->isIntOrPtrTy())\n+      continue;\n+\n+    const TypeSize &TS = DL.getTypeAllocSize(T);\n+    if (TS > 8)\n+      continue;\n+\n+    assert(TS <= 4 && \"Need to account for parameters larger than word size\");\n+    const unsigned NumRegs = TS > 4 ? 2 : 1;\n+    if (N < NumRegs)\n+      return;\n+\n+    N -= NumRegs;\n+    F->addParamAttr(A.getArgNo(), Attribute::InReg);\n+  }\n+}\n+\n FunctionCallee llvm::getOrInsertLibFunc(Module *M, const TargetLibraryInfo &TLI,\n                                         LibFunc TheLibFunc, FunctionType *T,\n                                         AttributeList AttributeList) {\n@@ -1289,6 +1327,8 @@ FunctionCallee llvm::getOrInsertLibFunc(Module *M, const TargetLibraryInfo &TLI,\n     break;\n   }\n \n+  markRegisterParameterAttributes(F);\n+\n   return C;\n }\n \n",
-  "tests": [
-    {
-      "file": "llvm/test/Transforms/InstCombine/simplify-libcalls-inreg.ll",
-      "commands": [
-        [
-          "opt -passes=instcombine -S %s",
-          "FileCheck %s"
-        ]
-      ],
-      "tests": [
-        {
-          "test_name": "test_fewer_params_than_num_register_parameters",
-          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\n@h = external constant [2 x i8]\n\ndeclare i32 @printf(ptr, ...)\n\ndefine void @test_fewer_params_than_num_register_parameters() {\n  %fmt = getelementptr [2 x i8], ptr @h, i32 0, i32 0\n  %1 = call i32 (ptr, ...) @printf(ptr %fmt)\n  ret void\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}",
-          "source_program": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\n@h = external constant [2 x i8]\n\ndeclare i32 @printf(ptr, ...)\n\ndefine void @test_fewer_params_than_num_register_parameters() {\n  %fmt = getelementptr [2 x i8], ptr @h, i32 0, i32 0\n  %1 = call i32 (ptr, ...) @printf(ptr %fmt)\n  ret void\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n"
-        },
-        {
-          "test_name": "test_variadic",
-          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\n@a = external global [60 x i8], align 1\n@b = external global [60 x i8], align 1\n\ndeclare i32 @__sprintf_chk(ptr, i32, i32, ptr, ...)\n\ndefine i32 @test_variadic() {\n  %dst = getelementptr inbounds [60 x i8], ptr @a, i32 0, i32 0\n  %fmt = getelementptr inbounds [60 x i8], ptr @b, i32 0, i32 0\n  %ret = call i32 (ptr, i32, i32, ptr, ...) @__sprintf_chk(ptr %dst, i32 0, i32 -1, ptr %fmt)\n  ret i32 %ret\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}",
-          "source_program": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\n@a = external global [60 x i8], align 1\n@b = external global [60 x i8], align 1\n\ndeclare i32 @__sprintf_chk(ptr, i32, i32, ptr, ...)\n\ndefine i32 @test_variadic() {\n  %dst = getelementptr inbounds [60 x i8], ptr @a, i32 0, i32 0\n  %fmt = getelementptr inbounds [60 x i8], ptr @b, i32 0, i32 0\n  %ret = call i32 (ptr, i32, i32, ptr, ...) @__sprintf_chk(ptr %dst, i32 0, i32 -1, ptr %fmt)\n  ret i32 %ret\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n"
-        },
-        {
-          "test_name": "baz",
-          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\ndeclare ptr @foo()\n\ndeclare i32 @memcmp(ptr inreg nocapture noundef, ptr inreg nocapture noundef, i32 inreg noundef)\n\ndefine i32 @baz(ptr inreg noundef %s2, i32 inreg noundef %n) {",
-          "source_program": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\ndeclare ptr @foo()\n\ndeclare i32 @memcmp(ptr inreg nocapture noundef, ptr inreg nocapture noundef, i32 inreg noundef)\n\ndefine i32 @baz(ptr inreg noundef %s2, i32 inreg noundef %n) {\n  %call = call ptr @foo()\n  %call1 = call i32 @memcmp(ptr inreg noundef %call, ptr inreg noundef %s2, i32 inreg noundef %n)\n  %cmp = icmp eq i32 %call1, 0\n  %conv = zext i1 %cmp to i32\n  ret i32 %conv\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n"
-        },
-        {
-          "test_name": "test_non_int_params",
-          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\ndeclare double @exp2(double)\n\ndefine double @test_non_int_params(i16 signext %x) {\n  %conv = sitofp i16 %x to double\n  %ret = call double @exp2(double %conv)\n  ret double %ret\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}",
-          "source_program": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\ndeclare double @exp2(double)\n\ndefine double @test_non_int_params(i16 signext %x) {\n  %conv = sitofp i16 %x to double\n  %ret = call double @exp2(double %conv)\n  ret double %ret\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n"
-        }
-      ]
-    }
-  ],
-  "issue": {
-    "title": "[instcombine] dropped inreg function argument attribute",
-    "body": "[inreg langref](https://llvm.org/docs/LangRef.html#parameter-attributes)\r\n\r\nWhen instcombine replace calls to `memcmp` with `bcmp`, it happens to NOT carry over the `inreg` flags on the arguments when they exist.  `inreg` is set by `-mregparm=3` for `-m32` (32b x86) linux kernel builds.\r\n\r\nblocks #4440\r\n\r\nexample: https://godbolt.org/z/z3fjveP4h\r\n\r\nThis is creating fun crashes at boot time because we've now totally messed up the calling convention.",
-    "author": "nickdesaulniers",
-    "labels": [
-      "bug",
-      "miscompilation",
-      "release:cherry-pick-failed",
-      "llvm:instcombine"
+    "components": [
+      "BuildLibCalls"
     ],
+    "fix_commit": "c167c0a4dcdb998affb2756ce76903a12f7d8ca5"
+  },
+  "issue": {
+    "author": "nickdesaulniers",
+    "body": "[inreg langref](https://llvm.org/docs/LangRef.html#parameter-attributes)\r\n\r\nWhen instcombine replace calls to `memcmp` with `bcmp`, it happens to NOT carry over the `inreg` flags on the arguments when they exist.  `inreg` is set by `-mregparm=3` for `-m32` (32b x86) linux kernel builds.\r\n\r\nblocks #4440\r\n\r\nexample: https://godbolt.org/z/z3fjveP4h\r\n\r\nThis is creating fun crashes at boot time because we've now totally messed up the calling convention.",
     "comments": [
       {
         "author": "nickdesaulniers",
@@ -128,10 +82,50 @@
         "author": "nickdesaulniers",
         "body": "yeah, ok, np, this one can ride the trains."
       }
-    ]
+    ],
+    "labels": [
+      "bug",
+      "miscompilation",
+      "release:cherry-pick-failed",
+      "llvm:instcombine"
+    ],
+    "title": "[instcombine] dropped inreg function argument attribute"
   },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/53645",
+  "knowledge_cutoff": "2022-02-08T00:21:02Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit c167c0a4dcdb998affb2756ce76903a12f7d8ca5\nAuthor: Nick Desaulniers <ndesaulniers@google.com>\nDate:   Tue May 10 16:21:17 2022 -0700\n\n    [BuildLibCalls] infer inreg param attrs from NumRegisterParameters\n    \n    We're having a hard time booting the ARCH=i386 Linux kernel with clang\n    after removing -ffreestanding because instcombine was dropping inreg\n    from callers during libcall simplification, but not the callees defined\n    in different translation units. This led the callers and callees to have\n    wildly different calling conventions, which (predictably) blew up at\n    runtime.\n    \n    Infer the inreg param attrs on function declarations from the module\n    metadata \"NumRegisterParameters.\" This allows us to boot the ARCH=i386\n    Linux kernel (w/ -ffreestanding removed).\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/53645\n    \n    Reviewed By: efriedma\n    \n    Differential Revision: https://reviews.llvm.org/D125285\n\ndiff --git a/llvm/lib/Transforms/Utils/BuildLibCalls.cpp b/llvm/lib/Transforms/Utils/BuildLibCalls.cpp\nindex 75dbf7aa2372..1caddfad2086 100644\n--- a/llvm/lib/Transforms/Utils/BuildLibCalls.cpp\n+++ b/llvm/lib/Transforms/Utils/BuildLibCalls.cpp\n@@ -15,12 +15,15 @@\n #include \"llvm/ADT/Statistic.h\"\n #include \"llvm/Analysis/MemoryBuiltins.h\"\n #include \"llvm/Analysis/TargetLibraryInfo.h\"\n+#include \"llvm/IR/Argument.h\"\n+#include \"llvm/IR/CallingConv.h\"\n #include \"llvm/IR/Constants.h\"\n #include \"llvm/IR/DataLayout.h\"\n #include \"llvm/IR/Function.h\"\n #include \"llvm/IR/IRBuilder.h\"\n #include \"llvm/IR/Module.h\"\n #include \"llvm/IR/Type.h\"\n+#include \"llvm/Support/TypeSize.h\"\n \n using namespace llvm;\n \n@@ -1224,6 +1227,41 @@ static void setArgExtAttr(Function &F, unsigned ArgNo,\n     F.addParamAttr(ArgNo, ExtAttr);\n }\n \n+// Modeled after X86TargetLowering::markLibCallAttributes.\n+static void markRegisterParameterAttributes(Function *F) {\n+  if (!F->arg_size() || F->isVarArg())\n+    return;\n+\n+  const CallingConv::ID CC = F->getCallingConv();\n+  if (CC != CallingConv::C && CC != CallingConv::X86_StdCall)\n+    return;\n+\n+  const Module *M = F->getParent();\n+  unsigned N = M->getNumberRegisterParameters();\n+  if (!N)\n+    return;\n+\n+  const DataLayout &DL = M->getDataLayout();\n+\n+  for (Argument &A : F->args()) {\n+    Type *T = A.getType();\n+    if (!T->isIntOrPtrTy())\n+      continue;\n+\n+    const TypeSize &TS = DL.getTypeAllocSize(T);\n+    if (TS > 8)\n+      continue;\n+\n+    assert(TS <= 4 && \"Need to account for parameters larger than word size\");\n+    const unsigned NumRegs = TS > 4 ? 2 : 1;\n+    if (N < NumRegs)\n+      return;\n+\n+    N -= NumRegs;\n+    F->addParamAttr(A.getArgNo(), Attribute::InReg);\n+  }\n+}\n+\n FunctionCallee llvm::getOrInsertLibFunc(Module *M, const TargetLibraryInfo &TLI,\n                                         LibFunc TheLibFunc, FunctionType *T,\n                                         AttributeList AttributeList) {\n@@ -1289,6 +1327,8 @@ FunctionCallee llvm::getOrInsertLibFunc(Module *M, const TargetLibraryInfo &TLI,\n     break;\n   }\n \n+  markRegisterParameterAttributes(F);\n+\n   return C;\n }\n \n",
   "properties": {
+    "difficulty": "medium",
     "is_single_file_fix": true,
     "is_single_func_fix": false
-  }
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=instcombine -S %s"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/simplify-libcalls-inreg.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\n@a = external global [60 x i8], align 1\n@b = external global [60 x i8], align 1\n\ndeclare i32 @__sprintf_chk(ptr, i32, i32, ptr, ...)\n\ndefine i32 @test_variadic() {\n  %dst = getelementptr inbounds [60 x i8], ptr @a, i32 0, i32 0\n  %fmt = getelementptr inbounds [60 x i8], ptr @b, i32 0, i32 0\n  %ret = call i32 (ptr, i32, i32, ptr, ...) @__sprintf_chk(ptr %dst, i32 0, i32 -1, ptr %fmt)\n  ret i32 %ret\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n",
+          "test_name": "test_variadic"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\ndeclare ptr @foo()\n\ndeclare i32 @memcmp(ptr inreg nocapture noundef, ptr inreg nocapture noundef, i32 inreg noundef)\n\ndefine i32 @baz(ptr inreg noundef %s2, i32 inreg noundef %n) {\n  %call = call ptr @foo()\n  %call1 = call i32 @memcmp(ptr inreg noundef %call, ptr inreg noundef %s2, i32 inreg noundef %n)\n  %cmp = icmp eq i32 %call1, 0\n  %conv = zext i1 %cmp to i32\n  ret i32 %conv\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n",
+          "test_name": "baz"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\ndeclare double @exp2(double)\n\ndefine double @test_non_int_params(i16 signext %x) {\n  %conv = sitofp i16 %x to double\n  %ret = call double @exp2(double %conv)\n  ret double %ret\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n",
+          "test_name": "test_non_int_params"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\n@h = external constant [2 x i8]\n\ndeclare i32 @printf(ptr, ...)\n\ndefine void @test_fewer_params_than_num_register_parameters() {\n  %fmt = getelementptr [2 x i8], ptr @h, i32 0, i32 0\n  %1 = call i32 (ptr, ...) @printf(ptr %fmt)\n  ret void\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"NumRegisterParameters\", i32 3}\n",
+          "test_name": "test_fewer_params_than_num_register_parameters"
+        }
+      ]
+    }
+  ]
 }
