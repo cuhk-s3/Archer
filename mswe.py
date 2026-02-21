@@ -208,7 +208,7 @@ class MyAgent(DefaultAgent):
   def __init__(self, model: Model, stats: RunStats, workdir: str) -> None:
     super().__init__(
       model=MyModel(
-        model=model, token_limit=MAX_CONSUMED_TOKENS, round_limit=MAX_CHAT_ROUNDS
+        model=model, token_limit=MAX_CONSUMED_TOKENS, round_limit=MAX_CHAT_ROUNDS * 2
       ),
       env=MyEnvironment(cwd=workdir, stats=stats),
       **yaml.safe_load(
