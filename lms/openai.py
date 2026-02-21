@@ -1,6 +1,7 @@
 # Implementation of OpenAI-compatible agents (Chat Completions API).
 
 import json
+import json_repair
 import os
 from typing import List
 
@@ -154,8 +155,13 @@ class OpenAIAgent(AgentBase):
           name=name,
           arguments=args,
         )
-        arguments = json.loads(args)
-        result = self.perform_tool_call(name, arguments)
+        try:
+          arguments = json_repair.loads(args)
+          if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+          result = self.perform_tool_call(name, arguments)
+        except Exception as e:
+          result = f"Error: Failed to parse tool arguments as JSON: {e}. Please check your tool call format and try again."
         self.append_function_tool_call_output(call_id=tool_call.id, result=result)
         flag, result = tool_call_handler(name, args, result)
         if not flag:
