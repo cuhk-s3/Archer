@@ -15,17 +15,21 @@ class StopTool(FuncToolBase):
       [
         FuncToolSpec.Param(
           "strategies",
-          "list[tuple[string,string,string,string]]",
+          "list[dict]",
           True,
-          "A list of bug-trigger test strategies with each being a tuple of strategy name, target, rationale and expected issue. "
-          "For example, [{\"name\":\"Strategy 1\",\"target\":\"target file or function\",\"rationale\":\"rationale for why this strategy can trigger the bug\",\"expected_issue\":\"the expected issue that can be observed when the strategy is executed\"}].",
+          "A list of bug-trigger test strategies with each being a dictionary of strategy name, target, rationale and expected issue. "
+          "For example, [{\"name\":\"Strategy 1\",\"target\":\"test target\",\"rationale\":\"rationale for why this strategy can trigger the bug\",\"expected_issue\":\"the expected issue that can be observed when the strategy is executed\"}, {...}, ...].",
           schema={
             "type": "array",
             "items": {
-              "type": "array",
-              "items": {"type": "string"},
-              "minItems": 4,
-              "maxItems": 4,
+              "type": "object",
+              "properties": {
+                "name": {"type": "string"},
+                "target": {"type": "string"},
+                "rationale": {"type": "string"},
+                "expected_issue": {"type": "string"}
+              },
+              "required": ["name", "target", "rationale", "expected_issue"]
             }
           },
         ),
@@ -52,14 +56,16 @@ class StopTool(FuncToolBase):
           raise FuncToolCallException(
             f"strategies must be a JSON array of objects; got a string that cannot be parsed: {strategies}"
           ) from e
-    # check if strategies is a list of tuples of 4 elements
+    # check if strategies is a list of dicts
     if not isinstance(strategies, list):
-      raise FuncToolCallException(f"Strategies must be a list of tuples: {strategies}")
+      raise FuncToolCallException(f"Strategies must be a list of dicts: {strategies}")
     for _, s in enumerate(strategies):
       if not isinstance(s, dict):
         raise FuncToolCallException(
           f"Each test strategy must be an object with keys "
-          f"(name, target, rationale, expected_issue): {s}"
+          f"(name, target, rationale, expected_issue). For example, "
+          f'{{"name":"Strategy 1","target":"test target","rationale":"rationale for why this strategy can trigger the bug","expected_issue":"the expected issue that can be observed when the strategy is executed"}}. '
+          f"Got: {s}"
         )
       try:
         name = s["name"]
