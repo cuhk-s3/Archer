@@ -91,21 +91,20 @@ class DiffTestTool(FuncToolBase):
           res = subprocess.run(
             [str(self.llubi_path), str(path)],
             capture_output=True,
-            text=True,
             timeout=timeout_s,
           )
           return {
             "timed_out": False,
             "return_code": res.returncode,
-            "stdout": res.stdout.strip(),
-            "stderr": res.stderr.strip(),
+            "stdout": res.stdout.decode('utf-8', errors='replace').strip(),
+            "stderr": res.stderr.decode('utf-8', errors='replace').strip(),
           }
         except subprocess.TimeoutExpired as e:
           return {
             "timed_out": True,
             "return_code": None,
-            "stdout": (e.stdout or "").strip(),
-            "stderr": (e.stderr or "").strip(),
+            "stdout": (e.stdout.decode('utf-8', errors='replace') if e.stdout else "").strip(),
+            "stderr": (e.stderr.decode('utf-8', errors='replace') if e.stderr else "").strip(),
           }
 
       out1 = run(orig_ir_path)
