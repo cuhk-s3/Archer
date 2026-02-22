@@ -22,16 +22,16 @@ def transform(orig_ir: str, args: str, build_dir: str) -> str:
         raise FuncToolCallException(f"opt tool not found at {opt_path}")
     with TemporaryDirectory() as tmpdir:
         orig_ir_path = Path(tmpdir) / "orig.ll"
-        with open(orig_ir_path, "w") as f:
+        with open(orig_ir_path, "w", encoding="utf-8") as f:
             f.write(orig_ir_code)
         cmd = f"{opt_path} {args} {orig_ir_path}"
         try:
             result = cmdline.check_output(cmd)
-            transformed_ir = result.decode("utf-8").strip()
+            transformed_ir = result.decode("utf-8", errors="replace").strip()
             return f"```llvm\n{transformed_ir}\n```"
         except CalledProcessError as e:
             raise FuncToolCallException(
-                f"Failed to transform the LLVM IR code. {e.stderr.decode('utf-8').strip() if e.stderr else str(e)}"
+                f"Failed to transform the LLVM IR code. {e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else str(e)}"
             )
     return f"```llvm\n{transformed_ir}\n```"
 
@@ -58,8 +58,14 @@ class TransTool(FuncToolBase):
                     True,
                     "The arguments for opt to specify the optimization pass and other options. For example, '-S -passes=instcombine'.",
                 ),
+                FuncToolSpec.Param(
+                    "thoughts",
+                    "string",
+                    True,
+                    "The thoughts explaining what is expected to be verified by this transformation.",
+                ),
             ],
         )
 
-    def _call(self, *, orig_ir: str, args: str, **kwargs) -> str:
+    def _call(self, *, orig_ir: str, args: str, thoughts: str, **kwargs) -> str:
         return transform(orig_ir, args, self.build_dir)

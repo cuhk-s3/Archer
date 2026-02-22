@@ -33,10 +33,16 @@ class VerifyTool(FuncToolBase):
                     True,
                     "The arguments for alive-tv to specify the verification options. For example, '-passes=instcombine'.",
                 ),
+                FuncToolSpec.Param(
+                    "thoughts",
+                    "string",
+                    True,
+                    "The thoughts explaining what mutation strategies were used to generate the original IR and what is expected.",
+                ),
             ],
         )
 
-    def _call(self, *, orig_ir: str, args: str, **kwargs) -> str:
+    def _call(self, *, orig_ir: str, args: str, thoughts: str, **kwargs) -> str:
         if not (
             isinstance(orig_ir, str)
             and orig_ir.startswith("```llvm")
@@ -56,7 +62,7 @@ class VerifyTool(FuncToolBase):
             orig_ir_path = Path(tmpdir) / "orig.ll"
             transformed_ir_path = Path(tmpdir) / "transformed.ll"
             orig_ir_code = strip_llvm_fence(orig_ir)
-            with open(orig_ir_path, "w") as f:
+            with open(orig_ir_path, "w", encoding="utf-8") as f:
                 f.write(orig_ir_code)
 
             cmd = f"{opt_path} -S {args} {orig_ir_path} -o {transformed_ir_path}"
@@ -64,16 +70,18 @@ class VerifyTool(FuncToolBase):
                 cmdline.check_output(cmd)
             except CalledProcessError as e:
                 raise FuncToolCallException(
-                    f"Failed to transform the LLVM IR code with opt. {e.stderr.decode('utf-8').strip() if e.stderr else str(e)}"
+                    f"Failed to transform the LLVM IR code with opt. {e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else str(e)}"
                 )
 
-            with open(transformed_ir_path, "r") as f:
+            with open(
+                transformed_ir_path, "r", encoding="utf-8", errors="replace"
+            ) as f:
                 transformed_ir_code = f.read()
 
             cmd = f"{alive_tv_path} {args} --disable-undef-input {orig_ir_path} {transformed_ir_path}"
             try:
                 result = cmdline.check_output(cmd)
-                verification_result = result.decode("utf-8").strip()
+                verification_result = result.decode("utf-8", errors="replace").strip()
                 m = re.search(r"(\d+)\s+incorrect transformations", verification_result)
                 return json.dumps(
                     {
@@ -82,9 +90,10 @@ class VerifyTool(FuncToolBase):
                         "original_ir": orig_ir_code,
                         "transformed_ir": transformed_ir_code,
                         "log": verification_result,
+                        "thoughts": thoughts,
                     }
                 )
             except CalledProcessError as e:
                 raise FuncToolCallException(
-                    f"Failed to verify the LLVM IR code transformation. {e.stderr.decode('utf-8').strip() if e.stderr else str(e)}"
+                    f"Failed to verify the LLVM IR code transformation. {e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else str(e)}"
                 )

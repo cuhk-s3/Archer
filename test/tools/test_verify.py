@@ -28,8 +28,9 @@ class TestVerifyTool(unittest.TestCase):
 
         orig_ir = "```llvm\n; original code\n```"
         args = "-passes=instcombine"
+        thoughts = "test thoughts"
 
-        result_json = self.tool._call(orig_ir=orig_ir, args=args)
+        result_json = self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
         result = json.loads(result_json)
 
         # Assertions
@@ -38,6 +39,7 @@ class TestVerifyTool(unittest.TestCase):
         self.assertEqual(result["original_ir"], "; original code")
         self.assertEqual(result["transformed_ir"], "; transformed code")
         self.assertEqual(result["log"], "0 incorrect transformations")
+        self.assertEqual(result["thoughts"], "test thoughts")
 
         self.assertEqual(mock_check_output.call_count, 2)
 
@@ -57,8 +59,9 @@ class TestVerifyTool(unittest.TestCase):
 
         orig_ir = "```llvm\n; original code\n```"
         args = "-passes=instcombine"
+        thoughts = "test thoughts"
 
-        result_json = self.tool._call(orig_ir=orig_ir, args=args)
+        result_json = self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
         result = json.loads(result_json)
 
         # Assertions
@@ -67,15 +70,17 @@ class TestVerifyTool(unittest.TestCase):
         self.assertEqual(result["original_ir"], "; original code")
         self.assertEqual(result["transformed_ir"], "; transformed code")
         self.assertEqual(result["log"], "1 incorrect transformations")
+        self.assertEqual(result["thoughts"], "test thoughts")
 
         self.assertEqual(mock_check_output.call_count, 2)
 
     def test_verify_invalid_ir_format(self):
         orig_ir = "; original code without markdown fences"
         args = "-passes=instcombine"
+        thoughts = "test thoughts"
 
         with self.assertRaises(FuncToolCallException) as cm:
-            self.tool._call(orig_ir=orig_ir, args=args)
+            self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
         self.assertIn(
             "orig_ir must be a self-contained LLVM IR code wrapped with ```llvm and ```",
             str(cm.exception),
@@ -88,9 +93,10 @@ class TestVerifyTool(unittest.TestCase):
 
         orig_ir = "```llvm\n; original code\n```"
         args = "-passes=instcombine"
+        thoughts = "test thoughts"
 
         with self.assertRaises(FuncToolCallException) as cm:
-            self.tool._call(orig_ir=orig_ir, args=args)
+            self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
         self.assertIn("opt tool not found", str(cm.exception))
 
     @patch("tools.verify.Path.is_file")
@@ -107,9 +113,10 @@ class TestVerifyTool(unittest.TestCase):
 
         orig_ir = "```llvm\n; original code\n```"
         args = "-passes=instcombine"
+        thoughts = "test thoughts"
 
         with self.assertRaises(FuncToolCallException) as cm:
-            self.tool._call(orig_ir=orig_ir, args=args)
+            self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
         self.assertIn("alive-tv tool not found", str(cm.exception))
 
     @patch("tools.verify.Path.is_file")
@@ -126,9 +133,10 @@ class TestVerifyTool(unittest.TestCase):
 
         orig_ir = "```llvm\n; original code\n```"
         args = "-passes=instcombine"
+        thoughts = "test thoughts"
 
         with self.assertRaises(FuncToolCallException) as cm:
-            self.tool._call(orig_ir=orig_ir, args=args)
+            self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
         self.assertIn(
             "Failed to transform the LLVM IR code with opt. opt error message",
             str(cm.exception),
@@ -150,9 +158,10 @@ class TestVerifyTool(unittest.TestCase):
 
         orig_ir = "```llvm\n; original code\n```"
         args = "-passes=instcombine"
+        thoughts = "test thoughts"
 
         with self.assertRaises(FuncToolCallException) as cm:
-            self.tool._call(orig_ir=orig_ir, args=args)
+            self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
         self.assertIn(
             "Failed to verify the LLVM IR code transformation. alive-tv error message",
             str(cm.exception),

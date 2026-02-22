@@ -28,15 +28,19 @@ class TestDiffTestTool(unittest.TestCase):
         orig_ir = "```llvm\n; original code\n```"
         args = "-S -passes=instcombine"
         call_instr = "call i32 @test(i32 1)"
+        thoughts = "test thoughts"
 
-        result_json = self.tool._call(orig_ir=orig_ir, args=args, call_instr=call_instr)
+        result_json = self.tool._call(
+            orig_ir=orig_ir, args=args, call_instr=call_instr, thoughts=thoughts
+        )
         result = json.loads(result_json)
 
         # Assertions
-        self.assertTrue(result["test_result"])
-        self.assertEqual(result["original_test_output"]["return_code"], 0)
-        self.assertEqual(result["original_test_output"]["stdout"], "result: 42")
-        self.assertEqual(result["transformed_test_output"]["return_code"], 0)
+        self.assertFalse(result["found"])
+        self.assertEqual(result["log"]["original_test_output"]["return_code"], 0)
+        self.assertEqual(result["log"]["original_test_output"]["stdout"], "result: 42")
+        self.assertEqual(result["log"]["transformed_test_output"]["return_code"], 0)
+        self.assertEqual(result["thoughts"], "test thoughts")
 
         mock_transform.assert_called_once_with(orig_ir, args, self.tool.build_dir)
         self.assertEqual(mock_subprocess_run.call_count, 2)
@@ -63,14 +67,20 @@ class TestDiffTestTool(unittest.TestCase):
         orig_ir = "```llvm\n; original code\n```"
         args = "-S -passes=instcombine"
         call_instr = "call i32 @test(i32 1)"
+        thoughts = "test thoughts"
 
-        result_json = self.tool._call(orig_ir=orig_ir, args=args, call_instr=call_instr)
+        result_json = self.tool._call(
+            orig_ir=orig_ir, args=args, call_instr=call_instr, thoughts=thoughts
+        )
         result = json.loads(result_json)
 
         # Assertions
-        self.assertFalse(result["test_result"])
-        self.assertEqual(result["original_test_output"]["stdout"], "result: 42")
-        self.assertEqual(result["transformed_test_output"]["stdout"], "result: 99")
+        self.assertTrue(result["found"])
+        self.assertEqual(result["log"]["original_test_output"]["stdout"], "result: 42")
+        self.assertEqual(
+            result["log"]["transformed_test_output"]["stdout"], "result: 99"
+        )
+        self.assertEqual(result["thoughts"], "test thoughts")
 
     @patch("tools.difftest.transform")
     @patch("tools.difftest.subprocess.run")
@@ -99,15 +109,19 @@ class TestDiffTestTool(unittest.TestCase):
         orig_ir = "```llvm\n; original code\n```"
         args = "-S -passes=instcombine"
         call_instr = "call i32 @test(i32 1)"
+        thoughts = "test thoughts"
 
-        result_json = self.tool._call(orig_ir=orig_ir, args=args, call_instr=call_instr)
+        result_json = self.tool._call(
+            orig_ir=orig_ir, args=args, call_instr=call_instr, thoughts=thoughts
+        )
         result = json.loads(result_json)
 
         # Assertions
-        self.assertFalse(result["test_result"])
-        self.assertFalse(result["original_test_output"]["timed_out"])
-        self.assertTrue(result["transformed_test_output"]["timed_out"])
-        self.assertEqual(result["transformed_test_output"]["stdout"], "partial")
+        self.assertTrue(result["found"])
+        self.assertFalse(result["log"]["original_test_output"]["timed_out"])
+        self.assertTrue(result["log"]["transformed_test_output"]["timed_out"])
+        self.assertEqual(result["log"]["transformed_test_output"]["stdout"], "partial")
+        self.assertEqual(result["thoughts"], "test thoughts")
 
     @patch("tools.difftest.transform")
     def test_invalid_call_instr(self, mock_transform):
@@ -117,9 +131,12 @@ class TestDiffTestTool(unittest.TestCase):
         orig_ir = "```llvm\n; original code\n```"
         args = "-S -passes=instcombine"
         call_instr = "call @test(i32 1)"
+        thoughts = "test thoughts"
 
         with self.assertRaises(FuncToolCallException) as cm:
-            self.tool._call(orig_ir=orig_ir, args=args, call_instr=call_instr)
+            self.tool._call(
+                orig_ir=orig_ir, args=args, call_instr=call_instr, thoughts=thoughts
+            )
         self.assertIn("The provided call instruction is not valid", str(cm.exception))
 
 

@@ -54,10 +54,16 @@ class DiffTestTool(FuncToolBase):
           "The call signature must match the target function defined in `orig_ir`. "
           "Example: `call float @test(i1 true, float 1.0, float bitcast (i32 2139095040 to float))`.",
         ),
+        FuncToolSpec.Param(
+          "thoughts",
+          "string",
+          True,
+          "The thoughts explaining what mutation strategies were used to generate the original IR and what is expected.",
+        ),
       ],
     )
 
-  def _call(self, *, orig_ir: str, args: str, call_instr: str, **kwargs) -> str:
+  def _call(self, *, orig_ir: str, args: str, call_instr: str, thoughts: str, **kwargs) -> str:
     transformed_ir = transform(orig_ir, args, self.build_dir)
 
     # Require a single call (no leading "%r ="); main will assign it to %r.
@@ -80,10 +86,12 @@ class DiffTestTool(FuncToolBase):
       transformed_ir_path = tmpdir / "transformed.ll"
 
       orig_ir_path.write_text(
-        TEMPLATE.format(ir=orig_ir_body, type=call_type, call_instr=call_instr.strip())
+        TEMPLATE.format(ir=orig_ir_body, type=call_type, call_instr=call_instr.strip()),
+        encoding="utf-8"
       )
       transformed_ir_path.write_text(
-        TEMPLATE.format(ir=transformed_ir_body, type=call_type, call_instr=call_instr.strip())
+        TEMPLATE.format(ir=transformed_ir_body, type=call_type, call_instr=call_instr.strip()),
+        encoding="utf-8"
       )
 
       def run(path, timeout_s: int = 10):
@@ -123,5 +131,6 @@ class DiffTestTool(FuncToolBase):
             "original_test_output": out1,
             "transformed_test_output": out2,
           },
+          "thoughts": thoughts,
         }
       )
