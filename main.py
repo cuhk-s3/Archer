@@ -41,7 +41,7 @@ from tools.verify import VerifyTool
 # We restrict the agent to chat at most 100 rounds for each run
 # and consume at most 5 million tokens among all runs.
 MAX_CHAT_ROUNDS = 100
-MAX_CONSUMED_TOKENS = 5_000_000
+MAX_CONSUMED_TOKENS = 10_000_000
 MAX_TCS_GET_CONTEXT = 50
 MAX_ROLS_PER_TC = 250
 
@@ -79,6 +79,7 @@ class Bug:
   original_ir: str
   transformed_ir: str
   log: str
+  thoughts: Optional[str] = None
 
 
 @dataclass
@@ -234,6 +235,7 @@ def generate_test(
     return True, (
       "Error: You are not calling any tool or your tool call format is incorrect. "
       "You should always continue with tool calling and correct tool call format. "
+      "You must use function tool call instead of using message to respond. "
       "Please continue."
       " If you are done, call the `report` tool with the result."
       " If you already called the `report` tool, please check the format and try again."
@@ -250,6 +252,7 @@ def generate_test(
             original_ir=bug["original_ir"],
             transformed_ir=bug["transformed_ir"],
             log=bug["log"],
+            thoughts=bug.get("thoughts"),
           ))
       except Exception:
         return (True, res)  # Continue the process with an error message
@@ -262,6 +265,7 @@ def generate_test(
             original_ir=diff_result["original_ir"],
             transformed_ir=diff_result["transformed_ir"],
             log=json.dumps(diff_result["log"]),
+            thoughts=diff_result.get("thoughts"),
           ))
       except Exception:
         return (True, res)  # Continue the process with an error message
@@ -329,7 +333,7 @@ def run_mini_agent(
       bug_type=fixenv.get_bug_type(),
       component=", ".join(fixenv.get_hint_components()),
       patch=fixenv.get_reference_patch(),
-      knowledge=get_component_knowledge(fixenv.get_hint_components()),
+      # knowledge=get_component_knowledge(fixenv.get_hint_components()),
     )
   )
 
@@ -338,6 +342,7 @@ def run_mini_agent(
     return True, (
       "Error: You are not calling any tool or your tool call format is incorrect. "
       "You should always continue with tool calling and correct tool call format. "
+      "You must use function tool call instead of using message to respond. "
       "Please continue."
       " If you are done, call the `stop` tool with the test strategies."
       " If you already called the `stop` tool, please check the format and try again."
@@ -364,6 +369,9 @@ def run_mini_agent(
       f"grep{MAX_ROLS_PER_TC}",
       # Documentation tools
       "langref",
+      "trans",
+      "verify",
+      "difftest",
       # Stop tool to finish the analysis
       "stop",
     ],
@@ -594,6 +602,9 @@ def main():
   console.print("----------")
   for idx, bug in enumerate(stats.bugs):
     console.print(f"Bug #{idx + 1}:")
+    if bug.thoughts:
+      console.print("Thoughts:")
+      console.print(bug.thoughts)
     console.print("Original LLVM IR:")
     console.print(bug.original_ir)
     console.print("Transformed LLVM IR:")
