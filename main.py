@@ -30,6 +30,7 @@ from tools.listn import ListNTool
 from tools.readn import ReadNTool
 from tools.report import ReportTool
 from tools.stop import StopTool
+from tools.tests import TestsTool, Test
 from tools.trans import TransTool
 from tools.verify import VerifyTool
 
@@ -209,23 +210,21 @@ def generate_test(
   stats: RunStats,
 ) -> Optional[str]:
   initial_tests = fixenv.get_tests()
-  tests_str = ""
-  
+  test_objects = []
   for _, test_file in enumerate(initial_tests):
     commands = test_file.get("commands", [])
     tests = test_file.get("tests", [])
     for test_idx, test in enumerate(tests):
       test_name = test.get("test_name", f"test_{test_idx}")
       test_body = test.get("test_body", "")
+      test_objects.append(Test(test_name=test_name, test_body=test_body, commands=commands))
 
-      tests_str += f"Test Case {test_idx}: {test_name}\n"
-      tests_str += f"Commands:\n{commands}\n"
-      tests_str += f"{test_body}\n\n"
+  tests_tool = TestsTool(test_objects)
+  agent.register_tool(tests_tool, MAX_TCS_GET_CONTEXT)
   
   console.print("Phase 2: Generating and verifying test cases ...")
   agent.append_user_message(
     prompts.PROMPT_GENERATE.format(
-      tests=tests_str,
       strategies=str(stats.strategies),
     )
   )
@@ -241,7 +240,7 @@ def generate_test(
     )
 
   def tool_call_handler(name: str, _: str, res: str) -> Tuple[bool, str]:
-    ensure_tools_available(agent, ["report", "verify", "difftest"])
+    ensure_tools_available(agent, ["report", "verify", "difftest", "tests_manager"])
     if name == "verify":
       try:
         bug = json_repair.loads(res)
@@ -268,6 +267,14 @@ def generate_test(
         return (True, res)  # Continue the process with an error message
     if name != "report":
       return True, res  # Continue the process
+
+    all_tested = all(t.tested for t in test_objects)
+    if not all_tested:
+      return True, ("Error: You cannot call `report` yet "
+        "because not all tests have been marked as tested. "
+        "Please use `tests_manager` to check untested tests, "
+        "test them, and mark them as tested.")
+
     try:
       # The report tool returns a parseable JSON string
       json.loads(res)
@@ -288,6 +295,7 @@ def generate_test(
       "trans",
       "verify",
       "difftest",
+      "tests_manager",
       # Stop tool to finish the analysis
       "report",
     ],

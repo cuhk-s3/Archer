@@ -23,6 +23,7 @@ You have multiple tools for each phase, but you should try to avoid using them w
 - `readN`: Read the content of a file in the LLVM codebase to understand existing tests or the fix.
 - `grepN`: Search for specific patterns in the codebase to find relevant tests or code regions.
 - `langref`: Query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.
+- `tests_manager`: Manage the list of test cases. You can list all tests to see their status, get the details of a specific test, or mark a test as tested. Your goal is to ensure all tests are tested.
 - `trans`: Run the `opt` tool with specific arguments to see how the LLVM IR code is transformed by the optimization pass.
 - `verify`: Use alive2 to verify if the transformation from original LLVM IR code to optimized LLVM IR code is correct, which can help check the validity of generated test cases in Phase 2.
 - `difftest`: Use llubi to perform differential testing on the original and transformed LLVM IR code, which can help check if the generated test cases cannot be proved by alive2.
@@ -90,47 +91,56 @@ only focus on the semantics related to the analysis above.
 PROMPT_GENERATE = """\
 # Phase 2: Generate Verified Test Cases
 
-Here are a list of test cases related to the original fix:
-
-{tests}
-
 You have proposed the following test strategies in Phase 1:
 
 {strategies}
 
 ## Your Task for Phase 2 ##
 
-Based on your analysis and the test strategies you proposed, \
-generate mutated versions of the above test case. Follow the steps below:
+In this phase, you will use the `tests_manager` tool to retrieve existing test cases, apply your proposed mutations, and verify them. \
+You must ensure that **every test case** managed by the `tests_manager` is processed and marked as tested.
 
-1. **Select a Test Case**: Choose one of the above test cases that you think is most relevant to the issues you identified in Phase 1.
-2. **Apply Mutations**: For the selected test case, apply mutations according to the test strategies you proposed. \
-   - For each test strategy, describe the specific mutation you will apply to the test case.
-   - Ensure that the mutations are focused on exposing the potential issues you identified in Phase 1.
-3. **Describe the Mutated Test Case**: For each mutated test case, provide a detailed description of the changes you made and the rationale behind them. \
-   - Explain how the mutation targets the specific issue you identified.
-   - Describe the expected behavior of the mutated test case if the fix is correct, and what incorrect behavior might indicate a failure of the fix.
+Follow this structured workflow:
 
-Please provide each test case in a separate ```llvm ... ``` code block. 
+### Step 1: Retrieve and Select Test Cases
+- Use the `tests_manager` tool with the `list` action to see all available test cases and their current status.
+- Use the `tests_manager` tool with the `get` action to retrieve the full details of an untested test case.
+- Select a test case that is most relevant to the issues you identified in Phase 1.
 
-After generating the test cases, use the `verify` tool to submit the generated test cases along with detailed reasoning for each mutation. \
-The `verify` tool will use alive2 to check if the generated test cases can expose any issues with the fix. \
-You can also use `difftest` tool to check if the generated test cases trigger the expected issues by specific input values. \
-The `difftest` tool will execute the original and optimized LLVM IR code which is transformed by opt, and check if there is any difference in the execution results.
+### Step 2: Apply Mutations
+For the selected test case, apply mutations according to your proposed test strategies:
+- Ensure the mutations focus on exposing the potential issues identified in Phase 1.
+- Provide each mutated test case in a separate ```llvm ... ``` code block.
+- **CRITICAL**: You must cover all the proposed test strategies across different test cases to ensure comprehensive testing of potential issues. 
 
-If the `verify` tool fails to find any issues, try to refine the test case only if you believe there are still unexplored potential issues based on your analysis. \
-Otherwise, you can continue to generate more test cases based on the same or different test strategies you proposed in Phase 1. 
+### Step 3: Verify and Test
+- **Verify Tool**: Use the `verify` tool to submit the generated test cases along with your reasoning. \
+This uses `alive2` to check if the test cases expose any issues with the fix.
+- **Difftest Tool**: Use the `difftest` tool to execute the original and optimized LLVM IR (transformed by `opt`) \
+with specific input values to check for execution differences.
 
-Instructions for refining test cases (if needed):
-- If alive2 reports failed-to-prove, you can try two approaches:
-  - try to reduce the test case to a smaller example that still fails. This can help isolate the specific conditions that cause the issue.
-  - try to call `difftest` to run the test case with specific input value that you think can trigger the issue based on your analysis. \
+### Step 4: Mark as Tested
+- Once you have fully explored and verified a test case, use the `tests_manager` tool with the `mark_tested` action to mark it as completed.
+- **CRITICAL**: You must repeat this process until the `tests_manager` confirms that **all** test cases have been tested.
+
+---
+
+## Guidelines for Refining Test Cases
+
+If the `verify` tool fails to find issues, refine the test case only if you believe unexplored potential issues remain. \
+Otherwise, move on to other strategies or test cases.
+
+**Handling `alive2` Results:**
+- **Failed-to-prove**: 
+  1. Try to reduce the test case to a smaller example that still fails. This can help isolate the specific conditions that cause the issue.
+  2. Try to call `difftest` to run the test case with specific input value that you think can trigger the issue based on your analysis. \
 This can help check if the issue can be exposed by actual execution even if it cannot be proved by alive2.
-- If alive2 reports alive2 errors, try to call `trans` to run opt with the same command arguments and adjust the test case or command arguments to fix. 
-- If alive2 reports correct transformation, try to first analyze if the test strategy is correct and then decide to refine the test case or continue to generate other test cases.
+- **Alive2 errors**: Try to call `trans` to run opt with the same command arguments and adjust the test case or command arguments to fix.
+- **Correct transformation**: Try to first analyze if the test strategy is correct and then decide to refine the test case or continue to generate other test cases.
 
-Note: If you think the provided test cases have limited coverage of potential issues, you can also find more related tests from the LLVM test suite \
-by using `find` or `list` tools and reading them with `read` or `grep` tools. 
-
-Make sure you have at least explored all the test strategies you proposed in Phase 1, and generated multiple test cases if possible. 
+## Additional Notes
+- **Coverage**: If you think the provided test cases have limited coverage of potential issues, you can also find more related tests from the LLVM test suite \
+by using `find` or `list` tools and reading them with `read` or `grep` tools.
+- **Completeness**: Make sure you have at least explored all the test strategies you proposed in Phase 1, and generated multiple test cases if possible.
+- **Completion**: You cannot finish Phase 2 until all tests in the `tests_manager` are marked as tested.
 """
