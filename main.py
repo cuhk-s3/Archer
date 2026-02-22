@@ -41,7 +41,7 @@ from tools.verify import VerifyTool
 # and consume at most 5 million tokens among all runs.
 MAX_CHAT_ROUNDS = 100
 MAX_CONSUMED_TOKENS = 5_000_000
-MAX_TCS_GET_CONTEXT = 250
+MAX_TCS_GET_CONTEXT = 50
 MAX_ROLS_PER_TC = 250
 
 # - ================================================
@@ -54,7 +54,7 @@ ADDITIONAL_CMAKE_FLAGS = [
 ]
 ALIVE_TV_PATH = os.environ.get("LAB_LLVM_ALIVE_TV", None)
 # TODO: integrate llubi to env scripts
-LLUBI_PATH = "deps/llvm-ub-aware-interpreter/build/llubi"
+LLUBI_PATH = os.environ.get("LAB_LLVM_LLUBI", None)
 
 # - ================================================
 # - Statistis and output
@@ -68,6 +68,9 @@ def panic(msg: str):
 
 if not ALIVE_TV_PATH:
     panic("LAB_LLVM_ALIVE_TV is not set")
+
+if not LLUBI_PATH:
+    panic("LAB_LLVM_LLUBI is not set")
 
 
 @dataclass
