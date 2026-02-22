@@ -221,7 +221,7 @@ def generate_test(
       test_objects.append(Test(test_name=test_name, test_body=test_body, commands=commands))
 
   tests_tool = TestsTool(test_objects)
-  agent.register_tool(tests_tool, MAX_TCS_GET_CONTEXT)
+  agent.register_tool(tests_tool, MAX_TCS_GET_CONTEXT * 2)
   
   console.print("Phase 2: Generating and verifying test cases ...")
   agent.append_user_message(
