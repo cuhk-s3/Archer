@@ -31,6 +31,8 @@ You have multiple tools for each phase, but you should try to avoid using them w
 - `report`: End Phase 2 by submitting the generated test cases and their verification results.
    
 You should pay special attention to `stop` and `report` tools, which are used to end Phase 1 and Phase 2 respectively. 
+
+**CRITICAL**: You MUST use tool call every action in Phase 1 and Phase 2. 
 """
 
 PROMPT_ANALYZE = """\
@@ -49,12 +51,6 @@ in Phase 2 to mutate existing test cases to target the identified issues.
 Please notice that you are analyzing the fix proposed by an expert LLVM developer. So you should pay special \
 attention to the semantics of the fix, especially regarding deep optimization correctness, rather than simple \
 syntax or surface-level issues. 
-   
-## Subsystem Knowledge for {component} ##
-
-For reference, here are some key points about the {component} you should consider (but do not limit to these) in your analysis:
-
-{knowledge}
    
 Once you have analyzed the fix and identified potential issues or edge cases, \
 use the `stop` tool to specify the issues you found and proposed test strategies along with detailed reasoning. \
