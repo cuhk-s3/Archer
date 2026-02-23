@@ -65,13 +65,13 @@ LLUBI_PATH = os.environ.get("LAB_LLVM_LLUBI", None)
 def panic(msg: str):
   console.print(f"Error: {msg}", color="red")
   exit(1)
-  
+
 
 if not ALIVE_TV_PATH:
-    panic("LAB_LLVM_ALIVE_TV is not set")
+  panic("LAB_LLVM_ALIVE_TV is not set")
 
 if not LLUBI_PATH:
-    panic("LAB_LLVM_LLUBI is not set")
+  panic("LAB_LLVM_LLUBI is not set")
 
 
 @dataclass
@@ -104,14 +104,16 @@ class RunStats:
   tool_usage: List[dict] = field(default_factory=list)
   # Review stats
   strategies: List[dict] = field(
-    default_factory=lambda *_, **__ : [{
-      "name": "<not-provided>",
-      "target": "<not-provided>",
-      "rationale": "<not-provided>",
-      "expected_issue": "<not-provided>"
-    }]
+    default_factory=lambda *_, **__: [
+      {
+        "name": "<not-provided>",
+        "target": "<not-provided>",
+        "rationale": "<not-provided>",
+        "expected_issue": "<not-provided>",
+      }
+    ]
   )
-  reason_thou: str = "<not-provided>" 
+  reason_thou: str = "<not-provided>"
   # The generated bugs for successful runs
   bugs: List[Bug] = field(default_factory=list)
   test_traj: List[str] = field(
@@ -141,7 +143,7 @@ class TestStrategy:
   target: str
   rationale: str
   expected_issue: str
-  
+
   def as_dict(self) -> dict:
     return {
       "name": self.name,
@@ -149,24 +151,26 @@ class TestStrategy:
       "rationale": self.rationale,
       "expected_issue": self.expected_issue,
     }
-  
+
   def __str__(self) -> str:
     return json.dumps(self.as_dict(), indent=2)
 
 
 def ensure_tools_available(agent: AgentBase, tools: List[str]):
-    available_tools = agent.tools.list(ignore_budget=False)
-    unavailable_tools = []
-    for tool in tools:
-        if tool not in available_tools:
-            unavailable_tools.append(tool)
-    if len(unavailable_tools) > 0:
-        raise ReachToolBudget(
-            f"Tools [{', '.join(unavailable_tools)}] are out of budget."
-        )
+  available_tools = agent.tools.list(ignore_budget=False)
+  unavailable_tools = []
+  for tool in tools:
+    if tool not in available_tools:
+      unavailable_tools.append(tool)
+  if len(unavailable_tools) > 0:
+    raise ReachToolBudget(
+      f"Tools [{', '.join(unavailable_tools)}] are out of budget."
+    )
 
 
-def get_tool_list(fixenv: Environment, llvm: LLVM, build_dir: str, debugger: DebuggerBase = None):
+def get_tool_list(
+  fixenv: Environment, llvm: LLVM, build_dir: str, debugger: DebuggerBase = None
+):
   return [
     # General tools
     (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
@@ -181,13 +185,13 @@ def get_tool_list(fixenv: Environment, llvm: LLVM, build_dir: str, debugger: Deb
     # Stop the analysis (Phase 1)
     (StopTool(), MAX_TCS_GET_CONTEXT),
     # Report the bug (Phase 2)
-    (ReportTool(), MAX_TCS_GET_CONTEXT)
+    (ReportTool(), MAX_TCS_GET_CONTEXT),
   ]
 
 
 def get_component_knowledge(component: List[str]) -> str:
   console.print(f"Retrieving knowledge for component: {component} ...")
-  
+
   knowledge_dir = Path(__file__).parent / "subsystem" / "summary"
 
   knowledge_file = []
@@ -218,18 +222,20 @@ def generate_test(
     for test_idx, test in enumerate(tests):
       test_name = test.get("test_name", f"test_{test_idx}")
       test_body = test.get("test_body", "")
-      test_objects.append(Test(test_name=test_name, test_body=test_body, commands=commands))
+      test_objects.append(
+        Test(test_name=test_name, test_body=test_body, commands=commands)
+      )
 
-  tests_tool = TestsTool(test_objects)
+  tests_tool = TestsTool(test_objects, strategies=stats.strategies)
   agent.register_tool(tests_tool, MAX_TCS_GET_CONTEXT * 2)
-  
+
   console.print("Phase 2: Generating and verifying test cases ...")
   agent.append_user_message(
     prompts.PROMPT_GENERATE.format(
       strategies=str(stats.strategies),
     )
   )
-  
+
   def response_handler(_: str) -> Tuple[bool, str]:
     ensure_tools_available(agent, ["report"])
     return True, (
@@ -248,12 +254,14 @@ def generate_test(
         bug = json_repair.loads(res)
         stats.test_traj.append(res)
         if bug.get("found", False):
-          stats.bugs.append(Bug(
-            original_ir=bug["original_ir"],
-            transformed_ir=bug["transformed_ir"],
-            log=bug["log"],
-            thoughts=bug.get("thoughts"),
-          ))
+          stats.bugs.append(
+            Bug(
+              original_ir=bug["original_ir"],
+              transformed_ir=bug["transformed_ir"],
+              log=bug["log"],
+              thoughts=bug.get("thoughts"),
+            )
+          )
       except Exception:
         return (True, res)  # Continue the process with an error message
     if name == "difftest":
@@ -261,12 +269,14 @@ def generate_test(
         diff_result = json.loads(res)
         stats.test_traj.append(res)
         if diff_result.get("found", False):
-          stats.bugs.append(Bug(
-            original_ir=diff_result["original_ir"],
-            transformed_ir=diff_result["transformed_ir"],
-            log=json.dumps(diff_result["log"]),
-            thoughts=diff_result.get("thoughts"),
-          ))
+          stats.bugs.append(
+            Bug(
+              original_ir=diff_result["original_ir"],
+              transformed_ir=diff_result["transformed_ir"],
+              log=json.dumps(diff_result["log"]),
+              thoughts=diff_result.get("thoughts"),
+            )
+          )
       except Exception:
         return (True, res)  # Continue the process with an error message
     if name != "report":
@@ -274,10 +284,22 @@ def generate_test(
 
     all_tested = all(t.tested for t in test_objects)
     if not all_tested:
-      return True, ("Error: You cannot call `report` yet "
+      return True, (
+        "Error: You cannot call `report` yet "
         "because not all tests have been marked as tested. "
         "Please use `tests_manager` to check untested tests, "
-        "test them, and mark them as tested.")
+        "test them, and mark them as tested."
+      )
+
+    if hasattr(tests_tool, "get_all_uncovered_strategies"):
+      uncovered = tests_tool.get_all_uncovered_strategies()
+      if uncovered:
+        return True, (
+          "Error: You cannot call `report` yet "
+          "because not all Phase 1 test strategies have been applied to EVERY test. "
+          f"Uncovered strategies per test index: {uncovered}. "
+          "Please ensure EVERY test covers ALL strategies and is marked accordingly via `tests_manager`."
+        )
 
     try:
       # The report tool returns a parseable JSON string
@@ -358,7 +380,7 @@ def run_mini_agent(
     except Exception:
       return (True, res)  # Continue the process with an error message
     return False, res  # Stop the process with the result
-  
+
   response = agent.run(
     # TODO: Remove the hardcoded tool names
     [
@@ -380,28 +402,32 @@ def run_mini_agent(
     round_limit=MAX_CHAT_ROUNDS,
   )
   stats.phase1_round = agent.chat_stats["chat_rounds"]
-  
+
   # Parse the response to get potential test strategies
   response = json.loads(response)
   strategies = response.get("strategies", [])
   reasoning_thoughts = response.get("thoughts", "")
   test_strategies = []
-  
+
   for strat in strategies:
     try:
       name, target, rationale, expected_issue = strat
-      test_strategies.append(TestStrategy(
-        name=name,
-        target=target,
-        rationale=rationale,
-        expected_issue=expected_issue,
-      ))
+      test_strategies.append(
+        TestStrategy(
+          name=name,
+          target=target,
+          rationale=rationale,
+          expected_issue=expected_issue,
+        )
+      )
     except Exception as e:
-      console.print(f"Warning: Invalid strategy format: {strat}: {e}", color="yellow")
+      console.print(
+        f"Warning: Invalid strategy format: {strat}: {e}", color="yellow"
+      )
 
   stats.reason_thou = reasoning_thoughts
   stats.strategies = [s.as_dict() for s in test_strategies]
-  
+
   return generate_test(
     agent=agent,
     fixenv=fixenv,
@@ -418,7 +444,7 @@ def autoreview(
   build_dir: str,
 ):
   debugger = None
-  
+
   tools = get_tool_list(fixenv, llvm, build_dir, debugger)
   for to, th in tools:
     agent.register_tool(to, th)
@@ -513,7 +539,7 @@ def main():
     stats_path = Path(args.stats)
     if stats_path.exists():
       panic(f"Stats file {stats_path} already exists.")
-  
+
   history_path = None
   if args.history:
     history_path = Path(args.history)
@@ -525,7 +551,7 @@ def main():
   set_llvm_build_dir(build_dir)
   env = Environment(
     args.issue,
-    base_model_knowledge_cutoff="2000-12-31Z", # FIXME: workaround for evaluation
+    base_model_knowledge_cutoff="2000-12-31Z",  # FIXME: workaround for evaluation
     additional_cmake_args=ADDITIONAL_CMAKE_FLAGS,
     max_build_jobs=os.environ.get("LLVM_AUTOREVIEW_MAX_BUILD_JOBS"),
   )
@@ -548,7 +574,8 @@ def main():
     env.apply()
   except Exception as e:
     console.print(
-      f"Warning: Failed to reset HEAD to {env.get_hint_fix_commit()}: {e}", color="yellow"
+      f"Warning: Failed to reset HEAD to {env.get_hint_fix_commit()}: {e}",
+      color="yellow",
     )
     console.print("Sync the repository and try again.", color="yellow")
     reset("main")
@@ -557,19 +584,21 @@ def main():
       env.apply()
     except Exception as e:
       panic(f"Failed to reset HEAD to {env.get_hint_fix_commit()}: {e}")
-    
+
   if not (Path(build_dir) / "bin" / "opt").exists():
     env.build()
-  
+
   llvm = LLVM()
-  
+
   # Start analyzing and repairing the issue
   stats = RunStats(command=vars(args))
   stats.total_time_sec = time.time()
   try:
     autoreview(agent, env, llvm, stats, build_dir)
     if not stats.bugs:
-        raise NoAvailableBugFound("All efforts tried yet no available patches found.")
+      raise NoAvailableBugFound(
+        "All efforts tried yet no available patches found."
+      )
   except Exception as e:
     import traceback
 
@@ -615,6 +644,7 @@ def main():
   console.print("Statistics")
   console.print("----------")
   console.print(json.dumps(stats.as_dict(), indent=2))
+
 
 if __name__ == "__main__":
   main()
