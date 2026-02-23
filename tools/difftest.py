@@ -14,8 +14,8 @@ TEMPLATE = """
 
 define {type} @main(i32 %argc, ptr %argv) {{
 entry:
-  %r = {call_instr}
-  ret {type} %r
+  {call_instr}
+  {ret_instr}
 }}
 """
 
@@ -84,13 +84,20 @@ class DiffTestTool(FuncToolBase):
       tmpdir = Path(tmpdir)
       orig_ir_path = tmpdir / "orig.ll"
       transformed_ir_path = tmpdir / "transformed.ll"
+      
+      if not call_type == "void":
+        call_instr = f"%r = {call_instr.strip()}"
+        ret_instr = f"ret {call_type} %r"
+      else:
+        call_instr = call_instr.strip()
+        ret_instr = "ret void"
 
       orig_ir_path.write_text(
-        TEMPLATE.format(ir=orig_ir_body, type=call_type, call_instr=call_instr.strip()),
+        TEMPLATE.format(ir=orig_ir_body, type=call_type, call_instr=call_instr.strip(), ret_instr=ret_instr.strip()),
         encoding="utf-8"
       )
       transformed_ir_path.write_text(
-        TEMPLATE.format(ir=transformed_ir_body, type=call_type, call_instr=call_instr.strip()),
+        TEMPLATE.format(ir=transformed_ir_body, type=call_type, call_instr=call_instr.strip(), ret_instr=ret_instr.strip()),
         encoding="utf-8"
       )
 
