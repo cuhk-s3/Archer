@@ -1,27 +1,26 @@
-from argparse import ArgumentParser
-from dataclasses import asdict, dataclass, field
 import json
 import os
-from pathlib import Path
 import time
+from argparse import ArgumentParser
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import json_repair
 
+import prompts
 from base.console import get_boxed_console
 from llvm.debugger import DebuggerBase
-from llvm.gdb_support import GDB
-from lms.agent import AgentBase
 from llvm.lab_env import Environment
 from llvm.llvm import LLVM
 from llvm.llvm_helper import (
-    get_llvm_build_dir,
-    git_execute,
-    llvm_dir,
-    reset,
-    set_llvm_build_dir,
+  get_llvm_build_dir,
+  git_execute,
+  llvm_dir,
+  reset,
+  set_llvm_build_dir,
 )
-import prompts
+from lms.agent import AgentBase
 from tools.difftest import DiffTestTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
@@ -30,7 +29,7 @@ from tools.listn import ListNTool
 from tools.readn import ReadNTool
 from tools.report import ReportTool
 from tools.stop import StopTool
-from tools.tests import TestsTool, Test
+from tools.tests import Test, TestsTool
 from tools.trans import TransTool
 from tools.verify import VerifyTool
 
@@ -119,6 +118,7 @@ class RunStats:
   test_traj: List[str] = field(
     default_factory=list
   )  # Trajectories of patches ever tried during testing
+  report: Optional[str] = None
 
   def as_dict(self) -> dict:
     return asdict(self)
@@ -163,9 +163,7 @@ def ensure_tools_available(agent: AgentBase, tools: List[str]):
     if tool not in available_tools:
       unavailable_tools.append(tool)
   if len(unavailable_tools) > 0:
-    raise ReachToolBudget(
-      f"Tools [{', '.join(unavailable_tools)}] are out of budget."
-    )
+    raise ReachToolBudget(f"Tools [{', '.join(unavailable_tools)}] are out of budget.")
 
 
 def get_tool_list(
@@ -271,15 +269,23 @@ def generate_test(
         if diff_result.get("action") == "confirm":
           original_ir = "<missing>"
           transformed_ir = "<missing>"
+          original_out = "<missing>"
+          transformed_out = "<missing>"
           # Find the last unconfirmed test in test_traj
           for i in range(len(stats.test_traj) - 1, -1, -1):
             try:
               prev_res = json.loads(stats.test_traj[i])
-              if prev_res.get("tool") == "difftest" and prev_res.get("action") == "test" and not prev_res.get("confirmed", False):
+              if (
+                prev_res.get("tool") == "difftest"
+                and prev_res.get("action") == "test"
+                and not prev_res.get("confirmed", False)
+              ):
                 original_ir = prev_res.get("original_ir", "<missing>")
                 transformed_ir = prev_res.get("transformed_ir", "<missing>")
-                original_out = diff_result.get("log", {}).get("original_test_output", "")
-                transformed_out = diff_result.get("log", {}).get("transformed_test_output", "")
+                original_out = prev_res.get("log", {}).get("original_test_output", "")
+                transformed_out = prev_res.get("log", {}).get(
+                  "transformed_test_output", ""
+                )
                 prev_res["confirmed"] = True
                 stats.test_traj[i] = json.dumps(prev_res)
                 break
@@ -288,13 +294,12 @@ def generate_test(
 
           if diff_result.get("found", False):
             # We only add to bugs if the agent confirms it's a real bug
+            log_msg = f"Confirmed as bug by agent.\nOriginal Output: {original_out}\nTransformed Output: {transformed_out}"
             stats.bugs.append(
               Bug(
                 original_ir=original_ir,
                 transformed_ir=transformed_ir,
-                original_out=original_out,
-                transformed_out=transformed_out,
-                log="Confirmed as bug by agent.",
+                log=log_msg,
                 thoughts=diff_result.get("thoughts"),
               )
             )
@@ -318,6 +323,7 @@ def generate_test(
       json.loads(res)
     except Exception:
       return (True, res)  # Continue the process with an error message
+    stats.report = json.loads(res).get("thoughts", None)
     return False, res  # Stop the process with the result
 
   ret = agent.run(
@@ -433,9 +439,7 @@ def run_mini_agent(
         )
       )
     except Exception as e:
-      console.print(
-        f"Warning: Invalid strategy format: {strat}: {e}", color="yellow"
-      )
+      console.print(f"Warning: Invalid strategy format: {strat}: {e}", color="yellow")
 
   stats.reason_thou = reasoning_thoughts
   stats.strategies = [s.as_dict() for s in test_strategies]
@@ -608,9 +612,7 @@ def main():
   try:
     autoreview(agent, env, llvm, stats, build_dir)
     if not stats.bugs:
-      raise NoAvailableBugFound(
-        "All efforts tried yet no available patches found."
-      )
+      raise NoAvailableBugFound("All efforts tried yet no available patches found.")
   except Exception as e:
     import traceback
 
@@ -653,6 +655,9 @@ def main():
     console.print("Verification Log:")
     console.print(bug.log)
     console.print("----------")
+  console.print("Report")
+  console.print("----------")
+  console.print(stats.report)
   console.print("Statistics")
   console.print("----------")
   console.print(json.dumps(stats.as_dict(), indent=2))

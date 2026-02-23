@@ -1,4 +1,3 @@
-import ast
 import json
 
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
@@ -18,7 +17,7 @@ class StopTool(FuncToolBase):
           "list[dict]",
           True,
           "A list of bug-trigger test strategies with each being a dictionary of strategy name, target, rationale and expected issue. "
-          "For example, [{\"name\":\"Strategy 1\",\"target\":\"test target\",\"rationale\":\"rationale for why this strategy can trigger the bug\",\"expected_issue\":\"the expected issue that can be observed when the strategy is executed\"}, {...}, ...].",
+          'For example, [{"name":"Strategy 1","target":"test target","rationale":"rationale for why this strategy can trigger the bug","expected_issue":"the expected issue that can be observed when the strategy is executed"}, {...}, ...].',
           schema={
             "type": "array",
             "items": {
@@ -27,17 +26,17 @@ class StopTool(FuncToolBase):
                 "name": {"type": "string"},
                 "target": {"type": "string"},
                 "rationale": {"type": "string"},
-                "expected_issue": {"type": "string"}
+                "expected_issue": {"type": "string"},
               },
-              "required": ["name", "target", "rationale", "expected_issue"]
-            }
+              "required": ["name", "target", "rationale", "expected_issue"],
+            },
           },
         ),
         FuncToolSpec.Param(
           "thoughts",
           "string",
           True,
-          'The detailed thoughts for diagnosing the fix including '
+          "The detailed thoughts for diagnosing the fix including "
           '1. "Fix Understanding", '
           '2. "Assumptions Identified", '
           '3. "Potential Cases to Break Assumptions", and '
@@ -49,13 +48,13 @@ class StopTool(FuncToolBase):
   def _call(self, *, strategies, thoughts: str) -> str:
     strats = []
     if isinstance(strategies, str):
-        s = strategies.strip()
-        try:
-          strategies = json.loads(s)
-        except Exception as e:
-          raise FuncToolCallException(
-            f"strategies must be a JSON array of objects; got a string that cannot be parsed: {strategies}"
-          ) from e
+      s = strategies.strip()
+      try:
+        strategies = json.loads(s)
+      except Exception as e:
+        raise FuncToolCallException(
+          f"strategies must be a JSON array of objects; got a string that cannot be parsed: {strategies}"
+        ) from e
     # check if strategies is a list of dicts
     if not isinstance(strategies, list):
       raise FuncToolCallException(f"Strategies must be a list of dicts: {strategies}")
@@ -73,9 +72,7 @@ class StopTool(FuncToolBase):
         rationale = s["rationale"]
         expected_issue = s["expected_issue"]
       except KeyError as e:
-        raise FuncToolCallException(
-          f"Strategy object missing required field {e}: {s}"
-        )
+        raise FuncToolCallException(f"Strategy object missing required field {e}: {s}")
       strats.append(
         (
           str(name).strip(),

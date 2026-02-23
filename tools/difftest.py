@@ -1,13 +1,12 @@
 import json
-from pathlib import Path
 import re
 import subprocess
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from llvm.llvm_helper import strip_llvm_fence
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
 from tools.trans import transform
-from llvm.llvm_helper import strip_llvm_fence
-
 
 TEMPLATE = """
 {ir}
@@ -77,10 +76,22 @@ class DiffTestTool(FuncToolBase):
       ],
     )
 
-  def _call(self, *, action: str, thoughts: str, orig_ir: str = None, args: str = None, call_instr: str = None, is_bug: bool = None, **kwargs) -> str:
+  def _call(
+    self,
+    *,
+    action: str,
+    thoughts: str,
+    orig_ir: str = None,
+    args: str = None,
+    call_instr: str = None,
+    is_bug: bool = None,
+    **kwargs,
+  ) -> str:
     if action == "confirm":
       if is_bug is None:
-        raise FuncToolCallException("The 'is_bug' parameter is required when action is 'confirm'.")
+        raise FuncToolCallException(
+          "The 'is_bug' parameter is required when action is 'confirm'."
+        )
       return json.dumps(
         {
           "found": is_bug,
@@ -91,8 +102,10 @@ class DiffTestTool(FuncToolBase):
       )
     elif action == "test":
       if not orig_ir or not args or not call_instr:
-        raise FuncToolCallException("The 'orig_ir', 'args', and 'call_instr' parameters are required when action is 'test'.")
-      
+        raise FuncToolCallException(
+          "The 'orig_ir', 'args', and 'call_instr' parameters are required when action is 'test'."
+        )
+
       transformed_ir = transform(orig_ir, args, self.build_dir)
 
       # Require a single call (no leading "%r ="); main will assign it to %r.
@@ -113,7 +126,7 @@ class DiffTestTool(FuncToolBase):
         tmpdir = Path(tmpdir)
         orig_ir_path = tmpdir / "orig.ll"
         transformed_ir_path = tmpdir / "transformed.ll"
-        
+
         if not call_type == "void":
           call_instr = f"%r = {call_instr.strip()}"
           ret_instr = f"ret {call_type} %r"
@@ -122,12 +135,22 @@ class DiffTestTool(FuncToolBase):
           ret_instr = "ret void"
 
         orig_ir_path.write_text(
-          TEMPLATE.format(ir=orig_ir_body, type=call_type, call_instr=call_instr.strip(), ret_instr=ret_instr.strip()),
-          encoding="utf-8"
+          TEMPLATE.format(
+            ir=orig_ir_body,
+            type=call_type,
+            call_instr=call_instr.strip(),
+            ret_instr=ret_instr.strip(),
+          ),
+          encoding="utf-8",
         )
         transformed_ir_path.write_text(
-          TEMPLATE.format(ir=transformed_ir_body, type=call_type, call_instr=call_instr.strip(), ret_instr=ret_instr.strip()),
-          encoding="utf-8"
+          TEMPLATE.format(
+            ir=transformed_ir_body,
+            type=call_type,
+            call_instr=call_instr.strip(),
+            ret_instr=ret_instr.strip(),
+          ),
+          encoding="utf-8",
         )
 
         def run(path, timeout_s: int = 10):
@@ -140,15 +163,19 @@ class DiffTestTool(FuncToolBase):
             return {
               "timed_out": False,
               "return_code": res.returncode,
-              "stdout": res.stdout.decode('utf-8', errors='replace').strip(),
-              "stderr": res.stderr.decode('utf-8', errors='replace').strip(),
+              "stdout": res.stdout.decode("utf-8", errors="replace").strip(),
+              "stderr": res.stderr.decode("utf-8", errors="replace").strip(),
             }
           except subprocess.TimeoutExpired as e:
             return {
               "timed_out": True,
               "return_code": None,
-              "stdout": (e.stdout.decode('utf-8', errors='replace') if e.stdout else "").strip(),
-              "stderr": (e.stderr.decode('utf-8', errors='replace') if e.stderr else "").strip(),
+              "stdout": (
+                e.stdout.decode("utf-8", errors="replace") if e.stdout else ""
+              ).strip(),
+              "stderr": (
+                e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+              ).strip(),
             }
 
         out1 = run(orig_ir_path)
@@ -169,4 +196,6 @@ class DiffTestTool(FuncToolBase):
           }
         )
     else:
-      raise FuncToolCallException(f"Invalid action '{action}'. Must be 'test' or 'confirm'.")
+      raise FuncToolCallException(
+        f"Invalid action '{action}'. Must be 'test' or 'confirm'."
+      )

@@ -1,11 +1,11 @@
+import sys
 from abc import abstractmethod
 from dataclasses import dataclass
-import sys
 from typing import Callable, List, Literal, Tuple, Union
 
 from base.console import get_boxed_console
-from lms.tool import FuncToolBase, ToolRegistry
 from llvm.llvm_helper import remove_path_from_output
+from lms.tool import FuncToolBase, ToolRegistry
 
 
 @dataclass

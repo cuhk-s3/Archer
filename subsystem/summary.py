@@ -1,15 +1,15 @@
 import argparse
+import json
 import logging
 import sys
-import json
 import time
 from pathlib import Path
 
 # Add the project root to sys.path to allow imports from lms and collect
 sys.path.append(str(Path(__file__).parent.parent))
 
-from subsystem.prompts import PROMPT_SYSTEM_SUMMARY, PROMPT_SUMMARY
-from subsystem.collect import SimpleOpenAIClient, RunStats
+from subsystem.collect import RunStats, SimpleOpenAIClient
+from subsystem.prompts import PROMPT_SUMMARY, PROMPT_SYSTEM_SUMMARY
 
 # Setup logging
 logging.basicConfig(
@@ -25,9 +25,7 @@ def parse_args():
     type=str,
     help="Component/Pass name (e.g., SLPVectorizer). Matches filename in passes directory.",
   )
-  parser.add_argument(
-    "--model", type=str, default="gpt-4o", help="Model name for LLMs"
-  )
+  parser.add_argument("--model", type=str, default="gpt-4o", help="Model name for LLMs")
   parser.add_argument(
     "--passes-dir",
     type=str,
@@ -113,7 +111,7 @@ def main():
       f.write(response)
 
     logger.info(f"Summary saved to {output_file}")
-  
+
   except Exception as e:
     import traceback
 

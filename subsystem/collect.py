@@ -5,26 +5,27 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional
-import time
 
 # Add the project root to sys.path to allow imports from lms and collect
 sys.path.append(str(Path(__file__).parent.parent))
 
-from subsystem.prompts import (
-    PROMPT_ANALYZE,
-    PROMPT_SYSTEM_ANALYZE,
-    PROMPT_SYSTEM_VERIFY,
-    PROMPT_VERIFY,
-)
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
+from subsystem.prompts import (
+  PROMPT_ANALYZE,
+  PROMPT_SYSTEM_ANALYZE,
+  PROMPT_SYSTEM_VERIFY,
+  PROMPT_VERIFY,
+)
+
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+  level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -120,9 +121,9 @@ class SimpleOpenAIClient:
       if response.usage:
         self.chat_stats["input_tokens"] += response.usage.prompt_tokens
         if response.usage.prompt_tokens_details:
-          self.chat_stats[
-            "cached_tokens"
-          ] += response.usage.prompt_tokens_details.cached_tokens
+          self.chat_stats["cached_tokens"] += (
+            response.usage.prompt_tokens_details.cached_tokens
+          )
         self.chat_stats["output_tokens"] += response.usage.completion_tokens
         self.chat_stats["total_tokens"] += response.usage.total_tokens
         cost = getattr(response.usage, "cost", None)
@@ -307,9 +308,7 @@ def parse_args():
   parser.add_argument(
     "--issue", type=str, required=True, help="Issue ID (e.g., 100298)"
   )
-  parser.add_argument(
-    "--model", type=str, default="gpt-4o", help="Model name for LLMs"
-  )
+  parser.add_argument("--model", type=str, default="gpt-4o", help="Model name for LLMs")
   parser.add_argument(
     "--dataset-dir",
     type=str,
@@ -393,9 +392,9 @@ def main():
           for md_path in md_paths:
             # Ensure directory exists
             md_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             file_exists = md_path.exists()
-            
+
             with open(md_path, "a") as f:
               if file_exists:
                 f.write("\n\n---\n\n")

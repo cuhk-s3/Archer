@@ -1,10 +1,10 @@
 # Implementation of OpenAI-compatible agents (Chat Completions API).
 
 import json
-import json_repair
 import os
 from typing import List
 
+import json_repair
 from openai import NOT_GIVEN, OpenAI
 from tenacity import (
   retry,

@@ -96,16 +96,18 @@ class BoxedConsole(BoxedConsoleBase):
 
 
 def get_boxed_console(
-  box_title=None, box_bg_color="black", console_name="autoreview", debug_mode=False, configs: Optional[BoxedConsoleConfigs]=None
+  box_title=None,
+  box_bg_color="black",
+  console_name="autoreview",
+  debug_mode=False,
+  configs: Optional[BoxedConsoleConfigs] = None,
 ) -> BoxedConsoleBase:
   configs = configs or BoxedConsoleConfigs()
   if debug_mode:
     if configs.out_dir:
       os.makedirs(configs.out_dir, exist_ok=True)
       return FileConsole(
-        out_file=str(
-          (Path(configs.out_dir) / (console_name + ".traj.log")).resolve()
-        ),
+        out_file=str((Path(configs.out_dir) / (console_name + ".traj.log")).resolve()),
         title=box_title,
         print_to_console=configs.print_to_console,
       )

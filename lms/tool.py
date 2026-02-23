@@ -14,7 +14,9 @@ class FuncToolSpec:
     desc: str  # Description of the parameter
     schema: dict = None  # Optional JSON schema for complex types
 
-  def __init__(self, name: str, desc: str, parameters: List[Param], schema: dict = None):
+  def __init__(
+    self, name: str, desc: str, parameters: List[Param], schema: dict = None
+  ):
     self.name = name
     self.desc = desc
     self.params = parameters

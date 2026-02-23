@@ -79,7 +79,7 @@ class Environment:
   def reset(self):
     with TimeCompensationGuard(self):
       llvm_helper.reset(self.base_commit)
-      
+
   def apply(self):
     with TimeCompensationGuard(self):
       llvm_helper.reset(self.test_commit)
@@ -204,9 +204,10 @@ class Environment:
           valid_count += 1
         else:
           # use llvm-diff for structural comparison
-          with tempfile.NamedTemporaryFile("w") as f_gold, tempfile.NamedTemporaryFile(
-            "w"
-          ) as f_patch:
+          with (
+            tempfile.NamedTemporaryFile("w") as f_gold,
+            tempfile.NamedTemporaryFile("w") as f_patch,
+          ):
             f_gold.write(gold_result[file])
             f_gold.flush()
             f_patch.write(res)

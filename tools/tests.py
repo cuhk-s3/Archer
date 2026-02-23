@@ -1,6 +1,7 @@
 import json
-from typing import List
 from dataclasses import dataclass, field
+from typing import List
+
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
 
 
@@ -95,9 +96,7 @@ class TestsTool(FuncToolBase):
           "All tests have been tested and EVERY test covers all strategies! You can now proceed to report."
         )
       elif all_uncovered:
-        output["message"] = (
-          "Some tests have not covered all Phase 1 strategies yet."
-        )
+        output["message"] = "Some tests have not covered all Phase 1 strategies yet."
       return json.dumps(output, indent=2)
 
     elif action == "get":
@@ -107,7 +106,7 @@ class TestsTool(FuncToolBase):
         )
       if index < 0 or index >= len(self.tests):
         raise FuncToolCallException(
-          f"Invalid index {index}. Must be between 0 and {len(self.tests)-1}."
+          f"Invalid index {index}. Must be between 0 and {len(self.tests) - 1}."
         )
 
       t = self.tests[index]
@@ -129,7 +128,7 @@ class TestsTool(FuncToolBase):
         )
       if index < 0 or index >= len(self.tests):
         raise FuncToolCallException(
-          f"Invalid index {index}. Must be between 0 and {len(self.tests)-1}."
+          f"Invalid index {index}. Must be between 0 and {len(self.tests) - 1}."
         )
       if covered_strategies is None:
         raise FuncToolCallException(
@@ -155,7 +154,7 @@ class TestsTool(FuncToolBase):
           msg = f"Test {index} marked as tested."
         else:
           msg = f"Test {index} NOT marked as tested because the following strategies are still uncovered: {uncovered_for_this_test}. Please test again and call 'mark_tested' again after covering them."
-        
+
         if not all_tested:
           msg += " There are still untested tests. Please continue testing them."
         return msg

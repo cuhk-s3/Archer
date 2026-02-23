@@ -16,8 +16,8 @@ os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] = "3"  # Retry 3 times
 import yaml
 from minisweagent import Model
 from minisweagent.agents.default import DefaultAgent
-from minisweagent.exceptions import Submitted
 from minisweagent.environments.local import LocalEnvironment
+from minisweagent.exceptions import Submitted
 from minisweagent.models.litellm_model import LitellmModel
 
 from base.console import get_boxed_console
@@ -84,7 +84,7 @@ EDITING_TOOLS = [
 class Patch:
   type: str
   patch: str
-  
+
   def as_dict(self) -> dict:
     return {
       "bug_type": self.type,
@@ -183,22 +183,23 @@ class MyEnvironment(LocalEnvironment):
     command = shlex.join(["bash", "-c", f". {self.shim_path} && {cmd}"])
     if cmd.startswith("opt"):
       try:
-          result = subprocess.run(
-              command,
-              shell=True,
-              text=True,
-              cwd=cwd,
-              env=os.environ | self.config.env,
-              timeout=timeout or self.config.timeout,
-              encoding="utf-8",
-              errors="replace",
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-          )
-          m = re.search(r"(\d+)\s+incorrect transformations", result.stdout)
-          if m and int(m.group(1)) > 0:
-            self.stats.bugs.append(result.stdout)
-      except:
+        result = subprocess.run(
+          command,
+          shell=True,
+          text=True,
+          cwd=cwd,
+          env=os.environ | self.config.env,
+          timeout=timeout or self.config.timeout,
+          encoding="utf-8",
+          errors="replace",
+          stdout=subprocess.PIPE,
+          stderr=subprocess.STDOUT,
+        )
+        m = re.search(r"(\d+)\s+incorrect transformations", result.stdout)
+        if m and int(m.group(1)) > 0:
+          self.stats.bugs.append(result.stdout)
+      except Exception as e:
+        console.print(f"Error executing command '{cmd}': {e}", color="red")
         pass
     action["command"] = command
     return super().execute(action, cwd, timeout=timeout)
@@ -228,7 +229,7 @@ class MyAgent(DefaultAgent):
     set_llvm_build_dir(build_dir)
     self.fixenv = FixEnvironment(
       issue,
-      base_model_knowledge_cutoff="2000-12-31Z", # FIXME: workaround for evaluation
+      base_model_knowledge_cutoff="2000-12-31Z",  # FIXME: workaround for evaluation
       additional_cmake_args=ADDITIONAL_CMAKE_FLAGS,
       max_build_jobs=os.environ.get("LLVM_AUTOREVIEW_MAX_BUILD_JOBS"),
     )
@@ -257,14 +258,11 @@ class MyAgent(DefaultAgent):
 
   def setup_patch(self) -> Patch:
     return Patch(
-      type=self.fixenv.get_bug_type(),
-      patch=self.fixenv.get_reference_patch()
+      type=self.fixenv.get_bug_type(), patch=self.fixenv.get_reference_patch()
     )
 
   def step(self):
-    console.print(
-      f"Remaining tools: [verify, report]"
-    )
+    console.print("Remaining tools: [verify, report]")
     return super().step()
 
 
