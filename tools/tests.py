@@ -136,23 +136,26 @@ class TestsTool(FuncToolBase):
           "The 'covered_strategies' parameter is required for the 'mark_tested' action to indicate which Phase 1 strategies this test covers."
         )
 
-      self.tests[index].tested = True
-
       # Update covered strategies for this specific test
       for s in covered_strategies:
         if s in self.all_strategies:
           self.tests[index].covered_strategies.add(s)
 
-      all_tested = all(t.tested for t in self.tests)
       uncovered_for_this_test = self.get_uncovered_strategies(index)
+      if not uncovered_for_this_test:
+        self.tests[index].tested = True
+
+      all_tested = all(t.tested for t in self.tests)
       all_uncovered = self.get_all_uncovered_strategies()
 
       if all_tested and not all_uncovered:
         return f"Test {index} marked as tested. All tests have been tested and EVERY test covers all strategies! You can now proceed to report."
       else:
-        msg = f"Test {index} marked as tested."
-        if uncovered_for_this_test:
-          msg += f" Note: For this test, the following strategies are still uncovered: {uncovered_for_this_test}. Please test again and call 'mark_tested' again after covering them."
+        if not uncovered_for_this_test:
+          msg = f"Test {index} marked as tested."
+        else:
+          msg = f"Test {index} NOT marked as tested because the following strategies are still uncovered: {uncovered_for_this_test}. Please test again and call 'mark_tested' again after covering them."
+        
         if not all_tested:
           msg += " There are still untested tests. Please continue testing them."
         return msg

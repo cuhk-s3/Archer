@@ -308,20 +308,10 @@ def generate_test(
     if not all_tested:
       return True, (
         "Error: You cannot call `report` yet "
-        "because not all tests have been marked as tested. "
+        "because not all tests have been marked as tested (which requires covering all strategies per test). "
         "Please use `tests_manager` to check untested tests, "
         "test them, and mark them as tested."
       )
-
-    if hasattr(tests_tool, "get_all_uncovered_strategies"):
-      uncovered = tests_tool.get_all_uncovered_strategies()
-      if uncovered:
-        return True, (
-          "Error: You cannot call `report` yet "
-          "because not all Phase 1 test strategies have been applied to EVERY test. "
-          f"Uncovered strategies per test index: {uncovered}. "
-          "Please ensure EVERY test covers ALL strategies and is marked accordingly via `tests_manager`."
-        )
 
     try:
       # The report tool returns a parseable JSON string
