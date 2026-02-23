@@ -24,7 +24,7 @@ def transform(orig_ir: str, args: str, build_dir: str) -> str:
         orig_ir_path = Path(tmpdir) / "orig.ll"
         with open(orig_ir_path, "w", encoding="utf-8") as f:
             f.write(orig_ir_code)
-        cmd = f"{opt_path} {args} {orig_ir_path}"
+        cmd = f"{opt_path} -S {args} {orig_ir_path}"
         try:
             result = cmdline.check_output(cmd)
             transformed_ir = result.decode("utf-8", errors="replace").strip()
