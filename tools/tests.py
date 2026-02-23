@@ -152,9 +152,9 @@ class TestsTool(FuncToolBase):
       else:
         msg = f"Test {index} marked as tested."
         if uncovered_for_this_test:
-          msg += f" Note: For this test, the following strategies are still uncovered: {uncovered_for_this_test}."
+          msg += f" Note: For this test, the following strategies are still uncovered: {uncovered_for_this_test}. Please test again and call 'mark_tested' again after covering them."
         if not all_tested:
-          msg += " There are still untested tests."
+          msg += " There are still untested tests. Please continue testing them."
         return msg
 
     else:

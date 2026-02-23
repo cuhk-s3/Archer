@@ -181,7 +181,7 @@ def get_tool_list(
     (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
     (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
     (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
-    (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT),
+    (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
     # Stop the analysis (Phase 1)
     (StopTool(), MAX_TCS_GET_CONTEXT),
     # Report the bug (Phase 2)
@@ -268,20 +268,42 @@ def generate_test(
       try:
         diff_result = json.loads(res)
         stats.test_traj.append(res)
-        if diff_result.get("found", False):
-          stats.bugs.append(
-            Bug(
-              original_ir=diff_result["original_ir"],
-              transformed_ir=diff_result["transformed_ir"],
-              log=json.dumps(diff_result["log"]),
-              thoughts=diff_result.get("thoughts"),
+        if diff_result.get("action") == "confirm":
+          original_ir = "<missing>"
+          transformed_ir = "<missing>"
+          # Find the last unconfirmed test in test_traj
+          for i in range(len(stats.test_traj) - 1, -1, -1):
+            try:
+              prev_res = json.loads(stats.test_traj[i])
+              if prev_res.get("tool") == "difftest" and prev_res.get("action") == "test" and not prev_res.get("confirmed", False):
+                original_ir = prev_res.get("original_ir", "<missing>")
+                transformed_ir = prev_res.get("transformed_ir", "<missing>")
+                original_out = diff_result.get("log", {}).get("original_test_output", "")
+                transformed_out = diff_result.get("log", {}).get("transformed_test_output", "")
+                prev_res["confirmed"] = True
+                stats.test_traj[i] = json.dumps(prev_res)
+                break
+            except Exception:
+              pass
+
+          if diff_result.get("found", False):
+            # We only add to bugs if the agent confirms it's a real bug
+            stats.bugs.append(
+              Bug(
+                original_ir=original_ir,
+                transformed_ir=transformed_ir,
+                original_out=original_out,
+                transformed_out=transformed_out,
+                log="Confirmed as bug by agent.",
+                thoughts=diff_result.get("thoughts"),
+              )
             )
-          )
+        elif diff_result.get("action") == "test":
+          return (True, res)
       except Exception:
         return (True, res)  # Continue the process with an error message
     if name != "report":
       return True, res  # Continue the process
-
     all_tested = all(t.tested for t in test_objects)
     if not all_tested:
       return True, (
