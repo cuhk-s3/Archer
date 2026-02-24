@@ -361,7 +361,7 @@ def generate_test(
             except Exception:
               pass
 
-          if diff_result.get("found", False):
+          if diff_result.get("found", False) and original_out != transformed_out:
             # We only add to bugs if the agent confirms it's a real bug
             log_msg = f"Confirmed as bug by agent.\nOriginal Output: {original_out}\nTransformed Output: {transformed_out}"
             stats.bugs.append(
