@@ -253,7 +253,7 @@ def generate_test(
     if not has_verification:
       return False, (
         f"You have not performed any `verify` or `difftest` actions for test {index} since you retrieved it. "
-        "You must verify the test case before marking it as tested. Ensure you pass `test_index` and `covered_strategies` to verification tools."
+        "You must verify the test case before marking it as tested. Ensure you pass `test_index` and `covered_strategy` to verification tools."
       )
 
     return True, ""
@@ -297,16 +297,15 @@ def generate_test(
         bug = json_repair.loads(res)
         stats.test_traj.append(res)
         idx = bug.get("test_index")
-        cov = bug.get("covered_strategies")
+        cov = bug.get("covered_strategy")
         if idx is not None and cov:
-          invalid_strategies = [s for s in cov if s not in tests_tool.all_strategies]
-          if invalid_strategies:
+          if cov not in tests_tool.all_strategies:
             return (
               True,
-              f"Error: The following strategies are not valid Phase 1 strategies: {invalid_strategies}. "
-              f"Please provide valid strategy names from: {list(tests_tool.all_strategies)}.",
+              f"Error: The strategy '{cov}' is not a valid Phase 1 strategy. "
+              f"Please provide a valid strategy name from: {list(tests_tool.all_strategies)}.",
             )
-          tests_tool.add_covered_strategies(idx, cov)
+          tests_tool.add_covered_strategy(idx, cov)
         if bug.get("found", False):
           stats.bugs.append(
             Bug(
@@ -324,16 +323,15 @@ def generate_test(
         stats.test_traj.append(res)
 
         idx = diff_result.get("test_index")
-        cov = diff_result.get("covered_strategies")
+        cov = diff_result.get("covered_strategy")
         if idx is not None and cov:
-          invalid_strategies = [s for s in cov if s not in tests_tool.all_strategies]
-          if invalid_strategies:
+          if cov not in tests_tool.all_strategies:
             return (
               True,
-              f"Error: The following strategies are not valid Phase 1 strategies: {invalid_strategies}. "
-              f"Please provide valid strategy names from: {list(tests_tool.all_strategies)}.",
+              f"Error: The strategy '{cov}' is not a valid Phase 1 strategy. "
+              f"Please provide a valid strategy name from: {list(tests_tool.all_strategies)}.",
             )
-          tests_tool.add_covered_strategies(idx, cov)
+          tests_tool.add_covered_strategy(idx, cov)
 
         if diff_result.get("action") == "confirm":
           original_ir = "<missing>"

@@ -81,12 +81,11 @@ class DiffTestTool(FuncToolBase):
           "Required when action is 'test' and the test case is derived from an existing test.",
         ),
         FuncToolSpec.Param(
-          "covered_strategies",
-          "list[string]",
+          "covered_strategy",
+          "string",
           False,
-          "A list of strategy names from Phase 1 that this verification covers. "
+          "The strategy name from Phase 1 that this verification covers. "
           "Required when action is 'test' and `test_index` is provided.",
-          schema={"type": "array", "items": {"type": "string"}},
         ),
       ],
     )
@@ -101,7 +100,7 @@ class DiffTestTool(FuncToolBase):
     call_instr: str = None,
     is_bug: bool = None,
     test_index: int = None,
-    covered_strategies: list[str] = None,
+    covered_strategy: str = None,
     **kwargs,
   ) -> str:
     if action == "confirm":
@@ -215,7 +214,7 @@ class DiffTestTool(FuncToolBase):
             },
             "thoughts": thoughts,
             "test_index": test_index,
-            "covered_strategies": covered_strategies,
+            "covered_strategy": covered_strategy,
           }
         )
     else:

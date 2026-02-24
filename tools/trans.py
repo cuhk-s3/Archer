@@ -30,8 +30,15 @@ def transform(orig_ir: str, args: str, build_dir: str) -> str:
       transformed_ir = result.decode("utf-8", errors="replace").strip()
       return f"```llvm\n{transformed_ir}\n```"
     except CalledProcessError as e:
+      err_msg = ""
+      if e.stderr:
+        err_msg = e.stderr.decode("utf-8", errors="replace")
+      elif e.stdout:
+        err_msg = e.stdout.decode("utf-8", errors="replace")
+      else:
+        err_msg = str(e)
       raise FuncToolCallException(
-        f"Failed to transform the LLVM IR code. {e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else str(e)}"
+        f"Failed to transform the LLVM IR code. {err_msg.strip()}"
       )
   return f"```llvm\n{transformed_ir}\n```"
 

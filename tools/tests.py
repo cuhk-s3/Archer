@@ -26,12 +26,11 @@ class TestsTool(FuncToolBase):
     self.all_strategies = {s.get("name") for s in self.strategies if s.get("name")}
     self.validator = validator
 
-  def add_covered_strategies(self, index: int, strategies: List[str]):
+  def add_covered_strategy(self, index: int, strategy: str):
     if index < 0 or index >= len(self.tests):
       return
-    for s in strategies:
-      if s in self.all_strategies:
-        self.tests[index].covered_strategies.add(s)
+    if strategy in self.all_strategies:
+      self.tests[index].covered_strategies.add(strategy)
 
   def get_uncovered_strategies(self, index: int) -> List[str]:
     if index < 0 or index >= len(self.tests):

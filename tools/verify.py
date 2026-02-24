@@ -13,7 +13,6 @@ class VerifyTool(FuncToolBase):
   def __init__(self, build_dir: str, alive_path: str):
     self.build_dir = Path(build_dir).resolve().absolute()
     self.alive_path = Path(alive_path).resolve().absolute()
-    print(self.build_dir, self.alive_path)
 
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
@@ -47,12 +46,11 @@ class VerifyTool(FuncToolBase):
           "Required when the test case is derived from an existing test.",
         ),
         FuncToolSpec.Param(
-          "covered_strategies",
-          "list[string]",
+          "covered_strategy",
+          "string",
           False,
-          "A list of strategy names from Phase 1 that this verification covers. "
+          "The strategy name from Phase 1 that this verification covers. "
           "Required when `test_index` is provided.",
-          schema={"type": "array", "items": {"type": "string"}},
         ),
       ],
     )
@@ -64,7 +62,7 @@ class VerifyTool(FuncToolBase):
     args: str,
     thoughts: str,
     test_index: int = None,
-    covered_strategies: list[str] = None,
+    covered_strategy: str = None,
     **kwargs,
   ) -> str:
     if not (
@@ -93,8 +91,17 @@ class VerifyTool(FuncToolBase):
       try:
         cmdline.check_output(cmd)
       except CalledProcessError as e:
+        # cmdline.check_output redirects stderr to stdout, so we check e.stdout/e.output.
+        # e.output is bytes if check_output returns bytes (which it does via getoutput).
+        err_msg = ""
+        if e.stderr:
+          err_msg = e.stderr.decode("utf-8", errors="replace")
+        elif e.stdout:
+          err_msg = e.stdout.decode("utf-8", errors="replace")
+        else:
+          err_msg = str(e)
         raise FuncToolCallException(
-          f"Failed to transform the LLVM IR code with opt. {e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else str(e)}"
+          f"Failed to transform the LLVM IR code with opt. {err_msg.strip()}"
         )
 
       with open(transformed_ir_path, "r", encoding="utf-8", errors="replace") as f:
@@ -114,10 +121,18 @@ class VerifyTool(FuncToolBase):
             "log": verification_result,
             "thoughts": thoughts,
             "test_index": test_index,
-            "covered_strategies": covered_strategies,
+            "covered_strategy": covered_strategy,
           }
         )
       except CalledProcessError as e:
+        # Same here, check stdout
+        err_msg = ""
+        if e.stderr:
+          err_msg = e.stderr.decode("utf-8", errors="replace")
+        elif e.stdout:
+          err_msg = e.stdout.decode("utf-8", errors="replace")
+        else:
+          err_msg = str(e)
         raise FuncToolCallException(
-          f"Failed to verify the LLVM IR code transformation. {e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else str(e)}"
+          f"Failed to verify the LLVM IR code transformation. {err_msg.strip()}"
         )
