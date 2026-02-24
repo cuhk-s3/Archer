@@ -37,11 +37,11 @@ from tools.verify import VerifyTool
 # - Agent configurations
 # - ===============================================
 
-# We restrict the agent to chat at most 100 rounds for each run
-# and consume at most 5 million tokens among all runs.
-MAX_CHAT_ROUNDS = 100
+# We restrict the agent to chat at most 500 rounds for each run
+# and consume at most 10 million tokens among all runs.
+MAX_CHAT_ROUNDS = 500
 MAX_CONSUMED_TOKENS = 10_000_000
-MAX_TCS_GET_CONTEXT = 50
+MAX_TCS_GET_CONTEXT = 250
 MAX_ROLS_PER_TC = 250
 
 # - ================================================
