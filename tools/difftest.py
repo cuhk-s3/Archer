@@ -73,6 +73,21 @@ class DiffTestTool(FuncToolBase):
           "When action is 'test', explain what mutation strategies were used to generate the original IR and what is expected. "
           "When action is 'confirm', explain why the difference is a real bug or not.",
         ),
+        FuncToolSpec.Param(
+          "test_index",
+          "integer",
+          False,
+          "The index of the test case in `tests_manager` that is being verified. "
+          "Required when action is 'test' and the test case is derived from an existing test.",
+        ),
+        FuncToolSpec.Param(
+          "covered_strategies",
+          "list[string]",
+          False,
+          "A list of strategy names from Phase 1 that this verification covers. "
+          "Required when action is 'test' and `test_index` is provided.",
+          schema={"type": "array", "items": {"type": "string"}},
+        ),
       ],
     )
 
@@ -85,6 +100,8 @@ class DiffTestTool(FuncToolBase):
     args: str = None,
     call_instr: str = None,
     is_bug: bool = None,
+    test_index: int = None,
+    covered_strategies: list[str] = None,
     **kwargs,
   ) -> str:
     if action == "confirm":
@@ -134,22 +151,26 @@ class DiffTestTool(FuncToolBase):
           call_instr = call_instr.strip()
           ret_instr = "ret void"
 
+        original_program = TEMPLATE.format(
+          ir=orig_ir_body,
+          type=call_type,
+          call_instr=call_instr.strip(),
+          ret_instr=ret_instr.strip(),
+        )
+
+        transformed_program = TEMPLATE.format(
+          ir=transformed_ir_body,
+          type=call_type,
+          call_instr=call_instr.strip(),
+          ret_instr=ret_instr.strip(),
+        )
+
         orig_ir_path.write_text(
-          TEMPLATE.format(
-            ir=orig_ir_body,
-            type=call_type,
-            call_instr=call_instr.strip(),
-            ret_instr=ret_instr.strip(),
-          ),
+          original_program,
           encoding="utf-8",
         )
         transformed_ir_path.write_text(
-          TEMPLATE.format(
-            ir=transformed_ir_body,
-            type=call_type,
-            call_instr=call_instr.strip(),
-            ret_instr=ret_instr.strip(),
-          ),
+          transformed_program,
           encoding="utf-8",
         )
 
@@ -186,13 +207,15 @@ class DiffTestTool(FuncToolBase):
             "found": False,
             "tool": "difftest",
             "action": "test",
-            "original_ir": orig_ir_body,
-            "transformed_ir": transformed_ir_body,
+            "original_ir": original_program,
+            "transformed_ir": transformed_program,
             "log": {
               "original_test_output": out1,
               "transformed_test_output": out2,
             },
             "thoughts": thoughts,
+            "test_index": test_index,
+            "covered_strategies": covered_strategies,
           }
         )
     else:

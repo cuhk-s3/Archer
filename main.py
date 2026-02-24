@@ -240,17 +240,11 @@ def generate_test(
     for action_str in relevant_actions:
       try:
         action = json_repair.loads(action_str)
-        # Check if it is a verification or differential testing result
-        if action.get("tool") in ["verify", "difftest"]:
-          has_verification = True
-          break
-        # Fallback for checking untagged results
-        if action.get("action") in ["test", "confirm"]:  # difftest actions
-          has_verification = True
-          break
-        if (
-          "original_ir" in action and "transformed_ir" in action
-        ):  # typical structure for verify output
+        # Check if the action is verify or difftest and is associated with the current test index
+        if action.get("test_index") == index and action.get("tool") in [
+          "verify",
+          "difftest",
+        ]:
           has_verification = True
           break
       except Exception:
@@ -258,8 +252,8 @@ def generate_test(
 
     if not has_verification:
       return False, (
-        f"You have not performed any `verify` or `difftest` actions since you retrieved test {index}. "
-        "You must verify the test case before marking it as tested. Do NOT fake a mark"
+        f"You have not performed any `verify` or `difftest` actions for test {index} since you retrieved it. "
+        "You must verify the test case before marking it as tested. Ensure you pass `test_index` and `covered_strategies` to verification tools."
       )
 
     return True, ""
@@ -302,6 +296,17 @@ def generate_test(
       try:
         bug = json_repair.loads(res)
         stats.test_traj.append(res)
+        idx = bug.get("test_index")
+        cov = bug.get("covered_strategies")
+        if idx is not None and cov:
+          invalid_strategies = [s for s in cov if s not in tests_tool.all_strategies]
+          if invalid_strategies:
+            return (
+              True,
+              f"Error: The following strategies are not valid Phase 1 strategies: {invalid_strategies}. "
+              f"Please provide valid strategy names from: {list(tests_tool.all_strategies)}.",
+            )
+          tests_tool.add_covered_strategies(idx, cov)
         if bug.get("found", False):
           stats.bugs.append(
             Bug(
@@ -317,6 +322,19 @@ def generate_test(
       try:
         diff_result = json.loads(res)
         stats.test_traj.append(res)
+
+        idx = diff_result.get("test_index")
+        cov = diff_result.get("covered_strategies")
+        if idx is not None and cov:
+          invalid_strategies = [s for s in cov if s not in tests_tool.all_strategies]
+          if invalid_strategies:
+            return (
+              True,
+              f"Error: The following strategies are not valid Phase 1 strategies: {invalid_strategies}. "
+              f"Please provide valid strategy names from: {list(tests_tool.all_strategies)}.",
+            )
+          tests_tool.add_covered_strategies(idx, cov)
+
         if diff_result.get("action") == "confirm":
           original_ir = "<missing>"
           transformed_ir = "<missing>"

@@ -30,9 +30,17 @@ class TestDiffTestTool(unittest.TestCase):
     args = "-S -passes=instcombine"
     call_instr = "call i32 @test(i32 1)"
     thoughts = "test thoughts"
+    test_index = 1
+    covered_strategies = ["strategy1"]
 
     result_json = self.tool._call(
-      orig_ir=orig_ir, args=args, call_instr=call_instr, thoughts=thoughts
+      action="test",
+      orig_ir=orig_ir,
+      args=args,
+      call_instr=call_instr,
+      thoughts=thoughts,
+      test_index=test_index,
+      covered_strategies=covered_strategies,
     )
     result = json.loads(result_json)
 
@@ -42,6 +50,8 @@ class TestDiffTestTool(unittest.TestCase):
     self.assertEqual(result["log"]["original_test_output"]["stdout"], "result: 42")
     self.assertEqual(result["log"]["transformed_test_output"]["return_code"], 0)
     self.assertEqual(result["thoughts"], "test thoughts")
+    self.assertEqual(result["test_index"], 1)
+    self.assertEqual(result["covered_strategies"], ["strategy1"])
 
     mock_transform.assert_called_once_with(orig_ir, args, self.tool.build_dir)
     self.assertEqual(mock_subprocess_run.call_count, 2)
@@ -71,7 +81,11 @@ class TestDiffTestTool(unittest.TestCase):
     thoughts = "test thoughts"
 
     result_json = self.tool._call(
-      orig_ir=orig_ir, args=args, call_instr=call_instr, thoughts=thoughts
+      action="test",
+      orig_ir=orig_ir,
+      args=args,
+      call_instr=call_instr,
+      thoughts=thoughts,
     )
     result = json.loads(result_json)
 
@@ -134,7 +148,11 @@ class TestDiffTestTool(unittest.TestCase):
 
     with self.assertRaises(FuncToolCallException) as cm:
       self.tool._call(
-        orig_ir=orig_ir, args=args, call_instr=call_instr, thoughts=thoughts
+        action="test",
+        orig_ir=orig_ir,
+        args=args,
+        call_instr=call_instr,
+        thoughts=thoughts,
       )
     self.assertIn("The provided call instruction is not valid", str(cm.exception))
 

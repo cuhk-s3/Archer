@@ -39,10 +39,34 @@ class VerifyTool(FuncToolBase):
           True,
           "The thoughts explaining what mutation strategies were used to generate the original IR and what is expected.",
         ),
+        FuncToolSpec.Param(
+          "test_index",
+          "integer",
+          False,
+          "The index of the test case in `tests_manager` that is being verified. "
+          "Required when the test case is derived from an existing test.",
+        ),
+        FuncToolSpec.Param(
+          "covered_strategies",
+          "list[string]",
+          False,
+          "A list of strategy names from Phase 1 that this verification covers. "
+          "Required when `test_index` is provided.",
+          schema={"type": "array", "items": {"type": "string"}},
+        ),
       ],
     )
 
-  def _call(self, *, orig_ir: str, args: str, thoughts: str, **kwargs) -> str:
+  def _call(
+    self,
+    *,
+    orig_ir: str,
+    args: str,
+    thoughts: str,
+    test_index: int = None,
+    covered_strategies: list[str] = None,
+    **kwargs,
+  ) -> str:
     if not (
       isinstance(orig_ir, str)
       and orig_ir.startswith("```llvm")
@@ -89,6 +113,8 @@ class VerifyTool(FuncToolBase):
             "transformed_ir": transformed_ir_code,
             "log": verification_result,
             "thoughts": thoughts,
+            "test_index": test_index,
+            "covered_strategies": covered_strategies,
           }
         )
       except CalledProcessError as e:

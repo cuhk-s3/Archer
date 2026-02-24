@@ -30,8 +30,16 @@ class TestVerifyTool(unittest.TestCase):
     orig_ir = "```llvm\n; original code\n```"
     args = "-passes=instcombine"
     thoughts = "test thoughts"
+    test_index = 1
+    covered_strategies = ["strategy1"]
 
-    result_json = self.tool._call(orig_ir=orig_ir, args=args, thoughts=thoughts)
+    result_json = self.tool._call(
+      orig_ir=orig_ir,
+      args=args,
+      thoughts=thoughts,
+      test_index=test_index,
+      covered_strategies=covered_strategies,
+    )
     result = json.loads(result_json)
 
     # Assertions
@@ -41,6 +49,8 @@ class TestVerifyTool(unittest.TestCase):
     self.assertEqual(result["transformed_ir"], "; transformed code")
     self.assertEqual(result["log"], "0 incorrect transformations")
     self.assertEqual(result["thoughts"], "test thoughts")
+    self.assertEqual(result["test_index"], 1)
+    self.assertEqual(result["covered_strategies"], ["strategy1"])
 
     self.assertEqual(mock_check_output.call_count, 2)
 

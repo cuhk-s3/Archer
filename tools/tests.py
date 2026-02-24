@@ -26,6 +26,13 @@ class TestsTool(FuncToolBase):
     self.all_strategies = {s.get("name") for s in self.strategies if s.get("name")}
     self.validator = validator
 
+  def add_covered_strategies(self, index: int, strategies: List[str]):
+    if index < 0 or index >= len(self.tests):
+      return
+    for s in strategies:
+      if s in self.all_strategies:
+        self.tests[index].covered_strategies.add(s)
+
   def get_uncovered_strategies(self, index: int) -> List[str]:
     if index < 0 or index >= len(self.tests):
       return []
@@ -57,13 +64,6 @@ class TestsTool(FuncToolBase):
           False,
           "The index of the test. Required when action is 'get' or 'mark_tested'.",
         ),
-        FuncToolSpec.Param(
-          "covered_strategies",
-          "list[string]",
-          False,
-          "A list of strategy names from Phase 1 that this specific test covers. Required when action is 'mark_tested'.",
-          schema={"type": "array", "items": {"type": "string"}},
-        ),
       ],
     )
 
@@ -72,7 +72,6 @@ class TestsTool(FuncToolBase):
     *,
     action: str,
     index: int = None,
-    covered_strategies: List[str] = None,
     **kwargs,
   ) -> str:
     if action == "list":
@@ -132,20 +131,11 @@ class TestsTool(FuncToolBase):
         raise FuncToolCallException(
           f"Invalid index {index}. Must be between 0 and {len(self.tests) - 1}."
         )
-      if covered_strategies is None:
-        raise FuncToolCallException(
-          "The 'covered_strategies' parameter is required for the 'mark_tested' action to indicate which Phase 1 strategies this test covers."
-        )
 
       if self.validator:
         is_valid, reason = self.validator(index)
         if not is_valid:
           return f"Test {index} NOT marked as tested. Reason: {reason}"
-
-      # Update covered strategies for this specific test
-      for s in covered_strategies:
-        if s in self.all_strategies:
-          self.tests[index].covered_strategies.add(s)
 
       uncovered_for_this_test = self.get_uncovered_strategies(index)
       if not uncovered_for_this_test:

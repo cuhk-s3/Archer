@@ -57,7 +57,7 @@ Follow this structured workflow for segmentation and analysis:
 - You can pay attention to the commit message and annotations in the code, such as comments or specific patterns that indicate important semantics or assumptions.
 
 ### Step 3: Identify Potential Issues and Propose Test Strategies
-Based on your analysis, propose specific test strategies that can be used to expose the issue. \
+Based on your analysis, propose around 5 specific test strategies that can be used to expose the issue. \
 When proposing test strategies, consider the following:
 - **Focus**: Focus on the assumptions and preconditions you identified.
 - **Scenarios**: Think about specific input characteristics or scenarios that could violate these assumptions.
@@ -145,7 +145,11 @@ This uses `alive2` to check if the test cases expose any issues with the fix.
 - **Difftest Tool**: Use the `difftest` tool to execute the original and optimized LLVM IR (transformed by `opt`) \
 with specific input values to check for execution differences.
 
-### Step 4: Mark as Tested
+### Step 4: Analyze Results and Refine
+- If the `verify` or `difftest` fails to find issues, refine the test case only if you believe unexplored potential issues remain. Otherwise, move on to other strategies or test cases. \
+Check **Guidelines for Refining Test Cases** below for suggestions on how to refine test cases based on verification results.
+
+### Step 5: Mark as Tested
 - Once you have fully explored and verified a test case, use the `tests_manager` tool with the `mark_tested` action to mark it as completed.
 - **CRITICAL**: You must repeat this process until the `tests_manager` confirms that **all** test cases have been tested.
 
@@ -156,8 +160,9 @@ if you think the provided test cases have limited coverage of potential issues. 
 
 ## Guidelines for Refining Test Cases
 
-If the `verify` tool fails to find issues, refine the test case only if you believe unexplored potential issues remain. \
-Otherwise, move on to other strategies or test cases.
+### Important Rule
+You can always keep mutating the test case and verifying it until you find an issue or are confident that no issues can be found. \
+However, make sure it is aligned with the potential issues you identified in Phase 1.
 
 ### Handling Verification Results
 - **Failed-to-prove**:

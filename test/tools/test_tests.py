@@ -76,6 +76,27 @@ class TestTestsTool(unittest.TestCase):
     self.assertTrue(list_res["all_tested"])
     self.assertIn("message", list_res)
 
+  def test_tests_tool_mark_tested_with_strategies(self):
+    tests = [
+      Test(test_name="test1", test_body="body1", commands=["cmd1"]),
+    ]
+    strategies = [{"name": "strat1"}, {"name": "strat2"}]
+    tool = TestsTool(tests, strategies=strategies)
+
+    # Try to mark as tested without covering strategies
+    res_str = tool._call(action="mark_tested", index=0)
+    self.assertIn("because the following strategies are still uncovered", res_str)
+    self.assertFalse(tests[0].tested)
+
+    # Cover strategies
+    tool.add_covered_strategies(0, ["strat1"])
+    tool.add_covered_strategies(0, ["strat2"])
+
+    # Mark as tested again
+    res_str = tool._call(action="mark_tested", index=0)
+    self.assertIn("Test 0 marked as tested", res_str)
+    self.assertTrue(tests[0].tested)
+
   def test_tests_tool_invalid_actions(self):
     tests = [Test(test_name="test1", test_body="body1", commands=["cmd1"])]
     tool = TestsTool(tests)
