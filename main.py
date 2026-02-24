@@ -224,7 +224,47 @@ def generate_test(
         Test(test_name=test_name, test_body=test_body, commands=commands)
       )
 
-  tests_tool = TestsTool(test_objects, strategies=stats.strategies)
+  test_get_timestamps = {}
+
+  def validator(index: int) -> Tuple[bool, str]:
+    if index not in test_get_timestamps:
+      return (
+        False,
+        f"You must call `tests_manager` with action='get' and index={index} before marking it as tested.",
+      )
+
+    start_time = test_get_timestamps[index]
+    relevant_actions = stats.test_traj[start_time:]
+
+    has_verification = False
+    for action_str in relevant_actions:
+      try:
+        action = json_repair.loads(action_str)
+        # Check if it is a verification or differential testing result
+        if action.get("tool") in ["verify", "difftest"]:
+          has_verification = True
+          break
+        # Fallback for checking untagged results
+        if action.get("action") in ["test", "confirm"]:  # difftest actions
+          has_verification = True
+          break
+        if (
+          "original_ir" in action and "transformed_ir" in action
+        ):  # typical structure for verify output
+          has_verification = True
+          break
+      except Exception:
+        pass
+
+    if not has_verification:
+      return False, (
+        f"You have not performed any `verify` or `difftest` actions since you retrieved test {index}. "
+        "You must verify the test case before marking it as tested. Do NOT fake a mark"
+      )
+
+    return True, ""
+
+  tests_tool = TestsTool(test_objects, strategies=stats.strategies, validator=validator)
   agent.register_tool(tests_tool, MAX_TCS_GET_CONTEXT * 2)
 
   console.print("Phase 2: Generating and verifying test cases ...")
@@ -245,8 +285,19 @@ def generate_test(
       " If you already called the `report` tool, please check the format and try again."
     )
 
-  def tool_call_handler(name: str, _: str, res: str) -> Tuple[bool, str]:
+  def tool_call_handler(name: str, args: str, res: str) -> Tuple[bool, str]:
     ensure_tools_available(agent, ["report", "verify", "difftest", "tests_manager"])
+
+    if name == "tests_manager":
+      try:
+        args_obj = json.loads(args)
+        if args_obj.get("action") == "get":
+          idx = args_obj.get("index")
+          if idx is not None:
+            test_get_timestamps[int(idx)] = len(stats.test_traj)
+      except Exception:
+        pass
+
     if name == "verify":
       try:
         bug = json_repair.loads(res)

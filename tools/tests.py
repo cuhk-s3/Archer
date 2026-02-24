@@ -15,14 +15,16 @@ class Test:
 
 
 class TestsTool(FuncToolBase):
-  def __init__(self, tests: List[Test], strategies: List[dict] = None):
+  def __init__(self, tests: List[Test], strategies: List[dict] = None, validator=None):
     """
     tests should be a list of Test objects.
     strategies should be a list of strategy dictionaries from Phase 1.
+    validator should be a callable that takes the test index being marked and returns (bool, str).
     """
     self.tests = tests
     self.strategies = strategies or []
     self.all_strategies = {s.get("name") for s in self.strategies if s.get("name")}
+    self.validator = validator
 
   def get_uncovered_strategies(self, index: int) -> List[str]:
     if index < 0 or index >= len(self.tests):
@@ -134,6 +136,11 @@ class TestsTool(FuncToolBase):
         raise FuncToolCallException(
           "The 'covered_strategies' parameter is required for the 'mark_tested' action to indicate which Phase 1 strategies this test covers."
         )
+
+      if self.validator:
+        is_valid, reason = self.validator(index)
+        if not is_valid:
+          return f"Test {index} NOT marked as tested. Reason: {reason}"
 
       # Update covered strategies for this specific test
       for s in covered_strategies:
