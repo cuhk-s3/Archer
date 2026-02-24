@@ -424,7 +424,7 @@ def run_mini_agent(
       bug_type=fixenv.get_bug_type(),
       component=", ".join(fixenv.get_hint_components()),
       patch=fixenv.get_reference_patch(),
-      # knowledge=get_component_knowledge(fixenv.get_hint_components()),
+      knowledge=get_component_knowledge(fixenv.get_hint_components()),
     )
   )
 

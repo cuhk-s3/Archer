@@ -91,6 +91,18 @@ For each potential issue you identified, propose specific test strategies with t
 
 ---
 
+## Subsystem Knowledge for {component}
+
+For reference, here are some key points about the {component} you should consider (but do not limit to these) in your analysis:
+
+{knowledge}
+
+**CRITICAL**: Subsystem knowledge is **ONLY** a reference for you to understand this component.
+Your analysis should not be limited to the provided knowledge. You should also try to understand the fix from \
+other perspectives and identify potential issues that are not mentioned in the provided knowledge.
+
+---
+
 ## Tools that you can use
 
 - `findN`: Search for files in the LLVM codebase related to the component or optimization pass to understand the context of the fix and find relevant tests.
