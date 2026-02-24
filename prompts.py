@@ -133,23 +133,28 @@ Follow this structured workflow:
 - Use the `tests_manager` tool with the `get` action to retrieve the full details of an untested test case.
 - Select a test case that is most relevant to the issues you identified in Phase 1.
 
-### Step 2: Apply Mutations
+### Step 2: Understand the Test Case
+- Analyze the selected test case to understand its structure, input characteristics, and what it is testing.
+- Call the `verify` tool to see how the LLVM IR code in the test case is transformed by the optimization pass. \
+This can help you understand the semantics of the test case and how it relates to the fix.
+
+### Step 3: Apply Mutations
 For the selected test case, apply mutations according to your proposed test strategies:
 - **Focus**: Ensure the mutations focus on exposing the potential issues identified in Phase 1.
 - **Format**: Provide each mutated test case in a separate ```llvm ... ``` code block.
 - **Coverage**: **CRITICAL**: You must cover all the proposed test strategies across different test cases to ensure comprehensive testing of potential issues.
 
-### Step 3: Verify and Test
+### Step 4: Verify and Test
 - **Verify Tool**: Use the `verify` tool to submit the generated test cases along with your reasoning. \
 This uses `alive2` to check if the test cases expose any issues with the fix.
 - **Difftest Tool**: Use the `difftest` tool to execute the original and optimized LLVM IR (transformed by `opt`) \
 with specific input values to check for execution differences.
 
-### Step 4: Analyze Results and Refine
+### Step 5: Analyze Results and Refine
 - If the `verify` or `difftest` fails to find issues, refine the test case only if you believe unexplored potential issues remain. Otherwise, move on to other strategies or test cases. \
 Check **Guidelines for Refining Test Cases** below for suggestions on how to refine test cases based on verification results.
 
-### Step 5: Mark as Tested
+### Step 6: Mark as Tested
 - Once you have fully explored and verified a test case, use the `tests_manager` tool with the `mark_tested` action to mark it as completed.
 - **CRITICAL**: You must repeat this process until the `tests_manager` confirms that **all** test cases have been tested.
 
