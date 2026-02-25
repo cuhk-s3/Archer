@@ -428,21 +428,32 @@ def generate_test(
         return (True, res)  # Continue the process with an error message
     if name != "report":
       return True, res  # Continue the process
+
+    try:
+      # The report tool returns a parseable JSON string
+      report_data = json.loads(res)
+    except Exception:
+      return (True, res)  # Continue the process with an error message
+
+    force_stop = report_data.get("force", False)
     all_tested = all(t.tested for t in test_objects)
-    if not all_tested:
+
+    if not all_tested and not force_stop:
       return True, (
         "Error: You cannot call `report` yet "
         "because not all tests have been marked as tested (which requires covering all strategies per test). "
         "Please use `tests_manager` to check untested tests, "
-        "test them, and mark them as tested."
+        "test them, and mark them as tested. "
+        "If you have already found at least one bug and want to stop immediately, set `force=True` in `report`."
       )
 
-    try:
-      # The report tool returns a parseable JSON string
-      json.loads(res)
-    except Exception:
-      return (True, res)  # Continue the process with an error message
-    stats.report = json.loads(res).get("thoughts", None)
+    if force_stop and not stats.bugs:
+      return True, (
+        "Error: You cannot use `force=True` in `report` because no bugs have been found yet. "
+        "Please verify the bug using `verify` or `difftest` tools first."
+      )
+
+    stats.report = report_data.get("thoughts", None)
     return False, res  # Stop the process with the result
 
   ret = agent.run(

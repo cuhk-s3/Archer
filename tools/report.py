@@ -33,10 +33,16 @@ class ReportTool(FuncToolBase):
           '1. "Bug Triggering Analysis" for why the provided test can trigger the bug, and '
           '2. "Fix Weakness Analysis" for why the provided test can reveal the weakness.',
         ),
+        FuncToolSpec.Param(
+          "force",
+          "boolean",
+          False,
+          "Set to true ONLY if you have already found at least one bug AND you are certain that no further testing is required.",
+        ),
       ],
     )
 
-  def _call(self, *, test: list[str], thoughts: str) -> str:
+  def _call(self, *, test: list[str], thoughts: str, force: bool = False) -> str:
     if not isinstance(test, list) or len(test) != 2:
       raise FuncToolCallException(f"Test must be a list of two elements: {test}")
     if not (
@@ -51,6 +57,7 @@ class ReportTool(FuncToolBase):
       {
         "test": [test[0].strip(), test[1].strip()],
         "thoughts": thoughts.strip(),
+        "force": force,
       },
       indent=2,
     )
