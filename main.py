@@ -227,27 +227,39 @@ def get_component_knowledge(component: List[str]) -> str:
   return "\n".join(knowledge)
 
 
+class RepeatedToolCallLimitExceeded(Exception):
+  pass
+
+
 def check_duplicate_tool_call(
-  name: str, args: str, executed_tool_calls: set
+  name: str, args: object, executed_tool_calls: set, consecutive_duplicates: List[int]
 ) -> Optional[str]:
   try:
-    # Use json_repair to handle partially malformed JSON
-    obj = json_repair.loads(args)
+    if isinstance(args, str):
+      # Use json_repair to handle partially malformed JSON string
+      obj = json_repair.loads(args)
+    else:
+      # If args is already a dict (or list), use it directly
+      obj = args
     # Ensure consistent string representation
     normalized_args = json.dumps(obj, sort_keys=True)
   except Exception:
     # Fallback to simple string normalization if JSON parsing fails entirely
     # Remove whitespace to be safer against formatting changes
-    normalized_args = "".join(args.split())
+    normalized_args = "".join(str(args).split())
 
   call_signature = (name, normalized_args)
   if call_signature in executed_tool_calls:
+    consecutive_duplicates[0] += 1
+    if consecutive_duplicates[0] >= 5:
+      raise RepeatedToolCallLimitExceeded("Too many consecutive duplicate tool calls.")
     return (
       f"Error: You have already executed the tool '{name}' with these exact arguments. "
       "Please change your arguments or thoughts to try a different approach. "
       "Repeating the same action will not yield new results."
     )
   executed_tool_calls.add(call_signature)
+  consecutive_duplicates[0] = 0
   return None
 
 
@@ -314,6 +326,17 @@ def generate_test(
   )
 
   executed_tool_calls = set()
+  consecutive_duplicates = [0]
+
+  # Set up pre-check handler to prevent duplicate tool calls
+  def tool_pre_check(name: str, args: dict) -> Optional[str]:
+    # Check for duplicate tool calls BEFORE execution
+    nonlocal executed_tool_calls, consecutive_duplicates
+    return check_duplicate_tool_call(
+      name, args, executed_tool_calls, consecutive_duplicates
+    )
+
+  agent.set_tool_pre_check_handler(tool_pre_check)
 
   def response_handler(_: str) -> Tuple[bool, str]:
     ensure_tools_available(agent, ["report"])
@@ -327,10 +350,7 @@ def generate_test(
     )
 
   def tool_call_handler(name: str, args: str, res: str) -> Tuple[bool, str]:
-    # Check for duplicate tool calls
-    nonlocal executed_tool_calls
-    if dup_msg := check_duplicate_tool_call(name, args, executed_tool_calls):
-      return True, dup_msg
+    # Note: Duplicate checking is now handled by tool_pre_check_handler in AgentBase
 
     ensure_tools_available(agent, ["report", "verify", "difftest", "tests_manager"])
 
@@ -509,6 +529,17 @@ def run_mini_agent(
   )
 
   executed_tool_calls = set()
+  consecutive_duplicates = [0]
+
+  # Set up pre-check handler to prevent duplicate tool calls
+  def tool_pre_check(name: str, args: dict) -> Optional[str]:
+    # Check for duplicate tool calls BEFORE execution
+    nonlocal executed_tool_calls, consecutive_duplicates
+    return check_duplicate_tool_call(
+      name, args, executed_tool_calls, consecutive_duplicates
+    )
+
+  agent.set_tool_pre_check_handler(tool_pre_check)
 
   def response_handler(_: str) -> Tuple[bool, str]:
     ensure_tools_available(agent, ["stop"])
@@ -522,11 +553,7 @@ def run_mini_agent(
     )
 
   def tool_call_handler(name: str, args: str, res: str) -> Tuple[bool, str]:
-    if name != "stop":
-      # Check for duplicate tool calls
-      nonlocal executed_tool_calls
-      if dup_msg := check_duplicate_tool_call(name, args, executed_tool_calls):
-        return True, dup_msg
+    # Note: Duplicate checking is now handled by tool_pre_check_handler in AgentBase
 
     ensure_tools_available(agent, ["stop"])
     if name != "stop":

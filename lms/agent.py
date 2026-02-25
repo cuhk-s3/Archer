@@ -88,6 +88,7 @@ class AgentBase:
       "total_tokens": 0,
       "total_cost": 0.0,
     }
+    self.tool_pre_check_handler = None
     self.console = get_boxed_console(debug_mode=debug_mode)
 
   def is_debug_mode(self):
@@ -106,6 +107,11 @@ class AgentBase:
       "Registering tool: " + tool.name() + " (budget=" + str(budget) + ")"
     )
     self.tools.register(tool, budget)
+
+  def set_tool_pre_check_handler(
+    self, handler: Callable[[str, dict], Union[str, None]]
+  ):
+    self.tool_pre_check_handler = handler
 
   @abstractmethod
   def run(
@@ -157,6 +163,13 @@ class AgentBase:
     )
 
   def perform_tool_call(self, tool_name: str, tool_args: dict) -> str:
+    if self.tool_pre_check_handler:
+      if skip_msg := self.tool_pre_check_handler(tool_name, tool_args):
+        self.console.printb(
+          title=f"Tool Execution Skipped ({tool_name})", message=skip_msg
+        )
+        return skip_msg
+
     MAX_TOOL_CALL_OUTPUT_LINES = 500
     res = remove_path_from_output(self.tools.call(tool_name, **tool_args))
     lines = res.splitlines()
