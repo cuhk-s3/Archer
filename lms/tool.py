@@ -138,12 +138,18 @@ class ToolRegistry:
 
   def register(self, tool: FuncToolBase, budget: int = sys.maxsize):
     if tool.name() in self.tools:
-      raise ValueError(f"Tool with name {tool.name()} is already registered.")
+      # Allow overwriting for now, or just warn. Main.py logic might re-register.
+      self.tools[tool.name()] = [tool, budget, budget]
+      return
     self.tools[tool.name()] = [
       tool,  # The tool itself
       budget,  # Remaining budget
       budget,  # Total budget
     ]
+
+  def remove_tool(self, name: str):
+    if name in self.tools:
+      del self.tools[name]
 
   def get(self, name: str) -> FuncToolBase:
     self._ensure_registered(name)

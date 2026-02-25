@@ -167,9 +167,13 @@ def ensure_tools_available(agent: AgentBase, tools: List[str]):
 
 
 def get_tool_list(
-  fixenv: Environment, llvm: LLVM, build_dir: str, debugger: DebuggerBase = None
+  fixenv: Environment,
+  llvm: LLVM,
+  build_dir: str,
+  debugger: DebuggerBase = None,
+  phase: int = 0,
 ):
-  return [
+  common_tools = [
     # General tools
     (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     (GrepNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
@@ -177,14 +181,31 @@ def get_tool_list(
     (ReadNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
     # LLVM-specific tools
     (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
-    (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
-    (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
-    (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
-    # Stop the analysis (Phase 1)
-    (StopTool(), MAX_TCS_GET_CONTEXT),
-    # Report the bug (Phase 2)
-    (ReportTool(), MAX_TCS_GET_CONTEXT),
   ]
+
+  if phase == 1:
+    return common_tools + [
+      # Stop the analysis (Phase 1)
+      (StopTool(), MAX_TCS_GET_CONTEXT),
+    ]
+  elif phase == 2:
+    return common_tools + [
+      # LLVM-specific tools for Phase 2
+      (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
+      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
+      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
+      # Report the bug (Phase 2)
+      (ReportTool(), MAX_TCS_GET_CONTEXT),
+    ]
+  else:
+    # Default behavior: return all tools (maybe for retro-compatibility or fallback)
+    return common_tools + [
+      (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
+      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
+      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
+      (StopTool(), MAX_TCS_GET_CONTEXT),
+      (ReportTool(), MAX_TCS_GET_CONTEXT),
+    ]
 
 
 def get_component_knowledge(component: List[str]) -> str:
@@ -204,6 +225,30 @@ def get_component_knowledge(component: List[str]) -> str:
   knowledge = [f.read_text(encoding="utf-8") for f in knowledge_file]
 
   return "\n".join(knowledge)
+
+
+def check_duplicate_tool_call(
+  name: str, args: str, executed_tool_calls: set
+) -> Optional[str]:
+  try:
+    # Use json_repair to handle partially malformed JSON
+    obj = json_repair.loads(args)
+    # Ensure consistent string representation
+    normalized_args = json.dumps(obj, sort_keys=True)
+  except Exception:
+    # Fallback to simple string normalization if JSON parsing fails entirely
+    # Remove whitespace to be safer against formatting changes
+    normalized_args = "".join(args.split())
+
+  call_signature = (name, normalized_args)
+  if call_signature in executed_tool_calls:
+    return (
+      f"Error: You have already executed the tool '{name}' with these exact arguments. "
+      "Please change your arguments or thoughts to try a different approach. "
+      "Repeating the same action will not yield new results."
+    )
+  executed_tool_calls.add(call_signature)
+  return None
 
 
 def generate_test(
@@ -268,6 +313,8 @@ def generate_test(
     )
   )
 
+  executed_tool_calls = set()
+
   def response_handler(_: str) -> Tuple[bool, str]:
     ensure_tools_available(agent, ["report"])
     return True, (
@@ -280,6 +327,11 @@ def generate_test(
     )
 
   def tool_call_handler(name: str, args: str, res: str) -> Tuple[bool, str]:
+    # Check for duplicate tool calls
+    nonlocal executed_tool_calls
+    if dup_msg := check_duplicate_tool_call(name, args, executed_tool_calls):
+      return True, dup_msg
+
     ensure_tools_available(agent, ["report", "verify", "difftest", "tests_manager"])
 
     if name == "tests_manager":
@@ -423,6 +475,7 @@ def run_mini_agent(
   fixenv: Environment,
   llvm: LLVM,
   stats: RunStats,
+  build_dir: str,
   debugger: DebuggerBase = None,
 ) -> Optional[str]:
   agent.clear_history()
@@ -444,6 +497,8 @@ def run_mini_agent(
     )
   )
 
+  executed_tool_calls = set()
+
   def response_handler(_: str) -> Tuple[bool, str]:
     ensure_tools_available(agent, ["stop"])
     return True, (
@@ -455,7 +510,13 @@ def run_mini_agent(
       " If you already called the `stop` tool, please check the format and try again."
     )
 
-  def tool_call_handler(name: str, _: str, res: str) -> Tuple[bool, str]:
+  def tool_call_handler(name: str, args: str, res: str) -> Tuple[bool, str]:
+    if name != "stop":
+      # Check for duplicate tool calls
+      nonlocal executed_tool_calls
+      if dup_msg := check_duplicate_tool_call(name, args, executed_tool_calls):
+        return True, dup_msg
+
     ensure_tools_available(agent, ["stop"])
     if name != "stop":
       return True, res  # Continue the process
@@ -476,9 +537,6 @@ def run_mini_agent(
       f"grep{MAX_ROLS_PER_TC}",
       # Documentation tools
       "langref",
-      "trans",
-      "verify",
-      "difftest",
       # Stop tool to finish the analysis
       "stop",
     ],
@@ -511,6 +569,16 @@ def run_mini_agent(
   stats.reason_thou = reasoning_thoughts
   stats.strategies = [s.as_dict() for s in test_strategies]
 
+  tools_phase2 = get_tool_list(fixenv, llvm, build_dir, debugger, phase=2)
+  try:
+    if hasattr(agent.tools, "remove_tool"):
+      agent.tools.remove_tool("stop")
+  except Exception:
+    pass
+
+  for to, th in tools_phase2:
+    agent.register_tool(to, th)
+
   return generate_test(
     agent=agent,
     fixenv=fixenv,
@@ -528,8 +596,9 @@ def autoreview(
 ):
   debugger = None
 
-  tools = get_tool_list(fixenv, llvm, build_dir, debugger)
-  for to, th in tools:
+  # Register Phase 1 tools
+  tools_phase1 = get_tool_list(fixenv, llvm, build_dir, debugger, phase=1)
+  for to, th in tools_phase1:
     agent.register_tool(to, th)
 
   return run_mini_agent(
@@ -538,6 +607,7 @@ def autoreview(
     fixenv=fixenv,
     llvm=llvm,
     stats=stats,
+    build_dir=build_dir,
   )
 
 
