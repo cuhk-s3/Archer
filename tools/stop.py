@@ -38,6 +38,7 @@ class StopTool(FuncToolBase):
           True,
           "The detailed thoughts for diagnosing the fix including "
           '1. "Fix Understanding", '
+          '2. "Formal Semantic Modeling", '
           '2. "Assumptions Identified", '
           '3. "Potential Cases to Break Assumptions", and '
           '4. "Test Strategies".',

@@ -28,6 +28,17 @@ This is a patch for fixing {bug_type} bugs in {component}:
 
 {patch}
 
+---
+
+## Subsystem Knowledge for {component}
+
+For reference, here are some key points about the {component} you should consider (but do not limit to these) in your analysis:
+
+{knowledge}
+
+**CRITICAL**: Subsystem knowledge is **ONLY** a reference for you to understand this component.
+Do NOT start your analysis from these patterns. Start from the patch semantics. Use these **ONLY** to cross-check your reasoning.
+
 ## Your Task for Phase 1
 
 In this phase, you will review and analyze the fix above carefully and identify potential issues, edge cases, or gaps that the fix might miss. \
@@ -56,7 +67,12 @@ Follow this structured workflow for segmentation and analysis:
 - You can use the `langref` tool to query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.
 - You can pay attention to the commit message and annotations in the code, such as comments or specific patterns that indicate important semantics or assumptions.
 
-### Step 3: Identify Potential Issues and Propose Test Strategies
+### Step 3: Formal Semantic Modeling
+- Define the exact semantic contract that this fix claims to satisfy.
+- Explicitly list the preconditions under which the contract is assumed to hold.
+- Identify how these preconditions may be violated.
+
+### Step 4: Identify Potential Issues and Propose Test Strategies
 Based on your analysis, propose around 5 specific test strategies that can be used to expose the issue. \
 When proposing test strategies, consider the following:
 - **Focus**: Focus on the assumptions and preconditions you identified.
@@ -72,34 +88,28 @@ Follow this structure for reasoning:
 - What optimization or transformation does this fix enable or correct?
 - What are the key changes made in the patch?
 
-### 2. Assumptions and Preconditions Identified
+### 2. Formal Semantic Modeling
+- What is the exact semantic function before the fix?
+- What is the exact semantic function after the fix?
+- Under what conditions might they differ?
+- Provide at least one concrete numerical instantiation to illustrate the difference.
+
+### 3. Assumptions and Preconditions Identified
 - What assumptions does the fix make about the input?
 - What preconditions must hold for this fix to be correct?
 
-### 3. Potential Cases to Break Assumptions
+### 4. Potential Cases to Break Assumptions
 For each assumption and precondition identified, describe specific scenarios \
 or input characteristics that could violate them. The potential cases should \
 only focus on the semantics related to the analysis above.
 
-### 4. Test Strategies
+### 5. Test Strategies
 For each potential issue you identified, propose specific test strategies with the following structure:
 
 - Name: [Name]
 - Target: [What to mutate]
 - Rationale: [Why this might expose an issue]
 - Expected Issue: [What incorrect behavior might occur]
-
----
-
-## Subsystem Knowledge for {component}
-
-For reference, here are some key points about the {component} you should consider (but do not limit to these) in your analysis:
-
-{knowledge}
-
-**CRITICAL**: Subsystem knowledge is **ONLY** a reference for you to understand this component.
-Your analysis should not be limited to the provided knowledge. You should also try to understand the fix from \
-other perspectives and identify potential issues that are not mentioned in the provided knowledge.
 
 ---
 
@@ -128,10 +138,10 @@ You must ensure that **every test case** managed by the `tests_manager` is proce
 
 Follow this structured workflow:
 
-### Step 1: Retrieve and Select Test Cases
+### Step 1: Retrieve and Prioritize Test Cases
 - Use the `tests_manager` tool with the `list` action to see all available test cases and their current status.
 - Use the `tests_manager` tool with the `get` action to retrieve the full details of an untested test case.
-- Select a test case that is most relevant to the issues you identified in Phase 1.
+- Due to context length and round limit, you should prioritize test cases that are more relevant to the identified issues.
 
 ### Step 2: Understand the Test Case
 - Analyze the selected test case to understand its structure, input characteristics, and what it is testing.
@@ -157,6 +167,8 @@ Check **Guidelines for Refining Test Cases** below for suggestions on how to ref
 ### Step 6: Mark as Tested
 - Once you have fully explored and verified a test case, use the `tests_manager` tool with the `mark_tested` action to mark it as completed.
 - **CRITICAL**: You must repeat this process until the `tests_manager` confirms that **all** test cases have been tested.
+
+Repeat the above steps for each test case until all test cases in the `tests_manager` are marked as tested.
 
 You are also allowed to generate tests from scratch or find more related tests from the LLVM test suite by using `find` or `list` tools and reading them with `read` or `grep` tools \
 if you think the provided test cases have limited coverage of potential issues. Make sure you call `verify` and `difftest` tools to check the validity of these test cases and confirm whether the issues can be exposed by actual execution.
