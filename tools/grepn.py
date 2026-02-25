@@ -54,7 +54,7 @@ class GrepNTool(FuncToolBase):
     k -= 1  # Convert to 0-based index
     if k >= len(lines):
       raise FuncToolCallException(
-        f"Index {k + 1} is out of bounds for the results (total results: {len(lines)})."
+        f"Index {k + 1} is out of bounds for the results (total results: {len(lines)}). It must be between 1 and {len(lines)}."
       )
     selected = lines[k : k + self.n]
     return "".join(selected)  # Return the selected lines as a single string

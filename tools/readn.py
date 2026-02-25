@@ -42,7 +42,7 @@ class ReadNTool(FuncToolBase, LlvmDirMixin):
     start_pos = position - 1  # Convert to 0-based index
     if start_pos >= len(lines):
       raise FuncToolCallException(
-        f"Position {position} is out of bounds for the file {file} (total lines: {len(lines)})."
+        f"Position {position} is out of bounds for the file {file} (total lines: {len(lines)}). It must be between 1 and {len(lines)}."
       )
     end_pos = min(start_pos + self.n, len(lines))
     selected = lines[start_pos:end_pos]

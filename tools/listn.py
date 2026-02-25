@@ -48,6 +48,6 @@ class ListNTool(FuncToolBase, LlvmDirMixin):
       raise FuncToolCallException(f"Failed to list the directory {directory}. {e}")
     if k >= len(results):
       raise FuncToolCallException(
-        f"Index {k + 1} is out of bounds for the contents (total contents: {len(results)})."
+        f"Index {k + 1} is out of bounds for the contents (total contents: {len(results)}). It must be between 1 and {len(results)}."
       )
     return "\n".join(results[k : k + self.n]) or "The directory is empty."

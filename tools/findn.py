@@ -48,7 +48,7 @@ class FindNTool(FuncToolBase, LlvmDirMixin):
     k -= 1  # Convert to 0-based index
     if k >= len(results):
       raise FuncToolCallException(
-        f"Index {k + 1} is out of bounds for the results (total results: {len(results)})."
+        f"Index {k + 1} is out of bounds for the results (total results: {len(results)}). It must be between 1 and {len(results)}."
       )
     selected = results[k : k + self.n]
     return "\n".join(selected)  # Return the selected files as a single string
