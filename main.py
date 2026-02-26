@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from argparse import ArgumentParser
 from dataclasses import asdict, dataclass, field
@@ -251,7 +252,7 @@ def check_duplicate_tool_call(
   call_signature = (name, normalized_args)
   if call_signature in executed_tool_calls:
     consecutive_duplicates[0] += 1
-    if consecutive_duplicates[0] >= 10:
+    if consecutive_duplicates[0] >= 5:
       raise RepeatedToolCallLimitExceeded()
     return (
       f"Error: You have already executed the tool '{name}' with these exact arguments. "
@@ -387,6 +388,12 @@ def generate_test(
               thoughts=bug.get("thoughts"),
             )
           )
+
+        log = bug.get("log", "")
+        if "failed-to-prove transformations" in log:
+          match = re.search(r"(\d+)\s+failed-to-prove transformations", log)
+          if match and int(match.group(1)) > 0:
+            res += "\n\nHint: There are failed-to-prove transformations. You should consider using the `difftest` tool to verify the correctness of this case."
       except Exception:
         return (True, res)  # Continue the process with an error message
     if name == "difftest":
