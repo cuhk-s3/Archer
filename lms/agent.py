@@ -59,6 +59,11 @@ class ReachTokenLimit(StopIteration):
     super().__init__("Reached the token limit for agent execution.")
 
 
+class RepeatedToolCallLimitExceeded(StopIteration):
+  def __init__(self):
+    super().__init__("Too many consecutive duplicate tool calls.")
+
+
 class AgentBase:
   def __init__(
     self,

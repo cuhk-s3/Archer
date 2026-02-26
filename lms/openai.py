@@ -19,6 +19,7 @@ from lms.agent import (
   ChatMessageMessage,
   ReachRoundLimit,
   ReachTokenLimit,
+  RepeatedToolCallLimitExceeded,
   ResponseHandler,
   ToolUseHandler,
 )
@@ -160,6 +161,8 @@ class OpenAIAgent(AgentBase):
           if isinstance(arguments, str):
             arguments = json.loads(arguments)
           result = self.perform_tool_call(name, arguments)
+        except RepeatedToolCallLimitExceeded:
+          raise
         except Exception as e:
           result = f"Error: Failed to parse tool arguments as JSON: {e}. Please check your tool call format and try again."
         self.append_function_tool_call_output(call_id=tool_call.id, result=result)

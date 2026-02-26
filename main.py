@@ -20,7 +20,7 @@ from llvm.llvm_helper import (
   reset,
   set_llvm_build_dir,
 )
-from lms.agent import AgentBase
+from lms.agent import AgentBase, RepeatedToolCallLimitExceeded
 from tools.difftest import DiffTestTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
@@ -227,10 +227,6 @@ def get_component_knowledge(component: List[str]) -> str:
   return "\n".join(knowledge)
 
 
-class RepeatedToolCallLimitExceeded(Exception):
-  pass
-
-
 def check_duplicate_tool_call(
   name: str, args: object, executed_tool_calls: set, consecutive_duplicates: List[int]
 ) -> Optional[str]:
@@ -248,15 +244,19 @@ def check_duplicate_tool_call(
     # Remove whitespace to be safer against formatting changes
     normalized_args = "".join(str(args).split())
 
+  # Only check for duplicates for specific tools
+  if not any(name.startswith(prefix) for prefix in ["find", "grep", "read", "list"]):
+    return None
+
   call_signature = (name, normalized_args)
   if call_signature in executed_tool_calls:
     consecutive_duplicates[0] += 1
-    if consecutive_duplicates[0] >= 5:
-      raise RepeatedToolCallLimitExceeded("Too many consecutive duplicate tool calls.")
+    if consecutive_duplicates[0] >= 10:
+      raise RepeatedToolCallLimitExceeded()
     return (
       f"Error: You have already executed the tool '{name}' with these exact arguments. "
       "Please change your arguments or thoughts to try a different approach. "
-      "Repeating the same action will not yield new results."
+      "Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
     )
   executed_tool_calls.add(call_signature)
   consecutive_duplicates[0] = 0
