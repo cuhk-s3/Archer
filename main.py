@@ -61,6 +61,8 @@ LLUBI_PATH = os.environ.get("LAB_LLVM_LLUBI", None)
 # - Statistis and output
 # - ================================================
 
+console = get_boxed_console(debug_mode=True)
+
 
 def panic(msg: str):
   console.print(f"Error: {msg}", color="red")
