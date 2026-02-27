@@ -181,7 +181,7 @@ class MyEnvironment(LocalEnvironment):
         }
       )
     command = shlex.join(["bash", "-c", f". {self.shim_path} && {cmd}"])
-    if cmd.startswith("opt"):
+    if "alive-tv" in cmd:
       try:
         result = subprocess.run(
           command,
@@ -195,10 +195,25 @@ class MyEnvironment(LocalEnvironment):
           stdout=subprocess.PIPE,
           stderr=subprocess.STDOUT,
         )
-        m = re.search(r"(\d+)\s+incorrect transformations", result.stdout)
-        if m and int(m.group(1)) > 0:
-          self.stats.bugs.append(result.stdout)
+        if result.returncode == 0:  # Check return code or output for errors
+          m = re.search(r"(\d+)\s+incorrect transformations", result.stdout)
+          if m and int(m.group(1)) > 0:
+            self.stats.bugs.append(result.stdout)
+        self.stats.test_traj.append(
+          {
+            "command": cmd,
+            "output": result.stdout,
+            "returncode": result.returncode,
+          }
+        )
       except Exception as e:
+        self.stats.test_traj.append(
+          {
+            "command": cmd,
+            "output": str(e),
+            "returncode": -1,
+          }
+        )
         console.print(f"Error executing command '{cmd}': {e}", color="red")
         pass
     action["command"] = command
@@ -292,6 +307,12 @@ def parse_args():
     default=False,
     help="Enable debug mode for more verbose output (default: False).",
   )
+  parser.add_argument(
+    "--history",
+    type=str,
+    default=None,
+    help="Path to save the agent execution history (trajectory).",
+  )
   return parser.parse_args()
 
 
@@ -308,6 +329,12 @@ def main():
   if args.stats:
     if Path(args.stats).exists():
       panic(f"Stats file {args.stats} already exists.")
+
+  history_path = None
+  if args.history:
+    history_path = Path(args.history)
+    if history_path.exists():
+      panic(f"History file {history_path} already exists.")
 
   stats = RunStats(command=vars(args))
   agent = MyAgent(args.model, stats, workdir=llvm_dir)
@@ -345,6 +372,11 @@ def main():
       console.print(f"Generation statistics saved to {args.stats}.")
       agent.model.config.model_kwargs["api_base"] = "hidden"
       agent.model.config.model_kwargs["api_key"] = "hidden"
+
+    if args.history:
+      agent.save(Path(args.history))
+      console.print(f"Agent trajectory saved to {args.history}.")
+
     stats.test_traj = agent.save(path=None)
 
   console.print("Bugs Found")
