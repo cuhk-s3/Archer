@@ -343,12 +343,22 @@ def main():
     patch = agent.setup_patch()
     stats.total_time_sec = time.time()
     console.print("Starting to review the patch ...")
-    agent.run(
-      "",
-      **patch.as_dict(),
-      forbidden_tools=", ".join(FORBIDDEN_TOOLS),
-      workdir=llvm_dir,
-    )
+
+    # Add llvm bin to PATH
+    old_path = os.environ["PATH"]
+    bin_dir = str(Path(get_llvm_build_dir()) / args.issue / "bin")
+    os.environ["PATH"] = f"{bin_dir}:{old_path}"
+
+    try:
+      agent.run(
+        "",
+        **patch.as_dict(),
+        forbidden_tools=", ".join(FORBIDDEN_TOOLS),
+        workdir=llvm_dir,
+      )
+    finally:
+      os.environ["PATH"] = old_path
+
     if not stats.bugs:
       raise NoAvailableBugFound("All efforts tried yet no bugs found.")
   except Exception as e:
