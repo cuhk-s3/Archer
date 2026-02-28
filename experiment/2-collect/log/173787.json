@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "173787",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1849,
+  "output_tokens": 24401,
+  "cached_tokens": 0,
+  "total_tokens": 26250,
+  "chat_cost": 0.29651,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 239.0569236278534,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Non-Power-of-Two Integer Widths in Bitwise Masking Transformations\n\n**Description**: \nThe bug is triggered by using non-power-of-two integer types (e.g., `i33`, `i15`) in operations that the compiler attempts to optimize using bitwise masking tricks derived from the type's bitwidth. \n\nSpecifically, when a transformation replaces an arithmetic operation\u2014such as a subtraction or modulo involving the bitwidth\u2014with a bitwise AND operation using `BitWidth - 1` as the mask, it implicitly assumes that the bitwidth is a power of two. For power-of-two bitwidths, `BitWidth - 1` forms a continuous all-ones mask, making the bitwise AND mathematically equivalent to the original arithmetic. However, for non-power-of-two bitwidths, `BitWidth - 1` does not form an all-ones mask. \n\nTo trigger this issue, one can construct LLVM IR that performs the targeted arithmetic pattern (like computing a shift amount based on leading zeros) on a non-power-of-two integer type. The compiler will erroneously apply the bitwise AND transformation, applying an invalid mask and producing an entirely different result, which ultimately leads to a miscompilation."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define i33 @test_shift(i33 %x, i33 %y) {\n  %ctlz = call i33 @llvm.ctlz.i33(i33 %y, i1 false)\n  %rem = urem i33 %ctlz, 33\n  %shl = shl i33 %x, %rem\n  ret i33 %shl\n}\n\ndeclare i33 @llvm.ctlz.i33(i33, i1)",
+      "transformed_ir": "define i33 @test_shift(i33 %x, i33 %y) {\n  %ctlz = call i33 @llvm.ctlz.i33(i33 %y, i1 false)\n  %and = and i33 %ctlz, 32\n  %shl = shl i33 %x, %and\n  ret i33 %shl\n}\n\ndeclare i33 @llvm.ctlz.i33(i33, i1)",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in InstCombine: \n\nThere exists an incorrect transformation for non-power-of-two integer widths in `foldBitCeil`.\n\nThe rewrite replaces the original computation `shift = BitWidth - ctlz(x)` to `shift = (-ctlz(x)) & (BitWidth - 1)`. \n\nThis masking trick is only valid when `BitWidth` is a power of two, because in that case `(BitWidth - 1)` is an all-ones mask and the expression effectively computes `(BitWidth - ctlz) mod BitWidth`.\n\nFor non-power-of-two widths (e.g. `i33`), `BitWidth - 1` is not an all-ones mask. As a result, `(-ctlz) & (BitWidth - 1)` does not compute `BitWidth - ctlz` and can produce an entirely different shift amount.\n\nFor example, with `i33` and `x = 7`:\n\n- `ctlz(7) = 30`\n- Source computes `shift = 33 - 30 = 3`, yielding `1 << 3 = 8`\n- Transformed code computes `(-30) & 32 = 32`, yielding` 1 << 32`\n\nThis causes a value mismatch and makes the transformation incorrect for non-power-of-two bit widths. \n\nAlive2 proof: https://alive2.llvm.org/ce/z/Z3Gq8Q\n\nExposed from https://github.com/llvm/llvm-project/commit/2c094ac761912eea0d7e8ccb140bc647b5378bdf, cc @dtcxzyw \n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 57927e9ffcf1ebd36b0b9d76c49e7af1dd5d31d1\nAuthor: Yunbo Ni <87902024+cardigan1008@users.noreply.github.com>\nDate:   Mon Dec 29 20:17:36 2025 +0800\n\n    [InstCombine] Restrict `foldBitCeil` to power-of-two integer widths (#173849)\n    \n    The masking rewrite in `foldBitCeil` assumes a power-of-two bitwidth.\n    \n    For non-power-of-two integer types, `(-ctlz) & (BitWidth - 1)` is not\n    equivalent to `BitWidth - ctlz` and can miscompile.\n    \n    This patch restricts the transform to power-of-two bitwidths.\n    \n    Alive2 proof: https://alive2.llvm.org/ce/z/i2E6zT\n    \n    Fixes #173787\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 67d184583272..480f31980139 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -3846,6 +3846,8 @@ static Instruction *foldBitCeil(SelectInst &SI, IRBuilderBase &Builder,\n                                 InstCombinerImpl &IC) {\n   Type *SelType = SI.getType();\n   unsigned BitWidth = SelType->getScalarSizeInBits();\n+  if (!isPowerOf2_32(BitWidth))\n+    return nullptr;\n \n   Value *FalseVal = SI.getFalseValue();\n   Value *TrueVal = SI.getTrueValue();\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Non-Power-of-Two Integer Widths in Bitwise Masking Transformations\n\n**Description**: \nThe bug is triggered by using non-power-of-two integer types (e.g., `i33`, `i15`) in operations that the compiler attempts to optimize using bitwise masking tricks derived from the type's bitwidth. \n\nSpecifically, when a transformation replaces an arithmetic operation\u2014such as a subtraction or modulo involving the bitwidth\u2014with a bitwise AND operation using `BitWidth - 1` as the mask, it implicitly assumes that the bitwidth is a power of two. For power-of-two bitwidths, `BitWidth - 1` forms a continuous all-ones mask, making the bitwise AND mathematically equivalent to the original arithmetic. However, for non-power-of-two bitwidths, `BitWidth - 1` does not form an all-ones mask. \n\nTo trigger this issue, one can construct LLVM IR that performs the targeted arithmetic pattern (like computing a shift amount based on leading zeros) on a non-power-of-two integer type. The compiler will erroneously apply the bitwise AND transformation, applying an invalid mask and producing an entirely different result, which ultimately leads to a miscompilation."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Non-Power-of-Two Integer Widths in Bitwise Masking Transformations\n\n**Description**: \nThe bug is triggered by using non-power-of-two integer types (e.g., `i33`, `i15`) in operations that the compiler attempts to optimize using bitwise masking tricks derived from the type's bitwidth. \n\nSpecifically, when a transformation replaces an arithmetic operation\u2014such as a subtraction or modulo involving the bitwidth\u2014with a bitwise AND operation using `BitWidth - 1` as the mask, it implicitly assumes that the bitwidth is a power of two. For power-of-two bitwidths, `BitWidth - 1` forms a continuous all-ones mask, making the bitwise AND mathematically equivalent to the original arithmetic. However, for non-power-of-two bitwidths, `BitWidth - 1` does not form an all-ones mask. \n\nTo trigger this issue, one can construct LLVM IR that performs the targeted arithmetic pattern (like computing a shift amount based on leading zeros) on a non-power-of-two integer type. The compiler will erroneously apply the bitwise AND transformation, applying an invalid mask and producing an entirely different result, which ultimately leads to a miscompilation.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define i33 @test_shift(i33 %x, i33 %y) {\\n  %ctlz = call i33 @llvm.ctlz.i33(i33 %y, i1 false)\\n  %rem = urem i33 %ctlz, 33\\n  %shl = shl i33 %x, %rem\\n  ret i33 %shl\\n}\\n\\ndeclare i33 @llvm.ctlz.i33(i33, i1)\",\n  \"optimized_ir\": \"define i33 @test_shift(i33 %x, i33 %y) {\\n  %ctlz = call i33 @llvm.ctlz.i33(i33 %y, i1 false)\\n  %and = and i33 %ctlz, 32\\n  %shl = shl i33 %x, %and\\n  ret i33 %shl\\n}\\n\\ndeclare i33 @llvm.ctlz.i33(i33, i1)\"\n}\n```"
+    }
+  ]
+}

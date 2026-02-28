@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "72831",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1897,
+  "output_tokens": 4074,
+  "cached_tokens": 0,
+  "total_tokens": 5971,
+  "chat_cost": 0.052682,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 60.92755579948425,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Incorrect Alias Analysis for GEPs with Wrapping Scaled Non-Zero Indices\n\n### Description\nThe bug is triggered when the compiler's alias analysis evaluates two `getelementptr` (GEP) instructions to determine if their memory accesses overlap. Specifically, the issue occurs when one of the GEPs uses a variable index that the compiler can prove is strictly non-zero (e.g., due to loop bounds, dominating branch conditions, or range metadata). \n\nThe alias analysis incorrectly assumes that if the variable index is non-zero, the resulting scaled offset (the variable index multiplied by its scale, such as the type's element size) must also have an absolute value of at least 1. However, this assumption fails to account for integer overflow. If the multiplication of the variable index and the scale wraps around the integer bitwidth, the resulting offset added to the pointer can actually be zero. \n\nBecause the analysis ignores the possibility of wrapping math resulting in a zero offset, it incorrectly concludes that the two pointers cannot point to the same memory location and returns a `NoAlias` result. This flawed alias information is subsequently used by memory optimization passes (such as Dead Store Elimination, Global Value Numbering, or instruction scheduling) to perform invalid transformations, like incorrectly reordering dependent memory operations or eliminating necessary stores, ultimately leading to a miscompilation."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define i32 @test(ptr %p, i64 %idx) {\nentry:\n  %cmp = icmp ne i64 %idx, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  ; GEP without 'inbounds'. If %idx is (1 << 62), %idx * 4 wraps to 0 in i64.\n  ; Thus, %gep can be equal to %p even if %idx != 0.\n  %gep = getelementptr i32, ptr %p, i64 %idx\n  store i32 1, ptr %p, align 4\n  store i32 2, ptr %gep, align 4\n  %val = load i32, ptr %p, align 4\n  ret i32 %val\n\nelse:\n  ret i32 0\n}\n",
+      "transformed_ir": "define i32 @test(ptr %p, i64 %idx) {\nentry:\n  %cmp = icmp ne i64 %idx, 0\n  br i1 %cmp, label %then, label %else\n\nthen:\n  %gep = getelementptr i32, ptr %p, i64 %idx\n  store i32 1, ptr %p, align 4\n  store i32 2, ptr %gep, align 4\n  ; The load is incorrectly optimized to 1 because Alias Analysis wrongly\n  ; assumes %p and %gep cannot alias since %idx != 0, ignoring the wrap.\n  ret i32 1\n\nelse:\n  ret i32 0\n}\n",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in AliasAnalysis: \n\nClang at -O2 produces the wrong code.\r\n\r\nBisected to d53b3df570e359d175d6e7a825ad1a02f9bc80a3, which was committed by @dc03 \r\n\r\nCompiler explorer:  https://godbolt.org/z/bcTzEb9zh\r\n\r\n```console\r\n% cat a.c\r\nint printf(const char *, ...);\r\nlong a = 3, b = 3, c = 1;\r\nunsigned char d;\r\nint g;\r\nstatic short h = -19730;\r\nint *k = &g;\r\nint l(long m, long *n) {\r\n  for (long e = 0; e < b; e++)\r\n    for (long f = 0; f < a; f++)\r\n      if (1 == m) {\r\n        *n = f;\r\n        return 1;\r\n      }\r\n  return 0;\r\n}\r\nint o(long m) {\r\n  long i;\r\n  int j = l(m, &i);\r\n  return j;\r\n}\r\nint main() {\r\n  d = -24;\r\n  char p[2];\r\n  int e = 0;\r\n  for (; e < 2; e++)\r\n    p[o(c) + 7 + (int)c + d + h + 19489 + e] = 2;\r\n  *k = p[0];\r\n  printf(\"%d\\n\", g);\r\n}\r\n% clang -O0 a.c && ./a.out\r\n2\r\n% clang -O2 a.c && ./a.out\r\n0\r\n%\r\n```\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 2d39cb49833abaf7a67110149a010940d7790d7e\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Tue Nov 21 14:27:50 2023 +0000\n\n    [BasicAA] Don't use MinAbsVarIndex = 1. (#72993)\n    \n    The current code incorrectly assumed that the absolute variable index\n    needs to be at least 1, if the variable is != 0. This is incorrect, in\n    case multiplying with Scale wraps.\n    \n    The code below already checks for wrapping properly, so just remove the\n    incorrect assignment.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/72831.\n\ndiff --git a/llvm/lib/Analysis/BasicAliasAnalysis.cpp b/llvm/lib/Analysis/BasicAliasAnalysis.cpp\nindex bf766ee67bb3..4d2f81ea4cfc 100644\n--- a/llvm/lib/Analysis/BasicAliasAnalysis.cpp\n+++ b/llvm/lib/Analysis/BasicAliasAnalysis.cpp\n@@ -1230,9 +1230,6 @@ AliasResult BasicAAResult::aliasGEP(\n     const VariableGEPIndex &Var = DecompGEP1.VarIndices[0];\n     if (Var.Val.TruncBits == 0 &&\n         isKnownNonZero(Var.Val.V, DL, 0, &AC, Var.CxtI, DT)) {\n-      // If V != 0, then abs(VarIndex) > 0.\n-      MinAbsVarIndex = APInt(Var.Scale.getBitWidth(), 1);\n-\n       // Check if abs(V*Scale) >= abs(Scale) holds in the presence of\n       // potentially wrapping math.\n       auto MultiplyByScaleNoWrap = [](const VariableGEPIndex &Var) {\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Incorrect Alias Analysis for GEPs with Wrapping Scaled Non-Zero Indices\n\n### Description\nThe bug is triggered when the compiler's alias analysis evaluates two `getelementptr` (GEP) instructions to determine if their memory accesses overlap. Specifically, the issue occurs when one of the GEPs uses a variable index that the compiler can prove is strictly non-zero (e.g., due to loop bounds, dominating branch conditions, or range metadata). \n\nThe alias analysis incorrectly assumes that if the variable index is non-zero, the resulting scaled offset (the variable index multiplied by its scale, such as the type's element size) must also have an absolute value of at least 1. However, this assumption fails to account for integer overflow. If the multiplication of the variable index and the scale wraps around the integer bitwidth, the resulting offset added to the pointer can actually be zero. \n\nBecause the analysis ignores the possibility of wrapping math resulting in a zero offset, it incorrectly concludes that the two pointers cannot point to the same memory location and returns a `NoAlias` result. This flawed alias information is subsequently used by memory optimization passes (such as Dead Store Elimination, Global Value Numbering, or instruction scheduling) to perform invalid transformations, like incorrectly reordering dependent memory operations or eliminating necessary stores, ultimately leading to a miscompilation."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Incorrect Alias Analysis for GEPs with Wrapping Scaled Non-Zero Indices\n\n### Description\nThe bug is triggered when the compiler's alias analysis evaluates two `getelementptr` (GEP) instructions to determine if their memory accesses overlap. Specifically, the issue occurs when one of the GEPs uses a variable index that the compiler can prove is strictly non-zero (e.g., due to loop bounds, dominating branch conditions, or range metadata). \n\nThe alias analysis incorrectly assumes that if the variable index is non-zero, the resulting scaled offset (the variable index multiplied by its scale, such as the type's element size) must also have an absolute value of at least 1. However, this assumption fails to account for integer overflow. If the multiplication of the variable index and the scale wraps around the integer bitwidth, the resulting offset added to the pointer can actually be zero. \n\nBecause the analysis ignores the possibility of wrapping math resulting in a zero offset, it incorrectly concludes that the two pointers cannot point to the same memory location and returns a `NoAlias` result. This flawed alias information is subsequently used by memory optimization passes (such as Dead Store Elimination, Global Value Numbering, or instruction scheduling) to perform invalid transformations, like incorrectly reordering dependent memory operations or eliminating necessary stores, ultimately leading to a miscompilation.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define i32 @test(ptr %p, i64 %idx) {\\nentry:\\n  %cmp = icmp ne i64 %idx, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  ; GEP without 'inbounds'. If %idx is (1 << 62), %idx * 4 wraps to 0 in i64.\\n  ; Thus, %gep can be equal to %p even if %idx != 0.\\n  %gep = getelementptr i32, ptr %p, i64 %idx\\n  store i32 1, ptr %p, align 4\\n  store i32 2, ptr %gep, align 4\\n  %val = load i32, ptr %p, align 4\\n  ret i32 %val\\n\\nelse:\\n  ret i32 0\\n}\\n\",\n  \"optimized_ir\": \"define i32 @test(ptr %p, i64 %idx) {\\nentry:\\n  %cmp = icmp ne i64 %idx, 0\\n  br i1 %cmp, label %then, label %else\\n\\nthen:\\n  %gep = getelementptr i32, ptr %p, i64 %idx\\n  store i32 1, ptr %p, align 4\\n  store i32 2, ptr %gep, align 4\\n  ; The load is incorrectly optimized to 1 because Alias Analysis wrongly\\n  ; assumes %p and %gep cannot alias since %idx != 0, ignoring the wrap.\\n  ret i32 1\\n\\nelse:\\n  ret i32 0\\n}\\n\"\n}\n```"
+    }
+  ]
+}

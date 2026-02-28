@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "154116",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 2044,
+  "output_tokens": 4243,
+  "cached_tokens": 0,
+  "total_tokens": 6287,
+  "chat_cost": 0.055004,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 56.5602343082428,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Improper Preservation of Poison-Generating Flags when Distributing Truncation over Arithmetic Operations\n\n**Description**: \nThe bug occurs when a truncation instruction (`trunc`) with poison-generating flags (such as `nuw` or `nsw`) is applied to the result of an arithmetic operation (e.g., `add`, `sub`, or `or`) that involves a constant offset. During optimization, the compiler attempts to separate the constant offset by distributing the truncation over the operands of the arithmetic operation. However, the optimization incorrectly preserves the poison-generating flags on the newly cloned truncation instructions. \n\nBecause the conditions required by the `nuw` or `nsw` flags might be satisfied by the final result of the arithmetic operation but not by its individual operands (for instance, an operand might have non-zero truncated bits that are later canceled out by the constant offset), the distributed truncation instructions can incorrectly evaluate to a poison value. This leads to a miscompilation where valid input IR is transformed into IR that produces poison. \n\nTo trigger this bug, one needs to construct a sequence where an arithmetic operation with a constant offset is followed by a `trunc` instruction with `nuw` or `nsw` flags, and ensure that the individual operands would violate the `nuw`/`nsw` constraints if truncated directly before the arithmetic operation takes place."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define i8 @test_add_nuw(i16 %x) {\n  %add = add i16 %x, 257\n  %trunc = trunc nuw i16 %add to i8\n  ret i8 %trunc\n}",
+      "transformed_ir": "define i8 @test_add_nuw(i16 %x) {\n  %trunc = trunc nuw i16 %x to i8\n  %add = add i8 %trunc, 1\n  ret i8 %add\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in SeparateConstOffsetFromGEP: \n\nllvm commit: 673750feea\n\nReproduce with:\n```\nopt -passes=separate-const-offset-from-gep bbi-109669_sep.ll -S -o - -mtriple=hexagon\n```\nThe input program does\n```\n%0 = phi i32 [ -20, %entry ]\n%1 = add i32 %0, 20\n%2 = trunc nuw i32 %1 to i16\n```\nwhere the \"trunc nuw\" is ok since %1 is 0. No truncated bits are set.\n\nHowever, in the result we get:\n```\n%0 = phi i32 [ -20, %entry ]\n[...]\n%1 = trunc nuw i32 %0 to i16\n```\nso here the input to \"trunc nuw\" is negative and the result is poison.\nLangref https://llvm.org/docs/LangRef.html#trunc-to-instruction says\n\"If the nuw keyword is present, and any of the truncated bits are non-zero, the result is a [poison value](https://llvm.org/docs/LangRef.html#poisonvalues).\"\n\nThen %1 is further used to compute the return value from the function so the whole thing results in poison which it did not in the input.\n\n(I stumbled upon this as a miscompile after\n https://github.com/llvm/llvm-project/pull/152990\nwhich I first incorrectly blamed.)\n\n[bbi-109669_sep.ll.gz](https://github.com/user-attachments/files/21836248/bbi-109669_sep.ll.gz)\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 2d3167f8d86ca9bdaff44cf839488c5a513f5583\nAuthor: Bjorn Pettersson <bjorn.a.pettersson@ericsson.com>\nDate:   Wed Aug 20 19:26:11 2025 +0200\n\n    [SeparateConstOffsetFromGEP] Avoid miscompiles related to trunc nuw/nsw (#154582)\n    \n    Drop poison generating flags on trunc when distributing trunc over\n    add/sub/or. We need to do this since for example\n    (add (trunc nuw A), (trunc nuw B)) is more poisonous than\n    (trunc nuw (add A, B))).\n    \n    In some situations it is pessimistic to drop the flags. Such as\n    if the add in the example above also has the nuw flag. For now we\n    keep it simple and always drop the flags.\n    \n    Worth mentioning is that we drop the flags when cloning\n    instructions and rebuilding the chain. This is done after the\n    \"allowsPreservingNUW\" checks in ConstantOffsetExtractor::Extract.\n    So we still take the \"trunc nuw\" into consideration when determining\n    if nuw can be preserved in the gep (which should be ok since that\n    check also require that all the involved binary operations has nuw).\n    \n    Fixes #154116\n\ndiff --git a/llvm/lib/Transforms/Scalar/SeparateConstOffsetFromGEP.cpp b/llvm/lib/Transforms/Scalar/SeparateConstOffsetFromGEP.cpp\nindex a88f8f19f852..8b9d06d7e443 100644\n--- a/llvm/lib/Transforms/Scalar/SeparateConstOffsetFromGEP.cpp\n+++ b/llvm/lib/Transforms/Scalar/SeparateConstOffsetFromGEP.cpp\n@@ -642,6 +642,13 @@ Value *ConstantOffsetExtractor::applyExts(Value *V) {\n \n     Instruction *Ext = I->clone();\n     Ext->setOperand(0, Current);\n+    // In ConstantOffsetExtractor::find we do not analyze nuw/nsw for trunc, so\n+    // we assume that it is ok to redistribute trunc over add/sub/or. But for\n+    // example (add (trunc nuw A), (trunc nuw B)) is more poisonous than (trunc\n+    // nuw (add A, B))). To make such redistributions legal we drop all the\n+    // poison generating flags from cloned trunc instructions here.\n+    if (isa<TruncInst>(Ext))\n+      Ext->dropPoisonGeneratingFlags();\n     Ext->insertBefore(*IP->getParent(), IP);\n     Current = Ext;\n   }\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Improper Preservation of Poison-Generating Flags when Distributing Truncation over Arithmetic Operations\n\n**Description**: \nThe bug occurs when a truncation instruction (`trunc`) with poison-generating flags (such as `nuw` or `nsw`) is applied to the result of an arithmetic operation (e.g., `add`, `sub`, or `or`) that involves a constant offset. During optimization, the compiler attempts to separate the constant offset by distributing the truncation over the operands of the arithmetic operation. However, the optimization incorrectly preserves the poison-generating flags on the newly cloned truncation instructions. \n\nBecause the conditions required by the `nuw` or `nsw` flags might be satisfied by the final result of the arithmetic operation but not by its individual operands (for instance, an operand might have non-zero truncated bits that are later canceled out by the constant offset), the distributed truncation instructions can incorrectly evaluate to a poison value. This leads to a miscompilation where valid input IR is transformed into IR that produces poison. \n\nTo trigger this bug, one needs to construct a sequence where an arithmetic operation with a constant offset is followed by a `trunc` instruction with `nuw` or `nsw` flags, and ensure that the individual operands would violate the `nuw`/`nsw` constraints if truncated directly before the arithmetic operation takes place."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Improper Preservation of Poison-Generating Flags when Distributing Truncation over Arithmetic Operations\n\n**Description**: \nThe bug occurs when a truncation instruction (`trunc`) with poison-generating flags (such as `nuw` or `nsw`) is applied to the result of an arithmetic operation (e.g., `add`, `sub`, or `or`) that involves a constant offset. During optimization, the compiler attempts to separate the constant offset by distributing the truncation over the operands of the arithmetic operation. However, the optimization incorrectly preserves the poison-generating flags on the newly cloned truncation instructions. \n\nBecause the conditions required by the `nuw` or `nsw` flags might be satisfied by the final result of the arithmetic operation but not by its individual operands (for instance, an operand might have non-zero truncated bits that are later canceled out by the constant offset), the distributed truncation instructions can incorrectly evaluate to a poison value. This leads to a miscompilation where valid input IR is transformed into IR that produces poison. \n\nTo trigger this bug, one needs to construct a sequence where an arithmetic operation with a constant offset is followed by a `trunc` instruction with `nuw` or `nsw` flags, and ensure that the individual operands would violate the `nuw`/`nsw` constraints if truncated directly before the arithmetic operation takes place.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define i8 @test_add_nuw(i16 %x) {\\n  %add = add i16 %x, 257\\n  %trunc = trunc nuw i16 %add to i8\\n  ret i8 %trunc\\n}\",\n  \"optimized_ir\": \"define i8 @test_add_nuw(i16 %x) {\\n  %trunc = trunc nuw i16 %x to i8\\n  %add = add i8 %trunc, 1\\n  ret i8 %add\\n}\"\n}\n```"
+    }
+  ]
+}

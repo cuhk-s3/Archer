@@ -1,0 +1,112 @@
+{
+  "command": {
+    "issue": "89516",
+    "model": "deepseek-chat",
+    "driver": "openai",
+    "stats": "autoreview-deepseek-chat/89516.json",
+    "history": "autoreview-deepseek-chat/history/89516.json",
+    "debug": true
+  },
+  "error": "NoAvailableBugFound",
+  "errmsg": "All efforts tried yet no available patches found.",
+  "traceback": "Traceback (most recent call last):\n  File \"/data/yunboni/projects/ReviewAgent/experiment/5-regression/regression.py\", line 225, in main\n    raise NoAvailableBugFound(\nmain.NoAvailableBugFound: All efforts tried yet no available patches found.\n",
+  "input_tokens": 1555490,
+  "output_tokens": 9888,
+  "cached_tokens": 1536576,
+  "total_tokens": 1565378,
+  "chat_cost": 0.0,
+  "chat_rounds": 46,
+  "phase1_round": 20,
+  "phase2_round": 26,
+  "total_time_sec": 257.16765880584717,
+  "tool_usage": [
+    {
+      "name": "find250",
+      "usage": 0
+    },
+    {
+      "name": "grep250",
+      "usage": 12
+    },
+    {
+      "name": "list250",
+      "usage": 0
+    },
+    {
+      "name": "read250",
+      "usage": 5
+    },
+    {
+      "name": "langref",
+      "usage": 1
+    },
+    {
+      "name": "trans",
+      "usage": 13
+    },
+    {
+      "name": "verify",
+      "usage": 9
+    },
+    {
+      "name": "difftest",
+      "usage": 3
+    },
+    {
+      "name": "stop",
+      "usage": 2
+    },
+    {
+      "name": "report",
+      "usage": 1
+    }
+  ],
+  "strategies": [
+    {
+      "name": "Non-Power-of-Two Type Widths",
+      "target": "Test cases with i33, i65 types",
+      "rationale": "The transformation uses bitwise AND with n-1 which assumes n is power of two. For non-power-of-two widths, even if n is power of two mathematically, the bitwise operation might not be equivalent.",
+      "expected_issue": "Incorrect transformation for non-power-of-two integer widths"
+    },
+    {
+      "name": "Vector with Poison/Undef Elements",
+      "target": "Vector tests with poison/undef in divisor",
+      "rationale": "isKnownToBeAPowerOfTwo might return true for vectors with some poison/undef elements, leading to incorrect transformation for those lanes.",
+      "expected_issue": "Miscompilation for vector lanes with poison/undef"
+    },
+    {
+      "name": "Overflow Flag Propagation",
+      "target": "Tests with nsw/nuw flags on srem/add",
+      "rationale": "Original instructions might have nsw/nuw flags that guarantee no overflow. The new and instruction doesn't preserve these flags, potentially introducing poison.",
+      "expected_issue": "Loss of poison guarantees leading to miscompilation"
+    },
+    {
+      "name": "Negative Power-of-Two Divisor",
+      "target": "Tests with negative divisors like -8",
+      "rationale": "The transformation assumes divisor is non-negative but only checks isKnownToBeAPowerOfTwo, which could return true for negative powers of two.",
+      "expected_issue": "Incorrect transformation for negative divisors"
+    },
+    {
+      "name": "Multi-Use SRem Instruction",
+      "target": "Tests where srem result has other uses",
+      "rationale": "The transformation changes srem to and which could affect other uses of the srem result that rely on its semantics.",
+      "expected_issue": "Incorrect optimization affecting other uses of srem"
+    }
+  ],
+  "reason_thou": "## Fix Understanding\n\nThe fix adds a new transformation `foldSelectWithSRem` in `InstCombineSelect.cpp` that optimizes a specific pattern for Euclidean division remainder calculation. The pattern is:\n\n```\n(x % n) < 0 ? (x % n) + n : (x % n)  ->  x & (n - 1)\n```\n\nWhere:\n- `n` is a power of two and guaranteed not to be negative\n- The comparison checks if the signed remainder is negative (sign bit check)\n- The select adds `n` to the remainder when it's negative, otherwise keeps the remainder\n\nThis transformation converts a signed remainder with conditional adjustment (Euclidean division remainder) into a bitwise AND operation when the divisor is a power of two.\n\n## Assumptions Identified\n\n1. **Divisor is a power of two**: The transformation uses `IC.isKnownToBeAPowerOfTwo(Remainder, /*OrZero*/ true)` to check this.\n\n2. **Divisor is non-negative**: The comment says \"when the divisor is a power of two and is guaranteed not to be negative\", but the code doesn't explicitly check this. It relies on `isKnownToBeAPowerOfTwo` which might return true for negative powers of two? Actually, `isKnownToBeAPowerOfTwo` should only return true for positive powers of two or zero.\n\n3. **Pattern matching correctness**: The code matches a very specific pattern:\n   - `%rem = srem i32 %x, %n`\n   - `%cnd = icmp slt i32 %rem, 0` (or other sign bit checks via `isSignBitCheck`)\n   - `%add = add i32 %rem, %n`\n   - `%sel = select i1 %cnd, i32 %add, i32 %rem`\n\n4. **No overflow in addition**: The transformation assumes `%rem + %n` doesn't overflow. Since `%rem` is in range `[-(n-1), n-1]` for signed remainder, and `n` is positive, `%rem + n` is in range `[1, 2n-1]`. For power-of-two `n`, this could overflow if `%rem = n-1` and `n` is at the max signed value? Actually `n` is positive power of two, so `n-1 + n = 2n-1` which could overflow if `n` is large enough.\n\n5. **Correct handling of sign bit checks**: The code uses `IC.isSignBitCheck(Pred, *C, TrueIfSigned)` which handles various predicates (SLT, SLE, SGT, SGE, UGT, UGE, ULT, ULE) that check the sign bit.\n\n6. **Type consistency**: The transformation assumes all values have the same type.\n\n## Potential Cases to Break Assumptions\n\n### 1. **Non-Power-of-Two Integer Widths**\nThe transformation uses `Constant::getAllOnesValue(RemRes->getType())` to create `n-1`. For non-power-of-two integer widths (e.g., `i33`), the bitwise AND with `n-1` might not be equivalent to the Euclidean remainder when `n` is not a power of two. The `isKnownToBeAPowerOfTwo` check should prevent this, but there could be edge cases where it incorrectly returns true.\n\n### 2. **Vector Types with Poison/Undef Elements**\nFor vector types, if `n` has poison or undef elements, `isKnownToBeAPowerOfTwo` might incorrectly return true. The transformation could generate incorrect results for lanes with poison/undef divisors.\n\n### 3. **Overflow Flags on Original Instructions**\nThe original `srem` and `add` instructions might have `nsw`/`nuw` flags. The transformation creates new `and` instruction without preserving these flags. If the original instructions had `nsw`/`nuw` flags, removing them could change poison semantics.\n\n### 4. **Multi-Use of SRem Result**\nThe pattern matching checks `FalseVal == RemRes` but doesn't check if `RemRes` has other uses. If the `srem` result is used elsewhere, transforming it to `and` could affect those other uses incorrectly.\n\n### 5. **Negative Divisor (Power of Two)**\nThe comment says divisor should be \"guaranteed not to be negative\", but the code doesn't explicitly check this. A negative power of two (e.g., `-8`) would pass `isKnownToBeAPowerOfTwo` but the transformation `x & (n - 1)` would be incorrect since `n-1` would be negative.\n\n### 6. **Zero Divisor**\nThe transformation uses `OrZero=true` in `isKnownToBeAPowerOfTwo`, so `n=0` could be accepted. But `srem` by zero is UB, so the transformation shouldn't apply. However, if `n=0` is known, the original code has UB anyway.\n\n### 7. **Integer Overflow in `n-1` Calculation**\nFor `n = 0`, `n-1 = -1` (all ones). For `n = 1`, `n-1 = 0`. These seem fine. But for signed types, if `n` is the minimum signed value (e.g., `-128` for `i8`), `n-1` could overflow.\n\n### 8. **Different Comparison Predicates**\nThe `isSignBitCheck` handles many predicates, but the transformation assumes the select operands are swapped correctly based on `TrueIfSigned`. Need to ensure the logic handles all predicate cases correctly.\n\n### 9. **Floating Point Types**\nThe transformation only works for integer types, but the pattern matching doesn't explicitly check types. `srem` is integer-only, so this should be safe.\n\n### 10. **Context-Specific Knowledge Leakage**\nIf `isKnownToBeAPowerOfTwo` uses context-specific knowledge (e.g., from `llvm.assume` or dominating conditions), applying the transformation might leak that context to other uses of the values.",
+  "bugs": [],
+  "test_traj": [
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i32 @rem_euclid_negative_divisor(i32 %0) {\\n  %rem = srem i32 %0, -8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, -8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmpejrb19c5/orig.ll'\\nsource_filename = \\\"/data/tmp/tmpejrb19c5/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_negative_divisor(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add nsw i32 %rem, -8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i32 @rem_euclid_negative_divisor(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 4294967288\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 4294967288\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\n=>\\ndefine i32 @rem_euclid_negative_divisor(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add nsw i32 %rem, 4294967288\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i33 @rem_euclid_i33(i33 %0) {\\n  %rem = srem i33 %0, 8\\n  %cond = icmp slt i33 %rem, 0\\n  %add = add i33 %rem, 8\\n  %sel = select i1 %cond, i33 %add, i33 %rem\\n  ret i33 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmp24hsu96o/orig.ll'\\nsource_filename = \\\"/data/tmp/tmp24hsu96o/orig.ll\\\"\\n\\ndefine i33 @rem_euclid_i33(i33 %0) {\\n  %sel = and i33 %0, 7\\n  ret i33 %sel\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i33 @rem_euclid_i33(i33 %#0) {\\n#1:\\n  %rem = srem i33 %#0, 8\\n  %cond = icmp slt i33 %rem, 0\\n  %add = add i33 %rem, 8\\n  %sel = select i1 %cond, i33 %add, i33 %rem\\n  ret i33 %sel\\n}\\n=>\\ndefine i33 @rem_euclid_i33(i33 %#0) {\\n#1:\\n  %sel = and i33 %#0, 7\\n  ret i33 %sel\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define <2 x i32> @rem_euclid_vec_undef(<2 x i32> %0) {\\n  %rem = srem <2 x i32> %0, <i32 8, i32 undef>\\n  %cond = icmp slt <2 x i32> %rem, zeroinitializer\\n  %add = add <2 x i32> %rem, <i32 8, i32 undef>\\n  %sel = select <2 x i1> %cond, <2 x i32> %add, <2 x i32> %rem\\n  ret <2 x i32> %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmpfs_ou_iu/orig.ll'\\nsource_filename = \\\"/data/tmp/tmpfs_ou_iu/orig.ll\\\"\\n\\ndefine <2 x i32> @rem_euclid_vec_undef(<2 x i32> %0) {\\n  ret <2 x i32> poison\\n}\\n\", \"log\": \"----------------------------------------\\ndefine <2 x i32> @rem_euclid_vec_undef(<2 x i32> %#0) {\\n#1:\\n  %rem = srem <2 x i32> %#0, { 8, undef }\\n  %cond = icmp slt <2 x i32> %rem, { 0, 0 }\\n  %add = add <2 x i32> %rem, { 8, undef }\\n  %sel = select <2 x i1> %cond, <2 x i32> %add, <2 x i32> %rem\\n  ret <2 x i32> %sel\\n}\\n=>\\ndefine <2 x i32> @rem_euclid_vec_undef(<2 x i32> %#0) {\\n#1:\\n  ret <2 x i32> poison\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i32 @rem_euclid_with_flags(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add nsw i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmp609b17jh/orig.ll'\\nsource_filename = \\\"/data/tmp/tmp609b17jh/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_with_flags(i32 %0) {\\n  %sel = and i32 %0, 7\\n  ret i32 %sel\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i32 @rem_euclid_with_flags(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add nsw i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\n=>\\ndefine i32 @rem_euclid_with_flags(i32 %#0) {\\n#1:\\n  %sel = and i32 %#0, 7\\n  ret i32 %sel\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i32 @rem_euclid_multi_use(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  %use1 = add i32 %rem, 1\\n  %use2 = mul i32 %rem, 2\\n  %result = add i32 %sel, %use1\\n  %final = add i32 %result, %use2\\n  ret i32 %final\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmp7wqf8wuy/orig.ll'\\nsource_filename = \\\"/data/tmp/tmp7wqf8wuy/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_multi_use(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %sel = and i32 %0, 7\\n  %use1 = add nsw i32 %rem, 1\\n  %use2 = shl nsw i32 %rem, 1\\n  %result = add nsw i32 %sel, %use1\\n  %final = add nsw i32 %result, %use2\\n  ret i32 %final\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i32 @rem_euclid_multi_use(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  %use1 = add i32 %rem, 1\\n  %use2 = mul i32 %rem, 2\\n  %result = add i32 %sel, %use1\\n  %final = add i32 %result, %use2\\n  ret i32 %final\\n}\\n=>\\ndefine i32 @rem_euclid_multi_use(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 8\\n  %sel = and i32 %#0, 7\\n  %use1 = add nsw i32 %rem, 1\\n  %use2 = shl nsw i32 %rem, 1\\n  %result = add nsw i32 %sel, %use1\\n  %final = add nsw i32 %result, %use2\\n  ret i32 %final\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"difftest\", \"original_ir\": \"define i32 @rem_euclid_multi_use(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  %use1 = add i32 %rem, 1\\n  %use2 = mul i32 %rem, 2\\n  %result = add i32 %sel, %use1\\n  %final = add i32 %result, %use2\\n  ret i32 %final\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmp_7m4d1k1/orig.ll'\\nsource_filename = \\\"/data/tmp/tmp_7m4d1k1/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_multi_use(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %sel = and i32 %0, 7\\n  %use1 = add nsw i32 %rem, 1\\n  %use2 = shl nsw i32 %rem, 1\\n  %result = add nsw i32 %sel, %use1\\n  %final = add nsw i32 %result, %use2\\n  ret i32 %final\\n}\", \"log\": {\"original_test_output\": {\"timed_out\": false, \"return_code\": 5, \"stdout\": \"\", \"stderr\": \"\"}, \"transformed_test_output\": {\"timed_out\": false, \"return_code\": 5, \"stdout\": \"\", \"stderr\": \"\"}}}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i32 @rem_euclid_zero_divisor(i32 %0) {\\n  %rem = srem i32 %0, 0\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 0\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmpk994im3e/orig.ll'\\nsource_filename = \\\"/data/tmp/tmpk994im3e/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_zero_divisor(i32 %0) {\\n  ret i32 poison\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i32 @rem_euclid_zero_divisor(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 0\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 0\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\n=>\\ndefine i32 @rem_euclid_zero_divisor(i32 %#0) {\\n#1:\\n  ret i32 poison\\n}\\n\\n****************************************\\nWARNING: Source function is always UB.\\nIt can be refined by any target function.\\nPlease make sure this is what you wanted.\\n****************************************\\n\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i32 @rem_euclid_overflow_case(i32 %0) {\\n  %rem = srem i32 %0, 1073741824  ; 2^30\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 1073741824  ; 2^30\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmpxq9xn3i5/orig.ll'\\nsource_filename = \\\"/data/tmp/tmpxq9xn3i5/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_overflow_case(i32 %0) {\\n  %sel = and i32 %0, 1073741823\\n  ret i32 %sel\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i32 @rem_euclid_overflow_case(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 1073741824\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 1073741824\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\n=>\\ndefine i32 @rem_euclid_overflow_case(i32 %#0) {\\n#1:\\n  %sel = and i32 %#0, 1073741823\\n  ret i32 %sel\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i32 @rem_euclid_uge_predicate(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %cond = icmp uge i32 %rem, 2147483648  ; sign bit for i32\\n  %add = add i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmprdnztctc/orig.ll'\\nsource_filename = \\\"/data/tmp/tmprdnztctc/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_uge_predicate(i32 %0) {\\n  %sel = and i32 %0, 7\\n  ret i32 %sel\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i32 @rem_euclid_uge_predicate(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 8\\n  %cond = icmp uge i32 %rem, 2147483648\\n  %add = add i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\n=>\\ndefine i32 @rem_euclid_uge_predicate(i32 %#0) {\\n#1:\\n  %sel = and i32 %#0, 7\\n  ret i32 %sel\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"difftest\", \"original_ir\": \"define i32 @rem_euclid_negative_pow2_divisor(i32 %0) {\\n  %rem = srem i32 %0, -8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, -8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmp7u7oobcw/orig.ll'\\nsource_filename = \\\"/data/tmp/tmp7u7oobcw/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_negative_pow2_divisor(i32 %0) {\\n  %rem = srem i32 %0, 8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add nsw i32 %rem, -8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"log\": {\"original_test_output\": {\"timed_out\": false, \"return_code\": 247, \"stdout\": \"\", \"stderr\": \"\"}, \"transformed_test_output\": {\"timed_out\": false, \"return_code\": 247, \"stdout\": \"\", \"stderr\": \"\"}}}",
+    "{\"found\": false, \"tool\": \"verify\", \"original_ir\": \"define i32 @rem_euclid_negative_pow2_divisor_2(i32 %0) {\\n  %rem = srem i32 %0, -8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 8  ; Note: adding positive 8, not -8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmpq0hirjrl/orig.ll'\\nsource_filename = \\\"/data/tmp/tmpq0hirjrl/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_negative_pow2_divisor_2(i32 %0) {\\n  %sel = and i32 %0, 7\\n  ret i32 %sel\\n}\\n\", \"log\": \"----------------------------------------\\ndefine i32 @rem_euclid_negative_pow2_divisor_2(i32 %#0) {\\n#1:\\n  %rem = srem i32 %#0, 4294967288\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\\n=>\\ndefine i32 @rem_euclid_negative_pow2_divisor_2(i32 %#0) {\\n#1:\\n  %sel = and i32 %#0, 7\\n  ret i32 %sel\\n}\\nTransformation seems to be correct!\\n\\nSummary:\\n  1 correct transformations\\n  0 incorrect transformations\\n  0 failed-to-prove transformations\\n  0 Alive2 errors\"}",
+    "{\"found\": false, \"tool\": \"difftest\", \"original_ir\": \"define i32 @rem_euclid_negative_pow2_divisor_2(i32 %0) {\\n  %rem = srem i32 %0, -8\\n  %cond = icmp slt i32 %rem, 0\\n  %add = add i32 %rem, 8  ; Note: adding positive 8, not -8\\n  %sel = select i1 %cond, i32 %add, i32 %rem\\n  ret i32 %sel\\n}\", \"transformed_ir\": \"; ModuleID = '/data/tmp/tmpcopnh9lb/orig.ll'\\nsource_filename = \\\"/data/tmp/tmpcopnh9lb/orig.ll\\\"\\n\\ndefine i32 @rem_euclid_negative_pow2_divisor_2(i32 %0) {\\n  %sel = and i32 %0, 7\\n  ret i32 %sel\\n}\", \"log\": {\"original_test_output\": {\"timed_out\": false, \"return_code\": 7, \"stdout\": \"\", \"stderr\": \"\"}, \"transformed_test_output\": {\"timed_out\": false, \"return_code\": 7, \"stdout\": \"\", \"stderr\": \"\"}}}"
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "112068",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1868,
+  "output_tokens": 3190,
+  "cached_tokens": 0,
+  "total_tokens": 5058,
+  "chat_cost": 0.042016,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 32.574026107788086,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Failure to Drop UB-Implying Attributes When Refining Intrinsics to Return Poison\n\n**Description**: \nThe bug is triggered when the compiler optimizes an intrinsic call that features a boolean flag controlling whether a specific edge-case input yields a poison value (such as the `is_zero_poison` argument in count-leading-zeros or count-trailing-zeros intrinsics). \n\nInitially, the intrinsic is configured to return a well-defined value for the edge-case input (i.e., the flag is set to `false`), and the call is annotated with an attribute that strictly forbids poison or undefined values, such as `noundef`. \n\nDuring optimization, the compiler analyzes the uses of the intrinsic's result (for example, being used solely as a shift amount) and determines that it is safe to relax the intrinsic to return poison for the edge-case input. It does this by toggling the flag to `true`. However, the transformation logic fails to drop the `noundef` attribute and other UB-implying metadata from the intrinsic call. \n\nAs a result, if the edge-case input occurs at runtime, the modified intrinsic produces a poison value. Because the `noundef` attribute was incorrectly retained, returning a poison value immediately escalates into undefined behavior, miscompiling a previously well-defined program."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "declare i32 @llvm.cttz.i32(i32, i1 immarg)\n\ndefine i32 @test(i32 %x) {\n  %tz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 false)\n  %shl = shl i32 1, %tz\n  ret i32 %shl\n}",
+      "transformed_ir": "declare i32 @llvm.cttz.i32(i32, i1 immarg)\n\ndefine i32 @test(i32 %x) {\n  %tz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 true)\n  %shl = shl i32 1, %tz\n  ret i32 %shl\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in InstCombine: \n\nReproducer: https://alive2.llvm.org/ce/z/7-TgAf\r\n```\r\ndefine i32 @src(i32 %x, i32 %y) {\r\nentry:\r\n  %cttz = call noundef i32 @llvm.cttz.i32(i32 %y, i1 false)\r\n  %res = lshr i32 %x, %cttz\r\n  ret i32 %res\r\n}\r\n\r\ndefine i32 @tgt(i32 %x, i32 %y) {\r\nentry:\r\n  %cttz = call noundef i32 @llvm.cttz.i32(i32 %y, i1 true)\r\n  %res = lshr i32 %x, %cttz\r\n  ret i32 %res\r\n}\r\n\r\ndefine i32 @src2(i32 %x) {\r\n  %ct = call noundef i32 @llvm.ctlz.i32(i32 %x, i1 false)\r\n  %cmp = icmp ne i32 %x, 0\r\n  %res = select i1 %cmp, i32 %ct, i32 123\r\n  ret i32 %res\r\n}\r\n\r\ndefine i32 @tgt2(i32 %x) {\r\n  %ct = call noundef i32 @llvm.ctlz.i32(i32 %x, i1 true)\r\n  %cmp = icmp ne i32 %x, 0\r\n  %res = select i1 %cmp, i32 %ct, i32 123\r\n  ret i32 %res\r\n}\r\n```\r\n`noundef` attribute should be dropped. Otherwise we will convert a poison value to immediate UB.\r\n\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit a59976bea8ad76f18119a11391dc8ba3e6ba07d5\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Tue Nov 19 20:06:34 2024 +0800\n\n    [InstCombine] Drop noundef attributes in `foldCttzCtlz` (#116718)\n    \n    Closes https://github.com/llvm/llvm-project/issues/112068.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 6cff3c7af91e..42c0acd1e45e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -505,8 +505,10 @@ static Instruction *foldCttzCtlz(IntrinsicInst &II, InstCombinerImpl &IC) {\n \n   // If ctlz/cttz is only used as a shift amount, set is_zero_poison to true.\n   if (II.hasOneUse() && match(Op1, m_Zero()) &&\n-      match(II.user_back(), m_Shift(m_Value(), m_Specific(&II))))\n+      match(II.user_back(), m_Shift(m_Value(), m_Specific(&II)))) {\n+    II.dropUBImplyingAttrsAndMetadata();\n     return IC.replaceOperand(II, 1, IC.Builder.getTrue());\n+  }\n \n   Constant *C;\n \n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Failure to Drop UB-Implying Attributes When Refining Intrinsics to Return Poison\n\n**Description**: \nThe bug is triggered when the compiler optimizes an intrinsic call that features a boolean flag controlling whether a specific edge-case input yields a poison value (such as the `is_zero_poison` argument in count-leading-zeros or count-trailing-zeros intrinsics). \n\nInitially, the intrinsic is configured to return a well-defined value for the edge-case input (i.e., the flag is set to `false`), and the call is annotated with an attribute that strictly forbids poison or undefined values, such as `noundef`. \n\nDuring optimization, the compiler analyzes the uses of the intrinsic's result (for example, being used solely as a shift amount) and determines that it is safe to relax the intrinsic to return poison for the edge-case input. It does this by toggling the flag to `true`. However, the transformation logic fails to drop the `noundef` attribute and other UB-implying metadata from the intrinsic call. \n\nAs a result, if the edge-case input occurs at runtime, the modified intrinsic produces a poison value. Because the `noundef` attribute was incorrectly retained, returning a poison value immediately escalates into undefined behavior, miscompiling a previously well-defined program."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Failure to Drop UB-Implying Attributes When Refining Intrinsics to Return Poison\n\n**Description**: \nThe bug is triggered when the compiler optimizes an intrinsic call that features a boolean flag controlling whether a specific edge-case input yields a poison value (such as the `is_zero_poison` argument in count-leading-zeros or count-trailing-zeros intrinsics). \n\nInitially, the intrinsic is configured to return a well-defined value for the edge-case input (i.e., the flag is set to `false`), and the call is annotated with an attribute that strictly forbids poison or undefined values, such as `noundef`. \n\nDuring optimization, the compiler analyzes the uses of the intrinsic's result (for example, being used solely as a shift amount) and determines that it is safe to relax the intrinsic to return poison for the edge-case input. It does this by toggling the flag to `true`. However, the transformation logic fails to drop the `noundef` attribute and other UB-implying metadata from the intrinsic call. \n\nAs a result, if the edge-case input occurs at runtime, the modified intrinsic produces a poison value. Because the `noundef` attribute was incorrectly retained, returning a poison value immediately escalates into undefined behavior, miscompiling a previously well-defined program.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"declare i32 @llvm.cttz.i32(i32, i1 immarg)\\n\\ndefine i32 @test(i32 %x) {\\n  %tz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 false)\\n  %shl = shl i32 1, %tz\\n  ret i32 %shl\\n}\",\n  \"optimized_ir\": \"declare i32 @llvm.cttz.i32(i32, i1 immarg)\\n\\ndefine i32 @test(i32 %x) {\\n  %tz = call noundef i32 @llvm.cttz.i32(i32 %x, i1 true)\\n  %shl = shl i32 1, %tz\\n  ret i32 %shl\\n}\"\n}\n```"
+    }
+  ]
+}
