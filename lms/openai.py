@@ -128,6 +128,7 @@ class OpenAIAgent(AgentBase):
         if completion.usage.prompt_tokens_details:
           self.chat_stats["cached_tokens"] += (
             completion.usage.prompt_tokens_details.cached_tokens
+            or 0  # Qwen may return None
           )
         self.chat_stats["output_tokens"] += completion.usage.completion_tokens
         self.chat_stats["total_tokens"] += completion.usage.total_tokens
