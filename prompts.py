@@ -179,7 +179,8 @@ if you think the provided test cases have limited coverage of potential issues. 
 
 ### Important Rule
 You can always keep mutating the test case and verifying it until you find an issue or are confident that no issues can be found. \
-However, make sure it is aligned with the potential issues you identified in Phase 1.
+However, make sure it is aligned with the potential issues you identified in Phase 1. \
+Meanwhile, avoid stucking on a test case for too long. If you have tried multiple mutations and still cannot find any issues, move on to other test cases or strategies.
 
 ### Handling Verification Results
 - **Failed-to-prove**:

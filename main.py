@@ -467,7 +467,13 @@ def generate_test(
     force_stop = report_data.get("force", False)
     all_tested = all(t.tested for t in test_objects)
 
-    if not all_tested and not force_stop:
+    # If all tests have been completed, allow the report regardless of bugs found
+    if all_tested:
+      stats.report = report_data.get("thoughts", None)
+      return False, res  # Stop the process with the result
+
+    # If not all tests are done and no force stop, require continuing
+    if not force_stop:
       return True, (
         "Error: You cannot call `report` yet "
         "because not all tests have been marked as tested (which requires covering all strategies per test). "
@@ -476,12 +482,14 @@ def generate_test(
         "If you have already found at least one bug and want to stop immediately, set `force=True` in `report`."
       )
 
-    if force_stop and not stats.bugs:
+    # Force stop requested but not all tests done - must have found bugs
+    if not stats.bugs:
       return True, (
         "Error: You cannot use `force=True` in `report` because no bugs have been found yet. "
         "Please verify the bug using `verify` or `difftest` tools first."
       )
 
+    # Force stop with bugs found - allow early termination
     stats.report = report_data.get("thoughts", None)
     return False, res  # Stop the process with the result
 

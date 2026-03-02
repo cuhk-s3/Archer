@@ -34,6 +34,7 @@ from llvm.llvm_helper import (
   dataset_dir,
   get_langref_desc,
   get_llvm_build_dir,
+  git_execute,
   infer_related_components,
   llvm_dir,
   reset,
@@ -307,11 +308,21 @@ def setup_llvm_environment(pr_info: PRInfo) -> bool:
   After this function, pr_info.tests will be populated with extracted tests.
   """
   # Checkout base commit
+  console.print("Checking out the base commit ...")
   try:
     reset(pr_info.base_commit)
   except Exception as e:
-    console.print(f"Failed to checkout base commit: {e}", color="red")
-    return False
+    console.print(
+      f"Warning: Failed to reset HEAD to {pr_info.base_commit}: {e}",
+      color="yellow",
+    )
+    console.print("Sync the repository and try again.", color="yellow")
+    reset("main")
+    git_execute(["pull", "origin", "main"])
+    try:
+      reset(pr_info.base_commit)
+    except Exception as e:
+      panic(f"Failed to reset HEAD to {pr_info.base_commit}: {e}")
 
   # Apply the patch
   success, log = apply_patch(pr_info.patch)
@@ -607,7 +618,13 @@ def generate_test_for_pr(
     force_stop = report_data.get("force", False)
     all_tested = all(t.tested for t in test_objects)
 
-    if not all_tested and not force_stop:
+    # If all tests have been completed, allow the report regardless of bugs found
+    if all_tested:
+      stats.report = report_data.get("thoughts", None)
+      return False, res
+
+    # If not all tests are done and no force stop, require continuing
+    if not force_stop:
       return True, (
         "Error: You cannot call `report` yet "
         "because not all tests have been marked as tested (which requires covering all strategies per test). "
@@ -616,12 +633,14 @@ def generate_test_for_pr(
         "If you have already found at least one bug and want to stop immediately, set `force=True` in `report`."
       )
 
-    if force_stop and not stats.bugs:
+    # Force stop requested but not all tests done - must have found bugs
+    if not stats.bugs:
       return True, (
         "Error: You cannot use `force=True` in `report` because no bugs have been found yet. "
         "Please verify the bug using `verify` or `difftest` tools first."
       )
 
+    # Force stop with bugs found - allow early termination
     stats.report = report_data.get("thoughts", None)
     return False, res
 
@@ -854,23 +873,22 @@ def main():
   # Setup build directory under open/
   base_build_dir = get_llvm_build_dir()
   build_dir = os.path.join(base_build_dir, "open", str(args.pr))
-  os.makedirs(build_dir, exist_ok=True)
-  set_llvm_build_dir(build_dir)
 
   # Check if PR info has changed
   saved_pr_info = load_saved_pr_info(args.pr)
   pr_changed = pr_info_changed(saved_pr_info, pr_info)
 
-  if pr_changed:
+  if pr_changed and Path(build_dir).exists():
     console.print(
-      "PR has changed or no previous build found. Preparing to rebuild...",
+      "PR has changed. Removing old build directory...",
       color="yellow",
     )
-    # Remove old build directory if it exists
-    if Path(build_dir).exists():
-      console.print(f"Removing old build directory: {build_dir}", color="yellow")
-      shutil.rmtree(build_dir)
-    os.makedirs(build_dir, exist_ok=True)
+    console.print(f"Removing old build directory: {build_dir}", color="yellow")
+    shutil.rmtree(build_dir)
+
+  # Ensure build directory exists
+  os.makedirs(build_dir, exist_ok=True)
+  set_llvm_build_dir(build_dir)
 
   # Setup LLVM environment
   if not setup_llvm_environment(pr_info):
