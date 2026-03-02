@@ -1,7 +1,7 @@
 #!/bin/bash
 
-MODEL="deepseek-chat"
-MODEL_DIR="deepseek-chat"
+MODEL="qwen3.5-plus"
+MODEL_DIR="qwen3"
 
 mkdir -p autoreview-"$MODEL_DIR"/history
 
