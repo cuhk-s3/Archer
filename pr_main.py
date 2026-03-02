@@ -177,6 +177,27 @@ def fetch_pr_info(pr_id: int, session: requests.Session) -> PRInfo:
   )
 
 
+def filter_patch_exclude_tests(full_patch: str) -> str:
+  """Filter out test file changes from a patch, keeping only code changes"""
+  try:
+    patchset = PatchSet(full_patch)
+  except Exception as e:
+    console.print(f"Warning: Failed to parse patch for filtering: {e}", color="yellow")
+    return full_patch  # Return original if parsing fails
+
+  # Keep files that are NOT test files
+  filtered_files = [f for f in patchset if not f.path.startswith("llvm/test/")]
+
+  if not filtered_files:
+    return ""  # Return empty if all files are tests
+
+  # Reconstruct patch from filtered files
+  result = ""
+  for file in filtered_files:
+    result += str(file)
+  return result
+
+
 def extract_tests_from_patch(full_patch: str) -> List[dict]:
   """Extract tests from patch after it has been applied, similar to postfix_extract.py
 
@@ -893,6 +914,9 @@ def main():
   # Setup LLVM environment
   if not setup_llvm_environment(pr_info):
     panic("Failed to setup LLVM environment")
+
+  # Filter out test files from patch before saving
+  pr_info.patch = filter_patch_exclude_tests(pr_info.patch)
 
   # Save PR info after successful setup
   save_pr_info(pr_info)
