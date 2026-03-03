@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-PR Review Script for Open Pull Requests
+PR Review Script for Pull Requests
 
-This script handles code review for open PRs in LLVM, similar to main.py but with the following differences:
+This script handles code review for PRs in LLVM, similar to main.py but with the following differences:
 1. Input is a PR ID instead of an issue ID
 2. Extracts patch from PR information
-3. Applies the patch and builds LLVM (in build_dir/open/)
+3. Applies the patch and builds LLVM (in build_dir/pr/)
 """
 
 import json
@@ -134,9 +134,6 @@ def fetch_pr_info(pr_id: int, session: requests.Session) -> PRInfo:
 
   if "message" in pr and pr["message"] == "Not Found":
     panic(f"PR #{pr_id} not found")
-
-  if pr["state"] == "closed":
-    panic(f"PR #{pr_id} is already closed. This script is for open PRs only.")
 
   # Fetch the patch
   patch_response = session.get(
@@ -358,10 +355,10 @@ def setup_llvm_environment(pr_info: PRInfo) -> bool:
 
 
 def get_pr_info_path(pr_id: int) -> Path:
-  """Get the path to store PR info for a specific PR in dataset_dir/open/"""
-  open_dir = Path(dataset_dir) / "open"
-  open_dir.mkdir(parents=True, exist_ok=True)
-  return open_dir / f"{pr_id}.json"
+  """Get the path to store PR info for a specific PR in dataset_dir/pr/"""
+  pr_dir = Path(dataset_dir) / "pr"
+  pr_dir.mkdir(parents=True, exist_ok=True)
+  return pr_dir / f"{pr_id}.json"
 
 
 def save_pr_info(pr_info: PRInfo):
@@ -831,7 +828,7 @@ def pr_review(
 
 
 def parse_args():
-  parser = ArgumentParser(description="PR Review Tool for Open LLVM Pull Requests")
+  parser = ArgumentParser(description="PR Review Tool for LLVM Pull Requests")
   parser.add_argument(
     "--pr",
     type=int,
@@ -891,9 +888,9 @@ def main():
   except Exception as e:
     panic(f"Failed to fetch PR information: {e}")
 
-  # Setup build directory under open/
+  # Setup build directory under pr/
   base_build_dir = get_llvm_build_dir()
-  build_dir = os.path.join(base_build_dir, "open", str(args.pr))
+  build_dir = os.path.join(base_build_dir, "pr", str(args.pr))
 
   # Check if PR info has changed
   saved_pr_info = load_saved_pr_info(args.pr)
