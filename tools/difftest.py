@@ -125,7 +125,9 @@ class DiffTestTool(FuncToolBase):
       transformed_ir = transform(orig_ir, args, self.build_dir)
 
       # Require a single call (no leading "%r ="); main will assign it to %r.
-      call_regex = r"\s*call\s+(.+?)\s+@[\w\d_]+\s*\(.*\)\s*$"
+      call_regex = (
+        r'\s*call\s+(.+?)\s+@(?:[-$._A-Za-z0-9]+|"(?:[^"\\]|\\.)+")\s*\(.*\)\s*$'
+      )
       m = re.fullmatch(call_regex, call_instr.strip())
       if not m:
         raise FuncToolCallException(
