@@ -98,14 +98,20 @@ class PRInfo:
   """Information extracted from a GitHub PR"""
 
   pr_id: int
+  pr_url: str
   title: str
   author: str
   base_commit: str
   fix_commit: str  # Latest commit in the PR
   patch: str
   components: List[str]
+  knowledge_cutoff: str = ""
   description: str = ""
-  tests: List[dict] = field(default_factory=list)  # Filled after applying patch
+  tests: List[dict] = field(default_factory=list)
+  labels: List[str] = field(default_factory=list)
+  comments: List[dict] = field(default_factory=list)
+  patch_location_lineno: dict = field(default_factory=dict)
+  patch_location_funcname: dict = field(default_factory=dict)
 
 
 class PREnvironment:

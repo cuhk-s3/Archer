@@ -23,7 +23,7 @@ from llvm import llvm_helper
 # PRs must be created within this date range
 # Format: "YYYY-MM-DD" or None for no limit
 PR_CREATED_AFTER = "2025-12-31"  # Only PRs created after this date
-PR_CREATED_BEFORE = "2026-03-01"  # Only PRs created before this date (None = no limit)
+PR_CREATED_BEFORE = "2026-02-28"  # Only PRs created before this date (None = no limit)
 
 github_token = os.environ["LAB_GITHUB_TOKEN"]
 cache_dir = Path(os.path.dirname(__file__)) / "cache_prs"

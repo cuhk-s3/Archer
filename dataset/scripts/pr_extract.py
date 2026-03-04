@@ -2,7 +2,8 @@
 """
 Extract and process PR data from LLVM GitHub repository.
 
-This script fetches PR information, extracts patches and tests, and saves them to the dataset directory.
+This script fetches PR information, extracts patches, tests, and patch location information,
+and saves them to the dataset directory.
 """
 
 import argparse
@@ -17,6 +18,8 @@ import requests
 from unidiff import PatchSet
 
 sys.path.append(str(Path(__file__).parent.parent))
+
+import hints
 
 import llvm.llvm_helper as llvm_helper
 
@@ -257,6 +260,26 @@ def main():
   print(f"Head commit: {fix_commit}")
   print(f"Components: {components}")
 
+  # Extract full PR context including comments
+  pr_comments = []
+  comments = session.get(pr["comments_url"]).json()
+  for comment in comments:
+    comment_obj = {
+      "author": comment["user"]["login"],
+      "body": comment["body"],
+    }
+    if llvm_helper.is_valid_comment(comment_obj):
+      pr_comments.append(comment_obj)
+
+  # Extract labels
+  labels = [label["name"] for label in pr.get("labels", [])]
+
+  # Extract knowledge cutoff (PR creation time)
+  knowledge_cutoff = pr["created_at"]
+
+  # Extract PR URL
+  pr_url = pr["html_url"]
+
   # Checkout base commit and apply patch
   print("Checking out base commit...")
   try:
@@ -280,6 +303,31 @@ def main():
     llvm_helper.reset("main")
     exit(1)
 
+  # Extract patch location information (line numbers and function names)
+  # Line level location
+  patch_location_lineno = {}
+  try:
+    patchset = PatchSet(patch)
+    for file in patchset:
+      location = hints.get_line_loc(file)
+      if len(location) != 0:
+        patch_location_lineno[file.path] = location
+  except Exception as e:
+    print(f"Warning: Failed to extract line locations: {e}")
+
+  # Function level location
+  patch_location_funcname = {}
+  try:
+    patchset = PatchSet(patch)
+    for file in patchset.modified_files:
+      print(f"Parsing {file.path}")
+      source_code = llvm_helper.git_execute(["show", f"{base_commit}:{file.path}"])
+      modified_funcs_valid = hints.get_funcname_loc(file, source_code)
+      if len(modified_funcs_valid) != 0:
+        patch_location_funcname[file.path] = sorted(modified_funcs_valid)
+  except Exception as e:
+    print(f"Warning: Failed to extract function names: {e}")
+
   # Extract tests from the applied patch
   print("Extracting tests from patch...")
   tests = extract_tests_from_patch(patch)
@@ -295,6 +343,7 @@ def main():
   # Save PR information
   pr_info = {
     "pr_id": pr_id,
+    "pr_url": pr_url,
     "state": pr_state,
     "title": pr["title"],
     "author": pr["user"]["login"],
@@ -304,6 +353,11 @@ def main():
     "components": sorted(components),
     "description": pr.get("body", "") or "",
     "tests": tests,
+    "labels": labels,
+    "comments": pr_comments,
+    "knowledge_cutoff": knowledge_cutoff,
+    "patch_location_lineno": patch_location_lineno,
+    "patch_location_funcname": patch_location_funcname,
   }
 
   with open(data_json_path, "w") as f:
