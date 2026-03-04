@@ -5,9 +5,9 @@ import shlex
 import subprocess
 import time
 from argparse import ArgumentParser
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import yaml
 from minisweagent import Model
@@ -37,6 +37,7 @@ from main import (
   MAX_CHAT_ROUNDS,
   MAX_CONSUMED_TOKENS,
   NoAvailableBugFound,
+  PRInfo,
   RunStats,
 )
 from tools.verify import VerifyTool
@@ -81,25 +82,6 @@ EDITING_TOOLS = [
   "sed",
   "awk",
 ]
-
-
-@dataclass
-class PRInfo:
-  """Information extracted from a GitHub PR"""
-
-  pr_id: int
-  title: str
-  author: str
-  base_commit: str
-  fix_commit: str  # Latest commit in the PR
-  patch: str
-  components: List[str]
-  description: str = ""
-  tests: List[dict] = None
-
-  def __post_init__(self):
-    if self.tests is None:
-      self.tests = []
 
 
 @dataclass
@@ -303,7 +285,9 @@ class MyAgent(DefaultAgent):
     try:
       with open(info_path, "r") as f:
         data = json.load(f)
-      return PRInfo(**data)
+      allowed_keys = {f.name for f in fields(PRInfo)}
+      filtered = {k: v for k, v in data.items() if k in allowed_keys}
+      return PRInfo(**filtered)
     except Exception as e:
       console.print(f"Warning: Failed to load saved PR info: {e}", color="yellow")
       return None

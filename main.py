@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import time
 from argparse import ArgumentParser
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -37,15 +37,7 @@ from llvm.llvm_helper import (
   reset,
   set_llvm_build_dir,
 )
-from lms.agent import AgentBase
-from main import (
-  Bug,
-  RunStats,
-  TestStrategy,
-  check_duplicate_tool_call,
-  ensure_tools_available,
-  get_component_knowledge,
-)
+from lms.agent import AgentBase, RepeatedToolCallLimitExceeded
 from tools.difftest import DiffTestTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
@@ -94,17 +86,147 @@ if not LLUBI_PATH:
 
 
 @dataclass
+class Bug:
+  original_ir: str
+  transformed_ir: str
+  log: str
+  thoughts: Optional[str] = None
+
+
+@dataclass
+class RunStats:
+  command: dict
+  error: Optional[str] = None
+  errmsg: Optional[str] = None
+  traceback: Optional[str] = None
+  input_tokens: int = 0
+  output_tokens: int = 0
+  cached_tokens: int = 0
+  total_tokens: int = 0
+  chat_cost: float = 0.0
+  chat_rounds: int = 0
+  phase1_round: int = 0
+  phase2_round: int = 0
+  total_time_sec: float = 0.0
+  tool_usage: List[dict] = field(default_factory=list)
+  strategies: List[dict] = field(
+    default_factory=lambda *_, **__: [
+      {
+        "name": "<not-provided>",
+        "target": "<not-provided>",
+        "rationale": "<not-provided>",
+        "expected_issue": "<not-provided>",
+      }
+    ]
+  )
+  reason_thou: str = "<not-provided>"
+  bugs: List[Bug] = field(default_factory=list)
+  test_traj: List[str] = field(default_factory=list)
+  report: Optional[str] = None
+
+  def as_dict(self) -> dict:
+    return asdict(self)
+
+
+class NoAvailableBugFound(Exception):
+  pass
+
+
+class ReachToolBudget(Exception):
+  pass
+
+
+@dataclass
+class TestStrategy:
+  name: str
+  target: str
+  rationale: str
+  expected_issue: str
+
+  def as_dict(self) -> dict:
+    return {
+      "name": self.name,
+      "target": self.target,
+      "rationale": self.rationale,
+      "expected_issue": self.expected_issue,
+    }
+
+  def __str__(self) -> str:
+    return json.dumps(self.as_dict(), indent=2)
+
+
+def ensure_tools_available(agent: AgentBase, tools: List[str]):
+  available_tools = agent.tools.list(ignore_budget=False)
+  unavailable_tools = []
+  for tool in tools:
+    if tool not in available_tools:
+      unavailable_tools.append(tool)
+  if len(unavailable_tools) > 0:
+    raise ReachToolBudget(f"Tools [{', '.join(unavailable_tools)}] are out of budget.")
+
+
+def get_component_knowledge(component: List[str]) -> str:
+  console.print(f"Retrieving knowledge for component: {component} ...")
+
+  knowledge_dir = Path(__file__).parent / "subsystem" / "summary"
+
+  knowledge_file = []
+  for comp_name in component:
+    candidate = knowledge_dir / f"{comp_name}.md"
+    if candidate.exists():
+      knowledge_file.append(candidate)
+
+  if not knowledge_file:
+    return "No specific knowledge provided for this component."
+
+  knowledge = [f.read_text(encoding="utf-8") for f in knowledge_file]
+  return "\n".join(knowledge)
+
+
+def check_duplicate_tool_call(
+  name: str, args: object, executed_tool_calls: set, consecutive_duplicates: List[int]
+) -> Optional[str]:
+  try:
+    if isinstance(args, str):
+      obj = json_repair.loads(args)
+    else:
+      obj = args
+    normalized_args = json.dumps(obj, sort_keys=True)
+  except Exception:
+    normalized_args = "".join(str(args).split())
+
+  if not any(name.startswith(prefix) for prefix in ["find", "grep", "read", "list"]):
+    return None
+
+  call_signature = (name, normalized_args)
+  if call_signature in executed_tool_calls:
+    consecutive_duplicates[0] += 1
+    if consecutive_duplicates[0] >= 5:
+      raise RepeatedToolCallLimitExceeded()
+    return (
+      f"Error: You have already executed the tool '{name}' with these exact arguments. "
+      "Please change your arguments or thoughts to try a different approach. "
+      "Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+    )
+
+  executed_tool_calls.add(call_signature)
+  consecutive_duplicates[0] = 0
+  return None
+
+
+@dataclass
 class PRInfo:
   """Information extracted from a GitHub PR"""
 
   pr_id: int
-  pr_url: str
-  title: str
-  author: str
-  base_commit: str
-  fix_commit: str  # Latest commit in the PR
-  patch: str
-  components: List[str]
+  pr_url: str = ""
+  title: str = ""
+  author: str = ""
+  base_commit: str = ""
+  fix_commit: str = ""  # Latest commit in the PR
+  patch: str = ""
+  components: List[str] = field(default_factory=list)
+  state: str = ""
   knowledge_cutoff: str = ""
   description: str = ""
   tests: List[dict] = field(default_factory=list)
@@ -208,7 +330,9 @@ def load_saved_pr_info(pr_id: int) -> Optional[PRInfo]:
   try:
     with open(info_path, "r") as f:
       data = json.load(f)
-    return PRInfo(**data)
+    allowed_keys = {f.name for f in fields(PRInfo)}
+    filtered = {k: v for k, v in data.items() if k in allowed_keys}
+    return PRInfo(**filtered)
   except Exception as e:
     console.print(f"Warning: Failed to load saved PR info: {e}", color="yellow")
     return None
@@ -457,42 +581,41 @@ def generate_test_for_pr(
       except Exception:
         return (True, res)
 
-    if name != "report":
-      return True, res
-
-    try:
+    if name == "report":
       report_data = json.loads(res)
-    except Exception:
-      return (True, res)
 
-    force_stop = report_data.get("force", False)
-    all_tested = all(t.tested for t in test_objects)
+      force_stop = report_data.get("force", False)
+      all_tested = all(t.tested for t in test_objects)
 
-    # If all tests have been completed, allow the report regardless of bugs found
-    if all_tested:
+      # If all tests have been completed, allow the report regardless of bugs found
+      if all_tested:
+        stats.report = report_data.get("thoughts", None)
+        return False, res
+
+      # If not all tests are done and no force stop, require continuing
+      if not force_stop:
+        return True, (
+          "Error: You cannot call `report` yet "
+          "because not all tests have been marked as tested (which requires covering all strategies per test). "
+          "Please use `tests_manager` to check untested tests, "
+          "test them, and mark them as tested. "
+          "If you have already found at least one bug and want to stop immediately, set `force=True` in `report`."
+        )
+
+      # Force stop requested but not all tests done - must have found bugs
+      if not stats.bugs:
+        return True, (
+          "Error: You cannot use `force=True` in `report` because no bugs have been found yet. "
+          "Please verify the bug using `verify` or `difftest` tools first."
+        )
+
+      console.print("Force stopping the process with bugs found. Generating report...")
+
+      # Force stop with bugs found - allow early termination
       stats.report = report_data.get("thoughts", None)
       return False, res
 
-    # If not all tests are done and no force stop, require continuing
-    if not force_stop:
-      return True, (
-        "Error: You cannot call `report` yet "
-        "because not all tests have been marked as tested (which requires covering all strategies per test). "
-        "Please use `tests_manager` to check untested tests, "
-        "test them, and mark them as tested. "
-        "If you have already found at least one bug and want to stop immediately, set `force=True` in `report`."
-      )
-
-    # Force stop requested but not all tests done - must have found bugs
-    if not stats.bugs:
-      return True, (
-        "Error: You cannot use `force=True` in `report` because no bugs have been found yet. "
-        "Please verify the bug using `verify` or `difftest` tools first."
-      )
-
-    # Force stop with bugs found - allow early termination
-    stats.report = report_data.get("thoughts", None)
-    return False, res
+    return True, res  # Continue the process for other tools
 
   ret = agent.run(
     [
