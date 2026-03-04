@@ -587,6 +587,10 @@ def generate_test_for_pr(
       force_stop = report_data.get("force", False)
       all_tested = all(t.tested for t in test_objects)
 
+      console.print(
+        f"Report called. force={force_stop}, all_tested={all_tested}, bugs_found={len(stats.bugs)}"
+      )
+
       # If all tests have been completed, allow the report regardless of bugs found
       if all_tested:
         stats.report = report_data.get("thoughts", None)
