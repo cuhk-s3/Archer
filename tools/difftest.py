@@ -23,13 +23,16 @@ class DiffTestTool(FuncToolBase):
   def __init__(self, build_dir: str, llubi_path: str):
     self.build_dir = Path(build_dir).resolve().absolute()
     self.llubi_path = Path(llubi_path).resolve().absolute()
+    # lli is typically in the same directory as other LLVM tools
+    self.lli_path = self.build_dir / "bin" / "lli"
 
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
       "difftest",
       "Perform differential testing on the input LLVM IR code and another transformed by opt, "
-      "then use llubi to execute to see if there is any difference. "
-      "You can also use this tool to confirm whether a previously found difference is a real bug.",
+      "then use llubi (or lli as fallback) to execute to see if there is any difference. "
+      "You can also use this tool to confirm whether a previously found difference is a real bug."
+      "If you encountered a crash when using llubi, please set `use_lli` to true to use lli for execution. ",
       [
         FuncToolSpec.Param(
           "action",
@@ -59,6 +62,12 @@ class DiffTestTool(FuncToolBase):
           "or constant expressions such as `bitcast (...)` are allowed). "
           "The call signature must match the target function defined in `orig_ir`. "
           "Example: `call float @test(i1 true, float 1.0, float bitcast (i32 2139095040 to float))`.",
+        ),
+        FuncToolSpec.Param(
+          "use_lli",
+          "boolean",
+          False,
+          "Optional. If true, use lli instead of llubi for execution. Use this if llubi crashes or has issues. Defaults to false (use llubi).",
         ),
         FuncToolSpec.Param(
           "is_bug",
@@ -98,6 +107,7 @@ class DiffTestTool(FuncToolBase):
     orig_ir: str = None,
     args: str = None,
     call_instr: str = None,
+    use_lli: bool = False,
     is_bug: bool = None,
     test_index: int = None,
     covered_strategy: str = None,
@@ -176,9 +186,13 @@ class DiffTestTool(FuncToolBase):
         )
 
         def run(path, timeout_s: int = 10):
+          # Choose executor based on use_lli flag
+          executor = self.lli_path if use_lli else self.llubi_path
+          executor_name = "lli" if use_lli else "llubi"
+
           try:
             res = subprocess.run(
-              [str(self.llubi_path), str(path)],
+              [str(executor), str(path)],
               capture_output=True,
               timeout=timeout_s,
             )
@@ -187,6 +201,7 @@ class DiffTestTool(FuncToolBase):
               "return_code": res.returncode,
               "stdout": res.stdout.decode("utf-8", errors="replace").strip(),
               "stderr": res.stderr.decode("utf-8", errors="replace").strip(),
+              "executor": executor_name,
             }
           except subprocess.TimeoutExpired as e:
             return {
@@ -198,6 +213,7 @@ class DiffTestTool(FuncToolBase):
               "stderr": (
                 e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
               ).strip(),
+              "executor": executor_name,
             }
 
         out1 = run(orig_ir_path)
