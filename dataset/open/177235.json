@@ -1,0 +1,98 @@
+{
+  "pr_id": 177235,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177235",
+  "state": "open",
+  "title": "[Inline][CloneAndPruneFunctionInto] Consider the nonnull argument for null check",
+  "author": "scui-ibm",
+  "base_commit": "b1907c109c95431ebf0bb6f128c3bbf3fb89b6de",
+  "fix_commit": "d4063f104ada9ff21621e2443480aea354a9bc80",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Utils/Cloning.h b/llvm/include/llvm/Transforms/Utils/Cloning.h\nindex cfa06a5be79fd..831163a8c6d51 100644\n--- a/llvm/include/llvm/Transforms/Utils/Cloning.h\n+++ b/llvm/include/llvm/Transforms/Utils/Cloning.h\n@@ -225,10 +225,10 @@ LLVM_ABI void CloneFunctionBodyInto(\n     const MetadataPredicate *IdentityMD = nullptr);\n \n LLVM_ABI void CloneAndPruneIntoFromInst(\n-    Function *NewFunc, const Function *OldFunc, const Instruction *StartingInst,\n-    ValueToValueMapTy &VMap, bool ModuleLevelChanges,\n-    SmallVectorImpl<ReturnInst *> &Returns, const char *NameSuffix = \"\",\n-    ClonedCodeInfo *CodeInfo = nullptr);\n+    CallBase &CB, Function *NewFunc, const Function *OldFunc,\n+    const Instruction *StartingInst, ValueToValueMapTy &VMap,\n+    bool ModuleLevelChanges, SmallVectorImpl<ReturnInst *> &Returns,\n+    const char *NameSuffix = \"\", ClonedCodeInfo *CodeInfo = nullptr);\n \n /// This works exactly like CloneFunctionInto,\n /// except that it does some simple constant prop and DCE on the fly.  The\n@@ -241,10 +241,13 @@ LLVM_ABI void CloneAndPruneIntoFromInst(\n /// If ModuleLevelChanges is false, VMap contains no non-identity GlobalValue\n /// mappings.\n ///\n-LLVM_ABI void CloneAndPruneFunctionInto(\n-    Function *NewFunc, const Function *OldFunc, ValueToValueMapTy &VMap,\n-    bool ModuleLevelChanges, SmallVectorImpl<ReturnInst *> &Returns,\n-    const char *NameSuffix = \"\", ClonedCodeInfo *CodeInfo = nullptr);\n+LLVM_ABI void CloneAndPruneFunctionInto(CallBase &CB, Function *NewFunc,\n+                                        const Function *OldFunc,\n+                                        ValueToValueMapTy &VMap,\n+                                        bool ModuleLevelChanges,\n+                                        SmallVectorImpl<ReturnInst *> &Returns,\n+                                        const char *NameSuffix = \"\",\n+                                        ClonedCodeInfo *CodeInfo = nullptr);\n \n /// This class captures the data input to the InlineFunction call, and records\n /// the auxiliary results produced by it.\ndiff --git a/llvm/lib/Transforms/Utils/CloneFunction.cpp b/llvm/lib/Transforms/Utils/CloneFunction.cpp\nindex 260dc3a12df43..46ae257fef5d0 100644\n--- a/llvm/lib/Transforms/Utils/CloneFunction.cpp\n+++ b/llvm/lib/Transforms/Utils/CloneFunction.cpp\n@@ -429,7 +429,7 @@ struct PruningFunctionCloner {\n   /// The specified block is found to be reachable, clone it and\n   /// anything that it can reach.\n   void CloneBlock(const BasicBlock *BB, BasicBlock::const_iterator StartingInst,\n-                  std::vector<const BasicBlock *> &ToClone);\n+                  std::vector<const BasicBlock *> &ToClone, CallBase &CB);\n };\n } // namespace\n \n@@ -506,9 +506,10 @@ PruningFunctionCloner::cloneInstruction(BasicBlock::const_iterator II) {\n \n /// The specified block is found to be reachable, clone it and\n /// anything that it can reach.\n-void PruningFunctionCloner::CloneBlock(\n-    const BasicBlock *BB, BasicBlock::const_iterator StartingInst,\n-    std::vector<const BasicBlock *> &ToClone) {\n+void PruningFunctionCloner::CloneBlock(const BasicBlock *BB,\n+                                       BasicBlock::const_iterator StartingInst,\n+                                       std::vector<const BasicBlock *> &ToClone,\n+                                       CallBase &CB) {\n   WeakTrackingVH &BBEntry = VMap[BB];\n \n   // Have we already cloned this block?\n@@ -639,6 +640,20 @@ void PruningFunctionCloner::CloneBlock(\n         VMap[OldTI] = NewBI;\n         ToClone.push_back(Dest);\n         TerminatorDone = true;\n+      } else {\n+        if (auto *CI = dyn_cast<CmpInst>(BI->getCondition()))\n+          if (auto *A = dyn_cast<Argument>(CI->getOperand(0)))\n+            if (CI->isEquality() &&\n+                isa<ConstantPointerNull>(CI->getOperand(1)) &&\n+                CB.paramHasAttr(A->getArgNo(), Attribute::NonNull)) {\n+              bool IsEqual = CI->getPredicate() == CmpInst::ICMP_EQ;\n+              BasicBlock *Dest = BI->getSuccessor(IsEqual);\n+              auto *NewBI = BranchInst::Create(Dest, NewBB);\n+              NewBI->setDebugLoc(BI->getDebugLoc());\n+              VMap[OldTI] = NewBI;\n+              ToClone.push_back(Dest);\n+              TerminatorDone = true;\n+            }\n       }\n     }\n   } else if (const SwitchInst *SI = dyn_cast<SwitchInst>(OldTI)) {\n@@ -699,13 +714,11 @@ void PruningFunctionCloner::CloneBlock(\n /// This works like CloneAndPruneFunctionInto, except that it does not clone the\n /// entire function. Instead it starts at an instruction provided by the caller\n /// and copies (and prunes) only the code reachable from that instruction.\n-void llvm::CloneAndPruneIntoFromInst(Function *NewFunc, const Function *OldFunc,\n-                                     const Instruction *StartingInst,\n-                                     ValueToValueMapTy &VMap,\n-                                     bool ModuleLevelChanges,\n-                                     SmallVectorImpl<ReturnInst *> &Returns,\n-                                     const char *NameSuffix,\n-                                     ClonedCodeInfo *CodeInfo) {\n+void llvm::CloneAndPruneIntoFromInst(\n+    CallBase &CB, Function *NewFunc, const Function *OldFunc,\n+    const Instruction *StartingInst, ValueToValueMapTy &VMap,\n+    bool ModuleLevelChanges, SmallVectorImpl<ReturnInst *> &Returns,\n+    const char *NameSuffix, ClonedCodeInfo *CodeInfo) {\n   assert(NameSuffix && \"NameSuffix cannot be null!\");\n \n   ValueMapTypeRemapper *TypeMapper = nullptr;\n@@ -731,11 +744,11 @@ void llvm::CloneAndPruneIntoFromInst(Function *NewFunc, const Function *OldFunc,\n \n   // Clone the entry block, and anything recursively reachable from it.\n   std::vector<const BasicBlock *> CloneWorklist;\n-  PFC.CloneBlock(StartingBB, StartingInst->getIterator(), CloneWorklist);\n+  PFC.CloneBlock(StartingBB, StartingInst->getIterator(), CloneWorklist, CB);\n   while (!CloneWorklist.empty()) {\n     const BasicBlock *BB = CloneWorklist.back();\n     CloneWorklist.pop_back();\n-    PFC.CloneBlock(BB, BB->begin(), CloneWorklist);\n+    PFC.CloneBlock(BB, BB->begin(), CloneWorklist, CB);\n   }\n \n   // Loop over all of the basic blocks in the old function.  If the block was\n@@ -985,12 +998,16 @@ void llvm::CloneAndPruneIntoFromInst(Function *NewFunc, const Function *OldFunc,\n /// constant arguments cause a significant amount of code in the callee to be\n /// dead.  Since this doesn't produce an exact copy of the input, it can't be\n /// used for things like CloneFunction or CloneModule.\n-void llvm::CloneAndPruneFunctionInto(\n-    Function *NewFunc, const Function *OldFunc, ValueToValueMapTy &VMap,\n-    bool ModuleLevelChanges, SmallVectorImpl<ReturnInst *> &Returns,\n-    const char *NameSuffix, ClonedCodeInfo *CodeInfo) {\n-  CloneAndPruneIntoFromInst(NewFunc, OldFunc, &OldFunc->front().front(), VMap,\n-                            ModuleLevelChanges, Returns, NameSuffix, CodeInfo);\n+void llvm::CloneAndPruneFunctionInto(CallBase &CB, Function *NewFunc,\n+                                     const Function *OldFunc,\n+                                     ValueToValueMapTy &VMap,\n+                                     bool ModuleLevelChanges,\n+                                     SmallVectorImpl<ReturnInst *> &Returns,\n+                                     const char *NameSuffix,\n+                                     ClonedCodeInfo *CodeInfo) {\n+  CloneAndPruneIntoFromInst(CB, NewFunc, OldFunc, &OldFunc->front().front(),\n+                            VMap, ModuleLevelChanges, Returns, NameSuffix,\n+                            CodeInfo);\n }\n \n /// Remaps instructions in \\p Blocks using the mapping in \\p VMap.\ndiff --git a/llvm/lib/Transforms/Utils/InlineFunction.cpp b/llvm/lib/Transforms/Utils/InlineFunction.cpp\nindex aa902f687d8aa..3cc3e3e2124a6 100644\n--- a/llvm/lib/Transforms/Utils/InlineFunction.cpp\n+++ b/llvm/lib/Transforms/Utils/InlineFunction.cpp\n@@ -2714,7 +2714,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,\n     // have no dead or constant instructions leftover after inlining occurs\n     // (which can happen, e.g., because an argument was constant), but we'll be\n     // happy with whatever the cloner can do.\n-    CloneAndPruneFunctionInto(Caller, CalledFunc, VMap,\n+    CloneAndPruneFunctionInto(CB, Caller, CalledFunc, VMap,\n                               /*ModuleLevelChanges=*/false, Returns, \".i\",\n                               &InlinedFunctionInfo);\n     // Remember the first block that is newly cloned over.\n",
+  "components": [
+    "CloneFunction",
+    "InlineFunction"
+  ],
+  "description": "Currently, for null check of a callee parameter, inline cost analysis checks if the corresponding argument at call site is marked nonnull and, if yes, the resulting dead blocks after the null check are excluded from the cost computation. But those dead blocks from the callee are still inlined into the caller. This is to teach inliner not to inline those dead blocks into the caller. This can reduce the code size of the caller after inlining.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Inline/nonnull.ll",
+      "commands": [
+        "opt -S -passes=inline %s",
+        "opt -S -passes='cgscc(inline)' %s",
+        "opt -S -passes='module-inline' %s"
+      ],
+      "tests": [
+        {
+          "test_name": "caller3",
+          "test_body": "declare void @callee(ptr)\n\ndefine void @caller3(ptr %arg) {\n  call void @callee(ptr nonnull %arg)\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-01-21T20:51:01Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Utils/Cloning.h": [
+      [
+        225,
+        234
+      ],
+      [
+        241,
+        250
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/CloneFunction.cpp": [
+      [
+        429,
+        435
+      ],
+      [
+        506,
+        514
+      ],
+      [
+        639,
+        644
+      ],
+      [
+        699,
+        711
+      ],
+      [
+        731,
+        741
+      ],
+      [
+        985,
+        996
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/InlineFunction.cpp": [
+      [
+        2714,
+        2720
+      ]
+    ],
+    "llvm/test/Transforms/Inline/nonnull.ll": [
+      [
+        76,
+        98
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Utils/CloneFunction.cpp": [
+      "PruningFunctionCloner::CloneBlock",
+      "PruningFunctionCloner::cloneInstruction",
+      "llvm::CloneAndPruneFunctionInto",
+      "llvm::CloneAndPruneIntoFromInst",
+      "llvm::remapInstructionsInBlocks"
+    ],
+    "llvm/lib/Transforms/Utils/InlineFunction.cpp": [
+      "llvm::InlineFunctionImpl"
+    ]
+  }
+}

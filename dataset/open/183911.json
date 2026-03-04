@@ -1,0 +1,255 @@
+{
+  "pr_id": 183911,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183911",
+  "state": "open",
+  "title": "[VPlan] Optimize FindLast of (binop %IV, live-in) by sinking.",
+  "author": "fhahn",
+  "base_commit": "e71f327b46059fe232b205414a3e8c1fc537c80f",
+  "fix_commit": "82f295773f1f76e246a0f8033ea19b4515ae566e",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex a24a483ab5e32..1b55c02461447 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -5666,6 +5666,41 @@ void VPlanTransforms::addExitUsersForFirstOrderRecurrences(VPlan &Plan,\n   }\n }\n \n+/// Check if \\p V is a binary expression of a widened IV and a loop-invariant\n+/// value. Returns the widened IV if found, nullptr otherwise.\n+static VPWidenIntOrFpInductionRecipe *\n+getExpressionIV(VPValue *V, VPRegionBlock *VectorLoopRegion) {\n+  auto *BinOp = dyn_cast<VPWidenRecipe>(V);\n+  if (!BinOp || !Instruction::isBinaryOp(BinOp->getOpcode()))\n+    return nullptr;\n+\n+  VPValue *Op0 = BinOp->getOperand(0);\n+  VPValue *Op1 = BinOp->getOperand(1);\n+  if (!isa<VPWidenIntOrFpInductionRecipe>(Op0))\n+    std::swap(Op0, Op1);\n+\n+  if (!Op1->isDefinedOutsideLoopRegions())\n+    return nullptr;\n+\n+  return dyn_cast<VPWidenIntOrFpInductionRecipe>(Op0);\n+}\n+\n+/// Create a scalar version of the binary op \\p V and sink before \\p InsertPt,\n+/// replacing \\p WidenIV with \\p ScalarIV.\n+static VPValue *sinkBinOpToMiddleBlock(VPValue *V, VPValue *ScalarIV,\n+                                       VPWidenIntOrFpInductionRecipe *WidenIV,\n+                                       VPBasicBlock::iterator InsertPt) {\n+  auto *BinOp = V->getDefiningRecipe()->clone();\n+  if (BinOp->getOperand(0) == WidenIV)\n+    BinOp->setOperand(0, ScalarIV);\n+  else {\n+    assert(BinOp->getOperand(1) == WidenIV && \"one operand must be WideIV\");\n+    BinOp->setOperand(1, ScalarIV);\n+  }\n+  BinOp->insertBefore(*InsertPt->getParent(), InsertPt);\n+  return cast<VPWidenRecipe>(BinOp);\n+}\n+\n void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n                                                PredicatedScalarEvolution &PSE,\n                                                Loop &L) {\n@@ -5712,11 +5747,15 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n                                     m_VPValue(FalseVal))))\n       continue;\n \n-    // The non-phi operand of the select is the IV.\n+    // The non-phi operand of the select is the IV or and expression of IV.\n     assert(is_contained(CondSelect->getDefiningRecipe()->operands(), PhiR));\n-    VPValue *IV = TrueVal == PhiR ? FalseVal : TrueVal;\n+    VPValue *ExprOfIV = TrueVal == PhiR ? FalseVal : TrueVal;\n \n-    const SCEV *IVSCEV = vputils::getSCEVExprForVPValue(IV, PSE, &L);\n+    // Check if IV is a simple expression of a widened IV. If so, we can track\n+    // the underlying IV and sink the expression.\n+    auto *ExpressionIV = getExpressionIV(ExprOfIV, VectorLoopRegion);\n+    const SCEV *IVSCEV = vputils::getSCEVExprForVPValue(\n+        ExpressionIV ? ExpressionIV : ExprOfIV, PSE, &L);\n     const SCEV *Step;\n     if (!match(IVSCEV, m_scev_AffineAddRec(m_SCEV(), m_SCEV(Step))))\n       continue;\n@@ -5725,21 +5764,40 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n     if (!SE.isKnownNonZero(Step))\n       continue;\n \n-    // Positive step means we need UMax/SMax to find the last IV value, and\n-    // UMin/SMin otherwise.\n-    bool UseMax = SE.isKnownPositive(Step);\n-    bool UseSigned = true;\n-    std::optional<APInt> SentinelVal =\n-        CheckSentinel(IVSCEV, UseMax, /*IsSigned=*/true);\n-    if (!SentinelVal) {\n-      SentinelVal = CheckSentinel(IVSCEV, UseMax, /*IsSigned=*/false);\n-      UseSigned = false;\n+    bool UseMax;\n+    bool UseSigned;\n+    std::optional<APInt> SentinelVal;\n+    auto TryToGetSentinel = [&](const SCEV *IVSCEV, const SCEV *Step) {\n+      // Positive step means we need UMax/SMax to find the last IV value, and\n+      // UMin/SMin otherwise.\n+      UseMax = SE.isKnownPositive(Step);\n+      UseSigned = true;\n+      SentinelVal = CheckSentinel(IVSCEV, UseMax, /*IsSigned=*/true);\n+      if (!SentinelVal) {\n+        SentinelVal = CheckSentinel(IVSCEV, UseMax, /*IsSigned=*/false);\n+        UseSigned = false;\n+      }\n+    };\n+\n+    // First, check if we can vectorize with sentinel value with ExpressionIV if\n+    // available and ExprOfIV otherwise.\n+    TryToGetSentinel(IVSCEV, Step);\n+    if (!SentinelVal && ExpressionIV) {\n+      // If we weren't able to use a sentinel with ExpressionIV, try if it is\n+      // possible with ExprOfIV.\n+      const SCEV *ExprOfIVSCEV =\n+          vputils::getSCEVExprForVPValue(ExprOfIV, PSE, &L);\n+      if (match(ExprOfIVSCEV, m_scev_AffineAddRec(m_SCEV(), m_SCEV(Step)))) {\n+        TryToGetSentinel(ExprOfIVSCEV, Step);\n+        IVSCEV = ExprOfIVSCEV;\n+      }\n     }\n \n     // If no sentinel was found, fall back to a boolean AnyOf reduction to track\n     // if the condition was ever true. Requires the IV to not wrap, otherwise we\n     // cannot use min/max.\n     if (!SentinelVal) {\n+      // TODO: Support expression sinking with boolean any-of tracking.\n       auto *AR = cast<SCEVAddRecExpr>(IVSCEV);\n       if (AR->hasNoSignedWrap())\n         UseSigned = true;\n@@ -5753,6 +5811,18 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n         BackedgeVal,\n         match_fn(m_VPInstruction<VPInstruction::ComputeReductionResult>())));\n \n+    // If IV is an expression, create a new select that tracks the underlying\n+    // IV directly and update the backedge value.\n+    if (ExpressionIV) {\n+      auto *SelectR = CondSelect->getDefiningRecipe();\n+      VPBuilder LoopBuilder(SelectR);\n+      if (TrueVal == PhiR)\n+        Cond = LoopBuilder.createNot(Cond);\n+      CondSelect = LoopBuilder.createSelect(Cond, ExpressionIV, PhiR,\n+                                            SelectR->getDebugLoc());\n+    }\n+\n+    // Create the reduction result in the middle block using sentinel directly.\n     RecurKind MinMaxKind =\n         UseMax ? (UseSigned ? RecurKind::SMax : RecurKind::UMax)\n                : (UseSigned ? RecurKind::SMin : RecurKind::UMin);\n@@ -5760,9 +5830,14 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n                     FastMathFlags());\n     DebugLoc ExitDL = RdxResult->getDebugLoc();\n     VPBuilder MiddleBuilder(RdxResult);\n-    VPValue *ReducedIV =\n-        MiddleBuilder.createNaryOp(VPInstruction::ComputeReductionResult,\n-                                   RdxResult->getOperand(0), Flags, ExitDL);\n+    VPValue *ReducedIV = MiddleBuilder.createNaryOp(\n+        VPInstruction::ComputeReductionResult, CondSelect, Flags, ExitDL);\n+\n+    // If IV was an expression, sink the expression to the middle block.\n+    VPValue *LoopExitingVal = ReducedIV;\n+    if (ExpressionIV)\n+      LoopExitingVal = sinkBinOpToMiddleBlock(ExprOfIV, ReducedIV, ExpressionIV,\n+                                              MiddleBuilder.getInsertPoint());\n \n     VPValue *NewRdxResult;\n     VPValue *StartVPV = PhiR->getStartValue();\n@@ -5773,7 +5848,7 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n       auto *Cmp = MiddleBuilder.createICmp(CmpInst::ICMP_NE, ReducedIV,\n                                            Sentinel, ExitDL);\n       NewRdxResult =\n-          MiddleBuilder.createSelect(Cmp, ReducedIV, StartVPV, ExitDL);\n+          MiddleBuilder.createSelect(Cmp, LoopExitingVal, StartVPV, ExitDL);\n       StartVPV = Sentinel;\n     } else {\n       // Introduce a boolean AnyOf reduction to track if the condition was ever\n@@ -5791,9 +5866,9 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n       VPValue *OrVal = LoopBuilder.createOr(AnyOfPhi, AnyOfCond);\n       AnyOfPhi->setOperand(1, OrVal);\n \n-      NewRdxResult =\n-          MiddleBuilder.createNaryOp(VPInstruction::ComputeAnyOfResult,\n-                                     {StartVPV, ReducedIV, OrVal}, {}, ExitDL);\n+      NewRdxResult = MiddleBuilder.createNaryOp(\n+          VPInstruction::ComputeAnyOfResult, {StartVPV, LoopExitingVal, OrVal},\n+          {}, ExitDL);\n \n       // Initialize the IV reduction phi with the neutral element, not the\n       // original start value, to ensure correct min/max reduction results.\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "When we are finding the last occurrence of a value of an expression that depends on an induction, we can vectorize this by just selecting the IV and sinking the expression in the middle block\r\n\r\nThis follows one of @ayalz's suggestions during earlier discussions for adding support for CAS/FindLast patterns.\r\n\r\nThis patch starts with the simplest case, where the selected value is a simple binary expression of a wide IV and a loop-invariant operand.\r\n\r\nThis should always be profitable, as the current restriction to binary operators ensures that the width of the wide IV matches the original reduction width, we won't introduce any new, wider reduction phi recipes, and remove the boolean reduction + the horizontal reduction in the loop.\r\n\r\nI will also share follow-ups to support sinking loads soon.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/find-last-iv-sinkable-expr.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "findlast_mul_expr",
+          "test_body": "define i64 @findlast_mul_expr(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i64 [ -1, %entry ], [ %sel, %loop ]\n  %gep = getelementptr inbounds i64, ptr %a, i64 %iv\n  %load = load i64, ptr %gep, align 8\n  %cmp = icmp eq i64 %load, 42\n  %expr = mul i64 %iv, 3\n  %sel = select i1 %cmp, i64 %expr, i64 %rdx\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit = icmp eq i64 %iv.next, %n\n  br i1 %exit, label %done, label %loop\n\ndone:                                             ; preds = %loop\n  ret i64 %sel\n}\n"
+        },
+        {
+          "test_name": "findlast_non_canonical_iv_with_expr",
+          "test_body": "define i64 @findlast_non_canonical_iv_with_expr(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 10, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i64 [ -1, %entry ], [ %sel, %loop ]\n  %gep = getelementptr inbounds i64, ptr %a, i64 %iv\n  %load = load i64, ptr %gep, align 8\n  %cmp = icmp eq i64 %load, 42\n  %expr = add i64 %iv, 100\n  %sel = select i1 %cmp, i64 %expr, i64 %rdx\n  %iv.next = add nuw nsw i64 %iv, 2\n  %exit = icmp eq i64 %iv.next, %n\n  br i1 %exit, label %done, label %loop\n\ndone:                                             ; preds = %loop\n  ret i64 %sel\n}\n"
+        },
+        {
+          "test_name": "findlast_shl_expr",
+          "test_body": "define i64 @findlast_shl_expr(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i64 [ -1, %entry ], [ %sel, %loop ]\n  %gep = getelementptr inbounds i64, ptr %a, i64 %iv\n  %load = load i64, ptr %gep, align 8\n  %cmp = icmp eq i64 %load, 42\n  %expr = shl i64 %iv, 2\n  %sel = select i1 %cmp, i64 %expr, i64 %rdx\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit = icmp eq i64 %iv.next, %n\n  br i1 %exit, label %done, label %loop\n\ndone:                                             ; preds = %loop\n  ret i64 %sel\n}\n"
+        },
+        {
+          "test_name": "findlast_sdiv_iv_as_divisor",
+          "test_body": "define i64 @findlast_sdiv_iv_as_divisor(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 1, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i64 [ -1, %entry ], [ %sel, %loop ]\n  %gep = getelementptr inbounds i64, ptr %a, i64 %iv\n  %load = load i64, ptr %gep, align 8\n  %cmp = icmp eq i64 %load, 42\n  %expr = sdiv i64 100, %iv\n  %sel = select i1 %cmp, i64 %expr, i64 %rdx\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit = icmp eq i64 %iv.next, %n\n  br i1 %exit, label %done, label %loop\n\ndone:                                             ; preds = %loop\n  ret i64 %sel\n}\n"
+        },
+        {
+          "test_name": "findlast_or_expr",
+          "test_body": "define i64 @findlast_or_expr(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i64 [ -1, %entry ], [ %sel, %loop ]\n  %gep = getelementptr inbounds i64, ptr %a, i64 %iv\n  %load = load i64, ptr %gep, align 8\n  %cmp = icmp eq i64 %load, 42\n  %expr = or i64 %iv, 1\n  %sel = select i1 %cmp, i64 %expr, i64 %rdx\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit = icmp eq i64 %iv.next, %n\n  br i1 %exit, label %done, label %loop\n\ndone:                                             ; preds = %loop\n  ret i64 %sel\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/iv-select-cmp-decreasing.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -S < %s",
+        "opt -passes=loop-vectorize -force-vector-interleave=4 -force-vector-width=4 -S < %s",
+        "opt -passes=loop-vectorize -force-vector-interleave=4 -force-vector-width=1 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "select_decreasing_induction_icmp_table_i16",
+          "test_body": "@table = external constant [13 x i16], align 1\n\ndefine i16 @select_decreasing_induction_icmp_table_i16(i16 noundef %val) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i16 [ 12, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i16 [ 0, %entry ], [ %spec.select, %loop ]\n  %gep.table.iv = getelementptr inbounds [13 x i16], ptr @table, i16 0, i16 %iv\n  %ld.table = load i16, ptr %gep.table.iv, align 1\n  %cmp.table.val = icmp ugt i16 %ld.table, %val\n  %iv.next = add nsw i16 %iv, -1\n  %spec.select = select i1 %cmp.table.val, i16 %iv.next, i16 %rdx\n  %exit.cond = icmp eq i16 %iv.next, 0\n  br i1 %exit.cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %spec.select.lcssa = phi i16 [ %spec.select, %loop ]\n  ret i16 %spec.select.lcssa\n}\n"
+        },
+        {
+          "test_name": "select_decreasing_induction_icmp_non_const_start",
+          "test_body": "define i64 @select_decreasing_induction_icmp_non_const_start(ptr %a, ptr %b, i64 %rdx.start, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %iv.next, %loop ], [ %n, %entry ]\n  %rdx = phi i64 [ %cond, %loop ], [ %rdx.start, %entry ]\n  %iv.next = add nsw i64 %iv, -1\n  %gep.a.iv = getelementptr inbounds i64, ptr %a, i64 %iv.next\n  %ld.a = load i64, ptr %gep.a.iv, align 8\n  %gep.b.iv = getelementptr inbounds i64, ptr %b, i64 %iv.next\n  %ld.b = load i64, ptr %gep.b.iv, align 8\n  %cmp.a.b = icmp sgt i64 %ld.a, %ld.b\n  %cond = select i1 %cmp.a.b, i64 %iv.next, i64 %rdx\n  %exit.cond = icmp ugt i64 %iv, 1\n  br i1 %exit.cond, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret i64 %cond\n}\n"
+        },
+        {
+          "test_name": "select_decreasing_induction_icmp_table_half",
+          "test_body": "@table = external constant [13 x i16], align 1\n\ndefine i16 @select_decreasing_induction_icmp_table_half(half noundef %val) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i16 [ 12, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i16 [ 0, %entry ], [ %spec.select, %loop ]\n  %gep.table.iv = getelementptr inbounds [13 x i16], ptr @table, i16 0, i16 %iv\n  %ld.table = load half, ptr %gep.table.iv, align 1\n  %cmp.table.val = fcmp ugt half %ld.table, %val\n  %iv.next = add nsw i16 %iv, -1\n  %spec.select = select i1 %cmp.table.val, i16 %iv.next, i16 %rdx\n  %exit.cond = icmp eq i16 %iv.next, 0\n  br i1 %exit.cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %spec.select.lcssa = phi i16 [ %spec.select, %loop ]\n  ret i16 %spec.select.lcssa\n}\n"
+        },
+        {
+          "test_name": "select_decreasing_induction_icmp_iv_just_within_bounds",
+          "test_body": "define i64 @select_decreasing_induction_icmp_iv_just_within_bounds(ptr %a, ptr %b, i64 %rdx.start) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ -1, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i64 [ %rdx.start, %entry ], [ %cond, %loop ]\n  %iv.next = add i64 %iv, -1\n  %gep.a.iv = getelementptr inbounds i8, ptr %a, i64 %iv.next\n  %ld.a = load i8, ptr %gep.a.iv, align 1\n  %gep.b.iv = getelementptr inbounds i8, ptr %b, i64 %iv.next\n  %ld.b = load i8, ptr %gep.b.iv, align 1\n  %cmp.a.b = icmp sgt i8 %ld.a, %ld.b\n  %cond = select i1 %cmp.a.b, i64 %iv.next, i64 %rdx\n  %exit.cond = icmp eq i64 %iv.next, 0\n  br i1 %exit.cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i64 %cond\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/iv-select-cmp.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -S < %s",
+        "opt -passes=loop-vectorize -force-vector-interleave=4 -force-vector-width=4 -S < %s",
+        "opt -passes=loop-vectorize -force-vector-interleave=4 -force-vector-width=1 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "select_icmp_xor_not_iv",
+          "test_body": "define i64 @select_icmp_xor_not_iv(ptr %a, i64 %n) {\nentry:\n  %cmp.guard = icmp sgt i64 %n, 0\n  br i1 %cmp.guard, label %for.body.preheader, label %exit\n\nfor.body.preheader:                               ; preds = %entry\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %iv = phi i64 [ %inc, %for.body ], [ 0, %for.body.preheader ]\n  %rdx = phi i64 [ %cond, %for.body ], [ 0, %for.body.preheader ]\n  %arrayidx = getelementptr inbounds i8, ptr %a, i64 %iv\n  %0 = load i8, ptr %arrayidx, align 1\n  %cmp2 = icmp eq i8 %0, 0\n  %not.iv = xor i64 %iv, -1\n  %cond = select i1 %cmp2, i64 %not.iv, i64 %rdx\n  %inc = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %inc, %n\n  br i1 %exitcond.not, label %exit.loopexit, label %for.body\n\nexit.loopexit:                                    ; preds = %for.body\n  %cond.lcssa = phi i64 [ %cond, %for.body ]\n  br label %exit\n\nexit:                                             ; preds = %exit.loopexit, %entry\n  %result = phi i64 [ 0, %entry ], [ %cond.lcssa, %exit.loopexit ]\n  ret i64 %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "cardigan1008",
+      "body": "Hi, I ran this test case with opt (`-passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4`) built on this PR:\r\n\r\n```llvm\r\n@a = global [10 x i64] [i64 0, i64 42, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0]\r\n\r\ndefine i64 @findlast_shl_expr(ptr %a, i64 %n) {\r\nentry:\r\n  br label %loop\r\n\r\nloop:                                             ; preds = %loop, %entry\r\n  %iv = phi i64 [ 1, %entry ], [ %iv.next, %loop ]\r\n  %rdx = phi i64 [ -1, %entry ], [ %sel, %loop ]\r\n  %gep = getelementptr inbounds i64, ptr %a, i64 %iv\r\n  %load = load i64, ptr %gep, align 8\r\n  %cmp = icmp eq i64 %load, 42\r\n  %expr = sdiv i64 100, %iv\r\n  %sel = select i1 %cmp, i64 %expr, i64 %rdx\r\n  %iv.next = add nuw nsw i64 %iv, 1\r\n  %exit = icmp eq i64 %iv.next, %n\r\n  br i1 %exit, label %done, label %loop\r\n\r\ndone:                                             ; preds = %loop\r\n  ret i64 %sel\r\n}\r\n\r\ndefine i64 @main(i32 %argc, ptr %argv) {\r\nentry:\r\n  %r = call i64 @findlast_shl_expr(ptr @a, i64 10)\r\n  ret i64 %r\r\n}\r\n```\r\n\r\nand got the transformed ir:\r\n\r\n```llvm\r\n; ModuleID = 'src.ll'\r\nsource_filename = \"src.ll\"\r\n\r\n@a = global [10 x i64] [i64 0, i64 42, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0]\r\n\r\ndefine i64 @findlast_shl_expr(ptr %a, i64 %n) {\r\nentry:\r\n  %0 = add i64 %n, -1\r\n  %min.iters.check = icmp ult i64 %0, 4\r\n  br i1 %min.iters.check, label %scalar.ph, label %vector.ph\r\n\r\nvector.ph:                                        ; preds = %entry\r\n  %n.mod.vf = urem i64 %0, 4\r\n  %n.vec = sub i64 %0, %n.mod.vf\r\n  %1 = add i64 1, %n.vec\r\n  br label %vector.body\r\n\r\nvector.body:                                      ; preds = %vector.body, %vector.ph\r\n  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]\r\n  %vec.ind = phi <4 x i64> [ <i64 1, i64 2, i64 3, i64 4>, %vector.ph ], [ %vec.ind.next, %vector.body ]\r\n  %vec.phi = phi <4 x i64> [ splat (i64 -9223372036854775808), %vector.ph ], [ %5, %vector.body ]\r\n  %offset.idx = add i64 1, %index\r\n  %2 = getelementptr inbounds i64, ptr %a, i64 %offset.idx\r\n  %wide.load = load <4 x i64>, ptr %2, align 8\r\n  %3 = icmp eq <4 x i64> %wide.load, splat (i64 42)\r\n  %4 = sdiv <4 x i64> splat (i64 100), %vec.ind\r\n  %5 = select <4 x i1> %3, <4 x i64> %4, <4 x i64> %vec.phi\r\n  %index.next = add nuw i64 %index, 4\r\n  %vec.ind.next = add nuw nsw <4 x i64> %vec.ind, splat (i64 4)\r\n  %6 = icmp eq i64 %index.next, %n.vec\r\n  br i1 %6, label %middle.block, label %vector.body, !llvm.loop !0\r\n\r\nmiddle.block:                                     ; preds = %vector.body\r\n  %7 = select <4 x i1> %3, <4 x i64> %vec.ind, <4 x i64> %vec.phi\r\n  %8 = call i64 @llvm.vector.reduce.smax.v4i64(<4 x i64> %7)\r\n  %9 = icmp ne i64 %8, -9223372036854775808\r\n  %10 = sdiv i64 100, %8\r\n  %11 = select i1 %9, i64 %10, i64 -1\r\n  %cmp.n = icmp eq i64 %0, %n.vec\r\n  br i1 %cmp.n, label %done, label %scalar.ph\r\n\r\nscalar.ph:                                        ; preds = %entry, %middle.block\r\n  %bc.resume.val = phi i64 [ %1, %middle.block ], [ 1, %entry ]\r\n  %bc.merge.rdx = phi i64 [ %11, %middle.block ], [ -1, %entry ]\r\n  br label %loop\r\n\r\nloop:                                             ; preds = %scalar.ph, %loop\r\n  %iv = phi i64 [ %bc.resume.val, %scalar.ph ], [ %iv.next, %loop ]\r\n  %rdx = phi i64 [ %bc.merge.rdx, %scalar.ph ], [ %sel, %loop ]\r\n  %gep = getelementptr inbounds i64, ptr %a, i64 %iv\r\n  %load = load i64, ptr %gep, align 8\r\n  %cmp = icmp eq i64 %load, 42\r\n  %expr = sdiv i64 100, %iv\r\n  %sel = select i1 %cmp, i64 %expr, i64 %rdx\r\n  %iv.next = add nuw nsw i64 %iv, 1\r\n  %exit = icmp eq i64 %iv.next, %n\r\n  br i1 %exit, label %done, label %loop, !llvm.loop !3\r\n\r\ndone:                                             ; preds = %middle.block, %loop\r\n  %sel.lcssa = phi i64 [ %sel, %loop ], [ %11, %middle.block ]\r\n  ret i64 %sel.lcssa\r\n}\r\n\r\ndefine i64 @main(i32 %argc, ptr %argv) {\r\nentry:\r\n  %r = call i64 @findlast_shl_expr(ptr @a, i64 10)\r\n  ret i64 %r\r\n}\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i64 @llvm.vector.reduce.smax.v4i64(<4 x i64>) #0\r\n\r\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\r\n\r\n!0 = distinct !{!0, !1, !2}\r\n!1 = !{!\"llvm.loop.isvectorized\", i32 1}\r\n!2 = !{!\"llvm.loop.unroll.runtime.disable\"}\r\n!3 = distinct !{!3, !2, !1}\r\n```\r\n\r\nThen ran lli on both cases:\r\n\r\n```sh\r\n$ lli src.ll \r\n$ echo $?\r\n100\r\n$ lli tgt.ll \r\n$ echo $?\r\n1\r\n```\r\n\r\nBut this case is verified to be correct with alive2: https://alive2.llvm.org/ce/z/Q6UX6f. If this is not a bug, please let me know and I\u2019ll adjust. \r\n\r\n> Note: This is a review assisted with a self-built agent using gemini-3.1-pro-preview. The reproducer was validated manually. Please let me know if anything is wrong. \r\n\r\nIn the vectorized form, `%vec.phi` carries the expression value (`%4 = sdiv splat(100), %vec.ind`). However, the middle block mixes IV lanes and expression lanes: `%7 = select %3, %vec.ind, %vec.phi`, followed by `reduce_smax(%7)` and then `sdiv 100, %8`. Here `%3` is the mask from the *last* `vector.body` iteration; in this test the last iteration compares a[5..8] (no 42), so `%3` is all-false and `%7` becomes `%vec.phi` (which still contains the previously-carried expr value 100). The smax reduction therefore yields 100, and the final division computes 100/100 = 1."
+    },
+    {
+      "author": "fhahn",
+      "body": "@cardigan1008 thanks for checking, should be fixed in the latest version\r\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 167411 tests passed\n* 3094 tests skipped\n\nAll executed tests passed, but another part of the build **failed**. Click on a failure below to see the details.\n\n<details>\n<summary>tools/clang/tools/extra/clangd/benchmarks/CMakeFiles/IndexBenchmark.dir/IndexBenchmark.cpp.o (Likely Already Failing)</summary>\nThis test is already failing at the base commit.\n\n```\nFAILED: tools/clang/tools/extra/clangd/benchmarks/CMakeFiles/IndexBenchmark.dir/IndexBenchmark.cpp.o\nsccache /opt/llvm/bin/clang++ -DBENCHMARK_STATIC_DEFINE -DLLVM_BUILD_STATIC -D_DEBUG -D_GLIBCXX_ASSERTIONS -D_GLIBCXX_USE_CXX11_ABI=1 -D_GNU_SOURCE -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/gha/actions-runner/_work/llvm-project/llvm-project/build/tools/clang/tools/extra/clangd/benchmarks -I/home/gha/actions-runner/_work/llvm-project/llvm-project/clang-tools-extra/clangd/benchmarks -I/home/gha/actions-runner/_work/llvm-project/llvm-project/clang-tools-extra/clangd/../include-cleaner/include -I/home/gha/actions-runner/_work/llvm-project/llvm-project/build/tools/clang/tools/extra/clangd/../clang-tidy -I/home/gha/actions-runner/_work/llvm-project/llvm-project/clang/include -I/home/gha/actions-runner/_work/llvm-project/llvm-project/build/tools/clang/include -I/home/gha/actions-runner/_work/llvm-project/llvm-project/build/include -I/home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/include -I/home/gha/actions-runner/_work/llvm-project/llvm-project/clang-tools-extra/clangd -I/home/gha/actions-runner/_work/llvm-project/llvm-project/build/tools/clang/tools/extra/clangd -I/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include -gmlt -fPIC -fno-semantic-interposition -fvisibility-inlines-hidden -Werror -Werror=date-time -Werror=unguarded-availability-new -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wmissing-field-initializers -pedantic -Wno-long-long -Wc++98-compat-extra-semi -Wimplicit-fallthrough -Wcovered-switch-default -Wno-noexcept-type -Wnon-virtual-dtor -Wdelete-non-virtual-dtor -Wsuggest-override -Wstring-conversion -Wno-pass-failed -Wmisleading-indentation -Wctad-maybe-unsupported -fdiagnostics-color -ffunction-sections -fdata-sections -fno-common -Woverloaded-virtual -Wno-nested-anon-types -O3 -DNDEBUG -std=c++17 -UNDEBUG -fno-exceptions -funwind-tables -fno-rtti -MD -MT tools/clang/tools/extra/clangd/benchmarks/CMakeFiles/IndexBenchmark.dir/IndexBenchmark.cpp.o -MF tools/clang/tools/extra/clangd/benchmarks/CMakeFiles/IndexBenchmark.dir/IndexBenchmark.cpp.o.d -o tools/clang/tools/extra/clangd/benchmarks/CMakeFiles/IndexBenchmark.dir/IndexBenchmark.cpp.o -c /home/gha/actions-runner/_work/llvm-project/llvm-project/clang-tools-extra/clangd/benchmarks/IndexBenchmark.cpp\n/home/gha/actions-runner/_work/llvm-project/llvm-project/clang-tools-extra/clangd/benchmarks/IndexBenchmark.cpp:83:1: error: '__COUNTER__' is a C2y extension [-Werror,-Wc2y-extensions]\n83 | BENCHMARK(memQueries);\n| ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1503:3: note: expanded from macro 'BENCHMARK'\n1503 |   BENCHMARK_PRIVATE_DECLARE(_benchmark_) =                           \\\n|   ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1498:44: note: expanded from macro 'BENCHMARK_PRIVATE_DECLARE'\n1498 |   static ::benchmark::internal::Benchmark* BENCHMARK_PRIVATE_NAME(n) \\\n|                                            ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1484:45: note: expanded from macro 'BENCHMARK_PRIVATE_NAME'\n1484 |   BENCHMARK_PRIVATE_CONCAT(benchmark_uniq_, BENCHMARK_PRIVATE_UNIQUE_ID, \\\n|                                             ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1475:37: note: expanded from macro 'BENCHMARK_PRIVATE_UNIQUE_ID'\n1475 | #define BENCHMARK_PRIVATE_UNIQUE_ID __COUNTER__\n|                                     ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/clang-tools-extra/clangd/benchmarks/IndexBenchmark.cpp:92:1: error: '__COUNTER__' is a C2y extension [-Werror,-Wc2y-extensions]\n92 | BENCHMARK(dexQueries);\n| ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1503:3: note: expanded from macro 'BENCHMARK'\n1503 |   BENCHMARK_PRIVATE_DECLARE(_benchmark_) =                           \\\n|   ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1498:44: note: expanded from macro 'BENCHMARK_PRIVATE_DECLARE'\n1498 |   static ::benchmark::internal::Benchmark* BENCHMARK_PRIVATE_NAME(n) \\\n|                                            ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1484:45: note: expanded from macro 'BENCHMARK_PRIVATE_NAME'\n1484 |   BENCHMARK_PRIVATE_CONCAT(benchmark_uniq_, BENCHMARK_PRIVATE_UNIQUE_ID, \\\n|                                             ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1475:37: note: expanded from macro 'BENCHMARK_PRIVATE_UNIQUE_ID'\n1475 | #define BENCHMARK_PRIVATE_UNIQUE_ID __COUNTER__\n|                                     ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/clang-tools-extra/clangd/benchmarks/IndexBenchmark.cpp:98:1: error: '__COUNTER__' is a C2y extension [-Werror,-Wc2y-extensions]\n98 | BENCHMARK(dexBuild);\n| ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1503:3: note: expanded from macro 'BENCHMARK'\n1503 |   BENCHMARK_PRIVATE_DECLARE(_benchmark_) =                           \\\n|   ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1498:44: note: expanded from macro 'BENCHMARK_PRIVATE_DECLARE'\n1498 |   static ::benchmark::internal::Benchmark* BENCHMARK_PRIVATE_NAME(n) \\\n|                                            ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1484:45: note: expanded from macro 'BENCHMARK_PRIVATE_NAME'\n1484 |   BENCHMARK_PRIVATE_CONCAT(benchmark_uniq_, BENCHMARK_PRIVATE_UNIQUE_ID, \\\n|                                             ^\n/home/gha/actions-runner/_work/llvm-project/llvm-project/third-party/benchmark/include/benchmark/benchmark.h:1475:37: note: expanded from macro 'BENCHMARK_PRIVATE_UNIQUE_ID'\n1475 | #define BENCHMARK_PRIVATE_UNIQUE_ID __COUNTER__\n|                                     ^\n3 errors generated.\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-28T12:53:07Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        5666,
+        5671
+      ],
+      [
+        5712,
+        5722
+      ],
+      [
+        5725,
+        5745
+      ],
+      [
+        5753,
+        5758
+      ],
+      [
+        5760,
+        5768
+      ],
+      [
+        5773,
+        5779
+      ],
+      [
+        5791,
+        5799
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/find-last-iv-sinkable-expr.ll": [
+      [
+        17,
+        38
+      ],
+      [
+        86,
+        107
+      ],
+      [
+        233,
+        254
+      ],
+      [
+        309,
+        315
+      ],
+      [
+        329,
+        343
+      ],
+      [
+        549,
+        554
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/iv-select-cmp-decreasing.ll": [
+      [
+        171,
+        186
+      ],
+      [
+        196,
+        205
+      ],
+      [
+        379,
+        406
+      ],
+      [
+        496,
+        511
+      ],
+      [
+        521,
+        530
+      ],
+      [
+        704,
+        731
+      ],
+      [
+        1004,
+        1012
+      ],
+      [
+        1016,
+        1036
+      ],
+      [
+        1060,
+        1070
+      ],
+      [
+        1095,
+        1104
+      ],
+      [
+        1108,
+        1115
+      ],
+      [
+        1128,
+        1134
+      ],
+      [
+        1241,
+        1250
+      ],
+      [
+        1254,
+        1270
+      ],
+      [
+        1317,
+        1327
+      ],
+      [
+        1352,
+        1365
+      ],
+      [
+        1369,
+        1380
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/iv-select-cmp.ll": [
+      [
+        2491,
+        2509
+      ],
+      [
+        2544,
+        2553
+      ],
+      [
+        2563,
+        2586
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::addExitUsersForFirstOrderRecurrences",
+      "VPlanTransforms::optimizeFindIVReductions"
+    ]
+  }
+}

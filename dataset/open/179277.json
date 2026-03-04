@@ -1,0 +1,136 @@
+{
+  "pr_id": 179277,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179277",
+  "state": "open",
+  "title": "[SimplifyCFG] Optimize select over pointers to eliminate no-op load/store",
+  "author": "dnsampaio",
+  "base_commit": "6420099bcc62a09e002e500870216b2dd9d256a9",
+  "fix_commit": "8a3459fcb742cd8307afe74c59b2de175d886084",
+  "patch": "diff --git a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\nindex 8b56109990b21..c79d01b696445 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n@@ -353,6 +353,174 @@ isSelectInRoleOfConjunctionOrDisjunction(const SelectInst *SI) {\n \n } // end anonymous namespace\n \n+/// Transform a pattern where one case of a select over pointers leads to a\n+/// store(load) of the same address, avoiding the load and store all together.\n+///\n+/// Pattern:\n+///   %gepA = getelementptr ... %a, ...\n+///   %gepB = getelementptr ... %b, ...\n+///   %sel = select i1 %cond, ptr %gepA, ptr %gepB\n+///   %val = load ... %sel\n+///   store ... %val, %gepA\n+///\n+/// When %sel chooses %gepA, the load and store\n+/// access the same address - this is a no-op.\n+///\n+/// This transforms it to:\n+///   br i1 %cond, label %cont, label %do_ldst\n+/// do_ldst:\n+///   %gepA = getelementptr ... %a, ...\n+///   %gepB = getelementptr ... %b, ...\n+///   %val = load ... %gepB\n+///   store ... %val, %gepA\n+///   br label %cont\n+/// cont:\n+///   ...\n+///\n+///\n+/// This optimization is beneficial over loops, where the select\n+/// will avoid the vectorizer to hadle the select, but with the\n+/// conditional branch it will be converted to load and masked store.\n+static bool foldSelectPointerLoadStoreToNoop(BasicBlock *BB,\n+                                             DomTreeUpdater *DTU) {\n+  for (Instruction &I : *BB) {\n+    auto *Sel = dyn_cast<SelectInst>(&I);\n+    if (!Sel || !Sel->getType()->isPointerTy() || !Sel->hasOneUse())\n+      continue;\n+\n+    Value *Cond = Sel->getCondition();\n+    Value *TruePtr = Sel->getTrueValue();\n+    Value *FalsePtr = Sel->getFalseValue();\n+\n+    // Select must be used by a GEP\n+    auto *LoadGEP = dyn_cast<GetElementPtrInst>(*Sel->user_begin());\n+    if (!LoadGEP || LoadGEP->getParent() != BB ||\n+        LoadGEP->getPointerOperand() != Sel || !LoadGEP->hasOneUse())\n+      continue;\n+\n+    // LoadGEP must be used by a load\n+    auto *LI = dyn_cast<LoadInst>(*LoadGEP->user_begin());\n+    if (!LI || LI->getParent() != BB || !LI->hasOneUse() || LI->isVolatile())\n+      continue;\n+\n+    // Load must be used by a store\n+    auto *SI = dyn_cast<StoreInst>(*LI->user_begin());\n+    if (!SI || SI->getParent() != BB || SI->getValueOperand() != LI ||\n+        SI->isVolatile())\n+      continue;\n+\n+    // Store destination must be a GEP with single use\n+    auto *StoreGEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand());\n+    if (!StoreGEP || StoreGEP->getParent() != BB || !StoreGEP->hasOneUse())\n+      continue;\n+\n+    // Check if indices match between load GEP and store GEP\n+    if (LoadGEP->getNumIndices() != StoreGEP->getNumIndices())\n+      continue;\n+\n+    bool IndicesMatch = true;\n+    for (auto [LoadIdx, StoreIdx] :\n+         zip(LoadGEP->indices(), StoreGEP->indices())) {\n+      if (LoadIdx != StoreIdx) {\n+        IndicesMatch = false;\n+        break;\n+      }\n+    }\n+    if (!IndicesMatch)\n+      continue;\n+\n+    // Check if one of the select operands matches the store GEP's base pointer\n+    Value *StoreBase = StoreGEP->getPointerOperand();\n+    Value *EffectivePtr = nullptr; // The pointer that does actual work\n+    bool NoopOnTrue = false;\n+\n+    if (TruePtr == StoreBase) {\n+      EffectivePtr = FalsePtr;\n+      NoopOnTrue = true;\n+    } else if (FalsePtr == StoreBase) {\n+      EffectivePtr = TruePtr;\n+      NoopOnTrue = false;\n+    } else {\n+      continue;\n+    }\n+\n+    LLVM_DEBUG(dbgs() << \"FOLDING SELECT LOAD STORE TO NOOP: \" << *Sel << \"\\n\");\n+    LLVM_DEBUG(dbgs() << \"  LoadGEP: \" << *LoadGEP << \"\\n\");\n+    LLVM_DEBUG(dbgs() << \"  Load: \" << *LI << \"\\n\");\n+    LLVM_DEBUG(dbgs() << \"  StoreGEP: \" << *StoreGEP << \"\\n\");\n+    LLVM_DEBUG(dbgs() << \"  Store: \" << *SI << \"\\n\");\n+    LLVM_DEBUG(dbgs() << \"  Noop on \" << (NoopOnTrue ? \"true\" : \"false\")\n+                      << \"\\n\");\n+\n+    // Create a branch that skips the load/store\n+    Function *F = BB->getParent();\n+    BasicBlock *DoLdStBB =\n+        BasicBlock::Create(F->getContext(), BB->getName() + \".do_ldst\", F);\n+    BasicBlock *ContBB =\n+        BB->splitBasicBlock(SI->getIterator(), BB->getName() + \".cont\");\n+\n+    // Remove the unconditional branch created by splitBasicBlock\n+    BB->getTerminator()->eraseFromParent();\n+\n+    // Create conditional branch: skip load/store on noop case\n+    IRBuilder<> Builder(BB);\n+    if (NoopOnTrue) {\n+      Builder.CreateCondBr(Cond, ContBB, DoLdStBB);\n+    } else {\n+      Builder.CreateCondBr(Cond, DoLdStBB, ContBB);\n+    }\n+\n+    // Build the load/store in DoLdStBB\n+    Builder.SetInsertPoint(DoLdStBB);\n+\n+    // Create new load GEP with the effective pointer\n+    SmallVector<Value *, 4> Indices(LoadGEP->indices());\n+    auto *NewLoadGEP =\n+        Builder.CreateGEP(LoadGEP->getSourceElementType(), EffectivePtr,\n+                          Indices, LoadGEP->getName() + \".eff\");\n+    if (LoadGEP->isInBounds())\n+      cast<GetElementPtrInst>(NewLoadGEP)->setIsInBounds(true);\n+\n+    // Create new load\n+    auto *NewLoad = Builder.CreateAlignedLoad(\n+        LI->getType(), NewLoadGEP, LI->getAlign(), LI->getName() + \".eff\");\n+\n+    // Create new store GEP\n+    SmallVector<Value *, 4> StoreIndices(StoreGEP->indices());\n+    auto *NewStoreGEP =\n+        Builder.CreateGEP(StoreGEP->getSourceElementType(), StoreBase,\n+                          StoreIndices, StoreGEP->getName() + \".eff\");\n+    if (StoreGEP->isInBounds())\n+      cast<GetElementPtrInst>(NewStoreGEP)->setIsInBounds(true);\n+\n+    // Create new store\n+    Builder.CreateAlignedStore(NewLoad, NewStoreGEP, SI->getAlign());\n+\n+    // Branch to continuation\n+    Builder.CreateBr(ContBB);\n+\n+    // Remove the original instructions\n+    SI->eraseFromParent();\n+    LI->eraseFromParent();\n+    StoreGEP->eraseFromParent();\n+    LoadGEP->eraseFromParent();\n+    Sel->eraseFromParent();\n+\n+    // Update dominator tree\n+    if (DTU) {\n+      SmallVector<DominatorTree::UpdateType, 4> Updates;\n+      Updates.push_back({DominatorTree::Insert, BB, DoLdStBB});\n+      Updates.push_back({DominatorTree::Insert, BB, ContBB});\n+      Updates.push_back({DominatorTree::Insert, DoLdStBB, ContBB});\n+      DTU->applyUpdates(Updates);\n+    }\n+\n+    return true;\n+  }\n+\n+  return false;\n+}\n+\n /// Return true if all the PHI nodes in the basic block \\p BB\n /// receive compatible (identical) incoming values when coming from\n /// all of the predecessor blocks that are specified in \\p IncomingBlocks.\n@@ -8950,6 +9118,12 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {\n     break;\n   }\n \n+  // Check for select over pointers that leads to a load/store where one\n+  // case is a no-op. Transform to conditional branch.\n+  if (!RequireAndPreserveDomTree)\n+    if (foldSelectPointerLoadStoreToNoop(BB, DTU))\n+      Changed |= requestResimplify();\n+\n   return Changed;\n }\n \n",
+  "components": [
+    "SimplifyCFG"
+  ],
+  "description": "Transform a pattern where one case of a select over pointers leads to a store(load) of the same address, by avoiding the load and store all together.\r\n\r\nPattern:\r\n  %sel = select i1 %cond, ptr %a, ptr %b\r\n  %val = load ... %sel\r\n  store ... %val, %a\r\n\r\nWhen %sel chooses %a, the load and store\r\naccess the same address - this is a no-op.\r\n\r\nThis transforms it to:\r\n  br i1 %cond, label %cont, label %do_ldst\r\ndo_ldst:\r\n  %val = load ... %b\r\n  store ... %val, %a\r\n  br label %cont\r\ncont:\r\n  ...",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SimplifyCFG/select-pointer-noop-store.ll",
+      "commands": [
+        "opt -S -passes=simplifycfg < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "volatile_store",
+          "test_body": "define void @volatile_store(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store volatile float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "double_type_aligned",
+          "test_body": "define void @double_type_aligned(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr double, ptr %sel, i64 %idx\n  %val = load double, ptr %gep, align 8\n  %store_gep = getelementptr double, ptr %a, i64 %idx\n  store double %val, ptr %store_gep, align 8\n  ret void\n}\n"
+        },
+        {
+          "test_name": "store_different_value",
+          "test_body": "define void @store_different_value(ptr %a, ptr %b, i1 %cond, i64 %idx, float %other) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store float %other, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "load_multi_use",
+          "test_body": "define float @load_multi_use(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret float %val\n}\n"
+        },
+        {
+          "test_name": "noop_on_true",
+          "test_body": "define void @noop_on_true(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "select_multi_use",
+          "test_body": "define ptr @select_multi_use(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret ptr %sel\n}\n"
+        },
+        {
+          "test_name": "integer_type",
+          "test_body": "define void @integer_type(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr i32, ptr %sel, i64 %idx\n  %val = load i32, ptr %gep, align 4\n  %store_gep = getelementptr i32, ptr %a, i64 %idx\n  store i32 %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "direct_ptr_no_gep",
+          "test_body": "define void @direct_ptr_no_gep(ptr %a, ptr %b, i1 %cond) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %val = load float, ptr %sel, align 4\n  store float %val, ptr %a, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "with_inbounds",
+          "test_body": "define void @with_inbounds(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr inbounds float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr inbounds float, ptr %a, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "noop_on_false",
+          "test_body": "define void @noop_on_false(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %b, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "volatile_load",
+          "test_body": "define void @volatile_load(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load volatile float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "load_gep_multi_use",
+          "test_body": "define ptr @load_gep_multi_use(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret ptr %gep\n}\n"
+        },
+        {
+          "test_name": "multi_index_gep",
+          "test_body": "define void @multi_index_gep(ptr %a, ptr %b, i1 %cond, i64 %idx1, i64 %idx2) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr [10 x float], ptr %sel, i64 %idx1, i64 %idx2\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr [10 x float], ptr %a, i64 %idx1, i64 %idx2\n  store float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "no_match_store_base",
+          "test_body": "define void @no_match_store_base(ptr %a, ptr %b, ptr %c, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %c, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "different_indices",
+          "test_body": "define void @different_indices(ptr %a, ptr %b, i1 %cond, i64 %idx1, i64 %idx2) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx1\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx2\n  store float %val, ptr %store_gep, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "store_gep_multi_use",
+          "test_body": "define ptr @store_gep_multi_use(ptr %a, ptr %b, i1 %cond, i64 %idx) {\nentry:\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %gep = getelementptr float, ptr %sel, i64 %idx\n  %val = load float, ptr %gep, align 4\n  %store_gep = getelementptr float, ptr %a, i64 %idx\n  store float %val, ptr %store_gep, align 4\n  ret ptr %store_gep\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189983 tests passed\n* 5068 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130810 tests passed\n* 2932 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "nikic",
+      "body": "It's not at all clear to me that this is a profitable transform, at least without profiling information that shows that the branch is well-predicated to be false. This transform is kind of the opposite of what isSafeToSpeculateStore does."
+    },
+    {
+      "author": "dnsampaio",
+      "body": "> It's not at all clear to me that this is a profitable transform, at least without profiling information that shows that the branch is well-predicated to be false. This transform is kind of the opposite of what isSafeToSpeculateStore does.\r\n\r\nHi @nikic, thanks for the review.\r\nIndeed we are creating a branch, where simplifycfg generates a select to exactly remove some branching. However, this is a case where the vectorizer can't handle. The idea is just to convert the ir from bad to good from this [example](https://godbolt.org/#g:!((g:!((g:!((h:codeEditor,i:(filename:'1',fontScale:14,fontUsePx:'0',j:1,lang:___c,selection:(endColumn:1,endLineNumber:14,positionColumn:1,positionLineNumber:14,selectionStartColumn:1,selectionStartLineNumber:14,startColumn:1,startLineNumber:14),source:'__attribute__((noinline))%0Avoid+bad(float*+restrict+a,+float*+restrict+b,+float*+restrict+c,+int*+d,+int+N)%7B%0A++++for+(int+i+%3D+0%3B+i+%3C+N%3B+i%2B%2B)%0A++++++++b%5Bi%5D+%3D+d%5Bi%5D+%3F+b%5Bi%5D+:+c%5Bi%5D%3B%0A%7D%0A%0A%0A__attribute__((noinline))%0Avoid+good(float*+restrict+a,+float*+restrict+b,+float*+restrict+c,+int*+d,+int+N)%7B%0A++++for+(int+i+%3D+0%3B+i+%3C+N%3B+i%2B%2B)%0A++++++if+(!!d%5Bi%5D)%0A++++++++b%5Bi%5D+%3D+c%5Bi%5D%3B%0A%7D%0A'),l:'5',n:'0',o:'C+source+%231',t:'0')),k:32.10013523117332,l:'4',n:'0',o:'',s:0,t:'0'),(g:!((h:compiler,i:(compiler:rv64-cclang,filters:(b:'0',binary:'1',binaryObject:'1',commentOnly:'0',debugCalls:'1',demangle:'0',directives:'0',execute:'0',intel:'0',libraryCode:'0',trim:'1',verboseDemangling:'0'),flagsViewOpen:'1',fontScale:14,fontUsePx:'0',j:1,lang:___c,libs:!(),options:'-march%3Drv64gcv+-O3',overrides:!(),selection:(endColumn:1,endLineNumber:1,positionColumn:1,positionLineNumber:1,selectionStartColumn:1,selectionStartLineNumber:1,startColumn:1,startLineNumber:1),source:1,wantOptInfo:'0'),l:'5',n:'0',o:'+RISC-V+rv64gc+clang+(trunk)+(Editor+%231)',t:'0')),k:26.428444323574595,l:'4',n:'0',o:'',s:0,t:'0'),(g:!((h:optPipelineView,i:('-fno-discard-value-names':'0',compilerName:'RISC-V+rv64gc+clang+(trunk)',demangle-symbols:'0',dump-full-module:'1',editorid:1,filter-debug-info:'0',filter-inconsequential-passes:'1',filter-instruction-metadata:'0',fontScale:14,fontUsePx:'0',j:1,selectedGroup:bad,selectedIndex:98,sidebarWidth:250,treeid:0),l:'5',n:'0',o:'Opt+Pipeline+Viewer+RISC-V+rv64gc+clang+(trunk)+(Editor+%231,+Compiler+%231)',t:'0')),k:41.47142044525209,l:'4',n:'0',o:'',s:0,t:'0')),l:'2',n:'0',o:'',t:'0')),version:4).\r\n\r\nThinking twice, the important is the case of loops, so I should enforce only the case with GEP."
+    },
+    {
+      "author": "nikic",
+      "body": "If the motivation is vectorization-specific then doing it as a VPlan transform may make more sense. Maybe @fhahn has thoughts on that."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-02T16:35:32Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Utils/SimplifyCFG.cpp": [
+      [
+        353,
+        358
+      ],
+      [
+        8950,
+        8955
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Utils/SimplifyCFG.cpp": [
+      "SimplifyCFGOpt::run",
+      "SimplifyCFGOpt::simplifyOnce"
+    ]
+  }
+}

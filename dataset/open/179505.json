@@ -1,0 +1,156 @@
+{
+  "pr_id": 179505,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179505",
+  "state": "open",
+  "title": "[InstCombine] Canonicalize zext+overflow check to overflow check if zext's only purpose is to check overflow",
+  "author": "SiliconA-Z",
+  "base_commit": "0b4147e0bc9a882c988246ddc6acaf7b6dc6cc9b",
+  "fix_commit": "33436bfe2ab8b3cfea02d1b530c6d05825cf6e02",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex aa762753130b0..50bd63ef423e8 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -6641,72 +6641,76 @@ bool InstCombinerImpl::OptimizeOverflowCheck(Instruction::BinaryOps BinaryOp,\n   llvm_unreachable(\"Unexpected overflow result\");\n }\n \n-/// Recognize and process idiom involving test for multiplication\n+/// Recognize and process idiom involving test for unsigned\n /// overflow.\n ///\n /// The caller has matched a pattern of the form:\n+///   I = cmp u (add(zext A, zext B), V\n ///   I = cmp u (mul(zext A, zext B), V\n /// The function checks if this is a test for overflow and if so replaces\n-/// multiplication with call to 'mul.with.overflow' intrinsic.\n+/// addition/multiplication with call to the umul intrinsic or the canonical\n+/// form of uadd overflow.\n ///\n /// \\param I Compare instruction.\n-/// \\param MulVal Result of 'mult' instruction.  It is one of the arguments of\n-///               the compare instruction.  Must be of integer type.\n+/// \\param Val Result of add/mul instruction.  It is one of the arguments of\n+///            the compare instruction.  Must be of integer type.\n /// \\param OtherVal The other argument of compare instruction.\n /// \\returns Instruction which must replace the compare instruction, NULL if no\n ///          replacement required.\n-static Instruction *processUMulZExtIdiom(ICmpInst &I, Value *MulVal,\n-                                         const APInt *OtherVal,\n-                                         InstCombinerImpl &IC) {\n+static Instruction *processUZExtIdiom(ICmpInst &I, Value *Val,\n+                                      const APInt *OtherVal,\n+                                      InstCombinerImpl &IC) {\n   // Don't bother doing this transformation for pointers, don't do it for\n   // vectors.\n-  if (!isa<IntegerType>(MulVal->getType()))\n+  if (!isa<IntegerType>(Val->getType()))\n     return nullptr;\n \n-  auto *MulInstr = dyn_cast<Instruction>(MulVal);\n-  if (!MulInstr)\n+  auto *Instr = dyn_cast<Instruction>(Val);\n+  if (!Instr)\n     return nullptr;\n-  assert(MulInstr->getOpcode() == Instruction::Mul);\n \n-  auto *LHS = cast<ZExtInst>(MulInstr->getOperand(0)),\n-       *RHS = cast<ZExtInst>(MulInstr->getOperand(1));\n+  unsigned Opcode = Instr->getOpcode();\n+  assert(Opcode == Instruction::Add || Opcode == Instruction::Mul);\n+\n+  auto *LHS = cast<ZExtInst>(Instr->getOperand(0)),\n+       *RHS = cast<ZExtInst>(Instr->getOperand(1));\n   assert(LHS->getOpcode() == Instruction::ZExt);\n   assert(RHS->getOpcode() == Instruction::ZExt);\n   Value *A = LHS->getOperand(0), *B = RHS->getOperand(0);\n \n-  // Calculate type and width of the result produced by mul.with.overflow.\n+  // Calculate type and width of the result produced by add/mul.with.overflow.\n   Type *TyA = A->getType(), *TyB = B->getType();\n   unsigned WidthA = TyA->getPrimitiveSizeInBits(),\n            WidthB = TyB->getPrimitiveSizeInBits();\n-  unsigned MulWidth;\n-  Type *MulType;\n+  unsigned ResultWidth;\n+  Type *ResultType;\n   if (WidthB > WidthA) {\n-    MulWidth = WidthB;\n-    MulType = TyB;\n+    ResultWidth = WidthB;\n+    ResultType = TyB;\n   } else {\n-    MulWidth = WidthA;\n-    MulType = TyA;\n+    ResultWidth = WidthA;\n+    ResultType = TyA;\n   }\n \n-  // In order to replace the original mul with a narrower mul.with.overflow,\n-  // all uses must ignore upper bits of the product.  The number of used low\n-  // bits must be not greater than the width of mul.with.overflow.\n-  if (MulVal->hasNUsesOrMore(2))\n-    for (User *U : MulVal->users()) {\n+  // In order to replace the original result with a narrower one, all uses must\n+  // ignore upper bits of the result. The number of used low bits must be not\n+  // greater than the width of add or mul.with.overflow.\n+  if (Val->hasNUsesOrMore(2))\n+    for (User *U : Val->users()) {\n       if (U == &I)\n         continue;\n       if (TruncInst *TI = dyn_cast<TruncInst>(U)) {\n-        // Check if truncation ignores bits above MulWidth.\n+        // Check if truncation ignores bits above ResultWidth.\n         unsigned TruncWidth = TI->getType()->getPrimitiveSizeInBits();\n-        if (TruncWidth > MulWidth)\n+        if (TruncWidth > ResultWidth)\n           return nullptr;\n       } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(U)) {\n-        // Check if AND ignores bits above MulWidth.\n+        // Check if AND ignores bits above ResultWidth.\n         if (BO->getOpcode() != Instruction::And)\n           return nullptr;\n         if (ConstantInt *CI = dyn_cast<ConstantInt>(BO->getOperand(1))) {\n           const APInt &CVal = CI->getValue();\n-          if (CVal.getBitWidth() - CVal.countl_zero() > MulWidth)\n+          if (CVal.getBitWidth() - CVal.countl_zero() > ResultWidth)\n             return nullptr;\n         } else {\n           // In this case we could have the operand of the binary operation\n@@ -6724,9 +6728,9 @@ static Instruction *processUMulZExtIdiom(ICmpInst &I, Value *MulVal,\n   switch (I.getPredicate()) {\n   case ICmpInst::ICMP_UGT: {\n     // Recognize pattern:\n-    //   mulval = mul(zext A, zext B)\n-    //   cmp ugt mulval, max\n-    APInt MaxVal = APInt::getMaxValue(MulWidth);\n+    //   val = add/mul(zext A, zext B)\n+    //   cmp ugt val, max\n+    APInt MaxVal = APInt::getMaxValue(ResultWidth);\n     MaxVal = MaxVal.zext(OtherVal->getBitWidth());\n     if (MaxVal.eq(*OtherVal))\n       break; // Recognized\n@@ -6735,9 +6739,9 @@ static Instruction *processUMulZExtIdiom(ICmpInst &I, Value *MulVal,\n \n   case ICmpInst::ICMP_ULT: {\n     // Recognize pattern:\n-    //   mulval = mul(zext A, zext B)\n-    //   cmp ule mulval, max + 1\n-    APInt MaxVal = APInt::getOneBitSet(OtherVal->getBitWidth(), MulWidth);\n+    //   val = add/mul(zext A, zext B)\n+    //   cmp ult val, max + 1\n+    APInt MaxVal = APInt::getOneBitSet(OtherVal->getBitWidth(), ResultWidth);\n     if (MaxVal.eq(*OtherVal))\n       break; // Recognized\n     return nullptr;\n@@ -6748,38 +6752,57 @@ static Instruction *processUMulZExtIdiom(ICmpInst &I, Value *MulVal,\n   }\n \n   InstCombiner::BuilderTy &Builder = IC.Builder;\n-  Builder.SetInsertPoint(MulInstr);\n-\n-  // Replace: mul(zext A, zext B) --> mul.with.overflow(A, B)\n-  Value *MulA = A, *MulB = B;\n-  if (WidthA < MulWidth)\n-    MulA = Builder.CreateZExt(A, MulType);\n-  if (WidthB < MulWidth)\n-    MulB = Builder.CreateZExt(B, MulType);\n-  CallInst *Call =\n-      Builder.CreateIntrinsic(Intrinsic::umul_with_overflow, MulType,\n-                              {MulA, MulB}, /*FMFSource=*/nullptr, \"umul\");\n-  IC.addToWorklist(MulInstr);\n-\n-  // If there are uses of mul result other than the comparison, we know that\n-  // they are truncation or binary AND. Change them to use result of\n-  // mul.with.overflow and adjust properly mask/size.\n-  if (MulVal->hasNUsesOrMore(2)) {\n-    Value *Mul = Builder.CreateExtractValue(Call, 0, \"umul.value\");\n-    for (User *U : make_early_inc_range(MulVal->users())) {\n+  Builder.SetInsertPoint(Instr);\n+\n+  // Replace: add/mul(zext A, zext B) --> canonical add/mul + overflow check\n+  Value *ResultA = A, *ResultB = B;\n+  if (WidthA < ResultWidth)\n+    ResultA = Builder.CreateZExt(A, ResultType);\n+  if (WidthB < ResultWidth)\n+    ResultB = Builder.CreateZExt(B, ResultType);\n+\n+  Value *ArithResult;\n+  Value *OverflowCheck;\n+\n+  if (Opcode == Instruction::Add) {\n+    // Canonical add overflow check: add + compare\n+    ArithResult = Builder.CreateAdd(ResultA, ResultB, \"add\");\n+    // Overflow if result < either operand (for unsigned add)\n+    if (I.getPredicate() == ICmpInst::ICMP_ULT)\n+      OverflowCheck =\n+          Builder.CreateICmpUGE(ArithResult, ResultA, \"not.add.overflow\");\n+    else\n+      OverflowCheck =\n+          Builder.CreateICmpULT(ArithResult, ResultA, \"add.overflow\");\n+  } else {\n+    // For multiplication, the intrinsic is actually the canonical form\n+    CallInst *Call = Builder.CreateIntrinsic(Intrinsic::umul_with_overflow,\n+                                             ResultType, {ResultA, ResultB},\n+                                             /*FMFSource=*/nullptr, \"umul\");\n+    ArithResult = Builder.CreateExtractValue(Call, 0, \"umul.value\");\n+    OverflowCheck = Builder.CreateExtractValue(Call, 1, \"umul.overflow\");\n+    if (I.getPredicate() == ICmpInst::ICMP_ULT)\n+      OverflowCheck = Builder.CreateNot(OverflowCheck);\n+  }\n+\n+  IC.addToWorklist(Instr);\n+\n+  // Replace uses of the original add/mul result with the new arithmetic result\n+  if (Val->hasNUsesOrMore(2)) {\n+    for (User *U : make_early_inc_range(Val->users())) {\n       if (U == &I)\n         continue;\n       if (TruncInst *TI = dyn_cast<TruncInst>(U)) {\n-        if (TI->getType()->getPrimitiveSizeInBits() == MulWidth)\n-          IC.replaceInstUsesWith(*TI, Mul);\n+        if (TI->getType()->getPrimitiveSizeInBits() == ResultWidth)\n+          IC.replaceInstUsesWith(*TI, ArithResult);\n         else\n-          TI->setOperand(0, Mul);\n+          TI->setOperand(0, ArithResult);\n       } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(U)) {\n         assert(BO->getOpcode() == Instruction::And);\n-        // Replace (mul & mask) --> zext (mul.with.overflow & short_mask)\n+        // Replace (ArithResult & mask) --> zext (ArithResult & short_mask)\n         ConstantInt *CI = cast<ConstantInt>(BO->getOperand(1));\n-        APInt ShortMask = CI->getValue().trunc(MulWidth);\n-        Value *ShortAnd = Builder.CreateAnd(Mul, ShortMask);\n+        APInt ShortMask = CI->getValue().trunc(ResultWidth);\n+        Value *ShortAnd = Builder.CreateAnd(ArithResult, ShortMask);\n         Value *Zext = Builder.CreateZExt(ShortAnd, BO->getType());\n         IC.replaceInstUsesWith(*BO, Zext);\n       } else {\n@@ -6789,14 +6812,7 @@ static Instruction *processUMulZExtIdiom(ICmpInst &I, Value *MulVal,\n     }\n   }\n \n-  // The original icmp gets replaced with the overflow value, maybe inverted\n-  // depending on predicate.\n-  if (I.getPredicate() == ICmpInst::ICMP_ULT) {\n-    Value *Res = Builder.CreateExtractValue(Call, 1);\n-    return BinaryOperator::CreateNot(Res);\n-  }\n-\n-  return ExtractValueInst::Create(Call, 1);\n+  return IC.replaceInstUsesWith(I, OverflowCheck);\n }\n \n /// When performing a comparison against a constant, it is possible that not all\n@@ -7958,10 +7974,12 @@ Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {\n       }\n     }\n \n+    // (zext X) + (zext Y)  --> add + overflow check.\n     // (zext X) * (zext Y)  --> llvm.umul.with.overflow.\n-    if (match(Op0, m_NUWMul(m_ZExt(m_Value(X)), m_ZExt(m_Value(Y)))) &&\n+    if ((match(Op0, m_NUWAdd(m_ZExt(m_Value(X)), m_ZExt(m_Value(Y)))) ||\n+         match(Op0, m_NUWMul(m_ZExt(m_Value(X)), m_ZExt(m_Value(Y))))) &&\n         match(Op1, m_APInt(C))) {\n-      if (Instruction *R = processUMulZExtIdiom(I, Op0, C, *this))\n+      if (Instruction *R = processUZExtIdiom(I, Op0, C, *this))\n         return R;\n     }\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Change processUMulZExtIdiom to also support adds, since the idiom is the same, except with add instead of mul.\r\n\r\nAlive2: https://alive2.llvm.org/ce/z/SsB4AK",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/overflow-mul.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "extra_and_use",
+          "test_body": "target datalayout = \"i32:8:8\"\n\ndeclare void @use.i64(i64)\n\ndefine i32 @extra_and_use(i32 %x, i32 %y) {\n  %l = zext i32 %x to i64\n  %r = zext i32 %y to i64\n  %mul64 = mul i64 %l, %r\n  %overflow = icmp ugt i64 %mul64, 4294967295\n  %and = and i64 %mul64, 4294967295\n  call void @use.i64(i64 %and)\n  %retval = zext i1 %overflow to i32\n  ret i32 %retval\n}\n"
+        },
+        {
+          "test_name": "extra_and_use_small_mask",
+          "test_body": "target datalayout = \"i32:8:8\"\n\ndeclare void @use.i64(i64)\n\ndefine i32 @extra_and_use_small_mask(i32 %x, i32 %y) {\n  %l = zext i32 %x to i64\n  %r = zext i32 %y to i64\n  %mul64 = mul i64 %l, %r\n  %overflow = icmp ugt i64 %mul64, 4294967295\n  %and = and i64 %mul64, 268435455\n  call void @use.i64(i64 %and)\n  %retval = zext i1 %overflow to i32\n  ret i32 %retval\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/saturating-add-sub.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fold_add_umax_to_usub_multiuse",
+          "test_body": "define i8 @fold_add_umax_to_usub_multiuse(i8 %a) {\n  %umax = call i8 @llvm.umax.i8(i8 %a, i8 10)\n  call void @usei8(i8 %umax)\n  %sel = add i8 %umax, -10\n  ret i8 %sel\n}\n\ndeclare void @usei8(i8)\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "uadd_with_zext_multi_use",
+          "test_body": "define i32 @uadd_with_zext_multi_use(i32 %x, i32 %y) {\n  %conv = zext i32 %x to i64\n  %conv1 = zext i32 %y to i64\n  %add = add i64 %conv, %conv1\n  %truncAdd = trunc i64 %add to i32\n  call void @usei32(i32 %truncAdd)\n  %cmp = icmp ugt i64 %add, 4294967295\n  %cond = select i1 %cmp, i32 -1, i32 %truncAdd\n  ret i32 %cond\n}\n\ndeclare void @usei32(i32)\n"
+        },
+        {
+          "test_name": "uadd_with_zext",
+          "test_body": "define i32 @uadd_with_zext(i32 %x, i32 %y) {\n  %conv = zext i32 %x to i64\n  %conv1 = zext i32 %y to i64\n  %add = add i64 %conv, %conv1\n  %cmp = icmp ugt i64 %add, 4294967295\n  %conv4 = trunc i64 %add to i32\n  %cond = select i1 %cmp, i32 -1, i32 %conv4\n  ret i32 %cond\n}\n"
+        },
+        {
+          "test_name": "sadd_sat_uge_int_max",
+          "test_body": "define i8 @sadd_sat_uge_int_max(i8 %x, i8 %y) {\n  %cmp = icmp sge i8 %x, 127\n  %add = add i8 %x, %y\n  %r = select i1 %cmp, i8 127, i8 %add\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "uadd_with_zext_neg_use",
+          "test_body": "define i32 @uadd_with_zext_neg_use(i32 %x, i32 %y) {\n  %conv = zext i32 %x to i64\n  %conv1 = zext i32 %y to i64\n  %add = add i64 %conv, %conv1\n  call void @usei64(i64 %add)\n  %cmp = icmp ugt i64 %add, 4294967295\n  %conv4 = trunc i64 %add to i32\n  %cond = select i1 %cmp, i32 -1, i32 %conv4\n  ret i32 %cond\n}\n\ndeclare void @usei64(i64)\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/uadd-with-overflow.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "uadd_with_zext_use_and",
+          "test_body": "define i32 @uadd_with_zext_use_and(i32 %x, i32 %y) {\n  %conv = zext i32 %x to i64\n  %conv1 = zext i32 %y to i64\n  %add = add i64 %conv, %conv1\n  %and = and i64 %add, 65535\n  call void @usei64(i64 %and)\n  %cmp = icmp ugt i64 %add, 4294967295\n  %cond = zext i1 %cmp to i32\n  ret i32 %cond\n}\n\ndeclare void @usei64(i64)\n"
+        },
+        {
+          "test_name": "fold_simple_splat_constant_with_or_fail",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { <2 x i32>, <2 x i1> } @llvm.uadd.with.overflow.v2i32(<2 x i32>, <2 x i32>) #0\n\ndefine { <2 x i32>, <2 x i1> } @fold_simple_splat_constant_with_or_fail(<2 x i32> %x) {\n  %a = or <2 x i32> %x, splat (i32 12)\n  %b = tail call { <2 x i32>, <2 x i1> } @llvm.uadd.with.overflow.v2i32(<2 x i32> %a, <2 x i32> splat (i32 30))\n  ret { <2 x i32>, <2 x i1> } %b\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "uadd_with_zext",
+          "test_body": "define i32 @uadd_with_zext(i32 %x, i32 %y) {\n  %conv = zext i32 %x to i64\n  %conv1 = zext i32 %y to i64\n  %add = add i64 %conv, %conv1\n  %cmp = icmp ugt i64 %add, 4294967295\n  %cond = zext i1 %cmp to i32\n  ret i32 %cond\n}\n"
+        },
+        {
+          "test_name": "uadd_with_zext_inverse",
+          "test_body": "define i32 @uadd_with_zext_inverse(i32 %x, i32 %y) {\n  %conv = zext i32 %x to i64\n  %conv1 = zext i32 %y to i64\n  %add = add i64 %conv, %conv1\n  %cmp = icmp ule i64 %add, 4294967295\n  %cond = zext i1 %cmp to i32\n  ret i32 %cond\n}\n"
+        },
+        {
+          "test_name": "uadd_with_zext_neg_use",
+          "test_body": "define i32 @uadd_with_zext_neg_use(i32 %x, i32 %y) {\n  %conv = zext i32 %x to i64\n  %conv1 = zext i32 %y to i64\n  %add = add i64 %conv, %conv1\n  call void @usei64(i64 %add)\n  %cmp = icmp ugt i64 %add, 4294967295\n  %cond = zext i1 %cmp to i32\n  ret i32 %cond\n}\n\ndeclare void @usei64(i64)\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "SiliconA-Z",
+      "body": "@dtcxzyw ping? "
+    }
+  ],
+  "knowledge_cutoff": "2026-02-03T17:14:11Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      [
+        6641,
+        6712
+      ],
+      [
+        6724,
+        6732
+      ],
+      [
+        6735,
+        6743
+      ],
+      [
+        6748,
+        6785
+      ],
+      [
+        6789,
+        6802
+      ],
+      [
+        7958,
+        7967
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/overflow-mul.ll": [
+      [
+        286,
+        293
+      ],
+      [
+        306,
+        314
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/saturating-add-sub.ll": [
+      [
+        2386,
+        2391
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/uadd-with-overflow.ll": [
+      [
+        147,
+        149
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      "InstCombinerImpl::OptimizeOverflowCheck",
+      "InstCombinerImpl::visitICmpInst",
+      "processUMulZExtIdiom"
+    ]
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "pr_id": 182443,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182443",
+  "state": "open",
+  "title": "[SLP] Check the Operands of Copyable elements as well in getBestOperand()",
+  "author": "bababuck",
+  "base_commit": "6705802ce2132eecc16fe3bcbba46ef68fe75175",
+  "fix_commit": "f9f6c28dc3d8c7338aa001c5c53ac71ed08239bd",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 4caa1707f0f27..e80b012800b3c 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -2795,6 +2795,8 @@ class slpvectorizer::BoUpSLP {\n     ScalarEvolution &SE;\n     const BoUpSLP &R;\n     const Loop *L = nullptr;\n+    const InstructionsState &S;\n+    ArrayRef<Value *> VL;\n \n     /// \\returns the operand data at \\p OpIdx and \\p Lane.\n     OperandData &getData(unsigned OpIdx, unsigned Lane) {\n@@ -2996,16 +2998,39 @@ class slpvectorizer::BoUpSLP {\n         case ReorderingMode::Load:\n         case ReorderingMode::Opcode: {\n           bool LeftToRight = Lane > LastLane;\n-          Value *OpLeft = (LeftToRight) ? OpLastLane : Op;\n-          Value *OpRight = (LeftToRight) ? Op : OpLastLane;\n-          int Score = getLookAheadScore(OpLeft, OpRight, MainAltOps, Lane,\n-                                        OpIdx, Idx, IsUsed, UsedLanes);\n-          if (Score > static_cast<int>(BestOp.Score) ||\n-              (Score > 0 && Score == static_cast<int>(BestOp.Score) &&\n-               Idx == OpIdx)) {\n-            BestOp.Idx = Idx;\n-            BestOp.Score = Score;\n-            BestScoresPerLanes[std::make_pair(OpIdx, Lane)] = Score;\n+          auto ScoreLoadOrOpcode = [&](Value *Op, Value *OpLastLane) -> void {\n+            Value *OpLeft = (LeftToRight) ? OpLastLane : Op;\n+            Value *OpRight = (LeftToRight) ? Op : OpLastLane;\n+            int Score = getLookAheadScore(OpLeft, OpRight, MainAltOps, Lane,\n+                                          OpIdx, Idx, IsUsed, UsedLanes);\n+            if (Score > static_cast<int>(BestOp.Score) ||\n+                (Score > 0 && Score == static_cast<int>(BestOp.Score) &&\n+                 Idx == OpIdx)) {\n+              BestOp.Idx = Idx;\n+              BestOp.Score = Score;\n+              BestScoresPerLanes[std::make_pair(OpIdx, Lane)] = Score;\n+            }\n+          };\n+          ScoreLoadOrOpcode(Op, OpLastLane);\n+          // If Op or OpLastLane is Copyable, score against the Copyable Value's\n+          // operands\n+          if (S.isCopyableElement(VL[Lane]) !=\n+              S.isCopyableElement(VL[LastLane])) {\n+            bool OpIsCopyable = S.isCopyableElement(VL[Lane]);\n+            Instruction *I =\n+                dyn_cast<Instruction>(OpIsCopyable ? Op : OpLastLane);\n+            if (I && Instruction::isBinaryOp(I->getOpcode())) {\n+              Value *IOp0 = I->getOperand(0);\n+              Value *NewOp = OpIsCopyable ? IOp0 : Op;\n+              Value *NewOpLastLane = OpIsCopyable ? OpLastLane : IOp0;\n+              ScoreLoadOrOpcode(NewOp, NewOpLastLane);\n+              if (I->isCommutative()) {\n+                Value *IOp1 = I->getOperand(1);\n+                NewOp = OpIsCopyable ? IOp1 : Op;\n+                NewOpLastLane = OpIsCopyable ? OpLastLane : IOp1;\n+                ScoreLoadOrOpcode(NewOp, NewOpLastLane);\n+              }\n+            }\n           }\n           break;\n         }\n@@ -3331,7 +3356,7 @@ class slpvectorizer::BoUpSLP {\n     VLOperands(ArrayRef<Value *> RootVL, ArrayRef<ValueList> Operands,\n                const InstructionsState &S, const BoUpSLP &R)\n         : TLI(*R.TLI), DL(*R.DL), SE(*R.SE), R(R),\n-          L(R.LI->getLoopFor(S.getMainOp()->getParent())) {\n+          L(R.LI->getLoopFor(S.getMainOp()->getParent())), S(S), VL(RootVL) {\n       // Append all the operands of RootVL.\n       appendOperands(RootVL, Operands, S);\n     }\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "When reordering operands, it may be beneficial to consider the operands of a copyable value, and not just the copyable value itself.\r\n\r\nAddresses issue from #181731, see https://github.com/llvm/llvm-project/pull/181731#discussion_r2823975392.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/copyable_reorder.ll",
+      "commands": [
+        "opt < %s -passes=slp-vectorizer -slp-threshold=-200 -mtriple=x86_64-unknown-linux -mcpu=core-avx2 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_add_udiv_commuted",
+          "test_body": "define void @test_add_udiv_commuted(ptr %arr1, ptr %arr2, i32 %a0, i32 %a1, i32 %a2, i32 %a3) {\nentry:\n  %gep1.1 = getelementptr i32, ptr %arr1, i32 1\n  %gep1.2 = getelementptr i32, ptr %arr1, i32 2\n  %gep1.3 = getelementptr i32, ptr %arr1, i32 3\n  %gep2.1 = getelementptr i32, ptr %arr2, i32 1\n  %gep2.2 = getelementptr i32, ptr %arr2, i32 2\n  %gep2.3 = getelementptr i32, ptr %arr2, i32 3\n  %v0 = load i32, ptr %arr1, align 4\n  %v1 = load i32, ptr %gep1.1, align 4\n  %v2 = load i32, ptr %gep1.2, align 4\n  %v3 = load i32, ptr %gep1.3, align 4\n  %y0 = add nsw i32 %a0, 1146\n  %y1 = add nsw i32 %a1, 146\n  %y2 = add nsw i32 %a2, 42\n  %y3 = add nsw i32 %a3, 0\n  %res0 = add nsw i32 %y0, %v0\n  %res1 = add nsw i32 %y1, %v1\n  %res2 = udiv i32 %v2, %y2\n  %res3 = add nsw i32 %y3, %v3\n  store i32 %res0, ptr %arr2, align 4\n  store i32 %res1, ptr %gep2.1, align 4\n  store i32 %res2, ptr %gep2.2, align 4\n  store i32 %res3, ptr %gep2.3, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_add_udiv_reorder_add",
+          "test_body": "define void @test_add_udiv_reorder_add(ptr %arr1, ptr %arr2, i32 %a0, i32 %a1, i32 %a2, i32 %a3) {\nentry:\n  %gep1.1 = getelementptr i32, ptr %arr1, i32 1\n  %gep1.2 = getelementptr i32, ptr %arr1, i32 2\n  %gep1.3 = getelementptr i32, ptr %arr1, i32 3\n  %gep2.1 = getelementptr i32, ptr %arr2, i32 1\n  %gep2.2 = getelementptr i32, ptr %arr2, i32 2\n  %gep2.3 = getelementptr i32, ptr %arr2, i32 3\n  %v0 = load i32, ptr %arr1, align 4\n  %v1 = load i32, ptr %gep1.1, align 4\n  %v2 = load i32, ptr %gep1.2, align 4\n  %v3 = load i32, ptr %gep1.3, align 4\n  %y0 = add nsw i32 %a0, 1146\n  %y1 = add nsw i32 %a1, 146\n  %y2 = add nsw i32 %a2, 42\n  %y3 = add nsw i32 %a3, 0\n  %res0 = add nsw i32 %v0, %y0\n  %res1 = add nsw i32 %y1, %v1\n  %res2 = udiv i32 %v2, %y2\n  %res3 = add nsw i32 %v3, %y3\n  store i32 %res0, ptr %arr2, align 4\n  store i32 %res1, ptr %gep2.1, align 4\n  store i32 %res2, ptr %gep2.2, align 4\n  store i32 %res3, ptr %gep2.3, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_add_udiv_sub_commuted",
+          "test_body": "define void @test_add_udiv_sub_commuted(ptr %arr1, ptr %arr2, i32 %a0, i32 %a1, i32 %a2, i32 %a3) {\nentry:\n  %gep1.1 = getelementptr i32, ptr %arr1, i32 1\n  %gep1.2 = getelementptr i32, ptr %arr1, i32 2\n  %gep1.3 = getelementptr i32, ptr %arr1, i32 3\n  %gep2.1 = getelementptr i32, ptr %arr2, i32 1\n  %gep2.2 = getelementptr i32, ptr %arr2, i32 2\n  %gep2.3 = getelementptr i32, ptr %arr2, i32 3\n  %v0 = load i32, ptr %arr1, align 4\n  %v1 = load i32, ptr %gep1.1, align 4\n  %v2 = load i32, ptr %gep1.2, align 4\n  %v3 = load i32, ptr %gep1.3, align 4\n  %y0 = add nsw i32 %a0, 1146\n  %y1 = add nsw i32 %a1, 146\n  %y2 = sub i32 %a2, 42\n  %y3 = add nsw i32 %a3, 0\n  %res0 = add nsw i32 %y0, %v0\n  %res1 = add nsw i32 %y1, %v1\n  %res2 = udiv i32 %v2, %y2\n  %res3 = add nsw i32 %y3, %v3\n  store i32 %res0, ptr %arr2, align 4\n  store i32 %res1, ptr %gep2.1, align 4\n  store i32 %res2, ptr %gep2.2, align 4\n  store i32 %res3, ptr %gep2.3, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_commutative",
+          "test_body": "define void @test_commutative(ptr %arr1, ptr %arr2, i32 %a0, i32 %a1, i32 %a2, i32 %a3) {\nentry:\n  %gep1.1 = getelementptr i32, ptr %arr1, i32 1\n  %gep1.2 = getelementptr i32, ptr %arr1, i32 2\n  %gep1.3 = getelementptr i32, ptr %arr1, i32 3\n  %gep1.4 = getelementptr i32, ptr %arr1, i32 4\n  %gep1.5 = getelementptr i32, ptr %arr1, i32 5\n  %gep1.6 = getelementptr i32, ptr %arr1, i32 6\n  %gep1.7 = getelementptr i32, ptr %arr1, i32 7\n  %gep2.1 = getelementptr i32, ptr %arr2, i32 1\n  %gep2.2 = getelementptr i32, ptr %arr2, i32 2\n  %gep2.3 = getelementptr i32, ptr %arr2, i32 3\n  %gep2.4 = getelementptr i32, ptr %arr2, i32 4\n  %gep2.5 = getelementptr i32, ptr %arr2, i32 5\n  %gep2.6 = getelementptr i32, ptr %arr2, i32 6\n  %gep2.7 = getelementptr i32, ptr %arr2, i32 7\n  %v0 = load i32, ptr %arr1, align 4\n  %v1 = load i32, ptr %gep1.1, align 4\n  %v2 = load i32, ptr %gep1.2, align 4\n  %v3 = load i32, ptr %gep1.3, align 4\n  %v4 = load i32, ptr %gep1.4, align 4\n  %v5 = load i32, ptr %gep1.5, align 4\n  %v6 = load i32, ptr %gep1.6, align 4\n  %v7 = load i32, ptr %gep1.7, align 4\n  %t0 = load i32, ptr %arr2, align 4\n  %t1 = load i32, ptr %gep2.1, align 4\n  %t2 = load i32, ptr %gep2.2, align 4\n  %t3 = load i32, ptr %gep2.3, align 4\n  %t4 = load i32, ptr %gep2.4, align 4\n  %t5 = load i32, ptr %gep2.5, align 4\n  %t6 = load i32, ptr %gep2.6, align 4\n  %t7 = load i32, ptr %gep2.7, align 4\n  %y1 = add nsw i32 %v1, %v1\n  %y2 = add nsw i32 %v2, %v2\n  br label %bb2\n\nbb2:                                              ; preds = %entry\n  %y0 = add nsw i32 %t0, %v0\n  %y3 = add nsw i32 %t3, %v3\n  %y4 = add nsw i32 %t4, %v4\n  %y5 = add nsw i32 %t5, %v5\n  %y6 = add nsw i32 %t6, %v6\n  %y7 = add nsw i32 %t7, %v7\n  %res0 = add nsw i32 %v0, %y0\n  %res1 = add nsw i32 %v1, %y1\n  %res2 = add nsw i32 %v2, %y2\n  %res3 = add nsw i32 %v3, %y3\n  %res4 = add nsw i32 %v4, %y4\n  %res5 = add nsw i32 %v5, %y5\n  %res6 = add nsw i32 %v6, %y6\n  %res7 = add nsw i32 %v7, %y7\n  store i32 %res0, ptr %arr2, align 4\n  store i32 %res1, ptr %gep2.1, align 4\n  store i32 %res2, ptr %gep2.2, align 4\n  store i32 %res3, ptr %gep2.3, align 4\n  store i32 %res4, ptr %gep2.4, align 4\n  store i32 %res5, ptr %gep2.5, align 4\n  store i32 %res6, ptr %gep2.6, align 4\n  store i32 %res7, ptr %gep2.7, align 4\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "bababuck",
+      "body": "Updates:\r\n- Rebased onto pre-committed test from `upstream/main`.\r\n- Call `scoreLoadOrOpcode`  on the operands if either `Op` or `OpLastLane` is copyable (before only did if `Op` was Copyable. However, the Copyable operand may be chosen as the first lane in which case it will only ever appear as `OpLastLane`."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-20T06:49:18Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        2795,
+        2800
+      ],
+      [
+        2996,
+        3011
+      ],
+      [
+        3331,
+        3337
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/copyable_reorder.ll": [
+      [
+        20,
+        33
+      ],
+      [
+        136,
+        159
+      ],
+      [
+        186,
+        206
+      ],
+      [
+        357,
+        377
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "VLOperands",
+      "getBestOperand",
+      "getData"
+    ]
+  }
+}

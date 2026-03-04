@@ -1,0 +1,109 @@
+{
+  "pr_id": 177109,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177109",
+  "state": "open",
+  "title": "[AggressiveInstCombine] POPCNT generation for bit-count pattern",
+  "author": "rohitaggarwal007",
+  "base_commit": "72915ea145c949dd8e092f9a898181b352e000b7",
+  "fix_commit": "669e15134fbd807009adbdc6c95936170ed5301d",
+  "patch": "diff --git a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\nindex 3341368208c24..c43f397d8b562 100644\n--- a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n+++ b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n@@ -372,6 +372,149 @@ static bool tryToRecognizePopCount(Instruction &I) {\n   return false;\n }\n \n+// Try to recognize below function as popcount intrinsic.\n+// https://doc.lagout.org/security/Hackers%20Delight.pdf\n+// Also used in TargetLowering::expandCTPOP().\n+//\n+// int popcount32(unsigned int i) {\n+// uWord = (uWord & 0x55555555) + ((uWord>>1) & 0x55555555);\n+// uWord = (uWord & 0x33333333) + ((uWord>>2) & 0x33333333);\n+// uWord = (uWord & 0x0F0F0F0F) + ((uWord>>4) & 0x0F0F0F0F);\n+// uWord = (uWord & 0x00FF00FF) + ((uWord>>8) & 0x00FF00FF);\n+// return  (uWord & 0x0000FFFF) + (uWord>>16);\n+// }\n+// int popcount64(unsigned long i) {\n+// uWord = (uWord & 0x5555555555555555) + ((uWord>>1) & 0x5555555555555555);\n+// uWord = (uWord & 0x3333333333333333) + ((uWord>>2) & 0x3333333333333333);\n+// uWord = (uWord & 0x0F0F0F0F0F0F0F0F) + ((uWord>>4) & 0x0F0F0F0F0F0F0F0F);\n+// uWord = (uWord & 0x00FF00FF00FF00FF) + ((uWord>>8) & 0x00FF00FF00FF00FF);\n+// return  (uWord & 0x0000FFFF0000FFFF) + ((uWord>>16) & 0x0000FFFF0000FFFF);\n+// return  (uWord & 0x00000000FFFFFFFF) + (uWord>>32) & 0x00000000FFFFFFFF;\n+// }\n+static bool tryToRecognizePopCount1(Instruction &I) {\n+  if (I.getOpcode() != Instruction::Add)\n+    return false;\n+\n+  Type *Ty = I.getType();\n+  if (!Ty->isIntOrIntVectorTy())\n+    return false;\n+\n+  unsigned Len = Ty->getScalarSizeInBits();\n+  if (!(Len <= 64 && Len > 8 && Len % 8 == 0))\n+    return false;\n+\n+  APInt Mask55 = APInt::getSplat(Len, APInt(8, 0x55));\n+  APInt Mask33 = APInt::getSplat(Len, APInt(8, 0x33));\n+  APInt Mask0F = APInt::getSplat(Len, APInt(8, 0x0F));\n+  APInt Mask00FF;\n+  if (Len <= 16) {\n+    Mask00FF = APInt(16, 0x00FF);\n+  } else {\n+    Mask00FF = APInt::getSplat(Len, APInt(16, 0x00FF));\n+  }\n+  APInt Mask0000FFFF;\n+  if (Len <= 32) {\n+    Mask0000FFFF = APInt(32, 0x0000FFFF);\n+  } else {\n+    Mask0000FFFF = APInt::getSplat(Len, APInt(32, 0x0000FFFF));\n+  }\n+\n+  APInt Mask64 = APInt(64, 0x00000000FFFFFFFF);\n+  // Matching \"(uWord & 0x00000000FFFFFFFF) + (uWord>>32)\".\n+  // OR\n+  // Matching \"(uWord & 0x00000000FFFFFFFF) + ((uWord>>32) &\n+  // 0x00000000FFFFFFFF)\".\n+  Value *ShiftOp;\n+  Value *Start = &I;\n+  bool is64 = false;\n+  if (match(Start,\n+            m_c_Add(m_And(m_LShr(m_Value(ShiftOp), m_SpecificInt(32)),\n+                          m_SpecificInt(Mask64)),\n+                    m_And(m_Deferred(ShiftOp), m_SpecificInt(Mask64)))) ||\n+      match(Start,\n+            m_c_Add(m_LShr(m_Value(ShiftOp), m_SpecificInt(32)),\n+                    m_And(m_Deferred(ShiftOp), m_SpecificInt(Mask64))))) {\n+    Start = ShiftOp;\n+    is64 = true;\n+  }\n+  Value *LShrOp0;\n+  // Matching \"(uWord & 0x0000FFFF) + (uWord>>16)\".\n+  // Matching \"(uWord & 0x0000FFFF) + ((uWord>>16) & 0x0000FFFF)\".\n+  bool test16 = match(\n+      Start, m_c_Add(m_And(m_LShr(m_Value(LShrOp0), m_SpecificInt(16)),\n+                           m_SpecificInt(Mask0000FFFF)),\n+                     m_And(m_Deferred(LShrOp0), m_SpecificInt(Mask0000FFFF))));\n+\n+  bool is32 = false;\n+  if ((is64 && test16) ||\n+      (!is64 && Len == 32 &&\n+       (test16 ||\n+        match(Start, m_c_Add(m_LShr(m_Value(LShrOp0), m_SpecificInt(16)),\n+                             m_And(m_Deferred(LShrOp0),\n+                                   m_SpecificInt(Mask0000FFFF))))))) {\n+    Start = LShrOp0;\n+\n+    is32 = true;\n+  }\n+  Value *ShiftOp0;\n+  // Matching \"uWord = (uWord & 0x00FF00FF) + ((uWord>>8) & 0x00FF00FF);\".\n+  // OR\n+  // Matching \"uWord = (uWord & 0x00FF00FF) + (uWord>>8) ;\".\n+  bool test8 = match(\n+      Start, m_c_Add(m_And(m_LShr(m_Value(ShiftOp0), m_SpecificInt(8)),\n+                           m_SpecificInt(Mask00FF)),\n+                     m_And(m_Deferred(ShiftOp0), m_SpecificInt(Mask00FF))));\n+\n+  bool is16 = false;\n+  if ((is32 && test8) ||\n+      (!is32 && Len == 16 &&\n+       (test8 ||\n+        match(Start, m_c_Add(m_LShr(m_Value(ShiftOp0), m_SpecificInt(8)),\n+                             m_And(m_Deferred(ShiftOp0),\n+                                   m_SpecificInt(Mask00FF))))))) {\n+    Start = ShiftOp0;\n+    is16 = true;\n+  }\n+\n+  Value *ShiftOp1;\n+  // Matching \"uWord = (uWord & 0x0F0F0F0F) + ((uWord>>4) & 0x0F0F0F0F)\".\n+  bool test4 =\n+      match(Start, m_c_Add(m_And(m_LShr(m_Value(ShiftOp1), m_SpecificInt(4)),\n+                                 m_SpecificInt(Mask0F)),\n+                           m_And(m_Deferred(ShiftOp1), m_SpecificInt(Mask0F))));\n+\n+  bool is8 = false;\n+  if ((is16 && test4)) {\n+    Start = ShiftOp1;\n+    is8 = true;\n+  }\n+\n+  Value *ShiftOp2;\n+  // Matching \"uWord = (uWord & 0x33333333) + ((uWord>>2) & 0x33333333)\".\n+  if (is8 &&\n+      match(Start,\n+            m_c_Add(m_And(m_LShr(m_Value(ShiftOp2), m_SpecificInt(2)),\n+                          m_SpecificInt(Mask33)),\n+                    m_And(m_Deferred(ShiftOp2), m_SpecificInt(Mask33))))) {\n+    Value *ShiftOp3;\n+    // Matching \"uWord = (uWord & 0x55555555) + ((uWord>>1) &\n+    // 0x55555555)\".\n+    if (match(ShiftOp2,\n+              m_c_Add(m_And(m_LShr(m_Value(ShiftOp3), m_SpecificInt(1)),\n+                            m_SpecificInt(Mask55)),\n+                      m_And(m_Deferred(ShiftOp3), m_SpecificInt(Mask55))))) {\n+      LLVM_DEBUG(dbgs() << \"Recognized popcount intrinsic\\n\");\n+      IRBuilder<> Builder(&I);\n+      I.replaceAllUsesWith(\n+          Builder.CreateIntrinsic(Intrinsic::ctpop, I.getType(), {ShiftOp3}));\n+      ++NumPopCountRecognized;\n+      return true;\n+    }\n+  }\n+\n+  return false;\n+}\n+\n /// Fold smin(smax(fptosi(x), C1), C2) to llvm.fptosi.sat(x), providing C1 and\n /// C2 saturate the value of the fp conversion. The transform is not reversable\n /// as the fptosi.sat is more defined than the input - all values produce a\n@@ -1826,6 +1969,7 @@ static bool foldUnusualPatterns(Function &F, DominatorTree &DT,\n       MadeChange |= foldAnyOrAllBitsSet(I);\n       MadeChange |= foldGuardedFunnelShift(I, DT);\n       MadeChange |= tryToRecognizePopCount(I);\n+      MadeChange |= tryToRecognizePopCount1(I);\n       MadeChange |= tryToFPToSat(I, TTI);\n       MadeChange |= tryToRecognizeTableBasedCttz(I, DL);\n       MadeChange |= foldConsecutiveLoads(I, DL, TTI, AA, DT);\n",
+  "components": [
+    "AggressiveInstCombine"
+  ],
+  "description": "The proposal is to enhance LLVM by teaching it to recognize the pattern and replace it with the hardware POPCNT instruction.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/AggressiveInstCombine/popcount.ll",
+      "commands": [
+        "opt < %s -passes=aggressive-instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "popcnt1_64",
+          "test_body": "define dso_local noundef i64 @popcnt1_64(i64 noundef %uWord) local_unnamed_addr {\nentry:\n  %and = and i64 %uWord, 6148914691236517205\n  %shr = lshr i64 %uWord, 1\n  %and1 = and i64 %shr, 6148914691236517205\n  %add = add nuw i64 %and1, %and\n  %and2 = and i64 %add, 3689348814741910323\n  %shr3 = lshr i64 %add, 2\n  %and4 = and i64 %shr3, 3689348814741910323\n  %add5 = add nuw nsw i64 %and4, %and2\n  %and6 = and i64 %add5, 1085102592571150095\n  %shr7 = lshr i64 %add5, 4\n  %and8 = and i64 %shr7, 1085102592571150095\n  %add9 = add nuw nsw i64 %and8, %and6\n  %and10 = and i64 %add9, 71777214294589695\n  %shr11 = lshr i64 %add9, 8\n  %and12 = and i64 %shr11, 71777214294589695\n  %add13 = add nuw nsw i64 %and12, %and10\n  %and14 = and i64 %add13, 281470681808895\n  %shr15 = lshr i64 %add13, 16\n  %and16 = and i64 %shr15, 281470681808895\n  %add17 = add nuw nsw i64 %and16, %and14\n  %and18 = and i64 %add17, 4294967295\n  %shr19 = lshr i64 %add17, 32\n  %add20 = add nuw nsw i64 %and18, %shr19\n  ret i64 %add20\n}\n"
+        },
+        {
+          "test_name": "popcnt1_32",
+          "test_body": "define dso_local noundef range(i32 0, 59) i32 @popcnt1_32(i32 noundef %uWord) local_unnamed_addr {\nentry:\n  %and = and i32 %uWord, 1431655765\n  %shr = lshr i32 %uWord, 1\n  %and1 = and i32 %shr, 1431655765\n  %add = add nuw i32 %and1, %and\n  %and2 = and i32 %add, 858993459\n  %shr3 = lshr i32 %add, 2\n  %and4 = and i32 %shr3, 858993459\n  %add5 = add nuw nsw i32 %and4, %and2\n  %and6 = and i32 %add5, 252645135\n  %shr7 = lshr i32 %add5, 4\n  %and8 = and i32 %shr7, 252645135\n  %add9 = add nuw nsw i32 %and8, %and6\n  %and10 = and i32 %add9, 16711935\n  %shr11 = lshr i32 %add9, 8\n  %and12 = and i32 %shr11, 16711935\n  %add13 = add nuw nsw i32 %and12, %and10\n  %and14 = and i32 %add13, 65535\n  %shr15 = lshr i32 %add13, 16\n  %add16 = add nuw nsw i32 %and14, %shr15\n  ret i32 %add16\n}\n"
+        },
+        {
+          "test_name": "popcnt1_16_variant2",
+          "test_body": "define i16 @popcnt1_16_variant2(i16 noundef %uWord) {\n  %and = and i16 %uWord, 21845\n  %shr = lshr i16 %uWord, 1\n  %and1 = and i16 %shr, 21845\n  %add = add nuw i16 %and1, %and\n  %and2 = and i16 %add, 13107\n  %shr3 = lshr i16 %add, 2\n  %and4 = and i16 %shr3, 13107\n  %add5 = add nuw nsw i16 %and4, %and2\n  %and6 = and i16 %add5, 3855\n  %shr7 = lshr i16 %add5, 4\n  %and8 = and i16 %shr7, 3855\n  %add9 = add nuw nsw i16 %and8, %and6\n  %and10 = and i16 %add9, 255\n  %shr11 = lshr i16 %add9, 8\n  %and12 = and i16 %shr11, 255\n  %add13 = add nuw nsw i16 %and10, %and12\n  ret i16 %add13\n}\n"
+        },
+        {
+          "test_name": "popcnt1_16",
+          "test_body": "define i16 @popcnt1_16(i16 noundef %uWord) {\n  %and = and i16 %uWord, 21845\n  %shr = lshr i16 %uWord, 1\n  %and1 = and i16 %shr, 21845\n  %add = add nuw i16 %and1, %and\n  %and2 = and i16 %add, 13107\n  %shr3 = lshr i16 %add, 2\n  %and4 = and i16 %shr3, 13107\n  %add5 = add nuw nsw i16 %and4, %and2\n  %and6 = and i16 %add5, 3855\n  %shr7 = lshr i16 %add5, 4\n  %and8 = and i16 %shr7, 3855\n  %add9 = add nuw nsw i16 %and8, %and6\n  %and10 = and i16 %add9, 255\n  %shr11 = lshr i16 %add9, 8\n  %add13 = add nuw nsw i16 %shr11, %and10\n  ret i16 %add13\n}\n"
+        },
+        {
+          "test_name": "popcnt1_16vec",
+          "test_body": "define <8 x i16> @popcnt1_16vec(<8 x i16> %uWord) {\n  %and = and <8 x i16> %uWord, splat (i16 21845)\n  %shr = lshr <8 x i16> %uWord, splat (i16 1)\n  %and1 = and <8 x i16> %shr, splat (i16 21845)\n  %add = add nuw <8 x i16> %and1, %and\n  %and2 = and <8 x i16> %add, splat (i16 13107)\n  %shr3 = lshr <8 x i16> %add, splat (i16 2)\n  %and4 = and <8 x i16> %shr3, splat (i16 13107)\n  %add5 = add nuw nsw <8 x i16> %and4, %and2\n  %and6 = and <8 x i16> %add5, splat (i16 3855)\n  %shr7 = lshr <8 x i16> %add5, splat (i16 4)\n  %and8 = and <8 x i16> %shr7, splat (i16 3855)\n  %add9 = add nuw nsw <8 x i16> %and8, %and6\n  %and10 = and <8 x i16> %add9, splat (i16 255)\n  %shr11 = lshr <8 x i16> %add9, splat (i16 8)\n  %add13 = add nuw nsw <8 x i16> %shr11, %and10\n  ret <8 x i16> %add13\n}\n"
+        },
+        {
+          "test_name": "popcnt1_32vec",
+          "test_body": "define <4 x i32> @popcnt1_32vec(<4 x i32> %uWord) {\n  %and = and <4 x i32> %uWord, splat (i32 1431655765)\n  %shr = lshr <4 x i32> %uWord, splat (i32 1)\n  %and1 = and <4 x i32> %shr, splat (i32 1431655765)\n  %add = add nuw <4 x i32> %and1, %and\n  %and2 = and <4 x i32> %add, splat (i32 858993459)\n  %shr3 = lshr <4 x i32> %add, splat (i32 2)\n  %and4 = and <4 x i32> %shr3, splat (i32 858993459)\n  %add5 = add nuw nsw <4 x i32> %and4, %and2\n  %and6 = and <4 x i32> %add5, splat (i32 252645135)\n  %shr7 = lshr <4 x i32> %add5, splat (i32 4)\n  %and8 = and <4 x i32> %shr7, splat (i32 252645135)\n  %add9 = add nuw nsw <4 x i32> %and8, %and6\n  %and10 = and <4 x i32> %add9, splat (i32 16711935)\n  %shr11 = lshr <4 x i32> %add9, splat (i32 8)\n  %and12 = and <4 x i32> %shr11, splat (i32 16711935)\n  %add13 = add nuw nsw <4 x i32> %and12, %and10\n  %and14 = and <4 x i32> %add13, splat (i32 65535)\n  %shr15 = lshr <4 x i32> %add13, splat (i32 16)\n  %add16 = add nuw nsw <4 x i32> %and14, %shr15\n  ret <4 x i32> %add16\n}\n"
+        },
+        {
+          "test_name": "popcnt1_64vec",
+          "test_body": "define <2 x i64> @popcnt1_64vec(<2 x i64> %uWord) {\n  %and = and <2 x i64> %uWord, splat (i64 6148914691236517205)\n  %shr = lshr <2 x i64> %uWord, splat (i64 1)\n  %and1 = and <2 x i64> %shr, splat (i64 6148914691236517205)\n  %add = add nuw <2 x i64> %and1, %and\n  %and2 = and <2 x i64> %add, splat (i64 3689348814741910323)\n  %shr3 = lshr <2 x i64> %add, splat (i64 2)\n  %and4 = and <2 x i64> %shr3, splat (i64 3689348814741910323)\n  %add5 = add nuw nsw <2 x i64> %and4, %and2\n  %and6 = and <2 x i64> %add5, splat (i64 1085102592571150095)\n  %shr7 = lshr <2 x i64> %add5, splat (i64 4)\n  %and8 = and <2 x i64> %shr7, splat (i64 1085102592571150095)\n  %add9 = add nuw nsw <2 x i64> %and8, %and6\n  %and10 = and <2 x i64> %add9, splat (i64 71777214294589695)\n  %shr11 = lshr <2 x i64> %add9, splat (i64 8)\n  %and12 = and <2 x i64> %shr11, splat (i64 71777214294589695)\n  %add13 = add nuw nsw <2 x i64> %and12, %and10\n  %and14 = and <2 x i64> %add13, splat (i64 281470681808895)\n  %shr15 = lshr <2 x i64> %add13, splat (i64 16)\n  %and16 = and <2 x i64> %shr15, splat (i64 281470681808895)\n  %add17 = add nuw nsw <2 x i64> %and16, %and14\n  %and18 = and <2 x i64> %add17, splat (i64 4294967295)\n  %shr19 = lshr <2 x i64> %add17, splat (i64 32)\n  %add20 = add nuw nsw <2 x i64> %and18, %shr19\n  ret <2 x i64> %add20\n}\n"
+        },
+        {
+          "test_name": "popcount64_mask",
+          "test_body": "define i32 @popcount64_mask(i64 %x) {\n  %mask = and i64 %x, -281470681808896\n  %1 = lshr i64 %mask, 1\n  %2 = and i64 %1, 6148820867675914240\n  %3 = sub nsw i64 %mask, %2\n  %4 = and i64 %3, 3689348814741910323\n  %5 = lshr i64 %3, 2\n  %6 = and i64 %5, 3689348814741910323\n  %7 = add nuw nsw i64 %6, %4\n  %8 = lshr i64 %7, 4\n  %9 = add nuw nsw i64 %8, %7\n  %10 = and i64 %9, 1085102592571150095\n  %11 = mul i64 %10, 72340172838076673\n  %12 = lshr i64 %11, 56\n  %13 = trunc nuw nsw i64 %12 to i32\n  ret i32 %13\n}\n"
+        },
+        {
+          "test_name": "popcnt1_32_variant2",
+          "test_body": "define dso_local noundef range(i32 0, 59) i32 @popcnt1_32_variant2(i32 noundef %uWord) local_unnamed_addr {\nentry:\n  %and = and i32 %uWord, 1431655765\n  %shr = lshr i32 %uWord, 1\n  %and1 = and i32 %shr, 1431655765\n  %add = add nuw i32 %and1, %and\n  %and2 = and i32 %add, 858993459\n  %shr3 = lshr i32 %add, 2\n  %and4 = and i32 %shr3, 858993459\n  %add5 = add nuw nsw i32 %and4, %and2\n  %and6 = and i32 %add5, 252645135\n  %shr7 = lshr i32 %add5, 4\n  %and8 = and i32 %shr7, 252645135\n  %add9 = add nuw nsw i32 %and8, %and6\n  %and10 = and i32 %add9, 16711935\n  %shr11 = lshr i32 %add9, 8\n  %and12 = and i32 %shr11, 16711935\n  %add13 = add nuw nsw i32 %and12, %and10\n  %and14 = and i32 %add13, 65535\n  %shr15 = lshr i32 %add13, 16\n  %and16 = and i32 %shr15, 65535\n  %add17 = add nuw nsw i32 %and14, %and16\n  ret i32 %add17\n}\n"
+        },
+        {
+          "test_name": "popcnt1_64_variant2",
+          "test_body": "define i64 @popcnt1_64_variant2(i64 noundef %uWord) {\n  %and = and i64 %uWord, 6148914691236517205\n  %shr = lshr i64 %uWord, 1\n  %and1 = and i64 %shr, 6148914691236517205\n  %add = add nuw i64 %and1, %and\n  %and2 = and i64 %add, 3689348814741910323\n  %shr3 = lshr i64 %add, 2\n  %and4 = and i64 %shr3, 3689348814741910323\n  %add5 = add nuw nsw i64 %and4, %and2\n  %and6 = and i64 %add5, 1085102592571150095\n  %shr7 = lshr i64 %add5, 4\n  %and8 = and i64 %shr7, 1085102592571150095\n  %add9 = add nuw nsw i64 %and8, %and6\n  %and10 = and i64 %add9, 71777214294589695\n  %shr11 = lshr i64 %add9, 8\n  %and12 = and i64 %shr11, 71777214294589695\n  %add13 = add nuw nsw i64 %and12, %and10\n  %and14 = and i64 %add13, 281470681808895\n  %shr15 = lshr i64 %add13, 16\n  %and16 = and i64 %shr15, 281470681808895\n  %add17 = add nuw nsw i64 %and16, %and14\n  %and18 = and i64 %add17, 4294967295\n  %shr19 = lshr i64 %add17, 32\n  %and20 = and i64 %shr19, 4294967295\n  %add21 = add nuw nsw i64 %and18, %and20\n  ret i64 %add21\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "rohitaggarwal007",
+      "body": "> > As there are matches on llvm-opt-benchmark we can consider this one. This recognizes two different patterns, which should be split into different PRs.\r\n> \r\n> Sure, I will split the PR into two PRs\r\n> \r\n> > This needs more test coverage. Even ignoring negative tests, the implementations claim to handle 16, 32, 64 and 128 bit integers, but there's no test coverage for that, and I doubt these are actually handled correctly based on a cursory look at the code (lots of hardcoded constants for 32-bit values).\r\n> \r\n> Sure, I will do the needful.\r\n\r\n"
+    },
+    {
+      "author": "rohitaggarwal007",
+      "body": "> As there are matches on llvm-opt-benchmark we can consider this one. This recognizes two different patterns, which should be split into different PRs.\r\n> \r\n> This needs more test coverage. Even ignoring negative tests, the implementations claim to handle 16, 32, 64 and 128 bit integers, but there's no test coverage for that, and I doubt these are actually handled correctly based on a cursory look at the code (lots of hardcoded constants for 32-bit values).\r\n\r\nI have added more test cases"
+    },
+    {
+      "author": "rohitaggarwal007",
+      "body": "> There are still no negative tests?\r\n\r\nSure, Will add more test case"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-21T07:26:07Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp": [
+      [
+        372,
+        377
+      ],
+      [
+        1826,
+        1831
+      ]
+    ],
+    "llvm/test/Transforms/AggressiveInstCombine/popcount.ll": [
+      [
+        239,
+        241
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp": [
+      "foldUnusualPatterns",
+      "tryToRecognizePopCount"
+    ],
+    "llvm/test/Transforms/AggressiveInstCombine/popcount.ll": [
+      "popcount8"
+    ]
+  }
+}

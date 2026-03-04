@@ -1,0 +1,119 @@
+{
+  "pr_id": 181709,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181709",
+  "state": "open",
+  "title": "[DSE] Introduce `eliminateRedundantStoresViaDominatingConditions`",
+  "author": "antoniofrighetto",
+  "base_commit": "943eb6fd958e8b130ee94f5c65b7d53ec3419acc",
+  "fix_commit": "0b281b9fd443fe0019f84c66735484f93f04b7cb",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\nindex 85d7618b3239c..9b6ae9cd575d1 100644\n--- a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n@@ -174,6 +174,11 @@ static cl::opt<bool> EnableInitializesImprovement(\n     \"enable-dse-initializes-attr-improvement\", cl::init(true), cl::Hidden,\n     cl::desc(\"Enable the initializes attr improvement in DSE\"));\n \n+static cl::opt<unsigned> MaxDepthRecursion(\n+    \"dse-max-dom-cond-depth\", cl::init(20), cl::Hidden,\n+    cl::desc(\"Limit dominator tree depth for recursion while eliminating \"\n+             \"redundant stores via dominating conditions\"));\n+\n //===----------------------------------------------------------------------===//\n // Helper functions\n //===----------------------------------------------------------------------===//\n@@ -1110,10 +1115,6 @@ struct DSEState {\n   /// try folding it into a call to calloc.\n   bool tryFoldIntoCalloc(MemoryDef *Def, const Value *DefUO);\n \n-  // Check if there is a dominating condition, that implies that the value\n-  // being stored in a ptr is already present in the ptr.\n-  bool dominatingConditionImpliesValue(MemoryDef *Def);\n-\n   /// \\returns true if \\p Def is a no-op store, either because it\n   /// directly stores back a loaded value or stores zero to a calloced object.\n   bool storeIsNoop(MemoryDef *Def, const Value *DefUO);\n@@ -1124,6 +1125,11 @@ struct DSEState {\n   /// is already stored at the same location.\n   bool eliminateRedundantStoresOfExistingValues();\n \n+  /// If there is a dominating condition that implies the value being stored in\n+  /// a pointer, and such a condition appears in a node that dominates the\n+  /// store, then the store may be redundant if no write occurs in between.\n+  bool eliminateRedundantStoresViaDominatingConditions();\n+\n   // Return the locations written by the initializes attribute.\n   // Note that this function considers:\n   // 1. Unwind edge: use \"initializes\" attribute only if the callee has\n@@ -2142,6 +2148,124 @@ bool DSEState::eliminateDeadWritesAtEndOfFunction() {\n   return MadeChange;\n }\n \n+bool DSEState::eliminateRedundantStoresViaDominatingConditions() {\n+  bool MadeChange = false;\n+  LLVM_DEBUG(dbgs() << \"Trying to eliminate MemoryDefs whose value being \"\n+                       \"written is implied by a dominating condition\\n\");\n+\n+  // A small struct to record `*Ptr == Val` equality facts.\n+  struct EqualityCond {\n+    Value *Ptr;\n+    Value *Val;\n+    Instruction *LI;\n+    EqualityCond(Value *Ptr, Value *Val, Instruction *LI)\n+        : Ptr(Ptr), Val(Val), LI(LI) {}\n+  };\n+\n+  // We maintain a stack of the active dominating conditions for a given node.\n+  SmallVector<EqualityCond, 8> ActiveConditions;\n+  auto GetDominatingCondition = [&](BasicBlock *BB)\n+      -> std::optional<std::pair<EqualityCond, BasicBlock *>> {\n+    auto *BI = dyn_cast<BranchInst>(BB->getTerminator());\n+    if (!BI || !BI->isConditional())\n+      return std::nullopt;\n+\n+    // In case both blocks are the same, it is not possible to determine\n+    // if optimization is possible. (We would not want to optimize a store\n+    // in the FalseBB if condition is true and vice versa.)\n+    if (BI->getSuccessor(0) == BI->getSuccessor(1))\n+      return std::nullopt;\n+\n+    Instruction *ICmpL;\n+    CmpPredicate Pred;\n+    Value *StorePtr, *StoreVal;\n+    if (!match(BI->getCondition(),\n+               m_c_ICmp(Pred, m_Instruction(ICmpL, m_Load(m_Value(StorePtr))),\n+                        m_Value(StoreVal))) ||\n+        !ICmpInst::isEquality(Pred))\n+      return std::nullopt;\n+\n+    // Ensure the replacement is allowed when comparing pointers, as\n+    // the equality compares addresses only, not pointers' provenance.\n+    if (StoreVal->getType()->isPointerTy() &&\n+        !canReplacePointersIfEqual(StoreVal, ICmpL, DL))\n+      return std::nullopt;\n+\n+    unsigned ImpliedSuccIdx = (Pred == ICmpInst::ICMP_EQ) ? 0 : 1;\n+    BasicBlock *ImpliedSucc = BI->getSuccessor(ImpliedSuccIdx);\n+    return {{EqualityCond(StorePtr, StoreVal, ICmpL), ImpliedSucc}};\n+  };\n+\n+  using NodePredicate = std::function<void(DomTreeNode *, unsigned)>;\n+  NodePredicate VisitNode = [&](DomTreeNode *Node, unsigned Depth) {\n+    if (Depth > MaxDepthRecursion)\n+      return;\n+\n+    BasicBlock *BB = Node->getBlock();\n+    // Check for redundant stores against active known conditions.\n+    if (auto *Accesses = MSSA.getBlockDefs(BB)) {\n+      for (auto &Access : make_early_inc_range(*Accesses)) {\n+        auto *Def = dyn_cast<MemoryDef>(&Access);\n+        if (!Def)\n+          continue;\n+\n+        auto *SI = dyn_cast<StoreInst>(Def->getMemoryInst());\n+        if (!SI || !SI->isUnordered())\n+          continue;\n+\n+        auto It = llvm::find_if(ActiveConditions, [&](const auto &C) {\n+          return C.Ptr == SI->getPointerOperand() &&\n+                 C.Val == SI->getValueOperand();\n+        });\n+        if (It == ActiveConditions.end())\n+          continue;\n+\n+        // Found a dominating condition that may imply the value being stored.\n+        // Make sure there does not exist any clobbering access between the\n+        // load and the potential redundant store.\n+        MemoryAccess *LoadAccess = MSSA.getMemoryAccess(It->LI);\n+        MemoryAccess *ClobberingAccess =\n+            MSSA.getSkipSelfWalker()->getClobberingMemoryAccess(Def, BatchAA);\n+        if (MSSA.dominates(ClobberingAccess, LoadAccess)) {\n+          LLVM_DEBUG(dbgs()\n+                     << \"Removing No-Op Store:\\n  DEAD: \" << *SI << '\\n');\n+          deleteDeadInstruction(SI);\n+          NumRedundantStores++;\n+          MadeChange = true;\n+        }\n+      }\n+    }\n+\n+    // See whether this basic block establishes a dominating condition.\n+    auto MaybeCondition = GetDominatingCondition(BB);\n+\n+    for (DomTreeNode *Child : Node->children()) {\n+      bool IsActive = false;\n+      if (MaybeCondition) {\n+        const auto &[Cond, ImpliedSucc] = *MaybeCondition;\n+        if (DT.dominates(BasicBlockEdge(BB, ImpliedSucc), Child->getBlock())) {\n+          // Found a condition that holds for this child, dominated by the\n+          // current node via the equality edge. Propagate the condition to\n+          // the subchilds by pushing it onto the stack.\n+          ActiveConditions.emplace_back(Cond);\n+          IsActive = true;\n+        }\n+      }\n+\n+      // Recursively visit the children of this node. Upon returning, pop\n+      // the no longer active condition before visiting any sibling nodes.\n+      VisitNode(Child, Depth + 1);\n+      if (IsActive)\n+        ActiveConditions.pop_back();\n+    }\n+  };\n+\n+  // Do a DFS walk of the dom-tree.\n+  VisitNode(DT.getRootNode(), 0);\n+\n+  return MadeChange;\n+}\n+\n bool DSEState::tryFoldIntoCalloc(MemoryDef *Def, const Value *DefUO) {\n   Instruction *DefI = Def->getMemoryInst();\n   MemSetInst *MemSet = dyn_cast<MemSetInst>(DefI);\n@@ -2246,61 +2370,6 @@ bool DSEState::tryFoldIntoCalloc(MemoryDef *Def, const Value *DefUO) {\n   return true;\n }\n \n-bool DSEState::dominatingConditionImpliesValue(MemoryDef *Def) {\n-  auto *StoreI = cast<StoreInst>(Def->getMemoryInst());\n-  BasicBlock *StoreBB = StoreI->getParent();\n-  Value *StorePtr = StoreI->getPointerOperand();\n-  Value *StoreVal = StoreI->getValueOperand();\n-\n-  DomTreeNode *IDom = DT.getNode(StoreBB)->getIDom();\n-  if (!IDom)\n-    return false;\n-\n-  auto *BI = dyn_cast<BranchInst>(IDom->getBlock()->getTerminator());\n-  if (!BI || !BI->isConditional())\n-    return false;\n-\n-  // In case both blocks are the same, it is not possible to determine\n-  // if optimization is possible. (We would not want to optimize a store\n-  // in the FalseBB if condition is true and vice versa.)\n-  if (BI->getSuccessor(0) == BI->getSuccessor(1))\n-    return false;\n-\n-  Instruction *ICmpL;\n-  CmpPredicate Pred;\n-  if (!match(BI->getCondition(),\n-             m_c_ICmp(Pred,\n-                      m_CombineAnd(m_Load(m_Specific(StorePtr)),\n-                                   m_Instruction(ICmpL)),\n-                      m_Specific(StoreVal))) ||\n-      !ICmpInst::isEquality(Pred))\n-    return false;\n-\n-  // Ensure the replacement is allowed when comparing pointers, as\n-  // the equality compares addresses only, not pointers' provenance.\n-  if (StoreVal->getType()->isPointerTy() &&\n-      !canReplacePointersIfEqual(StoreVal, ICmpL, DL))\n-    return false;\n-\n-  // In case the else blocks also branches to the if block or the other way\n-  // around it is not possible to determine if the optimization is possible.\n-  if (Pred == ICmpInst::ICMP_EQ &&\n-      !DT.dominates(BasicBlockEdge(BI->getParent(), BI->getSuccessor(0)),\n-                    StoreBB))\n-    return false;\n-\n-  if (Pred == ICmpInst::ICMP_NE &&\n-      !DT.dominates(BasicBlockEdge(BI->getParent(), BI->getSuccessor(1)),\n-                    StoreBB))\n-    return false;\n-\n-  MemoryAccess *LoadAcc = MSSA.getMemoryAccess(ICmpL);\n-  MemoryAccess *ClobAcc =\n-      MSSA.getSkipSelfWalker()->getClobberingMemoryAccess(Def, BatchAA);\n-\n-  return MSSA.dominates(ClobAcc, LoadAcc);\n-}\n-\n bool DSEState::storeIsNoop(MemoryDef *Def, const Value *DefUO) {\n   Instruction *DefI = Def->getMemoryInst();\n   StoreInst *Store = dyn_cast<StoreInst>(DefI);\n@@ -2329,9 +2398,6 @@ bool DSEState::storeIsNoop(MemoryDef *Def, const Value *DefUO) {\n   if (!Store)\n     return false;\n \n-  if (dominatingConditionImpliesValue(Def))\n-    return true;\n-\n   if (auto *LoadI = dyn_cast<LoadInst>(Store->getOperand(0))) {\n     if (LoadI->getPointerOperand() == Store->getOperand(1)) {\n       // Get the defining access for the load.\n@@ -2738,6 +2804,7 @@ static bool eliminateDeadStores(Function &F, AliasAnalysis &AA, MemorySSA &MSSA,\n \n   MadeChange |= State.eliminateRedundantStoresOfExistingValues();\n   MadeChange |= State.eliminateDeadWritesAtEndOfFunction();\n+  MadeChange |= State.eliminateRedundantStoresViaDominatingConditions();\n \n   while (!State.ToRemove.empty()) {\n     Instruction *DeadInst = State.ToRemove.pop_back_val();\n",
+  "components": [
+    "DeadStoreElimination"
+  ],
+  "description": "While optimizing tautological assignments, if there exists a dominating condition that implies the value being stored in a pointer, and such a condition appears in a node that dominates the store via equality edge, then subsequent stores may be redundant, if no write occurs in between. This is achieved via a DFS top-down walk of the dom-tree, collecting dominating conditions and propagating them to each subtree, popping them upon backtracking.\r\n\r\nThis also generalizes `dominatingConditionImpliesValue` transform, which was previously taking into account only the immediate dominator.\r\n\r\nCompile-time: https://llvm-compile-time-tracker.com/compare.php?from=f8906704104e446a7482aeca32d058b91867e05c&to=24c5d61f1e28acbe6a59ea4e9a5da0ffcee3bf1a&stat=instructions:u.\r\n\r\nCompile-time w/ limit on recursion: https://llvm-compile-time-tracker.com/compare.php?from=24c5d61f1e28acbe6a59ea4e9a5da0ffcee3bf1a&to=9889567fe8a0515ab895b22003c93fabfd9ac4e5&stat=instructions:u. Seems to alleviate the small regression in stage2-O3, but seemingly adds one in stage2-O0-g.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/DeadStoreElimination/dead-stores-via-dom-conditions.ll",
+      "commands": [
+        "opt < %s -aa-pipeline=basic-aa -passes='dse,verify<memoryssa>' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "remove_tautological_store_via_dom_condition_clobber_between",
+          "test_body": "define void @remove_tautological_store_via_dom_condition_clobber_between(ptr %x, i1 %c) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %if.eq, label %end\n\nif.eq:                                            ; preds = %entry\n  br label %next\n\nnext:                                             ; preds = %if.eq\n  call void @opaque(ptr %x)\n  br i1 %c, label %inner, label %end\n\ninner:                                            ; preds = %next\n  store i32 0, ptr %x, align 4\n  br label %end\n\nend:                                              ; preds = %inner, %next, %entry\n  ret void\n}\n\ndeclare void @opaque(ptr)\n"
+        },
+        {
+          "test_name": "remove_tautological_store_via_dom_condition_3",
+          "test_body": "define void @remove_tautological_store_via_dom_condition_3(ptr %x, ptr %y, i1 %c) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %then, label %end\n\nthen:                                             ; preds = %entry\n  %val.2 = load i32, ptr %y, align 4\n  %cmp.2 = icmp eq i32 %val.2, 0\n  br i1 %cmp.2, label %if.eq, label %if.else\n\nif.eq:                                            ; preds = %then\n  store i32 0, ptr %x, align 4\n  store i32 0, ptr %y, align 4\n  br label %join\n\nif.else:                                          ; preds = %then\n  br label %join\n\njoin:                                             ; preds = %if.else, %if.eq\n  br label %inner\n\ninner:                                            ; preds = %join\n  br label %end\n\nend:                                              ; preds = %inner, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "remove_tautological_store_via_dom_condition",
+          "test_body": "define void @remove_tautological_store_via_dom_condition(ptr %x, i1 %c) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %then, label %end\n\nthen:                                             ; preds = %entry\n  br i1 %c, label %if.eq, label %if.else\n\nif.eq:                                            ; preds = %then\n  br label %join\n\nif.else:                                          ; preds = %then\n  br label %join\n\njoin:                                             ; preds = %if.else, %if.eq\n  br label %inner\n\ninner:                                            ; preds = %join\n  store i32 0, ptr %x, align 4\n  br label %end\n\nend:                                              ; preds = %inner, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "remove_tautological_store_via_dom_condition_volatile_store",
+          "test_body": "define void @remove_tautological_store_via_dom_condition_volatile_store(ptr %x, i1 %c) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %then, label %end\n\nthen:                                             ; preds = %entry\n  br i1 %c, label %if.eq, label %if.else\n\nif.eq:                                            ; preds = %then\n  br label %join\n\nif.else:                                          ; preds = %then\n  br label %join\n\njoin:                                             ; preds = %if.else, %if.eq\n  store volatile i32 0, ptr %x, align 4\n  br label %end\n\nend:                                              ; preds = %join, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "remove_tautological_store_via_dom_condition_atomic_store",
+          "test_body": "define void @remove_tautological_store_via_dom_condition_atomic_store(ptr %x, i1 %c) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %then, label %end\n\nthen:                                             ; preds = %entry\n  br i1 %c, label %if.eq, label %if.else\n\nif.eq:                                            ; preds = %then\n  br label %join\n\nif.else:                                          ; preds = %then\n  br label %join\n\njoin:                                             ; preds = %if.else, %if.eq\n  store atomic i32 0, ptr %x release, align 4\n  br label %end\n\nend:                                              ; preds = %join, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "remove_tautological_store_via_dom_condition_2",
+          "test_body": "define void @remove_tautological_store_via_dom_condition_2(ptr %x, i1 %c) {\nentry:\n  br i1 %c, label %then, label %end\n\nthen:                                             ; preds = %entry\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %if.eq, label %if.else\n\nif.eq:                                            ; preds = %then\n  store i32 0, ptr %x, align 4\n  br label %join\n\nif.else:                                          ; preds = %then\n  br label %join\n\njoin:                                             ; preds = %if.else, %if.eq\n  store i32 0, ptr %x, align 4\n  br label %inner\n\ninner:                                            ; preds = %join\n  br label %end\n\nend:                                              ; preds = %inner, %entry\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 191555 tests passed\n* 4982 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "antoniofrighetto",
+      "body": "> Otherwise you would probably want to walk the dom-tree and remember which relevant dominating conditions you currently know about.\r\n\r\nI wonder if it may be worthwhile generalizing the approach in this PR to have instead a `DSEState::eliminateRedundantStoresUsingDomConditions()` to walk the dom-tree top-down, push `*Ptr == Val` facts (for children dominated by the node), and iterate over store later checking for redundancy, instead of the current approach of walking the dom-tree per-store."
+    },
+    {
+      "author": "nikic",
+      "body": "> > Otherwise you would probably want to walk the dom-tree and remember which relevant dominating conditions you currently know about.\r\n> \r\n> I wonder if it may be worthwhile generalizing the approach in this PR to have instead a `DSEState::eliminateRedundantStoresUsingDomConditions()` to walk the dom-tree top-down, push `*Ptr == Val` facts (for children dominated by the node), and iterate over store later checking for redundancy, instead of the current approach of walking the dom-tree per-store.\r\n\r\nYes, this is what I had in mind. Doing this walk per-store is expensive."
+    },
+    {
+      "author": "antoniofrighetto",
+      "body": "> > > Otherwise you would probably want to walk the dom-tree and remember which relevant dominating conditions you currently know about.\r\n> > \r\n> > \r\n> > I wonder if it may be worthwhile generalizing the approach in this PR to have instead a `DSEState::eliminateRedundantStoresUsingDomConditions()` to walk the dom-tree top-down, push `*Ptr == Val` facts (for children dominated by the node), and iterate over store later checking for redundancy, instead of the current approach of walking the dom-tree per-store.\r\n> \r\n> Yes, this is what I had in mind. Doing this walk per-store is expensive.\r\n\r\nThanks for clarifying, PR (and description) updated. I'm not exactly sure where the small regressions in stage2-O0-g may come from, may as well look into that if looks on the correct direction."
+    },
+    {
+      "author": "nikic",
+      "body": "> Thanks for clarifying, PR (and description) updated. I'm not exactly sure where the small regressions in stage2-O0-g may come from, may as well look into that if looks on the correct direction.\r\n\r\nPretty sure both of those results are just noise. You can try to rebase the perf branch for another run."
+    },
+    {
+      "author": "antoniofrighetto",
+      "body": "> > Thanks for clarifying, PR (and description) updated. I'm not exactly sure where the small regressions in stage2-O0-g may come from, may as well look into that if looks on the correct direction.\r\n> \r\n> Pretty sure both of those results are just noise. You can try to rebase the perf branch for another run.\r\n\r\nRight, it indeed looks like it is mostly noise: https://llvm-compile-time-tracker.com/compare.php?from=817b7f33332e7f03b47fc3d1d6f94e5527635748&to=4596d50d3922cd239beb0c5b588dae38c5a9edd2&stat=instructions:u."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-16T17:39:20Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+      [
+        174,
+        179
+      ],
+      [
+        1110,
+        1119
+      ],
+      [
+        1124,
+        1129
+      ],
+      [
+        2142,
+        2147
+      ],
+      [
+        2246,
+        2306
+      ],
+      [
+        2329,
+        2337
+      ],
+      [
+        2738,
+        2743
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+      "DSEState::dominatingConditionImpliesValue",
+      "DSEState::eliminateDeadWritesAtEndOfFunction",
+      "DSEState::storeIsNoop",
+      "DSEState::tryFoldIntoCalloc",
+      "eliminateDeadStores"
+    ]
+  }
+}

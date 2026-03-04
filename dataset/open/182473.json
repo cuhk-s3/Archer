@@ -1,0 +1,203 @@
+{
+  "pr_id": 182473,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182473",
+  "state": "open",
+  "title": "[LoopUnroll] Support parallel reductions for minmax",
+  "author": "madhur13490",
+  "base_commit": "8715094d52f9dc350de93b8e1ef93f1e23120189",
+  "fix_commit": "6ce6f666d3d1ce4e7041f970ddf8b1e3094247fa",
+  "patch": "diff --git a/llvm/lib/Transforms/Utils/LoopUnroll.cpp b/llvm/lib/Transforms/Utils/LoopUnroll.cpp\nindex d9422afe5e82a..315f919060bea 100644\n--- a/llvm/lib/Transforms/Utils/LoopUnroll.cpp\n+++ b/llvm/lib/Transforms/Utils/LoopUnroll.cpp\n@@ -108,9 +108,9 @@ UnrollVerifyLoopInfo(\"unroll-verify-loopinfo\", cl::Hidden,\n #endif\n                     );\n \n-static cl::opt<bool> UnrollAddParallelReductions(\n-    \"unroll-add-parallel-reductions\", cl::init(false), cl::Hidden,\n-    cl::desc(\"Allow unrolling to add parallel reduction phis.\"));\n+static cl::opt<bool> UnrollParallelReductions(\n+    \"unroll-parallel-reductions\", cl::init(false), cl::Hidden,\n+    cl::desc(\"Allow unrolling to parallelize reductions.\"));\n \n /// Check if unrolling created a situation where we need to insert phi nodes to\n /// preserve LCSSA form.\n@@ -670,8 +670,8 @@ llvm::UnrollLoop(Loop *L, UnrollLoopOptions ULO, LoopInfo *LI,\n   // to not exit.\n   DenseMap<PHINode *, RecurrenceDescriptor> Reductions;\n   bool CanAddAdditionalAccumulators =\n-      (UnrollAddParallelReductions.getNumOccurrences() > 0\n-           ? UnrollAddParallelReductions\n+      (UnrollParallelReductions.getNumOccurrences() > 0\n+           ? UnrollParallelReductions\n            : ULO.AddAdditionalAccumulators) &&\n       !CompletelyUnroll && L->getNumBlocks() == 1 &&\n       (ULO.Runtime ||\n@@ -1102,9 +1102,12 @@ llvm::UnrollLoop(Loop *L, UnrollLoopOptions ULO, LoopInfo *LI,\n         Builder.setFastMathFlags(Reductions.begin()->second.getFastMathFlags());\n         RecurKind RK = Reductions.begin()->second.getRecurrenceKind();\n         for (Instruction *RdxPart : drop_begin(PartialReductions)) {\n-          RdxResult = Builder.CreateBinOp(\n-              (Instruction::BinaryOps)RecurrenceDescriptor::getOpcode(RK),\n-              RdxPart, RdxResult, \"bin.rdx\");\n+          if (RecurrenceDescriptor::isMinMaxRecurrenceKind(RK))\n+            RdxResult = createMinMaxOp(Builder, RK, RdxResult, RdxPart);\n+          else\n+            RdxResult = Builder.CreateBinOp(\n+                (Instruction::BinaryOps)RecurrenceDescriptor::getOpcode(RK),\n+                RdxPart, RdxResult, \"bin.rdx\");\n         }\n         NeedToFixLCSSA = true;\n         for (Instruction *RdxPart : PartialReductions)\n@@ -1263,12 +1266,10 @@ llvm::canParallelizeReductionWhenUnrolling(PHINode &Phi, Loop *L,\n   if (RdxDesc.hasUsesOutsideReductionChain())\n     return std::nullopt;\n   RecurKind RK = RdxDesc.getRecurrenceKind();\n-  // Skip unsupported reductions.\n-  // TODO: Handle additional reductions, including FP and min-max\n-  // reductions.\n+  // Skip unsupported reductions. Min/max (integer and FP) are supported.\n+  // TODO: Handle additional reductions.\n   if (RecurrenceDescriptor::isAnyOfRecurrenceKind(RK) ||\n-      RecurrenceDescriptor::isFindRecurrenceKind(RK) ||\n-      RecurrenceDescriptor::isMinMaxRecurrenceKind(RK))\n+      RecurrenceDescriptor::isFindRecurrenceKind(RK))\n     return std::nullopt;\n \n   if (RdxDesc.hasExactFPMath())\n",
+  "components": [
+    "LoopUnroll"
+  ],
+  "description": "This patch\r\n* Supports parallel reductions for min/max operations in LoopUnroller.\r\n* Adds relevant test (including intrinsics) and their 8x unroll version.\r\n* Renames flag -unroll-add-parallel-reduction to -unroll-parallel-reduction.\r\n\r\nPlanning to take support for vector types in the next patch.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/partial-unroll-reductions.ll",
+      "commands": [
+        "opt -p loop-unroll -unroll-parallel-reductions -unroll-allow-partial -unroll-max-count=4 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_add",
+          "test_body": "define i32 @test_add(ptr %src, i64 %n, i32 %start) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i32 [ %start, %entry ], [ %rdx.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %gep.src = getelementptr i32, ptr %src, i64 %iv\n  %l = load i32, ptr %gep.src, align 1\n  %rdx.next = add i32 %rdx, %l\n  %ec = icmp ne i64 %iv.next, 1000\n  br i1 %ec, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret i32 %rdx.next\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/runtime-unroll-reductions.ll",
+      "commands": [
+        "opt -p loop-unroll -unroll-parallel-reductions -enable-no-nans-fp-math -enable-no-signed-zeros-fp-math -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_fmax_reduction_8x_unroll",
+          "test_body": "define float @test_fmax_reduction_8x_unroll(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ 0xFFF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %cmp = fcmp nnan nsz ogt float %max, %0\n  %rdx.next = select i1 %cmp, float %max, float %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 8}\n"
+        },
+        {
+          "test_name": "test_smin_reduction",
+          "test_body": "define i32 @test_smin_reduction(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi i32 [ 2147483647, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds i32, ptr %a, i64 %iv\n  %0 = load i32, ptr %gep.a, align 4\n  %cmp = icmp slt i32 %min, %0\n  %rdx.next = select i1 %cmp, i32 %min, i32 %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %rdx.next, %loop ]\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_fmin_reduction_8x_unroll",
+          "test_body": "define float @test_fmin_reduction_8x_unroll(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi float [ 0x7FF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %cmp = fcmp nnan nsz olt float %min, %0\n  %rdx.next = select i1 %cmp, float %min, float %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 8}\n"
+        },
+        {
+          "test_name": "test_fmin_reduction_intrinsic",
+          "test_body": "define float @test_fmin_reduction_intrinsic(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi float [ 0x7FF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %rdx.next = call float @llvm.minnum.f32(float %min, float %0)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_fadd_no_reassoc",
+          "test_body": "define float @test_fadd_no_reassoc(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi float [ 0.000000e+00, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds nuw float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 16\n  %rdx.next = fadd float %rdx, %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_fmin_reduction",
+          "test_body": "define float @test_fmin_reduction(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi float [ 0x7FF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %cmp = fcmp nnan nsz olt float %min, %0\n  %rdx.next = select i1 %cmp, float %min, float %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_fmin_reduction_intrinsic_8x_unroll",
+          "test_body": "define float @test_fmin_reduction_intrinsic_8x_unroll(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi float [ 0x7FF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %rdx.next = call float @llvm.minnum.f32(float %min, float %0)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 8}\n"
+        },
+        {
+          "test_name": "test_smax_reduction",
+          "test_body": "define i32 @test_smax_reduction(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi i32 [ -2147483648, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds i32, ptr %a, i64 %iv\n  %0 = load i32, ptr %gep.a, align 4\n  %cmp = icmp sgt i32 %max, %0\n  %rdx.next = select i1 %cmp, i32 %max, i32 %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %rdx.next, %loop ]\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_vector_fmin_reduction_intrinsic",
+          "test_body": "define <4 x float> @test_vector_fmin_reduction_intrinsic(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi <4 x float> [ splat (float 0x7FF0000000000000), %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds nuw <4 x float>, ptr %a, i64 %iv\n  %0 = load <4 x float>, ptr %gep.a, align 16\n  %rdx.next = call <4 x float> @llvm.minnum.v4f32(<4 x float> %rdx, <4 x float> %0)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi <4 x float> [ %rdx.next, %loop ]\n  ret <4 x float> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x float> @llvm.minnum.v4f32(<4 x float>, <4 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_add_reduction",
+          "test_body": "define i32 @test_add_reduction(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i32 [ 0, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds nuw i32, ptr %a, i64 %iv\n  %0 = load i32, ptr %gep.a, align 2\n  %rdx.next = add nuw nsw i32 %rdx, %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %rdx.next, %loop ]\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_fmax_reduction",
+          "test_body": "define float @test_fmax_reduction(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ 0xFFF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %cmp = fcmp nnan nsz ogt float %max, %0\n  %rdx.next = select i1 %cmp, float %max, float %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_smax_reduction_8x_unroll",
+          "test_body": "define i32 @test_smax_reduction_8x_unroll(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi i32 [ -2147483648, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds i32, ptr %a, i64 %iv\n  %0 = load i32, ptr %gep.a, align 4\n  %cmp = icmp sgt i32 %max, %0\n  %rdx.next = select i1 %cmp, i32 %max, i32 %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %rdx.next, %loop ]\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 8}\n"
+        },
+        {
+          "test_name": "test_fmax_reduction_intrinsic_8x_unroll",
+          "test_body": "define float @test_fmax_reduction_intrinsic_8x_unroll(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ 0xFFF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %rdx.next = call float @llvm.maxnum.f32(float %max, float %0)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 8}\n"
+        },
+        {
+          "test_name": "test_add_reduction_8x_unroll",
+          "test_body": "define i32 @test_add_reduction_8x_unroll(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i32 [ 0, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds nuw i32, ptr %a, i64 %iv\n  %0 = load i32, ptr %gep.a, align 2\n  %rdx.next = add nuw nsw i32 %rdx, %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %rdx.next, %loop ]\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 8}\n"
+        },
+        {
+          "test_name": "test_add_reduction_constant_op",
+          "test_body": "define i32 @test_add_reduction_constant_op(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i32 [ 0, %entry ], [ %rdx.next, %loop ]\n  %rdx.next = add nuw nsw i32 %rdx, 1\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %rdx.next, %loop ]\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_fadd_other_fastmath",
+          "test_body": "define float @test_fadd_other_fastmath(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi float [ 0.000000e+00, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds nuw float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 16\n  %rdx.next = fadd contract float %rdx, %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_vector_add_reduction",
+          "test_body": "define <4 x i32> @test_vector_add_reduction(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi <4 x i32> [ zeroinitializer, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds nuw <4 x i32>, ptr %a, i64 %iv\n  %0 = load <4 x i32>, ptr %gep.a, align 16\n  %rdx.next = add <4 x i32> %rdx, %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi <4 x i32> [ %rdx.next, %loop ]\n  ret <4 x i32> %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_fadd_reduction",
+          "test_body": "define float @test_fadd_reduction(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi float [ 0.000000e+00, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds nuw float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 16\n  %rdx.next = fadd reassoc float %rdx, %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        },
+        {
+          "test_name": "test_smin_reduction_8x_unroll",
+          "test_body": "define i32 @test_smin_reduction_8x_unroll(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %min = phi i32 [ 2147483647, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds i32, ptr %a, i64 %iv\n  %0 = load i32, ptr %gep.a, align 4\n  %cmp = icmp slt i32 %min, %0\n  %rdx.next = select i1 %cmp, i32 %min, i32 %0\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi i32 [ %rdx.next, %loop ]\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 8}\n"
+        },
+        {
+          "test_name": "test_fmax_reduction_intrinsic",
+          "test_body": "define float @test_fmax_reduction_intrinsic(ptr %a, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ 0xFFF0000000000000, %entry ], [ %rdx.next, %loop ]\n  %gep.a = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %gep.a, align 4\n  %rdx.next = call float @llvm.maxnum.f32(float %max, float %0)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %n\n  br i1 %ec, label %exit, label %loop, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  %res = phi float [ %rdx.next, %loop ]\n  ret float %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 2}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-20T11:01:02Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Utils/LoopUnroll.cpp": [
+      [
+        108,
+        116
+      ],
+      [
+        670,
+        677
+      ],
+      [
+        1102,
+        1110
+      ],
+      [
+        1263,
+        1274
+      ]
+    ],
+    "llvm/test/Transforms/LoopUnroll/partial-unroll-reductions.ll": [
+      [
+        1,
+        5
+      ]
+    ],
+    "llvm/test/Transforms/LoopUnroll/runtime-unroll-reductions.ll": [
+      [
+        1,
+        9
+      ],
+      [
+        70,
+        76
+      ],
+      [
+        123,
+        129
+      ],
+      [
+        222,
+        228
+      ],
+      [
+        287,
+        295
+      ],
+      [
+        313,
+        319
+      ],
+      [
+        356,
+        362
+      ],
+      [
+        379,
+        385
+      ],
+      [
+        421,
+        427
+      ],
+      [
+        444,
+        450
+      ],
+      [
+        484,
+        489
+      ],
+      [
+        500,
+        503
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Utils/LoopUnroll.cpp": [
+      "llvm::UnrollLoop",
+      "llvm::canParallelizeReductionWhenUnrolling"
+    ]
+  }
+}

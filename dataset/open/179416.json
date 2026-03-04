@@ -1,0 +1,236 @@
+{
+  "pr_id": 179416,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179416",
+  "state": "open",
+  "title": "[VectorCombine] Optimize vector combine in fold binop of reduction",
+  "author": "Anjian-Wen",
+  "base_commit": "b9f4c7887380ea52c0ce101548db584d329fdd70",
+  "fix_commit": "3315b61beb8df393297c1a7fba653b8ff42ec87b",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 963e6e1076eec..55dfd5ea1f8e9 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -47,6 +47,10 @@\n using namespace llvm;\n using namespace llvm::PatternMatch;\n \n+static cl::opt<bool> EnableFoldBinopOfReductions(\n+    \"vector-combine-fold-binop-of-reductions\", cl::init(true), cl::Hidden,\n+    cl::desc(\"Enable folding of binary operations of reductions\"));\n+\n STATISTIC(NumVecLoad, \"Number of vector loads formed\");\n STATISTIC(NumVecCmp, \"Number of vector compares formed\");\n STATISTIC(NumVecBO, \"Number of vector binops formed\");\n@@ -202,6 +206,13 @@ class VectorCombine {\n       }\n     }\n   }\n+\n+  template <typename IRBuilderTy>\n+  bool matchAssociativeReduction(\n+      Instruction &I, Instruction::BinaryOps BinOpOpc,\n+      Intrinsic::ID ReductionIID, IRBuilderTy &Builder, BinaryOperator *Op0,\n+      Value *ScalarReduceC, bool ScalarReduceCIsLeft,\n+      function_ref<void(Instruction &, Value &)> ReplaceValue);\n };\n } // namespace\n \n@@ -1736,6 +1747,151 @@ static void analyzeCostOfVecReduction(const IntrinsicInst &II,\n                                                       std::nullopt, CostKind);\n }\n \n+static Value *checkIntrinsicAndGetItsArgument(Value *V, Intrinsic::ID IID) {\n+  auto *II = dyn_cast<IntrinsicInst>(V);\n+  if (!II)\n+    return nullptr;\n+  if (II->getIntrinsicID() == IID && II->hasOneUse())\n+    return II->getArgOperand(0);\n+  return nullptr;\n+}\n+\n+template <typename IRBuilderTy>\n+bool VectorCombine::matchAssociativeReduction(\n+    Instruction &I, Instruction::BinaryOps BinOpOpc, Intrinsic::ID ReductionIID,\n+    IRBuilderTy &Builder, BinaryOperator *Op0, Value *ScalarReduceC,\n+    bool ScalarReduceCIsLeft,\n+    function_ref<void(Instruction &, Value &)> ReplaceValue) {\n+  if (Op0->getOpcode() != Instruction::Add &&\n+      Op0->getOpcode() != Instruction::Sub)\n+    return false;\n+\n+  Value *ReduceCVector =\n+      checkIntrinsicAndGetItsArgument(ScalarReduceC, ReductionIID);\n+  if (!ReduceCVector)\n+    return false;\n+\n+  Value *ReduceLVector =\n+      checkIntrinsicAndGetItsArgument(Op0->getOperand(0), ReductionIID);\n+  Value *ReduceRVector =\n+      checkIntrinsicAndGetItsArgument(Op0->getOperand(1), ReductionIID);\n+\n+  // Only one of the operands of Op0 should be a reduction\n+  if ((ReduceLVector && ReduceRVector) || (!ReduceLVector && !ReduceRVector))\n+    return false;\n+\n+  Value *ScalarReduceX =\n+      ReduceLVector ? Op0->getOperand(0) : Op0->getOperand(1);\n+  Value *OtherVal = ReduceLVector ? Op0->getOperand(1) : Op0->getOperand(0);\n+  bool IsReduceXOnLeft = (ReduceLVector != nullptr);\n+\n+  Instruction::BinaryOps OuterOp = BinOpOpc;\n+  Instruction::BinaryOps InnerOp = Op0->getOpcode();\n+  Instruction::BinaryOps NewReduceOp;\n+  Instruction::BinaryOps NewBinOp;\n+  Value *LHS_Reduce, *RHS_Reduce;\n+  Value *LHS_Bin, *RHS_Bin;\n+\n+  if (OuterOp == Instruction::Add) {\n+    if (InnerOp == Instruction::Add) {\n+      // (X + Y) + C -> (X + C) + Y\n+      NewReduceOp = Instruction::Add;\n+      NewBinOp = Instruction::Add;\n+      LHS_Reduce = ScalarReduceX;\n+      RHS_Reduce = ScalarReduceC;\n+      LHS_Bin = nullptr;\n+      RHS_Bin = OtherVal;\n+    } else { // Inner == Sub\n+      if (IsReduceXOnLeft) {\n+        // (X - Y) + C -> (X + C) - Y\n+        NewReduceOp = Instruction::Add;\n+        NewBinOp = Instruction::Sub;\n+        LHS_Reduce = ScalarReduceX;\n+        RHS_Reduce = ScalarReduceC;\n+        LHS_Bin = nullptr;\n+        RHS_Bin = OtherVal;\n+      } else {\n+        // (Y - X) + C -> Y - (X - C)\n+        NewReduceOp = Instruction::Sub;\n+        NewBinOp = Instruction::Sub;\n+        LHS_Reduce = ScalarReduceX;\n+        RHS_Reduce = ScalarReduceC;\n+        LHS_Bin = OtherVal;\n+        RHS_Bin = nullptr;\n+      }\n+    }\n+  } else {                      // Outer == Sub\n+    if (!ScalarReduceCIsLeft) { // (Op0 - C)\n+      if (InnerOp == Instruction::Add) {\n+        // (X + Y) - C -> (X - C) + Y\n+        NewReduceOp = Instruction::Sub;\n+        NewBinOp = Instruction::Add;\n+        LHS_Reduce = ScalarReduceX;\n+        RHS_Reduce = ScalarReduceC;\n+        LHS_Bin = nullptr;\n+        RHS_Bin = OtherVal;\n+      } else { // Inner == Sub\n+        if (IsReduceXOnLeft) {\n+          // (X - Y) - C -> (X - C) - Y\n+          NewReduceOp = Instruction::Sub;\n+          NewBinOp = Instruction::Sub;\n+          LHS_Reduce = ScalarReduceX;\n+          RHS_Reduce = ScalarReduceC;\n+          LHS_Bin = nullptr;\n+          RHS_Bin = OtherVal;\n+        } else {\n+          // (Y - X) - C -> Y - (X + C)\n+          NewReduceOp = Instruction::Add;\n+          NewBinOp = Instruction::Sub;\n+          LHS_Reduce = ScalarReduceX;\n+          RHS_Reduce = ScalarReduceC;\n+          LHS_Bin = OtherVal;\n+          RHS_Bin = nullptr;\n+        }\n+      }\n+    } else { // (C - Op0)\n+      if (InnerOp == Instruction::Add) {\n+        // C - (X + Y) -> (C - X) - Y\n+        NewReduceOp = Instruction::Sub;\n+        NewBinOp = Instruction::Sub;\n+        LHS_Reduce = ScalarReduceC;\n+        RHS_Reduce = ScalarReduceX;\n+        LHS_Bin = nullptr;\n+        RHS_Bin = OtherVal;\n+      } else { // Inner == Sub\n+        if (IsReduceXOnLeft) {\n+          // C - (X - Y) -> (C - X) + Y\n+          NewReduceOp = Instruction::Sub;\n+          NewBinOp = Instruction::Add;\n+          LHS_Reduce = ScalarReduceC;\n+          RHS_Reduce = ScalarReduceX;\n+          LHS_Bin = nullptr;\n+          RHS_Bin = OtherVal;\n+        } else {\n+          // C - (Y - X) -> (C + X) - Y\n+          NewReduceOp = Instruction::Add;\n+          NewBinOp = Instruction::Sub;\n+          LHS_Reduce = ScalarReduceC;\n+          RHS_Reduce = ScalarReduceX;\n+          LHS_Bin = nullptr;\n+          RHS_Bin = OtherVal;\n+        }\n+      }\n+    }\n+  }\n+\n+  Value *CombineNode = Builder.CreateBinOp(NewReduceOp, LHS_Reduce, RHS_Reduce);\n+\n+  Value *NewBinNode;\n+  if (LHS_Bin == nullptr)\n+    NewBinNode = Builder.CreateBinOp(NewBinOp, CombineNode, RHS_Bin);\n+  else\n+    NewBinNode = Builder.CreateBinOp(NewBinOp, LHS_Bin, CombineNode);\n+\n+  ReplaceValue(I, *NewBinNode);\n+  return true;\n+}\n+\n bool VectorCombine::foldBinopOfReductions(Instruction &I) {\n   Instruction::BinaryOps BinOpOpc = cast<BinaryOperator>(&I)->getOpcode();\n   Intrinsic::ID ReductionIID = getReductionForBinop(BinOpOpc);\n@@ -1744,15 +1900,33 @@ bool VectorCombine::foldBinopOfReductions(Instruction &I) {\n   if (ReductionIID == Intrinsic::not_intrinsic)\n     return false;\n \n-  auto checkIntrinsicAndGetItsArgument = [](Value *V,\n-                                            Intrinsic::ID IID) -> Value * {\n-    auto *II = dyn_cast<IntrinsicInst>(V);\n-    if (!II)\n-      return nullptr;\n-    if (II->getIntrinsicID() == IID && II->hasOneUse())\n-      return II->getArgOperand(0);\n-    return nullptr;\n-  };\n+  if (!EnableFoldBinopOfReductions)\n+    return false;\n+\n+  auto ReplaceValue = [&](Instruction &I, Value &V) { replaceValue(I, V); };\n+\n+  // Reduce the number of reductions by folding a binop of a reduction and a\n+  // scalar (which might be another reduction) into a single reduction of a\n+  // vector binop. This leverages associativity and commutativity of the\n+  // binary operation (Add/Sub) to group reductions together.\n+  //\n+  // Examples:\n+  //   (Reduce(X) + Y) + Reduce(Z)  -> Reduce(X + Z) + Y\n+  //   (Reduce(X) - Y) - Reduce(Z)  -> Reduce(X - Z) - Y\n+  //   Reduce(Z) - (Reduce(X) + Y)  -> Reduce(Z - X) - Y\n+  if (auto *Op0 = dyn_cast<BinaryOperator>(I.getOperand(0))) {\n+    if (matchAssociativeReduction(I, BinOpOpc, ReductionIID, Builder, Op0,\n+                                  I.getOperand(1),\n+                                  /*ScalarReduceCIsLeft=*/false, ReplaceValue))\n+      return true;\n+  }\n+\n+  if (auto *Op1 = dyn_cast<BinaryOperator>(I.getOperand(1))) {\n+    if (matchAssociativeReduction(I, BinOpOpc, ReductionIID, Builder, Op1,\n+                                  I.getOperand(0), /*ScalarReduceCIsLeft=*/true,\n+                                  ReplaceValue))\n+      return true;\n+  }\n \n   Value *V0 = checkIntrinsicAndGetItsArgument(I.getOperand(0), ReductionIID);\n   if (!V0)\n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "move the reduction op close by simple commutative property of Addition and Associative Property of Subtraction, which can pave the way for combining the next two instructions in some case and saving a reduction instruction if possible.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/AArch64/udotabd.ll",
+      "commands": [
+        "opt -S -O3 < %s",
+        "opt -S -passes=\"default<O3>,default<O3>\" < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\"\ntarget triple = \"aarch64\"\n\n; Function Attrs: nounwind uwtable vscale_range(1,16)\ndefine dso_local i32 @test(ptr noundef %p1, i32 noundef %s_p1, ptr noundef %p2, i32 noundef %s_p2) #0 {\nentry:\n  %p1.addr = alloca ptr, align 8\n  %s_p1.addr = alloca i32, align 4\n  %p2.addr = alloca ptr, align 8\n  %s_p2.addr = alloca i32, align 4\n  %i_sum = alloca i32, align 4\n  %y = alloca i32, align 4\n  %cleanup.dest.slot = alloca i32, align 4\n  %x = alloca i32, align 4\n  store ptr %p1, ptr %p1.addr, align 8, !tbaa !0\n  store i32 %s_p1, ptr %s_p1.addr, align 4, !tbaa !5\n  store ptr %p2, ptr %p2.addr, align 8, !tbaa !0\n  store i32 %s_p2, ptr %s_p2.addr, align 4, !tbaa !5\n  call void @llvm.lifetime.start.p0(ptr %i_sum) #3\n  store i32 0, ptr %i_sum, align 4, !tbaa !5\n  call void @llvm.lifetime.start.p0(ptr %y) #3\n  store i32 0, ptr %y, align 4, !tbaa !5\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.inc10, %entry\n  %0 = load i32, ptr %y, align 4, !tbaa !5\n  %cmp = icmp slt i32 %0, 16\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond\n  store i32 2, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %y) #3\n  br label %for.end12\n\nfor.body:                                         ; preds = %for.cond\n  call void @llvm.lifetime.start.p0(ptr %x) #3\n  store i32 0, ptr %x, align 4, !tbaa !5\n  br label %for.cond1\n\nfor.cond1:                                        ; preds = %for.inc, %for.body\n  %1 = load i32, ptr %x, align 4, !tbaa !5\n  %cmp2 = icmp slt i32 %1, 16\n  br i1 %cmp2, label %for.body4, label %for.cond.cleanup3\n\nfor.cond.cleanup3:                                ; preds = %for.cond1\n  store i32 5, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %x) #3\n  br label %for.end\n\nfor.body4:                                        ; preds = %for.cond1\n  %2 = load ptr, ptr %p1.addr, align 8, !tbaa !0\n  %3 = load i32, ptr %x, align 4, !tbaa !5\n  %idxprom = sext i32 %3 to i64\n  %arrayidx = getelementptr inbounds i8, ptr %2, i64 %idxprom\n  %4 = load i8, ptr %arrayidx, align 1, !tbaa !7\n  %conv = zext i8 %4 to i32\n  %5 = load ptr, ptr %p2.addr, align 8, !tbaa !0\n  %6 = load i32, ptr %x, align 4, !tbaa !5\n  %idxprom5 = sext i32 %6 to i64\n  %arrayidx6 = getelementptr inbounds i8, ptr %5, i64 %idxprom5\n  %7 = load i8, ptr %arrayidx6, align 1, !tbaa !7\n  %conv7 = zext i8 %7 to i32\n  %sub = sub nsw i32 %conv, %conv7\n  %8 = call i32 @llvm.abs.i32(i32 %sub, i1 true)\n  %9 = load i32, ptr %i_sum, align 4, !tbaa !5\n  %add = add nsw i32 %9, %8\n  store i32 %add, ptr %i_sum, align 4, !tbaa !5\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.body4\n  %10 = load i32, ptr %x, align 4, !tbaa !5\n  %inc = add nsw i32 %10, 1\n  store i32 %inc, ptr %x, align 4, !tbaa !5\n  br label %for.cond1, !llvm.loop !8\n\nfor.end:                                          ; preds = %for.cond.cleanup3\n  %11 = load i32, ptr %s_p1.addr, align 4, !tbaa !5\n  %12 = load ptr, ptr %p1.addr, align 8, !tbaa !0\n  %idx.ext = sext i32 %11 to i64\n  %add.ptr = getelementptr inbounds i8, ptr %12, i64 %idx.ext\n  store ptr %add.ptr, ptr %p1.addr, align 8, !tbaa !0\n  %13 = load i32, ptr %s_p2.addr, align 4, !tbaa !5\n  %14 = load ptr, ptr %p2.addr, align 8, !tbaa !0\n  %idx.ext8 = sext i32 %13 to i64\n  %add.ptr9 = getelementptr inbounds i8, ptr %14, i64 %idx.ext8\n  store ptr %add.ptr9, ptr %p2.addr, align 8, !tbaa !0\n  br label %for.inc10\n\nfor.inc10:                                        ; preds = %for.end\n  %15 = load i32, ptr %y, align 4, !tbaa !5\n  %inc11 = add nsw i32 %15, 1\n  store i32 %inc11, ptr %y, align 4, !tbaa !5\n  br label %for.cond, !llvm.loop !10\n\nfor.end12:                                        ; preds = %for.cond.cleanup\n  %16 = load i32, ptr %i_sum, align 4, !tbaa !5\n  store i32 1, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %i_sum) #3\n  ret i32 %16\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.abs.i32(i32, i1 immarg) #2\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\nattributes #0 = { nounwind uwtable vscale_range(1,16) \"frame-pointer\"=\"non-leaf\" \"no-trapping-math\"=\"true\" \"stack-protector-buffer-size\"=\"8\" \"target-cpu\"=\"generic\" \"target-features\"=\"+bf16,+bti,+ccidx,+complxnum,+crc,+dit,+dotprod,+ete,+flagm,+fp-armv8,+fp16fml,+fullfp16,+i8mm,+jsconv,+lse,+mte,+neon,+pauth,+perfmon,+predres,+rand,+ras,+rcpc,+rdm,+sb,+spe,+ssbs,+sve,+sve-bitperm,+sve2,+trbe,+v8.1a,+v8.2a,+v8.3a,+v8.4a,+v8.5a,+v8a,+v9a,-fmv\" }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\nattributes #2 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #3 = { nounwind }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"p1 omnipotent char\", !2, i64 0}\n!2 = !{!\"any pointer\", !3, i64 0}\n!3 = !{!\"omnipotent char\", !4, i64 0}\n!4 = !{!\"Simple C/C++ TBAA\"}\n!5 = !{!6, !6, i64 0}\n!6 = !{!\"int\", !3, i64 0}\n!7 = !{!3, !3, i64 0}\n!8 = distinct !{!8, !9}\n!9 = !{!\"llvm.loop.mustprogress\"}\n!10 = distinct !{!10, !9}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/fold-binop-of-reductions-add.ll",
+      "commands": [
+        "opt -S -passes=vector-combine %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_add_add_reduction",
+          "test_body": "define i32 @test_add_add_reduction(i32 %a, <4 x i32> %b, <4 x i32> %c) {\n  %reduce_b = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %b)\n  %add1 = add i32 %reduce_b, %a\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %add2 = add i32 %add1, %reduce_c\n  ret i32 %add2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_add_add_reduction_reverse",
+          "test_body": "define i32 @test_add_add_reduction_reverse(i32 %a, <4 x i32> %b, <4 x i32> %c) {\n  %reduce_b = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %b)\n  %add1 = add i32 %a, %reduce_b\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %add2 = add i32 %add1, %reduce_c\n  ret i32 %add2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_add_reduction_add",
+          "test_body": "define i32 @test_add_reduction_add(i32 %c, <4 x i32> %a, <4 x i32> %b) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_b = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %b)\n  %add1 = add i32 %reduce_b, %c\n  %add2 = add i32 %reduce_a, %add1\n  ret i32 %add2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/fold-binop-of-reductions-sub.ll",
+      "commands": [
+        "opt -S -passes=vector-combine %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_sub_sub_reduction_1",
+          "test_body": "define i32 @test_sub_sub_reduction_1(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %op0 = sub i32 %reduce_a, %b\n  %sub = sub i32 %op0, %reduce_c\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_sub_add_reduction_2",
+          "test_body": "define i32 @test_sub_add_reduction_2(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %add = add i32 %b, %reduce_a\n  %sub = sub i32 %add, %reduce_c\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_sub_add_reduction_1",
+          "test_body": "define i32 @test_sub_add_reduction_1(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %add = add i32 %reduce_a, %b\n  %sub = sub i32 %add, %reduce_c\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_sub_add_reduction_4",
+          "test_body": "define i32 @test_sub_add_reduction_4(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %op0 = add i32 %b, %reduce_a\n  %sub = sub i32 %reduce_c, %op0\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_sub_add_reduction_3",
+          "test_body": "define i32 @test_sub_add_reduction_3(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %op0 = add i32 %reduce_a, %b\n  %sub = sub i32 %reduce_c, %op0\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_sub_sub_reduction_3",
+          "test_body": "define i32 @test_sub_sub_reduction_3(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %op0 = sub i32 %reduce_a, %b\n  %sub = sub i32 %reduce_c, %op0\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_sub_sub_reduction_2",
+          "test_body": "define i32 @test_sub_sub_reduction_2(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %op0 = sub i32 %b, %reduce_a\n  %sub = sub i32 %op0, %reduce_c\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_sub_sub_reduction_4",
+          "test_body": "define i32 @test_sub_sub_reduction_4(i32 %b, <4 x i32> %a, <4 x i32> %c) {\n  %reduce_a = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %a)\n  %reduce_c = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %c)\n  %op0 = sub i32 %b, %reduce_a\n  %sub = sub i32 %reduce_c, %op0\n  ret i32 %sub\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/fold-binop-of-reductions.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "sub_add_reduction_s_reduction",
+          "test_body": "define i32 @sub_add_reduction_s_reduction(<vscale x 8 x i32> %v0, <vscale x 8 x i32> %v1, i32 %s1) {\n  %v0_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v0)\n  %v1_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v1)\n  %add1 = add i32 %v0_red, %s1\n  %res = sub i32 %add1, %v1_red\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "sub_add_s_reduction_reduction",
+          "test_body": "define i32 @sub_add_s_reduction_reduction(<vscale x 8 x i32> %v0, <vscale x 8 x i32> %v1, i32 %s1) {\n  %v0_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v0)\n  %v1_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v1)\n  %add1 = add i32 %s1, %v0_red\n  %res = sub i32 %add1, %v1_red\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "sub_sub_reduction_s_reduction",
+          "test_body": "define i32 @sub_sub_reduction_s_reduction(<vscale x 8 x i32> %v0, <vscale x 8 x i32> %v1, i32 %s1) {\n  %v0_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v0)\n  %v1_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v1)\n  %sub1 = sub i32 %v0_red, %s1\n  %res = sub i32 %sub1, %v1_red\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "element_counts_do_not_match_vscale",
+          "test_body": "define i32 @element_counts_do_not_match_vscale(<vscale x 16 x i32> %v0, <vscale x 8 x i32> %v1) {\n  %v0_red = tail call i32 @llvm.vector.reduce.add.nxv16i32(<vscale x 16 x i32> %v0)\n  %v1_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v1)\n  %res = add i32 %v0_red, %v1_red\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32>) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.nxv16i32(<vscale x 16 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "sub_sub_s_reduction_reduction",
+          "test_body": "define i32 @sub_sub_s_reduction_reduction(<vscale x 8 x i32> %v0, <vscale x 8 x i32> %v1, i32 %s1) {\n  %v0_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v0)\n  %v1_red = tail call i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32> %v1)\n  %sub1 = sub i32 %s1, %v0_red\n  %res = sub i32 %sub1, %v1_red\n  ret i32 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.nxv8i32(<vscale x 8 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions cpp -- llvm/lib/Transforms/Vectorize/VectorCombine.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 70c7c5a6c..a200abbd5 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -1813,7 +1813,7 @@ static bool matchAssociativeReduction(\n         RHS_Bin = nullptr;\n       }\n     }\n-  } else { // Outer == Sub\n+  } else {                      // Outer == Sub\n     if (!ScalarReduceCIsLeft) { // (Op0 - C)\n       if (InnerOp == Instruction::Add) {\n         // (X + Y) - C -> (X - C) + Y\n@@ -1873,8 +1873,7 @@ static bool matchAssociativeReduction(\n     }\n   }\n \n-  Value *CombineNode =\n-      Builder.CreateBinOp(NewReduceOp, LHS_Reduce, RHS_Reduce);\n+  Value *CombineNode = Builder.CreateBinOp(NewReduceOp, LHS_Reduce, RHS_Reduce);\n \n   Value *NewBinNode;\n   if (LHS_Bin == nullptr)\n@@ -1910,8 +1909,8 @@ bool VectorCombine::foldBinopOfReductions(Instruction &I) {\n   //   Reduce(Z) - (Reduce(X) + Y)  -> Reduce(Z - X) - Y\n   if (auto *Op0 = dyn_cast<BinaryOperator>(I.getOperand(0))) {\n     if (matchAssociativeReduction(I, BinOpOpc, ReductionIID, Builder, Op0,\n-                                  I.getOperand(1), /*ScalarReduceCIsLeft=*/false,\n-                                  ReplaceValue))\n+                                  I.getOperand(1),\n+                                  /*ScalarReduceCIsLeft=*/false, ReplaceValue))\n       return true;\n   }\n \n@@ -1922,8 +1921,6 @@ bool VectorCombine::foldBinopOfReductions(Instruction &I) {\n       return true;\n   }\n \n-\n-\n   Value *V0 = checkIntrinsicAndGetItsArgument(I.getOperand(0), ReductionIID);\n   if (!V0)\n     return false;\n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "davemgreen",
+      "body": "When is this expected to be better? Some architectures have efficient instructions for add(vecreduce), and this change might just end up messing that up."
+    },
+    {
+      "author": "Anjian-Wen",
+      "body": "> Shouldn't this be handed in reassociation? VectorCombine is primarily a cost driven optimisation pass\r\n\r\nThanks for your review! This patch tries to reassociate the vector reduce_add Node in some pattern only for folding two reduce_add into one in the later foldBinopOfReductions function in VectorCombine Pass, I think maybe we don't need to reassociate that early in Reassociation Pass? And I think maybe it is easier to understand to put the change here?"
+    },
+    {
+      "author": "Anjian-Wen",
+      "body": "> When is this expected to be better? Some architectures have efficient instructions for add(vecreduce), and this change might just end up messing that up.\r\n\r\nThanks for your review! like the .ll test, this patch supposed to change the order of the pattern like `(ReduceX - Y) + ReduceC -> (ReduceX + ReduceC) - Y`, and give it a chance for foldBinopOfReductions to decide whether to fold. I don't know if I understand it well, If you mean add two vecreduce, this patch won't change that kind of pattern. If not, could you help give any example .ll?"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-03T08:30:09Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        47,
+        52
+      ],
+      [
+        202,
+        207
+      ],
+      [
+        1736,
+        1741
+      ],
+      [
+        1744,
+        1758
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/AArch64/udotabd.ll": [
+      [
+        219,
+        226
+      ],
+      [
+        232,
+        237
+      ],
+      [
+        241,
+        248
+      ],
+      [
+        254,
+        259
+      ],
+      [
+        264,
+        270
+      ],
+      [
+        275,
+        281
+      ],
+      [
+        286,
+        292
+      ],
+      [
+        297,
+        303
+      ],
+      [
+        308,
+        314
+      ],
+      [
+        318,
+        324
+      ],
+      [
+        330,
+        336
+      ],
+      [
+        341,
+        347
+      ],
+      [
+        352,
+        358
+      ],
+      [
+        362,
+        368
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/fold-binop-of-reductions.ll": [
+      [
+        205,
+        207
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::foldBinopOfReductions",
+      "analyzeCostOfVecReduction",
+      "eraseInstruction"
+    ]
+  }
+}

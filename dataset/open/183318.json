@@ -1,0 +1,260 @@
+{
+  "pr_id": 183318,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183318",
+  "state": "open",
+  "title": "[LV] Adjust exit recipe detection to run on early vplan",
+  "author": "huntergr-arm",
+  "base_commit": "5eb307e299c76e2520174acf45ea3a3d320a9509",
+  "fix_commit": "86f5e81a44fad46f344b53a20176aec5b3f2e4b4",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Vectorize/LoopVectorizationLegality.h b/llvm/include/llvm/Transforms/Vectorize/LoopVectorizationLegality.h\nindex f82fc588639dd..11c03224ba3ff 100644\n--- a/llvm/include/llvm/Transforms/Vectorize/LoopVectorizationLegality.h\n+++ b/llvm/include/llvm/Transforms/Vectorize/LoopVectorizationLegality.h\n@@ -245,6 +245,13 @@ struct HistogramInfo {\n       : Load(Load), Update(Update), Store(Store) {}\n };\n \n+/// Indicates the characteristics of a loop with an uncountable early exit.\n+/// * None      -- No uncountable exit present.\n+/// * ReadOnly  -- At least one uncountable exit in a readonly loop.\n+/// * ReadWrite -- At least one uncountable exit in a loop with side effects\n+///                that may require masking.\n+enum class UncountableEarlyExitDetail { None, ReadOnly, ReadWrite };\n+\n /// LoopVectorizationLegality checks if it is legal to vectorize a loop, and\n /// to what vectorization factor.\n /// This class does not look at the profitability of vectorization, only the\n@@ -407,16 +414,23 @@ class LoopVectorizationLegality {\n     return LAI->getDepChecker().getMaxSafeVectorWidthInBits();\n   }\n \n+  UncountableEarlyExitDetail getUncountableEarlyExitDetail() const {\n+    return UncountableExitType;\n+  }\n+\n   /// Returns true if the loop has uncountable early exits, i.e. uncountable\n   /// exits that aren't the latch block.\n-  bool hasUncountableEarlyExit() const { return HasUncountableEarlyExit; }\n+  bool hasUncountableEarlyExit() const {\n+    return getUncountableEarlyExitDetail() != UncountableEarlyExitDetail::None;\n+  }\n \n   /// Returns true if this is an early exit loop with state-changing or\n   /// potentially-faulting operations and the condition for the uncountable\n   /// exit must be determined before any of the state changes or potentially\n   /// faulting operations take place.\n   bool hasUncountableExitWithSideEffects() const {\n-    return UncountableExitWithSideEffects;\n+    return getUncountableEarlyExitDetail() ==\n+           UncountableEarlyExitDetail::ReadWrite;\n   }\n \n   /// Return true if there is store-load forwarding dependencies.\n@@ -738,12 +752,10 @@ class LoopVectorizationLegality {\n   /// the exact backedge taken count is not computable.\n   SmallVector<BasicBlock *, 4> CountableExitingBlocks;\n \n-  /// True if the loop has uncountable early exits.\n-  bool HasUncountableEarlyExit = false;\n-\n-  /// If true, the loop has at least one uncountable exit and operations within\n-  /// the loop may have observable side effects.\n-  bool UncountableExitWithSideEffects = false;\n+  /// Records whether we have an uncountable early exit in a loop that's\n+  /// either read-only or read-write.\n+  UncountableEarlyExitDetail UncountableExitType =\n+      UncountableEarlyExitDetail::None;\n };\n \n } // namespace llvm\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp\nindex fec32762db55f..892bf49914b78 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp\n@@ -1875,8 +1875,8 @@ bool LoopVectorizationLegality::isVectorizableEarlyExitLoop() {\n   LLVM_DEBUG(dbgs() << \"LV: Found an early exit loop with symbolic max \"\n                        \"backedge taken count: \"\n                     << *SymbolicMaxBTC << '\\n');\n-  HasUncountableEarlyExit = true;\n-  UncountableExitWithSideEffects = HasSideEffects;\n+  UncountableExitType = HasSideEffects ? UncountableEarlyExitDetail::ReadWrite\n+                                       : UncountableEarlyExitDetail::ReadOnly;\n   return true;\n }\n \n@@ -2041,8 +2041,7 @@ bool LoopVectorizationLegality::canVectorize(bool UseVPlanNativePath) {\n         return false;\n     } else {\n       if (!isVectorizableEarlyExitLoop()) {\n-        assert(!hasUncountableEarlyExit() &&\n-               !hasUncountableExitWithSideEffects() &&\n+        assert(UncountableExitType == UncountableEarlyExitDetail::None &&\n                \"Must be false without vectorizable early-exit loop\");\n         if (DoExtraAnalysis)\n           Result = false;\n@@ -2061,10 +2060,9 @@ bool LoopVectorizationLegality::canVectorize(bool UseVPlanNativePath) {\n       return false;\n   }\n \n-  // Bail out for state-changing loops with uncountable exits for now.\n-  if (UncountableExitWithSideEffects) {\n+  // Bail out for ReadWrite loops with uncountable exits for now.\n+  if (UncountableExitType == UncountableEarlyExitDetail::ReadWrite) {\n     reportVectorizationFailure(\n-        \"Writes to memory unsupported in early exit loops\",\n         \"Cannot vectorize early exit loop with writes to memory\",\n         \"WritesInEarlyExitLoop\", ORE, TheLoop);\n     return false;\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 0fd425c23c7aa..9010a68abd79f 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8173,7 +8173,8 @@ VPlanPtr LoopVectorizationPlanner::tryToBuildVPlanWithVPRecipes(\n             return !CM.requiresScalarEpilogue(VF.isVector());\n           },\n           Range);\n-  VPlanTransforms::handleEarlyExits(*Plan, Legal->hasUncountableEarlyExit());\n+  VPlanTransforms::handleEarlyExits(*Plan,\n+                                    Legal->getUncountableEarlyExitDetail());\n   VPlanTransforms::addMiddleCheck(*Plan, RequiresScalarEpilogueCheck,\n                                   CM.foldTailByMasking());\n \n@@ -8426,8 +8427,7 @@ VPlanPtr LoopVectorizationPlanner::tryToBuildVPlan(VFRange &Range) {\n       MapVector<PHINode *, RecurrenceDescriptor>(),\n       SmallPtrSet<const PHINode *, 1>(), SmallPtrSet<PHINode *, 1>(),\n       /*AllowReordering=*/false);\n-  VPlanTransforms::handleEarlyExits(*Plan,\n-                                    /*HasUncountableExit*/ false);\n+  VPlanTransforms::handleEarlyExits(*Plan, UncountableEarlyExitDetail::None);\n   VPlanTransforms::addMiddleCheck(*Plan, /*RequiresScalarEpilogue*/ true,\n                                   /*TailFolded*/ false);\n \ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex 7455129ff91e8..66514693348f9 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -76,6 +76,23 @@ typedef unsigned ID;\n \n using VPlanPtr = std::unique_ptr<VPlan>;\n \n+// Different methods of handling early exits.\n+//\n+// For MaskedHandleLastIterationInScalarLoop, all memory operations besides the\n+// load(s) required to determine whether an uncountable exit occurred will be\n+// masked based on that condition. If an uncountable exit is taken, then all\n+// lanes before the exiting lane will complete, leaving just the final lane to\n+// execute in the scalar tail.\n+//\n+// For ReadOnlyUncountableExitsInVectorLoop, there are no side effects to worry\n+// about, so we can instead process any uncountable exit inside the vector\n+// body and branch to an appropriate exit block, matching the behaviour of the\n+// scalar loop.\n+enum class EarlyExitStyleTy {\n+  MaskedHandleLastIterationInScalarLoop = 0,\n+  ReadOnlyUncountableExitsInVectorLoop\n+};\n+\n /// VPBlockBase is the building block of the Hierarchical Control-Flow Graph.\n /// A VPBlockBase can be either a VPBasicBlock or a VPRegionBlock.\n class LLVM_ABI_FOR_TEST VPBlockBase {\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex 3101b42625c53..0788b96a39ffc 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -902,15 +902,18 @@ void VPlanTransforms::createInLoopReductionRecipes(\n }\n \n void VPlanTransforms::handleEarlyExits(VPlan &Plan,\n-                                       bool HasUncountableEarlyExit) {\n+                                       UncountableEarlyExitDetail Detail) {\n   auto *MiddleVPBB = cast<VPBasicBlock>(\n       Plan.getScalarHeader()->getSinglePredecessor()->getPredecessors()[0]);\n   auto *LatchVPBB = cast<VPBasicBlock>(MiddleVPBB->getSinglePredecessor());\n-  VPBlockBase *HeaderVPB = cast<VPBasicBlock>(LatchVPBB->getSuccessors()[1]);\n-\n-  if (HasUncountableEarlyExit) {\n-    handleUncountableEarlyExits(Plan, cast<VPBasicBlock>(HeaderVPB), LatchVPBB,\n-                                MiddleVPBB);\n+  VPBasicBlock *HeaderVPBB = cast<VPBasicBlock>(LatchVPBB->getSuccessors()[1]);\n+\n+  if (Detail != UncountableEarlyExitDetail::None) {\n+    handleUncountableEarlyExits(\n+        Plan, HeaderVPBB, LatchVPBB, MiddleVPBB,\n+        Detail == UncountableEarlyExitDetail::ReadWrite\n+            ? EarlyExitStyleTy::MaskedHandleLastIterationInScalarLoop\n+            : EarlyExitStyleTy::ReadOnlyUncountableExitsInVectorLoop);\n     return;\n   }\n \ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\nindex db229300af17a..22f335abb995e 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n@@ -791,7 +791,8 @@ m_SpecificCmp(CmpPredicate MatchPred, const Op0_t &Op0, const Op1_t &Op1) {\n template <typename Op0_t, typename Op1_t>\n using GEPLikeRecipe_match = match_combine_or<\n     Recipe_match<std::tuple<Op0_t, Op1_t>, Instruction::GetElementPtr,\n-                 /*Commutative*/ false, VPReplicateRecipe, VPWidenGEPRecipe>,\n+                 /*Commutative*/ false, VPReplicateRecipe, VPWidenGEPRecipe,\n+                 VPInstruction>,\n     match_combine_or<\n         VPInstruction_match<VPInstruction::PtrAdd, Op0_t, Op1_t>,\n         VPInstruction_match<VPInstruction::WidePtrAdd, Op0_t, Op1_t>>>;\n@@ -801,8 +802,8 @@ inline GEPLikeRecipe_match<Op0_t, Op1_t> m_GetElementPtr(const Op0_t &Op0,\n                                                          const Op1_t &Op1) {\n   return m_CombineOr(\n       Recipe_match<std::tuple<Op0_t, Op1_t>, Instruction::GetElementPtr,\n-                   /*Commutative*/ false, VPReplicateRecipe, VPWidenGEPRecipe>(\n-          Op0, Op1),\n+                   /*Commutative*/ false, VPReplicateRecipe, VPWidenGEPRecipe,\n+                   VPInstruction>(Op0, Op1),\n       m_CombineOr(\n           VPInstruction_match<VPInstruction::PtrAdd, Op0_t, Op1_t>(Op0, Op1),\n           VPInstruction_match<VPInstruction::WidePtrAdd, Op0_t, Op1_t>(Op0,\n@@ -901,6 +902,12 @@ inline Load_match<Addr_t, Mask_t> m_MaskedLoad(const Addr_t &Addr,\n   return Load_match<Addr_t, Mask_t>(Addr, Mask);\n }\n \n+template <typename Addr_t>\n+inline VPInstruction_match<Instruction::Load, Addr_t>\n+m_UnmaskedLoad(const Addr_t &Addr) {\n+  return m_VPInstruction<Instruction::Load, Addr_t>(Addr);\n+}\n+\n template <typename Addr_t, typename Val_t, typename Mask_t> struct Store_match {\n   Addr_t Addr;\n   Val_t Val;\n@@ -926,6 +933,12 @@ m_MaskedStore(const Addr_t &Addr, const Val_t &Val, const Mask_t &Mask) {\n   return Store_match<Addr_t, Val_t, Mask_t>(Addr, Val, Mask);\n }\n \n+template <typename Addr_t, typename Val_t>\n+inline VPInstruction_match<Instruction::Store, Addr_t, Val_t>\n+m_UnmaskedStore(const Addr_t &Addr, const Val_t &Val) {\n+  return m_VPInstruction<Instruction::Store, Addr_t, Val_t>(Addr, Val);\n+}\n+\n template <typename Op0_t, typename Op1_t>\n using VectorEndPointerRecipe_match =\n     Recipe_match<std::tuple<Op0_t, Op1_t>, 0,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex c16149303b180..b1e29be2e4c93 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -4064,7 +4064,8 @@ void VPlanTransforms::convertToConcreteRecipes(VPlan &Plan) {\n void VPlanTransforms::handleUncountableEarlyExits(VPlan &Plan,\n                                                   VPBasicBlock *HeaderVPBB,\n                                                   VPBasicBlock *LatchVPBB,\n-                                                  VPBasicBlock *MiddleVPBB) {\n+                                                  VPBasicBlock *MiddleVPBB,\n+                                                  EarlyExitStyleTy Style) {\n   struct EarlyExitInfo {\n     VPBasicBlock *EarlyExitingVPBB;\n     VPIRBasicBlock *EarlyExitVPBB;\n@@ -4125,6 +4126,9 @@ void VPlanTransforms::handleUncountableEarlyExits(VPlan &Plan,\n   VPValue *IsAnyExitTaken =\n       Builder.createNaryOp(VPInstruction::AnyOf, {Combined});\n \n+  assert(Style == EarlyExitStyleTy::ReadOnlyUncountableExitsInVectorLoop &&\n+         \"Early exit store masking not implemented\");\n+\n   // Create the vector.early.exit blocks.\n   SmallVector<VPBasicBlock *> VectorEarlyExitVPBBs(Exits.size());\n   for (unsigned Idx = 0; Idx != Exits.size(); ++Idx) {\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\nindex 7c5d44daf003f..b2d0f4f687f90 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n@@ -20,6 +20,7 @@\n #include \"llvm/Support/CommandLine.h\"\n #include \"llvm/Support/Compiler.h\"\n #include \"llvm/Support/Regex.h\"\n+#include \"llvm/Transforms/Vectorize/LoopVectorizationLegality.h\"\n \n namespace llvm {\n \n@@ -148,8 +149,8 @@ struct VPlanTransforms {\n       ElementCount MinVF);\n \n   /// Update \\p Plan to account for all early exits.\n-  LLVM_ABI_FOR_TEST static void handleEarlyExits(VPlan &Plan,\n-                                                 bool HasUncountableExit);\n+  LLVM_ABI_FOR_TEST static void\n+  handleEarlyExits(VPlan &Plan, UncountableEarlyExitDetail Detail);\n \n   /// If a check is needed to guard executing the scalar epilogue loop, it will\n   /// be added to the middle block.\n@@ -326,7 +327,8 @@ struct VPlanTransforms {\n   /// that determines which exit to take based on lane-by-lane semantics.\n   static void handleUncountableEarlyExits(VPlan &Plan, VPBasicBlock *HeaderVPBB,\n                                           VPBasicBlock *LatchVPBB,\n-                                          VPBasicBlock *MiddleVPBB);\n+                                          VPBasicBlock *MiddleVPBB,\n+                                          EarlyExitStyleTy Style);\n \n   /// Replaces the exit condition from\n   ///   (branch-on-cond eq CanonicalIVInc, VectorTripCount)\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanUtils.cpp b/llvm/lib/Transforms/Vectorize/VPlanUtils.cpp\nindex 821a4f7911bb8..bbfc70d3da4e7 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanUtils.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanUtils.cpp\n@@ -472,10 +472,9 @@ unsigned vputils::getVFScaleFactor(VPRecipeBase *R) {\n   return 1;\n }\n \n-std::optional<VPValue *>\n-vputils::getRecipesForUncountableExit(VPlan &Plan,\n-                                      SmallVectorImpl<VPRecipeBase *> &Recipes,\n-                                      SmallVectorImpl<VPRecipeBase *> &GEPs) {\n+std::optional<VPValue *> vputils::getRecipesForUncountableExit(\n+    VPlan &Plan, SmallVectorImpl<VPRecipeBase *> &Recipes,\n+    SmallVectorImpl<VPRecipeBase *> &GEPs, VPBasicBlock *LatchVPBB) {\n   // Given a VPlan like the following (just including the recipes contributing\n   // to loop control exiting here, not the actual work), we're looking to match\n   // the recipes contributing to the uncountable exit condition comparison\n@@ -488,43 +487,48 @@ vputils::getRecipesForUncountableExit(VPlan &Plan,\n   // and a live-in base address. This constraint may be relaxed later.\n   //\n   // VPlan ' for UF>=1' {\n-  // Live-in vp<%0> = VF\n-  // Live-in ir<64> = original trip-count\n+  // Live-in vp<%0> = VF * UF\n+  // Live-in vp<%1> = vector-trip-count\n+  // Live-in ir<20> = original trip-count\n   //\n-  // entry:\n-  // Successor(s): preheader, vector.ph\n+  // ir-bb<entry>:\n+  // Successor(s): scalar.ph, vector.ph\n   //\n   // vector.ph:\n-  // Successor(s): vector loop\n+  // Successor(s): for.body\n   //\n-  // <x1> vector loop: {\n-  //   vector.body:\n-  //     EMIT vp<%2> = CANONICAL-INDUCTION ir<0>\n-  //     vp<%3> = SCALAR-STEPS vp<%2>, ir<1>, vp<%0>\n-  //     CLONE ir<%ee.addr> = getelementptr ir<0>, vp<%3>\n-  //     WIDEN ir<%ee.load> = load ir<%ee.addr>\n-  //     WIDEN vp<%4> = icmp eq ir<%ee.load>, ir<0>\n-  //     EMIT vp<%5> = any-of vp<%4>\n-  //     EMIT vp<%6> = add vp<%2>, vp<%0>\n-  //     EMIT vp<%7> = icmp eq vp<%6>, ir<64>\n-  //     EMIT branch-on-two-conds vp<%5>, vp<%7>\n-  //   No successors\n-  // }\n-  // Successor(s): early.exit, middle.block\n+  // for.body:\n+  //   EMIT vp<%2> = CANONICAL-INDUCTION ir<0>, vp<%index.next>\n+  //   EMIT-SCALAR ir<%iv> = phi [ ir<0>, vector.ph ], [ ir<%iv.next>, for.inc ]\n+  //   EMIT ir<%uncountable.addr> = getelementptr inbounds nuw ir<%pred>,ir<%iv>\n+  //   EMIT ir<%uncountable.val> = load ir<%uncountable.addr>\n+  //   EMIT ir<%uncountable.cond> = icmp sgt ir<%uncountable.val>, ir<500>\n+  // Successor(s): for.inc\n+  //\n+  // for.inc:\n+  //   EMIT ir<%iv.next> = add nuw nsw ir<%iv>, ir<1>\n+  //   EMIT ir<%countable.cond> = icmp eq ir<%iv.next>, ir<20>\n+  //   EMIT vp<%index.next> = add nuw vp<%2>, vp<%0>\n+  //   EMIT vp<%3> = any-of ir<%uncountable.cond>\n+  //   EMIT vp<%4> = icmp eq vp<%index.next>, vp<%1>\n+  //   EMIT vp<%5> = or vp<%3>, vp<%4>\n+  //   EMIT branch-on-cond vp<%5>\n+  // Successor(s): middle.block, for.body\n   //\n   // middle.block:\n-  // Successor(s): preheader\n+  // Successor(s): ir-bb<exit>, scalar.ph\n   //\n-  // preheader:\n+  // ir-bb<exit>:\n   // No successors\n+  //\n+  // scalar.ph:\n   // }\n \n   // Find the uncountable loop exit condition.\n-  auto *Region = Plan.getVectorLoopRegion();\n   VPValue *UncountableCondition = nullptr;\n-  if (!match(Region->getExitingBasicBlock()->getTerminator(),\n-             m_BranchOnTwoConds(m_AnyOf(m_VPValue(UncountableCondition)),\n-                                m_VPValue())))\n+  if (!match(LatchVPBB->getTerminator(),\n+             m_BranchOnCond(m_c_BinaryOr(\n+                 m_AnyOf(m_VPValue(UncountableCondition)), m_VPValue()))))\n     return std::nullopt;\n \n   SmallVector<VPValue *, 4> Worklist;\n@@ -548,23 +552,35 @@ vputils::getRecipesForUncountableExit(VPlan &Plan,\n       Worklist.push_back(Op1);\n       Worklist.push_back(Op2);\n       Recipes.push_back(V->getDefiningRecipe());\n-    } else if (auto *Load = dyn_cast<VPWidenLoadRecipe>(V)) {\n-      // Reject masked loads for the time being; they make the exit condition\n-      // more complex.\n-      if (Load->isMasked())\n-        return std::nullopt;\n-\n-      VPValue *GEP = Load->getAddr();\n-      if (!match(GEP, m_GetElementPtr(m_LiveIn(), m_VPValue())))\n+    } else if (match(V, m_UnmaskedLoad(m_VPValue(Op1)))) {\n+      // TODO: I think there's be a way to match the GEP above and capture it\n+      // too.\n+      Recipes.push_back(V->getDefiningRecipe());\n+      if (!match(Op1, m_GetElementPtr(m_LiveIn(), m_VPValue())))\n         return std::nullopt;\n-\n-      Recipes.push_back(Load);\n-      Recipes.push_back(GEP->getDefiningRecipe());\n-      GEPs.push_back(GEP->getDefiningRecipe());\n+      Recipes.push_back(Op1->getDefiningRecipe());\n+      GEPs.push_back(Op1->getDefiningRecipe());\n     } else\n       return std::nullopt;\n   }\n \n+  // If we couldn't match anything, don't return the condition. It may be\n+  // defined outside the loop.\n+  if (Recipes.empty() || GEPs.empty())\n+    return std::nullopt;\n+\n+#ifndef NDEBUG\n+  // Check dominance ordering\n+  VPRecipeBase *RA = Recipes.front();\n+  VPDominatorTree VPDT(Plan);\n+  bool Ordered = all_of(drop_begin(Recipes), [&VPDT, &RA](VPRecipeBase *RB) {\n+    bool Dominates = VPDT.properlyDominates(RB, RA);\n+    RA = RB;\n+    return Dominates;\n+  });\n+  assert(Ordered && \"Uncountable exit recipes unordered\");\n+#endif\n+\n   return UncountableCondition;\n }\n \ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanUtils.h b/llvm/lib/Transforms/Vectorize/VPlanUtils.h\nindex a5692699d9d76..4a46a4f1f3f96 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanUtils.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanUtils.h\n@@ -79,10 +79,9 @@ unsigned getVFScaleFactor(VPRecipeBase *R);\n /// \\p Recipes, and recipes forming an address for a load are also added to\n /// \\p GEPs.\n LLVM_ABI_FOR_TEST\n-std::optional<VPValue *>\n-getRecipesForUncountableExit(VPlan &Plan,\n-                             SmallVectorImpl<VPRecipeBase *> &Recipes,\n-                             SmallVectorImpl<VPRecipeBase *> &GEPs);\n+std::optional<VPValue *> getRecipesForUncountableExit(\n+    VPlan &Plan, SmallVectorImpl<VPRecipeBase *> &Recipes,\n+    SmallVectorImpl<VPRecipeBase *> &GEPs, VPBasicBlock *LatchVPBB);\n \n /// Return a MemoryLocation for \\p R with noalias metadata populated from\n /// \\p R, if the recipe is supported and std::nullopt otherwise. The pointer of\ndiff --git a/llvm/unittests/Transforms/Vectorize/VPlanTestBase.h b/llvm/unittests/Transforms/Vectorize/VPlanTestBase.h\nindex 3a585e958c3f3..8afe1aaa33140 100644\n--- a/llvm/unittests/Transforms/Vectorize/VPlanTestBase.h\n+++ b/llvm/unittests/Transforms/Vectorize/VPlanTestBase.h\n@@ -65,7 +65,7 @@ class VPlanTestIRBase : public testing::Test {\n   }\n \n   /// Build the VPlan for the loop starting from \\p LoopHeader.\n-  VPlanPtr buildVPlan(BasicBlock *LoopHeader, bool HasUncountableExit = false) {\n+  VPlanPtr buildVPlan(BasicBlock *LoopHeader) {\n     Function &F = *LoopHeader->getParent();\n     assert(!verifyFunction(F) && \"input function must be valid\");\n     doAnalysis(F);\n@@ -75,12 +75,23 @@ class VPlanTestIRBase : public testing::Test {\n     auto Plan = VPlanTransforms::buildVPlan0(L, *LI, IntegerType::get(*Ctx, 64),\n                                              {}, PSE);\n \n-    VPlanTransforms::handleEarlyExits(*Plan, HasUncountableExit);\n+    VPlanTransforms::handleEarlyExits(*Plan, UncountableEarlyExitDetail::None);\n     VPlanTransforms::addMiddleCheck(*Plan, true, false);\n \n     VPlanTransforms::createLoopRegions(*Plan);\n     return Plan;\n   }\n+\n+  VPlanPtr buildVPlan0(BasicBlock *LoopHeader) {\n+    Function &F = *LoopHeader->getParent();\n+    assert(!verifyFunction(F) && \"input function must be valid\");\n+    doAnalysis(F);\n+\n+    Loop *L = LI->getLoopFor(LoopHeader);\n+    PredicatedScalarEvolution PSE(*SE, *L);\n+    return VPlanTransforms::buildVPlan0(L, *LI, IntegerType::get(*Ctx, 64), {},\n+                                        PSE);\n+  }\n };\n \n class VPlanTestBase : public testing::Test {\ndiff --git a/llvm/unittests/Transforms/Vectorize/VPlanUncountableExitTest.cpp b/llvm/unittests/Transforms/Vectorize/VPlanUncountableExitTest.cpp\nindex c701382c54e6b..2decc630ee9a6 100644\n--- a/llvm/unittests/Transforms/Vectorize/VPlanUncountableExitTest.cpp\n+++ b/llvm/unittests/Transforms/Vectorize/VPlanUncountableExitTest.cpp\n@@ -7,7 +7,9 @@\n //\n //===----------------------------------------------------------------------===//\n \n+#include \"../lib/Transforms/Vectorize/VPRecipeBuilder.h\"\n #include \"../lib/Transforms/Vectorize/VPlan.h\"\n+#include \"../lib/Transforms/Vectorize/VPlanPatternMatch.h\"\n #include \"../lib/Transforms/Vectorize/VPlanUtils.h\"\n #include \"VPlanTestBase.h\"\n #include \"llvm/ADT/SmallVector.h\"\n@@ -18,6 +20,93 @@ namespace llvm {\n namespace {\n class VPUncountableExitTest : public VPlanTestIRBase {};\n \n+// TODO: This performs part of VPlanTransforms::handleUncountableEarlyExits,\n+//       perhaps we could share the code...\n+static void combineExitConditions(VPlan &Plan) {\n+  struct EarlyExitInfo {\n+    VPBasicBlock *EarlyExitingVPBB;\n+    VPIRBasicBlock *EarlyExitVPBB;\n+    VPValue *CondToExit;\n+  };\n+\n+  auto *MiddleVPBB = cast<VPBasicBlock>(\n+      Plan.getScalarHeader()->getSinglePredecessor()->getPredecessors()[0]);\n+  auto *LatchVPBB = cast<VPBasicBlock>(MiddleVPBB->getSinglePredecessor());\n+  using namespace VPlanPatternMatch;\n+\n+  VPDominatorTree VPDT(Plan);\n+  VPBuilder Builder(LatchVPBB->getTerminator());\n+  SmallVector<EarlyExitInfo> Exits;\n+  for (VPIRBasicBlock *ExitBlock : Plan.getExitBlocks()) {\n+    for (VPBlockBase *Pred : to_vector(ExitBlock->getPredecessors())) {\n+      if (Pred == MiddleVPBB)\n+        continue;\n+      // Collect condition for this early exit.\n+      auto *EarlyExitingVPBB = cast<VPBasicBlock>(Pred);\n+      VPBlockBase *TrueSucc = EarlyExitingVPBB->getSuccessors()[0];\n+      VPValue *CondOfEarlyExitingVPBB;\n+      [[maybe_unused]] bool Matched =\n+          match(EarlyExitingVPBB->getTerminator(),\n+                m_BranchOnCond(m_VPValue(CondOfEarlyExitingVPBB)));\n+      assert(Matched && \"Terminator must be BranchOnCond\");\n+      auto *CondToEarlyExit = TrueSucc == ExitBlock\n+                                  ? CondOfEarlyExitingVPBB\n+                                  : Builder.createNot(CondOfEarlyExitingVPBB);\n+      assert((isa<VPIRValue>(CondOfEarlyExitingVPBB) ||\n+              VPDT.properlyDominates(\n+                  CondOfEarlyExitingVPBB->getDefiningRecipe()->getParent(),\n+                  LatchVPBB)) &&\n+             \"exit condition must dominate the latch\");\n+      Exits.push_back({\n+          EarlyExitingVPBB,\n+          ExitBlock,\n+          CondToEarlyExit,\n+      });\n+    }\n+  }\n+\n+  // For the negative test case.\n+  if (Exits.empty())\n+    return;\n+\n+  // Sort exits by dominance to get the correct program order.\n+  llvm::sort(Exits, [&VPDT](const EarlyExitInfo &A, const EarlyExitInfo &B) {\n+    return VPDT.properlyDominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB);\n+  });\n+\n+  // Build the AnyOf condition for the latch terminator using logical OR\n+  // to avoid poison propagation from later exit conditions when an earlier\n+  // exit is taken.\n+  VPValue *Combined = Exits[0].CondToExit;\n+  for (const EarlyExitInfo &Info : drop_begin(Exits))\n+    Combined = Builder.createLogicalOr(Combined, Info.CondToExit);\n+\n+  VPValue *IsAnyExitTaken =\n+      Builder.createNaryOp(VPInstruction::AnyOf, {Combined});\n+\n+  auto *LatchExitingBranch = cast<VPInstruction>(LatchVPBB->getTerminator());\n+  assert(LatchExitingBranch->getOpcode() == VPInstruction::BranchOnCount &&\n+         \"Unexpected terminator\");\n+  auto *IsLatchExitTaken =\n+      Builder.createICmp(CmpInst::ICMP_EQ, LatchExitingBranch->getOperand(0),\n+                         LatchExitingBranch->getOperand(1));\n+  LatchExitingBranch->eraseFromParent();\n+  Builder.setInsertPoint(LatchVPBB);\n+  VPValue *CombineAllExits = Builder.createOr(IsAnyExitTaken, IsLatchExitTaken);\n+  Builder.createNaryOp(VPInstruction::BranchOnCond, {CombineAllExits});\n+\n+  // Disconnect early exiting blocks from successors, remove branches. We\n+  // currently don't support multiple uses for recipes involved in creating\n+  // the uncountable exit condition.\n+  for (auto &Exit : Exits) {\n+    if (Exit.EarlyExitingVPBB == LatchVPBB)\n+      continue;\n+\n+    Exit.EarlyExitingVPBB->getTerminator()->eraseFromParent();\n+    VPBlockUtils::disconnectBlocks(Exit.EarlyExitingVPBB, Exit.EarlyExitVPBB);\n+  }\n+}\n+\n TEST_F(VPUncountableExitTest, FindUncountableExitRecipes) {\n   const char *ModuleString =\n       \"define void @f(ptr %array, ptr %pred) {\\n\"\n@@ -46,15 +135,18 @@ TEST_F(VPUncountableExitTest, FindUncountableExitRecipes) {\n \n   Function *F = M.getFunction(\"f\");\n   BasicBlock *LoopHeader = F->getEntryBlock().getSingleSuccessor();\n-  auto Plan = buildVPlan(LoopHeader, /*HasUncountableExit=*/true);\n-  VPlanTransforms::tryToConvertVPInstructionsToVPRecipes(*Plan, *TLI);\n-  VPlanTransforms::optimize(*Plan);\n+  VPlanPtr Plan = buildVPlan0(LoopHeader);\n+  combineExitConditions(*Plan);\n \n   SmallVector<VPRecipeBase *> Recipes;\n   SmallVector<VPRecipeBase *> GEPs;\n \n+  auto *MiddleVPBB = cast<VPBasicBlock>(\n+      Plan->getScalarHeader()->getSinglePredecessor()->getPredecessors()[0]);\n+  auto *LatchVPBB = cast<VPBasicBlock>(MiddleVPBB->getSinglePredecessor());\n+\n   std::optional<VPValue *> UncountableCondition =\n-      vputils::getRecipesForUncountableExit(*Plan, Recipes, GEPs);\n+      vputils::getRecipesForUncountableExit(*Plan, Recipes, GEPs, LatchVPBB);\n   ASSERT_TRUE(UncountableCondition.has_value());\n   ASSERT_EQ(GEPs.size(), 1ull);\n   ASSERT_EQ(Recipes.size(), 3ull);\n@@ -82,15 +174,18 @@ TEST_F(VPUncountableExitTest, NoUncountableExit) {\n \n   Function *F = M.getFunction(\"f\");\n   BasicBlock *LoopHeader = F->getEntryBlock().getSingleSuccessor();\n-  auto Plan = buildVPlan(LoopHeader);\n-  VPlanTransforms::tryToConvertVPInstructionsToVPRecipes(*Plan, *TLI);\n-  VPlanTransforms::optimize(*Plan);\n+  auto Plan = buildVPlan0(LoopHeader);\n+  combineExitConditions(*Plan);\n \n   SmallVector<VPRecipeBase *> Recipes;\n   SmallVector<VPRecipeBase *> GEPs;\n \n+  auto *MiddleVPBB = cast<VPBasicBlock>(\n+      Plan->getScalarHeader()->getSinglePredecessor()->getPredecessors()[0]);\n+  auto *LatchVPBB = cast<VPBasicBlock>(MiddleVPBB->getSinglePredecessor());\n+\n   std::optional<VPValue *> UncountableCondition =\n-      vputils::getRecipesForUncountableExit(*Plan, Recipes, GEPs);\n+      vputils::getRecipesForUncountableExit(*Plan, Recipes, GEPs, LatchVPBB);\n   ASSERT_FALSE(UncountableCondition.has_value());\n   ASSERT_EQ(GEPs.size(), 0ull);\n   ASSERT_EQ(Recipes.size(), 0ull);\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Splitting out some work from #178454; this covers the enums for\r\nearly exit loop type (none, readonly, readwrite) and the style\r\nused (readonly with multiple exit blocks, or masking with the\r\nlast iteration done in scalar code), along with changing the early\r\nexit recipe detection to suit moving the transform for handling\r\nearly exit readwrite loops earlier in the vplan pipeline.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/early_exit_store_legality.ll",
+      "commands": [
+        "opt -S < %s -p loop-vectorize -debug-only=loop-vectorize -force-vector-width=4 -disable-output 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "loop_contains_store_condition_load_has_single_user",
+          "test_body": "define void @loop_contains_store_condition_load_has_single_user(ptr noalias dereferenceable(40) %array, ptr readonly align 2 dereferenceable(40) %pred) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.inc ]\n  %st.addr = getelementptr inbounds nuw i16, ptr %array, i64 %iv\n  %data = load i16, ptr %st.addr, align 2\n  %inc = add nsw i16 %data, 1\n  store i16 %inc, ptr %st.addr, align 2\n  %ee.addr = getelementptr inbounds nuw i16, ptr %pred, i64 %iv\n  %ee.val = load i16, ptr %ee.addr, align 2\n  %ee.cond = icmp sgt i16 %ee.val, 500\n  br i1 %ee.cond, label %exit, label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %iv.next = add nuw nsw i64 %iv, 1\n  %counted.cond = icmp eq i64 %iv.next, 20\n  br i1 %counted.cond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.inc, %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "loop_contains_store_to_pointer_with_no_deref_info",
+          "test_body": "define void @loop_contains_store_to_pointer_with_no_deref_info(ptr readonly align 2 dereferenceable(40) %load.array, ptr noalias align 2 %array, ptr readonly align 2 dereferenceable(40) %pred) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.inc ]\n  %ld.addr = getelementptr inbounds nuw i16, ptr %load.array, i64 %iv\n  %data = load i16, ptr %ld.addr, align 2\n  %inc = add nsw i16 %data, 1\n  %st.addr = getelementptr inbounds nuw i16, ptr %array, i64 %iv\n  store i16 %inc, ptr %st.addr, align 2\n  %ee.addr = getelementptr inbounds nuw i16, ptr %pred, i64 %iv\n  %ee.val = load i16, ptr %ee.addr, align 2\n  %ee.cond = icmp sgt i16 %ee.val, 500\n  br i1 %ee.cond, label %exit, label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %iv.next = add nuw nsw i64 %iv, 1\n  %counted.cond = icmp eq i64 %iv.next, 20\n  br i1 %counted.cond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.inc, %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "loop_contains_store_in_latch_block",
+          "test_body": "define void @loop_contains_store_in_latch_block(ptr noalias dereferenceable(40) %array, ptr readonly align 2 dereferenceable(40) %pred) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.inc ]\n  %st.addr = getelementptr inbounds nuw i16, ptr %array, i64 %iv\n  %data = load i16, ptr %st.addr, align 2\n  %inc = add nsw i16 %data, 1\n  %ee.addr = getelementptr inbounds nuw i16, ptr %pred, i64 %iv\n  %ee.val = load i16, ptr %ee.addr, align 2\n  %ee.cond = icmp sgt i16 %ee.val, 500\n  br i1 %ee.cond, label %exit, label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  store i16 %inc, ptr %st.addr, align 2\n  %iv.next = add nuw nsw i64 %iv, 1\n  %counted.cond = icmp eq i64 %iv.next, 20\n  br i1 %counted.cond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.inc, %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "loop_contains_store_decrementing_iv",
+          "test_body": "define void @loop_contains_store_decrementing_iv(ptr noalias dereferenceable(40) %array, ptr readonly align 2 dereferenceable(40) %pred) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %iv = phi i64 [ 19, %entry ], [ %iv.next, %for.inc ]\n  %st.addr = getelementptr inbounds nuw i16, ptr %array, i64 %iv\n  %data = load i16, ptr %st.addr, align 2\n  %inc = add nsw i16 %data, 1\n  store i16 %inc, ptr %st.addr, align 2\n  %ee.addr = getelementptr inbounds nuw i16, ptr %pred, i64 %iv\n  %ee.val = load i16, ptr %ee.addr, align 2\n  %ee.cond = icmp sgt i16 %ee.val, 500\n  br i1 %ee.cond, label %exit, label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %iv.next = sub nuw nsw i64 %iv, 1\n  %counted.cond = icmp eq i64 %iv.next, 0\n  br i1 %counted.cond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.inc, %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "loop_contains_store_to_invariant_location",
+          "test_body": "define void @loop_contains_store_to_invariant_location(ptr readonly dereferenceable(40) %array, ptr readonly align 2 dereferenceable(40) %pred, ptr noalias %store_addr) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.inc ]\n  %addr = getelementptr inbounds nuw i16, ptr %array, i64 %iv\n  %data = load i16, ptr %addr, align 2\n  %inc = add nsw i16 %data, 1\n  store i16 %inc, ptr %store_addr, align 2\n  %ee.addr = getelementptr inbounds nuw i16, ptr %pred, i64 %iv\n  %ee.val = load i16, ptr %ee.addr, align 2\n  %ee.cond = icmp sgt i16 %ee.val, 500\n  br i1 %ee.cond, label %exit, label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %iv.next = add nuw nsw i64 %iv, 1\n  %counted.cond = icmp eq i64 %iv.next, 20\n  br i1 %counted.cond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.inc, %for.body\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "huntergr-arm",
+      "body": "This version of `getRecipesForUncountableExit` is intended to run on a vplan at the same point that `handleEarlyExits` is, so we can't rely on loop regions or widened recipes."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-25T16:03:50Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Vectorize/LoopVectorizationLegality.h": [
+      [
+        245,
+        250
+      ],
+      [
+        407,
+        422
+      ],
+      [
+        738,
+        749
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp": [
+      [
+        1875,
+        1882
+      ],
+      [
+        2041,
+        2048
+      ],
+      [
+        2061,
+        2070
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        8173,
+        8179
+      ],
+      [
+        8426,
+        8433
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      [
+        76,
+        81
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        902,
+        916
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      [
+        791,
+        797
+      ],
+      [
+        801,
+        808
+      ],
+      [
+        901,
+        906
+      ],
+      [
+        926,
+        931
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        4064,
+        4070
+      ],
+      [
+        4125,
+        4130
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.h": [
+      [
+        20,
+        25
+      ],
+      [
+        148,
+        155
+      ],
+      [
+        326,
+        332
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanUtils.cpp": [
+      [
+        472,
+        481
+      ],
+      [
+        488,
+        530
+      ],
+      [
+        548,
+        570
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanUtils.h": [
+      [
+        79,
+        88
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/early_exit_store_legality.ll": [
+      [
+        30,
+        36
+      ],
+      [
+        196,
+        202
+      ],
+      [
+        275,
+        281
+      ],
+      [
+        301,
+        307
+      ],
+      [
+        381,
+        387
+      ]
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanTestBase.h": [
+      [
+        65,
+        71
+      ],
+      [
+        75,
+        86
+      ]
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanUncountableExitTest.cpp": [
+      [
+        7,
+        13
+      ],
+      [
+        18,
+        23
+      ],
+      [
+        46,
+        60
+      ],
+      [
+        82,
+        96
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Transforms/Vectorize/LoopVectorizationLegality.h": [
+      "getMaxSafeVectorWidthInBits",
+      "hasUncountableEarlyExit",
+      "hasUncountableExitWithSideEffects",
+      "isSafeForAnyStoreLoadForwardDistances"
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp": [
+      "LoopVectorizationLegality::canUncountableExitConditionLoadBeMoved",
+      "LoopVectorizationLegality::canVectorize",
+      "LoopVectorizationLegality::isVectorizableEarlyExitLoop"
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationPlanner::tryToBuildVPlanWithVPRecipes"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      "VPBlockBase"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "VPlanTransforms::handleEarlyExits"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      "m_GetElementPtr",
+      "m_MaskedLoad",
+      "m_MaskedStore"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::handleUncountableEarlyExits"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanUtils.cpp": [
+      "vputils::findHeaderMask",
+      "vputils::getRecipesForUncountableExit",
+      "vputils::getVFScaleFactor"
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanTestBase.h": [
+      "buildVPlan"
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanUncountableExitTest.cpp": [
+      "TEST_F"
+    ]
+  }
+}

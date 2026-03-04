@@ -1,0 +1,97 @@
+{
+  "pr_id": 183031,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183031",
+  "state": "open",
+  "title": "[ConstantFolding] Respect AllowNonDeterministic when flushing denormals",
+  "author": "nikic",
+  "base_commit": "864506500733ef2813430b3d67138593b3abc04c",
+  "fix_commit": "09aa5b56fa953e4c4db4bbb8bb36a3928bdb3ac7",
+  "patch": "diff --git a/llvm/include/llvm/Analysis/ConstantFolding.h b/llvm/include/llvm/Analysis/ConstantFolding.h\nindex 5e77b2ae6f15b..ddb350ec10e23 100644\n--- a/llvm/include/llvm/Analysis/ConstantFolding.h\n+++ b/llvm/include/llvm/Analysis/ConstantFolding.h\n@@ -117,7 +117,7 @@ ConstantFoldFPInstOperands(unsigned Opcode, Constant *LHS, Constant *RHS,\n /// If the calling function's denormal_fpenv input mode is dynamic for the\n /// floating-point type, returns nullptr for denormal inputs.\n LLVM_ABI Constant *FlushFPConstant(Constant *Operand, const Instruction *I,\n-                                   bool IsOutput);\n+                                   bool IsOutput, bool AllowNonDeterministic);\n \n /// Attempt to constant fold a cast with the specified operand.  If it\n /// fails, it returns a constant expression of the specified operand.\ndiff --git a/llvm/lib/Analysis/ConstantFolding.cpp b/llvm/lib/Analysis/ConstantFolding.cpp\nindex 738d0c063a5e4..44d539a9476b8 100644\n--- a/llvm/lib/Analysis/ConstantFolding.cpp\n+++ b/llvm/lib/Analysis/ConstantFolding.cpp\n@@ -1297,10 +1297,13 @@ Constant *llvm::ConstantFoldCompareInstOperands(\n   if (CmpInst::isFPPredicate(Predicate)) {\n     // Flush any denormal constant float input according to denormal handling\n     // mode.\n-    Ops0 = FlushFPConstant(Ops0, I, /*IsOutput=*/false);\n+    // TODO: Pass through AllowNonDeterministic flag.\n+    Ops0 = FlushFPConstant(Ops0, I, /*IsOutput=*/false,\n+                           /*AllowNonDeterministic=*/true);\n     if (!Ops0)\n       return nullptr;\n-    Ops1 = FlushFPConstant(Ops1, I, /*IsOutput=*/false);\n+    Ops1 = FlushFPConstant(Ops1, I, /*IsOutput=*/false,\n+                           /*AllowNonDeterministic=*/true);\n     if (!Ops1)\n       return nullptr;\n   }\n@@ -1329,7 +1332,12 @@ Constant *llvm::ConstantFoldBinaryOpOperands(unsigned Opcode, Constant *LHS,\n }\n \n static ConstantFP *flushDenormalConstant(Type *Ty, const APFloat &APF,\n-                                         DenormalMode::DenormalModeKind Mode) {\n+                                         DenormalMode::DenormalModeKind Mode,\n+                                         bool AllowNonDeterministic) {\n+  // All modes apart from ieee are non-deterministic.\n+  if (!AllowNonDeterministic && Mode != DenormalMode::IEEE)\n+    return nullptr;\n+\n   switch (Mode) {\n   case DenormalMode::Dynamic:\n     return nullptr;\n@@ -1359,20 +1367,22 @@ static DenormalMode getInstrDenormalMode(const Instruction *CtxI, Type *Ty) {\n \n static ConstantFP *flushDenormalConstantFP(ConstantFP *CFP,\n                                            const Instruction *Inst,\n-                                           bool IsOutput) {\n+                                           bool IsOutput,\n+                                           bool AllowNonDeterministic) {\n   const APFloat &APF = CFP->getValueAPF();\n   if (!APF.isDenormal())\n     return CFP;\n \n   DenormalMode Mode = getInstrDenormalMode(Inst, CFP->getType());\n   return flushDenormalConstant(CFP->getType(), APF,\n-                               IsOutput ? Mode.Output : Mode.Input);\n+                               IsOutput ? Mode.Output : Mode.Input,\n+                               AllowNonDeterministic);\n }\n \n Constant *llvm::FlushFPConstant(Constant *Operand, const Instruction *Inst,\n-                                bool IsOutput) {\n+                                bool IsOutput, bool AllowNonDeterministic) {\n   if (ConstantFP *CFP = dyn_cast<ConstantFP>(Operand))\n-    return flushDenormalConstantFP(CFP, Inst, IsOutput);\n+    return flushDenormalConstantFP(CFP, Inst, IsOutput, AllowNonDeterministic);\n \n   if (isa<ConstantAggregateZero, UndefValue>(Operand))\n     return Operand;\n@@ -1381,7 +1391,8 @@ Constant *llvm::FlushFPConstant(Constant *Operand, const Instruction *Inst,\n   VectorType *VecTy = dyn_cast<VectorType>(Ty);\n   if (VecTy) {\n     if (auto *Splat = dyn_cast_or_null<ConstantFP>(Operand->getSplatValue())) {\n-      ConstantFP *Folded = flushDenormalConstantFP(Splat, Inst, IsOutput);\n+      ConstantFP *Folded =\n+          flushDenormalConstantFP(Splat, Inst, IsOutput, AllowNonDeterministic);\n       if (!Folded)\n         return nullptr;\n       return ConstantVector::getSplat(VecTy->getElementCount(), Folded);\n@@ -1406,7 +1417,8 @@ Constant *llvm::FlushFPConstant(Constant *Operand, const Instruction *Inst,\n       if (!CFP)\n         return nullptr;\n \n-      ConstantFP *Folded = flushDenormalConstantFP(CFP, Inst, IsOutput);\n+      ConstantFP *Folded =\n+          flushDenormalConstantFP(CFP, Inst, IsOutput, AllowNonDeterministic);\n       if (!Folded)\n         return nullptr;\n       NewElts.push_back(Folded);\n@@ -1424,7 +1436,8 @@ Constant *llvm::FlushFPConstant(Constant *Operand, const Instruction *Inst,\n       } else {\n         DenormalMode Mode = getInstrDenormalMode(Inst, Ty);\n         ConstantFP *Folded =\n-            flushDenormalConstant(Ty, Elt, IsOutput ? Mode.Output : Mode.Input);\n+            flushDenormalConstant(Ty, Elt, IsOutput ? Mode.Output : Mode.Input,\n+                                  AllowNonDeterministic);\n         if (!Folded)\n           return nullptr;\n         NewElts.push_back(Folded);\n@@ -1443,10 +1456,12 @@ Constant *llvm::ConstantFoldFPInstOperands(unsigned Opcode, Constant *LHS,\n                                            bool AllowNonDeterministic) {\n   if (Instruction::isBinaryOp(Opcode)) {\n     // Flush denormal inputs if needed.\n-    Constant *Op0 = FlushFPConstant(LHS, I, /* IsOutput */ false);\n+    Constant *Op0 =\n+        FlushFPConstant(LHS, I, /*IsOutput=*/false, AllowNonDeterministic);\n     if (!Op0)\n       return nullptr;\n-    Constant *Op1 = FlushFPConstant(RHS, I, /* IsOutput */ false);\n+    Constant *Op1 =\n+        FlushFPConstant(RHS, I, /*IsOutput=*/false, AllowNonDeterministic);\n     if (!Op1)\n       return nullptr;\n \n@@ -1465,7 +1480,7 @@ Constant *llvm::ConstantFoldFPInstOperands(unsigned Opcode, Constant *LHS,\n       return nullptr;\n \n     // Flush denormal output if needed.\n-    C = FlushFPConstant(C, I, /* IsOutput */ true);\n+    C = FlushFPConstant(C, I, /*IsOutput=*/true, AllowNonDeterministic);\n     if (!C)\n       return nullptr;\n \n",
+  "components": [
+    "ConstantFold"
+  ],
+  "description": "Apart from IEEE, all the denormal modes flush non-deterministically, so we should respect the AllowNonDeterministic flag.\r\n\r\nIn particular, this makes sure that SCEV does not compute brute-force exit counts for cases where the exit count depends on whether denormal flushing occurs or not.",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/ScalarEvolution/exhaustive-trip-counts.ll",
+      "commands": [
+        "opt -disable-output \"-passes=print<scalar-evolution>\" -scalar-evolution-classify-expressions=0 < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ntarget datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @f_0() {\n;\n;\nentry:\n  br label %for.body\n\nfor.body:\n  %i.05 = phi i32 [ 32, %entry ], [ %div4, %for.body ]\n  tail call void @dummy()\n  %div4 = lshr i32 %i.05, 1\n  %cmp = icmp eq i32 %div4, 0\n  br i1 %cmp, label %for.cond.cleanup, label %for.body\n\nfor.cond.cleanup:\n  ret void\n}\n\n; Do not compute exhaustive trip count based on FP libcalls, as their exact\n; return value may not be specified.\ndefine i64 @test_fp_libcall() {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi double [ 1.000000e+00, %entry ], [ %fv.next, %loop ]\n  call void @use(double %fv)\n  %fv.next = call double @llvm.sin.f64(double %fv)\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp une double %fv, 0x3FC6BA15EE8460B0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\n; Do not compute exhaustive trip count based on FP constant folding resulting\n; in NaN values, as we don't specify which NaN exactly is returned.\ndefine i64 @test_nan_sign() {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi double [ -1.000000e+00, %entry ], [ %fv.next, %loop ]\n  call void @use(double %fv)\n  %a = fsub double %fv, 0x7F86C16C16C16C16\n  %b = fadd double %a, %a\n  %fv.next = fsub double %b, %a\n  %iv.next = add i64 %iv, 1\n  %fv.bc = bitcast double %fv to i64\n  %icmp = icmp slt i64 %fv.bc, 0\n  br i1 %icmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\n; Do not compute exhaustive trip count based on FP constant folding if the\n; involved operation has nsz or one of the algebraic FMF flags (reassoc, arcp,\n; contract) set. The examples in the following are dummies and don't illustrate\n; real cases where FMF transforms could cause issues.\n\ndefine i64 @test_fp_nsz() {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi double [ 1.000000e+00, %entry ], [ %fv.next, %loop ]\n  call void @use(double %fv)\n  %fv.next = fadd nsz double %fv, 1.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp une double %fv, 100.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndefine i64 @test_fp_reassoc() {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi double [ 1.000000e+00, %entry ], [ %fv.next, %loop ]\n  call void @use(double %fv)\n  %fv.next = fadd reassoc double %fv, 1.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp une double %fv, 100.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndefine i64 @test_fp_arcp() {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi double [ 1.000000e+00, %entry ], [ %fv.next, %loop ]\n  call void @use(double %fv)\n  %fv.next = fadd arcp double %fv, 1.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp une double %fv, 100.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndefine i64 @test_fp_contract() {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi double [ 1.000000e+00, %entry ], [ %fv.next, %loop ]\n  call void @use(double %fv)\n  %fv.next = fadd contract double %fv, 1.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp une double %fv, 100.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndefine i64 @test_fp_fdiv_denormal_ieee() {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi float [ 0x3900000000000000, %entry ], [ %fv.next, %loop ]\n  call void @use.f32(float %fv)\n  %fv.next = fdiv float %fv, 2.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp one float %fv, 0.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndefine i64 @test_fp_fdiv_denormal_dynamic() denormal_fpenv(dynamic) {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi float [ 0x3900000000000000, %entry ], [ %fv.next, %loop ]\n  call void @use.f32(float %fv)\n  %fv.next = fdiv float %fv, 2.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp one float %fv, 0.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndefine i64 @test_fp_fdiv_denormal_preservesign() denormal_fpenv(preservesign) {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi float [ 0x3900000000000000, %entry ], [ %fv.next, %loop ]\n  call void @use.f32(float %fv)\n  %fv.next = fdiv float %fv, 2.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp one float %fv, 0.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndefine i64 @test_fp_fdiv_denormal_positivezero() denormal_fpenv(preservesign) {\n;\nentry:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %fv = phi float [ 0x3900000000000000, %entry ], [ %fv.next, %loop ]\n  call void @use.f32(float %fv)\n  %fv.next = fdiv float %fv, 2.0\n  %iv.next = add i64 %iv, 1\n  %fcmp = fcmp one float %fv, 0.0\n  br i1 %fcmp, label %loop, label %exit\n\nexit:\n  ret i64 %iv\n}\n\ndeclare void @dummy()\ndeclare void @use(double)\ndeclare void @use.f32(float)\ndeclare double @llvm.sin.f64(double)"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "floating-point",
+    "llvm:analysis"
+  ],
+  "comments": [
+    {
+      "author": "nikic",
+      "body": "Ping"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-24T11:55:03Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Analysis/ConstantFolding.h": [
+      [
+        117,
+        123
+      ]
+    ],
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      [
+        1297,
+        1306
+      ],
+      [
+        1329,
+        1335
+      ],
+      [
+        1359,
+        1378
+      ],
+      [
+        1381,
+        1387
+      ],
+      [
+        1406,
+        1412
+      ],
+      [
+        1424,
+        1430
+      ],
+      [
+        1443,
+        1452
+      ],
+      [
+        1465,
+        1471
+      ]
+    ],
+    "llvm/test/Analysis/ScalarEvolution/exhaustive-trip-counts.ll": [
+      [
+        177,
+        182
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      "flushDenormalConstantFP",
+      "getInstrDenormalMode",
+      "llvm::ConstantFoldBinaryOpOperands",
+      "llvm::ConstantFoldCompareInstOperands",
+      "llvm::ConstantFoldFPInstOperands",
+      "llvm::FlushFPConstant"
+    ]
+  }
+}

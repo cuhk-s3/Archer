@@ -1,0 +1,101 @@
+{
+  "pr_id": 183082,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183082",
+  "state": "open",
+  "title": "[LICM] Reassociate add/sub expressions to hoist invariant computations",
+  "author": "SavchenkoValeriy",
+  "base_commit": "c5d6feb3152bf39d820935df0d0490f90364d44c",
+  "fix_commit": "d6aa07b4d44cf583f5268c73fd327d297516e796",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/LICM.cpp b/llvm/lib/Transforms/Scalar/LICM.cpp\nindex 8ac1cb6a899ba..73d9e21df81d2 100644\n--- a/llvm/lib/Transforms/Scalar/LICM.cpp\n+++ b/llvm/lib/Transforms/Scalar/LICM.cpp\n@@ -2927,6 +2927,92 @@ static bool hoistBOAssociation(Instruction &I, Loop &L,\n   return true;\n }\n \n+/// Reassociate add/sub expressions of the form:\n+///\n+/// 1. \"(LV + C1) - C2\" ==> \"LV + (C1 - C2)\"\n+/// 2. \"(LV - C1) - C2\" ==> \"LV - (C1 + C2)\"\n+/// 3. \"(LV - C1) + C2\" ==> \"LV + (C2 - C1)\"\n+///\n+/// where LV is a loop variant, and C1 and C2 are loop invariants.\n+/// Sub is not associative, but these algebraic identities allow hoisting\n+/// invariant computations out of the loop.\n+static bool hoistSubAddAssociation(Instruction &I, Loop &L,\n+                                   ICFLoopSafetyInfo &SafetyInfo,\n+                                   MemorySSAUpdater &MSSAU, AssumptionCache *AC,\n+                                   DominatorTree *DT) {\n+  using namespace PatternMatch;\n+\n+  Instruction *BO;\n+  Value *LV, *C1, *C2;\n+  Instruction::BinaryOps InvOp, ResultOp;\n+\n+  // Try to match one of three reassociation patterns involving sub.\n+  //\n+  //   1. (LV + C1) - C2 ==> LV + (C1 - C2)\n+  //   2. (LV - C1) - C2 ==> LV - (C1 + C2)\n+  //   3. (LV - C1) + C2 ==> LV + (C2 - C1)\n+  //                            ^     ^\n+  //                             \\     \\___ InvOp\n+  //                              \\\n+  //                               \\____ ResultOp\n+  //\n+  if (match(&I,\n+            m_Sub(m_OneUse(m_Instruction(BO, m_Add(m_Value(LV), m_Value(C1)))),\n+                  m_Value(C2)))) {\n+    // Case 1.\n+    //\n+    // Depending on which of the addition is invariant, we might need to swap\n+    // the arguments\n+    if (L.isLoopInvariant(LV) && !L.isLoopInvariant(C1))\n+      std::swap(LV, C1);\n+    InvOp = Instruction::Sub;\n+    ResultOp = Instruction::Add;\n+  } else if (match(&I, m_Sub(m_OneUse(m_Instruction(\n+                                 BO, m_Sub(m_Value(LV), m_Value(C1)))),\n+                             m_Value(C2)))) {\n+    // Case 2.\n+    InvOp = Instruction::Add;\n+    ResultOp = Instruction::Sub;\n+  } else if (match(&I, m_c_Add(m_OneUse(m_Instruction(\n+                                   BO, m_Sub(m_Value(LV), m_Value(C1)))),\n+                               m_Value(C2)))) {\n+    // Case 3.\n+    //\n+    // We use (C2 - C1) as the invariant as opposed to case 1, but instead of\n+    // adding a special case in invariant creation, we can just swap the\n+    // operands here.\n+    std::swap(C1, C2);\n+    InvOp = Instruction::Sub;\n+    ResultOp = Instruction::Add;\n+  } else {\n+    return false;\n+  }\n+\n+  if (L.isLoopInvariant(LV) || !L.isLoopInvariant(C1) || !L.isLoopInvariant(C2))\n+    return false;\n+\n+  auto *Preheader = L.getLoopPreheader();\n+  assert(Preheader && \"Loop is not in simplify form?\");\n+\n+  IRBuilder<> Builder(Preheader->getTerminator());\n+  auto *Inv = Builder.CreateBinOp(InvOp, C1, C2, \"invariant.op\");\n+\n+  auto *NewBO = BinaryOperator::Create(ResultOp, LV, Inv,\n+                                       I.getName() + \".reass\", I.getIterator());\n+  NewBO->setDebugLoc(DebugLoc::getDropped());\n+\n+  // No overflow flags are set on the new instructions -- reassociation\n+  // involving sub does not preserve nsw/nuw in general.\n+\n+  I.replaceAllUsesWith(NewBO);\n+  eraseInstruction(I, SafetyInfo, MSSAU);\n+\n+  salvageDebugInfo(*BO);\n+  eraseInstruction(*BO, SafetyInfo, MSSAU);\n+\n+  return true;\n+}\n+\n static bool hoistArithmetics(Instruction &I, Loop &L,\n                              ICFLoopSafetyInfo &SafetyInfo,\n                              MemorySSAUpdater &MSSAU, AssumptionCache *AC,\n@@ -2970,6 +3056,12 @@ static bool hoistArithmetics(Instruction &I, Loop &L,\n     return true;\n   }\n \n+  if (hoistSubAddAssociation(I, L, SafetyInfo, MSSAU, AC, DT)) {\n+    ++NumHoisted;\n+    ++NumBOAssociationsHoisted;\n+    return true;\n+  }\n+\n   return false;\n }\n \n",
+  "components": [
+    "LICM"
+  ],
+  "description": "While `sub` is not associative, we can still reassociate `add` and `sub`.\r\n\r\n## Alive2 proofs\r\n\r\n| Case | Transform | Proof |\r\n|------|-----------|-------|\r\n| 1 | `(x + c1) - c2` => `x + (c1 - c2)` | [proof](https://alive2.llvm.org/ce/z/iofzYy) |\r\n| 2 | `(x - c1) - c2` => `x - (c1 + c2)` | [proof](https://alive2.llvm.org/ce/z/U4K_tE) |\r\n| 3 | `(x - c1) + c2` => `x + (c2 - c1)` | [proof](https://alive2.llvm.org/ce/z/moiJVw) |",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LICM/hoist-binop.ll",
+      "commands": [
+        "opt -S -passes=licm < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sub_add_comm",
+          "test_body": "define void @sub_add_comm(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 0, %entry ], [ %index.next, %loop ]\n  %step.sub = sub i64 %index, %c1\n  %index.next = add i64 %c2, %step.sub\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "sub_sub_two_uses",
+          "test_body": "define void @sub_sub_two_uses(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 1000, %entry ], [ %index.next, %loop ]\n  %step.sub = sub i64 %index, %c1\n  call void @use(i64 %step.sub)\n  %index.next = sub i64 %step.sub, %c2\n  br label %loop\n}\n\ndeclare void @use()\n"
+        },
+        {
+          "test_name": "add_sub",
+          "test_body": "define void @add_sub(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 0, %entry ], [ %index.next, %loop ]\n  %step.add = add i64 %index, %c1\n  %index.next = sub i64 %step.add, %c2\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "add_sub_comm",
+          "test_body": "define void @add_sub_comm(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 0, %entry ], [ %index.next, %loop ]\n  %step.add = add i64 %c1, %index\n  %index.next = sub i64 %step.add, %c2\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "sub_sub",
+          "test_body": "define void @sub_sub(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 0, %entry ], [ %index.next, %loop ]\n  %step.add = sub i64 %index, %c1\n  %index.next = sub i64 %step.add, %c2\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "sub_sub_drop_flags",
+          "test_body": "define void @sub_sub_drop_flags(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 1000, %entry ], [ %index.next, %loop ]\n  %step.sub = sub nuw nsw i64 %index, %c1\n  %index.next = sub nuw nsw i64 %step.sub, %c2\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "sub_sub_variant_rhs_neg",
+          "test_body": "define void @sub_sub_variant_rhs_neg(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 0, %entry ], [ %index.next, %loop ]\n  %step.sub = sub i64 %index, %c1\n  %index.next = sub i64 %c2, %step.sub\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "sub_add",
+          "test_body": "define void @sub_add(i64 %c1, i64 %c2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %index = phi i64 [ 0, %entry ], [ %index.next, %loop ]\n  %step.sub = sub i64 %index, %c1\n  %index.next = add i64 %step.sub, %c2\n  br label %loop\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "SavchenkoValeriy",
+      "body": "> LGTM\r\n> \r\n> There is a regression on llvm-opt-benchmark that may be worth a look.\r\n\r\n@nikic great catch! I missed it.\r\n\r\nI looked into it a bit and at least for that case I can minimize it to this:\r\n```llvm\r\ndeclare ptr @memchr(ptr, i32, i64)\r\n\r\ndefine i64 @test(i64 %n) {\r\nentry:\r\n  %guard = icmp eq i64 %n, 0\r\n  br i1 %guard, label %exit, label %loop\r\n\r\nloop:\r\n  %iv = phi i64 [ 1, %entry ], [ %next, %body ]\r\n  %sub = sub nuw i64 %iv, %n\r\n  %len = add i64 %sub, 1\r\n  %len.zero = icmp eq i64 %len, 0\r\n  br i1 %len.zero, label %exit, label %body\r\n\r\nbody:\r\n  %p = call ptr @memchr(ptr null, i32 0, i64 %len)\r\n  %next = ptrtoint ptr %p to i64\r\n  br label %loop\r\n\r\nexit:\r\n  ret i64 0\r\n}\r\n```\r\n\r\nThe main problem is that we reassociate `(A - B) + C` into `A + (C - B)` and `A - B` has `nuw` giving us a good foundation for range-based reasoning. In the new expression, we can't generally infer the same flags and, thus, lose this opportunity further down the line.\r\n\r\nI tried to experiment with inference of ranges for the original expression so that I can potentially attach it as `!range` to the new expression, but it didn't quite work this way.\r\n\r\nWhat do you think we should do about it? Thanks!"
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "@nikic a gentle ping"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-24T15:47:32Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/LICM.cpp": [
+      [
+        2927,
+        2932
+      ],
+      [
+        2970,
+        2975
+      ]
+    ],
+    "llvm/test/Transforms/LICM/hoist-binop.ll": [
+      [
+        475,
+        489
+      ],
+      [
+        929,
+        932
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/LICM.cpp": [
+      "hoistArithmetics",
+      "hoistBOAssociation"
+    ],
+    "llvm/test/Transforms/LICM/hoist-binop.ll": [
+      "hoist"
+    ]
+  }
+}

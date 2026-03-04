@@ -1,0 +1,171 @@
+{
+  "pr_id": 181615,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181615",
+  "state": "open",
+  "title": "[DSE] Add variant of conditions implying value established by all predecessors",
+  "author": "antoniofrighetto",
+  "base_commit": "4f92cf9599c4077c08b7fac0a21624e55da572f9",
+  "fix_commit": "b77ddd771c724f2c04bf08883ab0af22e898136d",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\nindex b0a8d86a46578..223d873573570 100644\n--- a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n@@ -1109,9 +1109,11 @@ struct DSEState {\n   /// try folding it into a call to calloc.\n   bool tryFoldIntoCalloc(MemoryDef *Def, const Value *DefUO);\n \n-  // Check if there is a dominating condition, that implies that the value\n-  // being stored in a ptr is already present in the ptr.\n-  bool dominatingConditionImpliesValue(MemoryDef *Def);\n+  // If there is a dominating condition that implies the value being stored in a\n+  // pointer, and such a condition appears either in its idom or in a node that\n+  // strictly dominates the store, then the store may be redundant as long as\n+  // no write occurs in between.\n+  bool dominatingConditionOrPredsImplyValue(StoreInst *SI, MemoryDef *Def);\n \n   /// \\returns true if \\p Def is a no-op store, either because it\n   /// directly stores back a loaded value or stores zero to a calloced object.\n@@ -2245,53 +2247,104 @@ bool DSEState::tryFoldIntoCalloc(MemoryDef *Def, const Value *DefUO) {\n   return true;\n }\n \n-bool DSEState::dominatingConditionImpliesValue(MemoryDef *Def) {\n-  auto *StoreI = cast<StoreInst>(Def->getMemoryInst());\n-  BasicBlock *StoreBB = StoreI->getParent();\n-  Value *StorePtr = StoreI->getPointerOperand();\n-  Value *StoreVal = StoreI->getValueOperand();\n+bool DSEState::dominatingConditionOrPredsImplyValue(StoreInst *SI,\n+                                                    MemoryDef *Def) {\n+  BasicBlock *StoreBB = SI->getParent();\n+  Value *StorePtr = SI->getPointerOperand();\n+  Value *StoreVal = SI->getValueOperand();\n \n-  DomTreeNode *IDom = DT.getNode(StoreBB)->getIDom();\n-  if (!IDom)\n-    return false;\n+  auto MatchCondition = [&](BasicBlock *BB)\n+      -> std::optional<std::pair<BasicBlock *, Instruction *>> {\n+    auto *BI = dyn_cast<BranchInst>(BB->getTerminator());\n+    if (!BI || !BI->isConditional())\n+      return std::nullopt;\n \n-  auto *BI = dyn_cast<BranchInst>(IDom->getBlock()->getTerminator());\n-  if (!BI || !BI->isConditional())\n-    return false;\n+    // In case both blocks are the same, it is not possible to determine\n+    // if optimization is possible. (We would not want to optimize a store\n+    // in the FalseBB if condition is true and vice versa.)\n+    if (BI->getSuccessor(0) == BI->getSuccessor(1))\n+      return std::nullopt;\n \n-  // In case both blocks are the same, it is not possible to determine\n-  // if optimization is possible. (We would not want to optimize a store\n-  // in the FalseBB if condition is true and vice versa.)\n-  if (BI->getSuccessor(0) == BI->getSuccessor(1))\n-    return false;\n+    Instruction *ICmpL;\n+    CmpPredicate Pred;\n+    if (!match(BI->getCondition(),\n+               m_c_ICmp(Pred,\n+                        m_CombineAnd(m_Load(m_Specific(StorePtr)),\n+                                     m_Instruction(ICmpL)),\n+                        m_Specific(StoreVal))) ||\n+        !ICmpInst::isEquality(Pred))\n+      return std::nullopt;\n \n-  Instruction *ICmpL;\n-  CmpPredicate Pred;\n-  if (!match(BI->getCondition(),\n-             m_c_ICmp(Pred,\n-                      m_CombineAnd(m_Load(m_Specific(StorePtr)),\n-                                   m_Instruction(ICmpL)),\n-                      m_Specific(StoreVal))) ||\n-      !ICmpInst::isEquality(Pred))\n-    return false;\n+    unsigned ImpliedIdx = (Pred == ICmpInst::ICMP_EQ) ? 0 : 1;\n+    return {{BI->getSuccessor(ImpliedIdx), ICmpL}};\n+  };\n+\n+  // Walk up the dominator tree looking for dominating conditions, up to limit.\n+  static constexpr unsigned Limit = 4;\n+  BasicBlock *Node = StoreBB;\n+  for (unsigned Depth = 0; Depth < Limit; ++Depth) {\n+    DomTreeNode *IDomNode = DT.getNode(Node)->getIDom();\n+    if (!IDomNode)\n+      break;\n+    Node = IDomNode->getBlock();\n+\n+    auto Match = MatchCondition(Node);\n+    if (!Match)\n+      continue;\n+\n+    const auto &[ImpliedSucc, LI] = *Match;\n+    if (!DT.dominates(BasicBlockEdge(Node, ImpliedSucc), StoreBB))\n+      continue;\n+\n+    // Found a dominating condition. Make sure there does not exist any\n+    // clobbering access between the load and the potential redundant store.\n+    MemoryAccess *LoadAcc = MSSA.getMemoryAccess(LI);\n+    MemoryAccess *ClobAcc =\n+        MSSA.getSkipSelfWalker()->getClobberingMemoryAccess(Def, BatchAA);\n \n-  // In case the else blocks also branches to the if block or the other way\n-  // around it is not possible to determine if the optimization is possible.\n-  if (Pred == ICmpInst::ICMP_EQ &&\n-      !DT.dominates(BasicBlockEdge(BI->getParent(), BI->getSuccessor(0)),\n-                    StoreBB))\n+    if (MSSA.dominates(ClobAcc, LoadAcc))\n+      return true;\n+    break;\n+  }\n+\n+  // If we haven't found any dominating condition, try evaluating whether all\n+  // the predecessors establish a condition implying the value being stored.\n+  unsigned NumPreds = pred_size(StoreBB);\n+  if (NumPreds < 2 || NumPreds > 4)\n     return false;\n \n-  if (Pred == ICmpInst::ICMP_NE &&\n-      !DT.dominates(BasicBlockEdge(BI->getParent(), BI->getSuccessor(1)),\n-                    StoreBB))\n+  SmallDenseMap<BasicBlock *, Instruction *, 4> PredToLoad;\n+  for (BasicBlock *PredBB : predecessors(StoreBB)) {\n+    auto Match = MatchCondition(PredBB);\n+    if (!Match)\n+      return false;\n+\n+    const auto &[ImpliedSucc, LI] = *Match;\n+    if (ImpliedSucc != StoreBB)\n+      return false;\n+\n+    PredToLoad[PredBB] = LI;\n+  }\n+  assert(PredToLoad.size() == NumPreds);\n+\n+  // If we are not merging the memory reads from the predecessors, the memory\n+  // location may be clobbered.\n+  auto *MPhi = dyn_cast<MemoryPhi>(Def->getDefiningAccess());\n+  if (!MPhi || MPhi->getBlock() != StoreBB)\n     return false;\n \n-  MemoryAccess *LoadAcc = MSSA.getMemoryAccess(ICmpL);\n-  MemoryAccess *ClobAcc =\n-      MSSA.getSkipSelfWalker()->getClobberingMemoryAccess(Def, BatchAA);\n+  MemoryLocation StoreLoc = MemoryLocation::get(SI);\n+  for (unsigned I = 0; I < MPhi->getNumIncomingValues(); ++I) {\n+    MemoryAccess *LoadAccess =\n+        MSSA.getMemoryAccess(PredToLoad[MPhi->getIncomingBlock(I)]);\n+    MemoryAccess *ClobberingAccess =\n+        MSSA.getWalker()->getClobberingMemoryAccess(MPhi->getIncomingValue(I),\n+                                                    StoreLoc, BatchAA);\n+    if (!MSSA.dominates(ClobberingAccess, LoadAccess))\n+      return false;\n+  }\n \n-  return MSSA.dominates(ClobAcc, LoadAcc);\n+  return true;\n }\n \n bool DSEState::storeIsNoop(MemoryDef *Def, const Value *DefUO) {\n@@ -2322,7 +2375,7 @@ bool DSEState::storeIsNoop(MemoryDef *Def, const Value *DefUO) {\n   if (!Store)\n     return false;\n \n-  if (dominatingConditionImpliesValue(Def))\n+  if (dominatingConditionOrPredsImplyValue(Store, Def))\n     return true;\n \n   if (auto *LoadI = dyn_cast<LoadInst>(Store->getOperand(0))) {\n",
+  "components": [
+    "DeadStoreElimination"
+  ],
+  "description": "Following up on https://github.com/llvm/llvm-project/pull/181709, extend `dominatingConditionImpliesValue` to take into account the variant where conditions implying the value being stored are established by all the predecessors.\r\n\r\nFixes: https://github.com/llvm/llvm-project/issues/86920.\r\n\r\nRebased over: https://github.com/llvm/llvm-project/pull/181709.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/DeadStoreElimination/noop-stores.ll",
+      "commands": [
+        "opt < %s -aa-pipeline=basic-aa -passes='dse,verify<memoryssa>' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "zero_memset_after_malloc",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndeclare noalias ptr @malloc(i64)\n\ndefine ptr @zero_memset_after_malloc(i64 %size) {\n  %call = call ptr @malloc(i64 %size) #1\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %size, i1 false)\n  ret ptr %call\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "zero_memset_after_calloc_inaccessiblememonly",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\n; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare ptr @calloc(i64, i64) #1\n\ndefine ptr @zero_memset_after_calloc_inaccessiblememonly() {\n  %call = tail call ptr @calloc(i64 10000, i64 4) #1\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 40000, i1 false)\n  ret ptr %call\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "remove_tautological_store_block_not_idom",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndefine void @remove_tautological_store_block_not_idom(ptr %x, i1 %c) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %then, label %end\n\nthen:                                             ; preds = %entry\n  br i1 %c, label %if.eq, label %if.else\n\nif.eq:                                            ; preds = %then\n  br label %join\n\nif.else:                                          ; preds = %then\n  br label %join\n\njoin:                                             ; preds = %if.else, %if.eq\n  br label %inner\n\ninner:                                            ; preds = %join\n  store i32 0, ptr %x, align 4\n  br label %end\n\nend:                                              ; preds = %inner, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "remove_tautological_store_not_idom_no_edge_domination",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndefine void @remove_tautological_store_not_idom_no_edge_domination(ptr %x) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %if.eq, label %if.else\n\nif.eq:                                            ; preds = %entry\n  br label %join\n\nif.else:                                          ; preds = %entry\n  br label %join\n\njoin:                                             ; preds = %if.else, %if.eq\n  br label %inner\n\ninner:                                            ; preds = %join\n  store i32 0, ptr %x, align 4\n  br label %end\n\nend:                                              ; preds = %inner\n  ret void\n}\n"
+        },
+        {
+          "test_name": "remove_tautological_store_block_not_idom_clobber_between",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndeclare void @unkown_write(ptr)\n\ndefine void @remove_tautological_store_block_not_idom_clobber_between(ptr %x, i1 %c) {\nentry:\n  %val = load i32, ptr %x, align 4\n  %cmp = icmp eq i32 %val, 0\n  br i1 %cmp, label %if.eq, label %end\n\nif.eq:                                            ; preds = %entry\n  br label %next\n\nnext:                                             ; preds = %if.eq\n  call void @unkown_write(ptr %x)\n  br i1 %c, label %inner, label %end\n\ninner:                                            ; preds = %next\n  store i32 0, ptr %x, align 4\n  br label %end\n\nend:                                              ; preds = %inner, %next, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "remove_tautological_store_multi_preds",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndeclare void @unkown_write(ptr)\n\ndefine void @remove_tautological_store_multi_preds(ptr %p) {\nentry:\n  %l1 = load i32, ptr %p, align 4\n  %cmp1 = icmp eq i32 %l1, 0\n  br i1 %cmp1, label %then, label %else\n\nelse:                                             ; preds = %entry\n  call void @unkown_write(ptr null)\n  %l2 = load i32, ptr %p, align 4\n  %cmp2 = icmp eq i32 %l2, 0\n  br i1 %cmp2, label %then, label %exit\n\nthen:                                             ; preds = %else, %entry\n  store i32 0, ptr %p, align 4\n  br label %exit\n\nexit:                                             ; preds = %then, %else\n  ret void\n}\n"
+        },
+        {
+          "test_name": "malloc_with_no_nointer_null_check",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndeclare noalias ptr @malloc(i64)\n\ndefine ptr @malloc_with_no_nointer_null_check(i64 %0, i32 %1) {\nentry:\n  %call = call ptr @malloc(i64 %0) #1\n  %a = and i32 %1, 32\n  %cmp = icmp eq i32 %a, 0\n  br i1 %cmp, label %cleanup, label %if.end\n\nif.end:                                           ; preds = %entry\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %0, i1 false)\n  br label %cleanup\n\ncleanup:                                          ; preds = %if.end, %entry\n  ret ptr %call\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "remove_tautological_store_multi_preds_cond_mixed",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndefine void @remove_tautological_store_multi_preds_cond_mixed(ptr %p) {\nentry:\n  %l1 = load i32, ptr %p, align 4\n  %cmp1 = icmp eq i32 %l1, 0\n  br i1 %cmp1, label %then, label %else\n\nelse:                                             ; preds = %entry\n  %l2 = load i32, ptr %p, align 4\n  %cmp2 = icmp ne i32 %l2, 0\n  br i1 %cmp2, label %then, label %exit\n\nthen:                                             ; preds = %else, %entry\n  store i32 0, ptr %p, align 4\n  br label %exit\n\nexit:                                             ; preds = %then, %else\n  ret void\n}\n"
+        },
+        {
+          "test_name": "notmalloc_memset",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndefine ptr @notmalloc_memset(i64 %size, ptr %notmalloc) {\n  %call1 = call ptr %notmalloc(i64 %size)\n  call void @llvm.memset.p0.i64(ptr %call1, i8 0, i64 %size, i1 false)\n  ret ptr %call1\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\n"
+        },
+        {
+          "test_name": "customalloc_memset",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndefine ptr @customalloc_memset(i64 %size, i64 %align) {\n  %call = call ptr @customalloc(i64 %size, i64 %align)\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %size, i1 false)\n  ret ptr %call\n}\n\n; Function Attrs: allockind(\"alloc\")\ndeclare ptr @customalloc(i64, i64) #1\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { allockind(\"alloc\") \"alloc-family\"=\"customalloc\" \"alloc-variant-zeroed\"=\"customalloc_zeroed\" }\n"
+        },
+        {
+          "test_name": "customalloc_memset_custom_cc",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndefine cc99 ptr @customalloc_memset_custom_cc(i64 %size, i64 %align) {\n  %call = call cc99 ptr @customalloc_custom_cc(i64 %size, i64 %align)\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %size, i1 false)\n  ret ptr %call\n}\n\n; Function Attrs: allockind(\"alloc\")\ndeclare cc99 ptr @customalloc_custom_cc(i64, i64) #1\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { allockind(\"alloc\") \"alloc-family\"=\"customalloc_custom_cc\" \"alloc-variant-zeroed\"=\"customalloc_zeroed_custom_cc\" }\n"
+        },
+        {
+          "test_name": "remove_tautological_store_multi_preds_clobbering_between",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndefine void @remove_tautological_store_multi_preds_clobbering_between(ptr %p) {\nentry:\n  %l1 = load i32, ptr %p, align 4\n  store i32 1, ptr %p, align 4\n  %cmp1 = icmp eq i32 %l1, 0\n  br i1 %cmp1, label %then, label %else\n\nelse:                                             ; preds = %entry\n  %l2 = load i32, ptr %p, align 4\n  %cmp2 = icmp eq i32 %l2, 0\n  br i1 %cmp2, label %then, label %exit\n\nthen:                                             ; preds = %else, %entry\n  store i32 0, ptr %p, align 4\n  br label %exit\n\nexit:                                             ; preds = %then, %else\n  ret void\n}\n"
+        },
+        {
+          "test_name": "zero_memset_after_malloc_with_intermediate_clobbering",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndeclare noalias ptr @malloc(i64)\n\ndeclare void @clobber_memory(ptr)\n\ndefine ptr @zero_memset_after_malloc_with_intermediate_clobbering(i64 %size) {\n  %call = call ptr @malloc(i64 %size) #1\n  call void @clobber_memory(ptr %call)\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %size, i1 false)\n  ret ptr %call\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "zero_memset_after_malloc_with_different_sizes",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndeclare noalias ptr @malloc(i64)\n\ndefine ptr @zero_memset_after_malloc_with_different_sizes(i64 %size) {\n  %call = call ptr @malloc(i64 %size) #1\n  %size2 = add nsw i64 %size, -1\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %size2, i1 false)\n  ret ptr %call\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "store_zero_after_calloc_inaccessiblememonly",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare ptr @calloc(i64, i64) #0\n\ndefine ptr @store_zero_after_calloc_inaccessiblememonly() {\n  %call = tail call ptr @calloc(i64 1, i64 10) #0\n  store i8 0, ptr %call, align 1\n  ret ptr %call\n}\n\nattributes #0 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "partial_zero_memset_and_store_with_dyn_index_after_calloc",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\n; Function Attrs: memory(inaccessiblemem: readwrite)\ndeclare ptr @calloc(i64, i64) #1\n\ndefine ptr @partial_zero_memset_and_store_with_dyn_index_after_calloc(i8 %v, i64 %idx) {\n  %call = tail call ptr @calloc(i64 10000, i64 4)\n  %gep = getelementptr inbounds i8, ptr %call, i64 %idx\n  store i8 %v, ptr %gep, align 1\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 20, i1 false)\n  ret ptr %call\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "remove_tautological_store_multi_preds_clobbering_between_2",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndeclare void @unkown_write(ptr)\n\ndefine void @remove_tautological_store_multi_preds_clobbering_between_2(ptr %p) {\nentry:\n  %l1 = load i32, ptr %p, align 4\n  %cmp1 = icmp eq i32 %l1, 0\n  br i1 %cmp1, label %then, label %else\n\nelse:                                             ; preds = %entry\n  %l2 = load i32, ptr %p, align 4\n  %cmp2 = icmp eq i32 %l2, 0\n  br i1 %cmp2, label %then, label %exit\n\nthen:                                             ; preds = %else, %entry\n  call void @unkown_write(ptr %p)\n  store i32 0, ptr %p, align 4\n  br label %exit\n\nexit:                                             ; preds = %then, %else\n  ret void\n}\n"
+        },
+        {
+          "test_name": "readnone_malloc",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndeclare noalias ptr @malloc(i64)\n\ndefine ptr @readnone_malloc() {\n  %alloc = call ptr @malloc(i64 16) #1\n  call void @llvm.memset.p0.i64(ptr %alloc, i8 0, i64 16, i1 false)\n  ret ptr %alloc\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "antoniofrighetto",
+      "body": "> A high level concern I have here is that the current implementation is a bit of a hack, because it only supports an idom comparison.\r\n\r\nThanks, admittedly, I second we are adding a special-case (predecessors) on top of an already sort of ad-hoc strategy (idom-only). \r\n\r\n> The principled thing to do would be to take into account all dominating conditions.\r\n\r\nThat would imply: for each predecessors, walk up the dom tree and collect dominating conditions, correct? (Otherwise we wouldn't be covering #86920)."
+    },
+    {
+      "author": "antoniofrighetto",
+      "body": "> > The principled thing to do would be to take into account all dominating conditions.\r\n> \r\n> That would imply: for each predecessors, walk up the dom tree and collect dominating conditions, correct? (Otherwise we wouldn't be covering #86920).\r\n\r\nOh, I think I see that now: add the variant for the predecessors on top of taking into account all the dominating conditions.\r\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-16T09:05:06Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+      [
+        1109,
+        1117
+      ],
+      [
+        2245,
+        2297
+      ],
+      [
+        2322,
+        2328
+      ]
+    ],
+    "llvm/test/Transforms/DeadStoreElimination/noop-stores.ll": [
+      [
+        325,
+        331
+      ],
+      [
+        339,
+        345
+      ],
+      [
+        376,
+        384
+      ],
+      [
+        390,
+        398
+      ],
+      [
+        482,
+        488
+      ],
+      [
+        507,
+        513
+      ],
+      [
+        600,
+        606
+      ],
+      [
+        696,
+        702
+      ],
+      [
+        1179,
+        1181
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+      "DSEState::dominatingConditionImpliesValue",
+      "DSEState::storeIsNoop",
+      "DSEState::tryFoldIntoCalloc"
+    ]
+  }
+}

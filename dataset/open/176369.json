@@ -1,0 +1,276 @@
+{
+  "pr_id": 176369,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176369",
+  "state": "open",
+  "title": "[DA] Remove calls to monotonicity checks and `-da-enable-monotonicity-check` flag",
+  "author": "kasuga-fj",
+  "base_commit": "13d2124605579c8886f1d8ae5f1b5c7bdf41064d",
+  "fix_commit": "1a60eb1ad054a67f28adb35eeb78e1572cc9cec0",
+  "patch": "diff --git a/llvm/lib/Analysis/DependenceAnalysis.cpp b/llvm/lib/Analysis/DependenceAnalysis.cpp\nindex c2c6ad0b1a8c4..3cc7d279161f6 100644\n--- a/llvm/lib/Analysis/DependenceAnalysis.cpp\n+++ b/llvm/lib/Analysis/DependenceAnalysis.cpp\n@@ -155,13 +155,6 @@ static cl::opt<DependenceTestType> EnableDependenceTest(\n                clEnumValN(DependenceTestType::BanerjeeMIV, \"banerjee-miv\",\n                           \"Enable only Banerjee MIV test.\")));\n \n-// TODO: This flag is disabled by default because it is still under development.\n-// Enable it or delete this flag when the feature is ready.\n-static cl::opt<bool> EnableMonotonicityCheck(\n-    \"da-enable-monotonicity-check\", cl::init(false), cl::Hidden,\n-    cl::desc(\"Check if the subscripts are monotonic. If it's not, dependence \"\n-             \"is reported as unknown.\"));\n-\n static cl::opt<bool> DumpMonotonicityReport(\n     \"da-dump-monotonicity-report\", cl::init(false), cl::Hidden,\n     cl::desc(\n@@ -330,11 +323,9 @@ struct SCEVMonotonicityChecker\n   /// Check the monotonicity of \\p Expr over \\p Domain. \\p Expr must be integer\n   /// type. If \\p OutermostLoop is not null, \\p Expr must be defined in \\p\n   /// OutermostLoop or one of its nested loops.\n-  /// TODO: The default value of \\p Domain is temporary. Drop it once all the\n-  /// calls are updated.\n-  SCEVMonotonicity checkMonotonicity(\n-      const SCEV *Expr, const Loop *OutermostLoop,\n-      SCEVMonotonicityDomain Domain = SCEVMonotonicityDomain::Effective);\n+  SCEVMonotonicity checkMonotonicity(const SCEV *Expr,\n+                                     const Loop *OutermostLoop,\n+                                     SCEVMonotonicityDomain Domain);\n \n private:\n   ScalarEvolution *SE;\n@@ -3367,19 +3358,10 @@ bool DependenceInfo::tryDelinearize(Instruction *Src, Instruction *Dst,\n   // resize Pair to contain as many pairs of subscripts as the delinearization\n   // has found, and then initialize the pairs following the delinearization.\n   Pair.resize(Size);\n-  SCEVMonotonicityChecker MonChecker(SE);\n-  const Loop *OutermostLoop = SrcLoop ? SrcLoop->getOutermostLoop() : nullptr;\n   for (int I = 0; I < Size; ++I) {\n     Pair[I].Src = SrcSubscripts[I];\n     Pair[I].Dst = DstSubscripts[I];\n     unifySubscriptType(&Pair[I]);\n-\n-    if (EnableMonotonicityCheck) {\n-      if (MonChecker.checkMonotonicity(Pair[I].Src, OutermostLoop).isUnknown())\n-        return false;\n-      if (MonChecker.checkMonotonicity(Pair[I].Dst, OutermostLoop).isUnknown())\n-        return false;\n-    }\n   }\n \n   return true;\n@@ -3639,14 +3621,6 @@ DependenceInfo::depends(Instruction *Src, Instruction *Dst,\n   Pair[0].Src = SrcEv;\n   Pair[0].Dst = DstEv;\n \n-  SCEVMonotonicityChecker MonChecker(SE);\n-  const Loop *OutermostLoop = SrcLoop ? SrcLoop->getOutermostLoop() : nullptr;\n-  if (EnableMonotonicityCheck)\n-    if (MonChecker.checkMonotonicity(Pair[0].Src, OutermostLoop).isUnknown() ||\n-        MonChecker.checkMonotonicity(Pair[0].Dst, OutermostLoop).isUnknown())\n-      return std::make_unique<Dependence>(Src, Dst,\n-                                          SCEVUnionPredicate(Assume, *SE));\n-\n   if (Delinearize) {\n     if (tryDelinearize(Src, Dst, Pair)) {\n       LLVM_DEBUG(dbgs() << \"    delinearized\\n\");\n",
+  "components": [
+    "DependenceAnalysis"
+  ],
+  "description": "In #162280, monotonicity checks were injected before any dependence tests. However, it's preferable to check monotonicity within each dependence test, since different dependence tests may have different requirements for monotonicity. It will result in duplicated monotonicity checks across different tests, but that should be acceptable because the checks are basically inexpensive.\r\n\r\nTo do this, #176371 will add a new function, `isMonotonic`, which is intended to be called from within dependence tests. As a preparation for that, this patch removes the existing calls to monotonicity-check calls and the flag `--da-enable-monotonicity-check`, which controlled whether to perform monotonicity checks. As the default value of the flag was `false`, this change doesn't affect the current behavior.",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/DependenceAnalysis/monotonicity-cast.ll",
+      "commands": [
+        "opt < %s -disable-output -passes=\"print<da>\" -da-dump-monotonicity-report 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "zext_cross_zero",
+          "test_body": "define void @zext_cross_zero(ptr %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i8 [ -1, %entry ], [ %i.inc, %loop ]\n  %offset.zext = zext nneg i8 %i to i64\n  %idx = getelementptr i8, ptr %a, i64 %offset.zext\n  store i8 0, ptr %idx, align 1\n  %i.inc = add nsw i8 %i, 1\n  %exitcond = icmp eq i8 %i.inc, 100\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "offset_truncated_to_i1",
+          "test_body": "define void @offset_truncated_to_i1(ptr %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop ]\n  %and = and i64 %i, 1\n  %idx = getelementptr inbounds i8, ptr %a, i64 %and\n  store i8 0, ptr %idx, align 1\n  %i.inc = add nsw i64 %i, 1\n  %exitcond = icmp eq i64 %i.inc, 100\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "sext_may_wrap",
+          "test_body": "define void @sext_may_wrap(ptr %a, i8 %start, i8 %step) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop ]\n  %offset = phi i8 [ %start, %entry ], [ %offset.next, %loop ]\n  %offset.sext = sext i8 %offset to i64\n  %idx = getelementptr i8, ptr %a, i64 %offset.sext\n  store i8 0, ptr %idx, align 1\n  %i.inc = add nsw i64 %i, 1\n  %offset.next = add i8 %offset, %step\n  %exitcond = icmp eq i64 %i.inc, 100\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "zext_nneg_nsw",
+          "test_body": "define void @zext_nneg_nsw(ptr %a, i8 %step) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop ]\n  %offset = phi i8 [ 0, %entry ], [ %offset.next, %loop ]\n  %offset.zext = zext nneg i8 %offset to i64\n  %idx = getelementptr i8, ptr %a, i64 %offset.zext\n  store i8 0, ptr %idx, align 1\n  %i.inc = add nsw i64 %i, 1\n  %offset.next = add nsw i8 %offset, %step\n  %exitcond = icmp eq i64 %i.inc, 100\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Analysis/DependenceAnalysis/monotonicity-delinearize.ll",
+      "commands": [
+        "opt < %s -disable-output -passes=\"print<da>\" -da-dump-monotonicity-report 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "linearized_offset_wrap",
+          "test_body": "define void @linearized_offset_wrap(ptr %a) {\nentry:\n  br label %loop.i.header\n\nloop.i.header:                                    ; preds = %loop.i.latch, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop.i.latch ]\n  br label %loop.j.header\n\nloop.j.header:                                    ; preds = %loop.j.latch, %loop.i.header\n  %j = phi i64 [ 0, %loop.i.header ], [ %j.inc, %loop.j.latch ]\n  %cond = icmp slt i64 %i, 144115188075855872\n  br i1 %cond, label %if.then, label %loop.j.latch\n\nif.then:                                          ; preds = %loop.j.header\n  %gep = getelementptr inbounds [32 x i8], ptr %a, i64 %i, i64 %j\n  store i8 0, ptr %gep, align 1\n  br label %loop.j.latch\n\nloop.j.latch:                                     ; preds = %if.then, %loop.j.header\n  %j.inc = add nuw nsw i64 %j, 1\n  %ec.j = icmp eq i64 %j.inc, 32\n  br i1 %ec.j, label %loop.i.latch, label %loop.j.header\n\nloop.i.latch:                                     ; preds = %loop.j.latch\n  %i.inc = add nuw nsw i64 %i, 1\n  %ec.i = icmp eq i64 %i.inc, 4611686018427387904\n  br i1 %ec.i, label %exit, label %loop.i.header\n\nexit:                                             ; preds = %loop.i.latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Analysis/DependenceAnalysis/monotonicity-invariant.ll",
+      "commands": [
+        "opt < %s -disable-output -passes=\"print<da>\" -da-dump-monotonicity-report 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "single_loop_variant",
+          "test_body": "define void @single_loop_variant(ptr %a, i64 %x, i64 %y, i64 %n) {\nentry:\n  %guard = icmp sgt i64 %n, 0\n  br i1 %guard, label %loop, label %exit\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop ]\n  %offset = phi i64 [ %x, %entry ], [ %offset.next, %loop ]\n  %offset.next = phi i64 [ %y, %entry ], [ %offset, %loop ]\n  %idx = getelementptr inbounds i8, ptr %a, i64 %offset\n  store i8 0, ptr %idx, align 1\n  %i.inc = add nsw i64 %i, 1\n  %exitcond = icmp eq i64 %i.inc, %n\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop, %entry\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Analysis/DependenceAnalysis/monotonicity-loop-guard.ll",
+      "commands": [
+        "opt < %s -disable-output -passes=\"print<da>\" -da-dump-monotonicity-report 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\n; for (i = 0; i < INT64_MAX - 1; i++)\n;   if (i < 1000)\n;     for (j = 0; j < 2000; j++)\n;       a[i + j] = 0;\n;\ndefine void @nsw_under_loop_guard0(ptr %a) {\n;\nentry:\n  br label %loop.i.header\n\nloop.i.header:\n  %i = phi i64 [ 0 , %entry ], [ %i.next, %loop.i.latch ]\n  br label %loop.j.pr\n\nloop.j.pr:\n  %guard.j = icmp slt i64 %i, 1000\n  br i1 %guard.j, label %loop.j, label %loop.i.latch\n\nloop.j:\n  %j = phi i64 [ 0, %loop.j.pr ], [ %j.next, %loop.j ]\n  %offset = add nsw i64 %i, %j\n  %idx = getelementptr inbounds i8, ptr %a, i64 %offset\n  store i8 0, ptr %idx\n  %j.next = add nsw i64 %j, 1\n  %ec.j = icmp eq i64 %j.next, 2000\n  br i1 %ec.j, label %loop.i.latch, label %loop.j\n\nloop.i.latch:\n  %i.next = add nsw i64 %i, 1\n  %ec.i = icmp eq i64 %i.next, 9223372036854775807\n  br i1 %ec.i, label %exit, label %loop.i.header\n\nexit:\n  ret void\n}\n\n; for (i = 0; i < INT64_MAX; i++)\n;   if (100 < i)\n;     for (j = 0; j < 100; j++)\n;       a[INT64_MAX - i + j] = 0;\n;\ndefine void @nsw_under_loop_guard1(ptr %a) {\n;\nentry:\n  br label %loop.i.header\n\nloop.i.header:\n  %i = phi i64 [ 0 , %entry ], [ %i.next, %loop.i.latch ]\n  br label %loop.j.pr\n\nloop.j.pr:\n  %guard.j = icmp sgt i64 %i, 100\n  br i1 %guard.j, label %loop.j, label %exit\n\nloop.j:\n  %j = phi i64 [ 0, %loop.j.pr ], [ %j.next, %loop.j ]\n  %val.0 = sub nsw i64 9223372036854775807, %i\n  %val = add nsw i64 %val.0, %j\n  %idx = getelementptr inbounds i8, ptr %a, i64 %val\n  store i8 0, ptr %idx\n  %j.next = add nsw i64 %j, 1\n  %ec.j = icmp eq i64 %j.next, 100\n  br i1 %ec.j, label %loop.i.latch, label %loop.j\n\nloop.i.latch:\n  %i.next = add nsw i64 %i, 1\n  %ec.i = icmp eq i64 %i.next, 9223372036854775807\n  br i1 %ec.i, label %exit, label %loop.i.header\n\nexit:\n  ret void\n}\n\n; for (i = 0; i < n; i++)\n;   if (i < m)\n;     for (j = 0; j < k; j++)\n;       a[i + j] = 0;\n;\ndefine void @nsw_under_loop_guard2(ptr %a, i64 %n, i64 %m, i64 %k) {\n;\nentry:\n  br label %loop.i.header\n\nloop.i.header:\n  %i = phi i64 [ 0 , %entry ], [ %i.next, %loop.i.latch ]\n  br label %loop.j.pr\n\nloop.j.pr:\n  %guard.j = icmp slt i64 %i, %m\n  br i1 %guard.j, label %loop.j, label %exit\n\nloop.j:\n  %j = phi i64 [ 0, %loop.j.pr ], [ %j.next, %loop.j ]\n  %val = phi i64 [ %i, %loop.j.pr ], [ %val.next, %loop.j ]\n  %j.next = add nsw i64 %j, 1\n  %idx = getelementptr inbounds i8, ptr %a, i64 %val\n  store i8 0, ptr %idx\n  %val.next = add nsw i64 %val, 1\n  %ec.j = icmp eq i64 %j.next, %k\n  br i1 %ec.j, label %loop.i.latch, label %loop.j\n\nloop.i.latch:\n  %i.next = add nsw i64 %i, 1\n  %ec.i = icmp eq i64 %i.next, %n\n  br i1 %ec.i, label %exit, label %loop.i.header\n\nexit:\n  ret void\n}"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Analysis/DependenceAnalysis/monotonicity-no-wrap-flags.ll",
+      "commands": [
+        "opt < %s -disable-output -passes=\"print<da>\" -da-dump-monotonicity-report 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "single_loop_nuw",
+          "test_body": "define void @single_loop_nuw(ptr %a, i64 %begin, i64 %end) {\nentry:\n  %guard = icmp ult i64 %begin, %end\n  br i1 %guard, label %loop, label %exit\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i64 [ %begin, %entry ], [ %i.inc, %loop ]\n  %idx = getelementptr i8, ptr %a, i64 %i\n  store i8 0, ptr %idx, align 1\n  %i.inc = add nuw i64 %i, 1\n  %exitcond = icmp eq i64 %i.inc, %end\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "conditional_store0",
+          "test_body": "define void @conditional_store0(ptr %a, i64 %n, i64 %m) {\nentry:\n  %guard.i = icmp sgt i64 %n, 0\n  br i1 %guard.i, label %loop.i.header, label %exit\n\nloop.i.header:                                    ; preds = %loop.i.latch, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop.i.latch ]\n  br label %loop.j.preheader\n\nloop.j.preheader:                                 ; preds = %loop.i.header\n  %gurard.j = icmp sgt i64 %m, 0\n  br i1 %gurard.j, label %loop.j.header, label %loop.i.latch\n\nloop.j.header:                                    ; preds = %loop.j.latch, %loop.j.preheader\n  %j = phi i64 [ 0, %loop.j.preheader ], [ %j.inc, %loop.j.latch ]\n  %offset = add nsw i64 %i, %j\n  %cond = freeze i1 poison\n  br i1 %cond, label %if.then, label %loop.j.latch\n\nif.then:                                          ; preds = %loop.j.header\n  %idx = getelementptr inbounds i8, ptr %a, i64 %offset\n  store i8 0, ptr %idx, align 1\n  br label %loop.j.latch\n\nloop.j.latch:                                     ; preds = %if.then, %loop.j.header\n  %j.inc = add nsw i64 %j, 1\n  %exitcond.j = icmp eq i64 %j.inc, %m\n  br i1 %exitcond.j, label %loop.i.latch, label %loop.j.header\n\nloop.i.latch:                                     ; preds = %loop.j.latch, %loop.j.preheader\n  %i.inc = add nsw i64 %i, 1\n  %exitcond.i = icmp eq i64 %i.inc, %n\n  br i1 %exitcond.i, label %exit, label %loop.i.header\n\nexit:                                             ; preds = %loop.i.latch, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "step_is_variant",
+          "test_body": "define void @step_is_variant(ptr %a) {\nentry:\n  br label %loop.i.header\n\nloop.i.header:                                    ; preds = %loop.i.latch, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop.i.latch ]\n  %offset.i = phi i64 [ 0, %entry ], [ %offset.i.next, %loop.i.latch ]\n  %step.i.0 = phi i64 [ 0, %entry ], [ %step.i.1, %loop.i.latch ]\n  %step.i.1 = phi i64 [ 3, %entry ], [ %step.i.0, %loop.i.latch ]\n  br label %loop.j\n\nloop.j:                                           ; preds = %loop.j, %loop.i.header\n  %j = phi i64 [ 0, %loop.i.header ], [ %j.inc, %loop.j ]\n  %offset = add nsw i64 %offset.i, %j\n  %idx = getelementptr inbounds i8, ptr %a, i64 %offset\n  store i8 0, ptr %idx, align 1\n  %j.inc = add nsw i64 %j, 1\n  %exitcond.j = icmp eq i64 %j.inc, 100\n  br i1 %exitcond.j, label %loop.i.latch, label %loop.j\n\nloop.i.latch:                                     ; preds = %loop.j\n  %i.inc = add nsw i64 %i, 1\n  %offset.i.next = add nsw i64 %offset.i, %step.i.0\n  %exitcond.i = icmp eq i64 %i.inc, 100\n  br i1 %exitcond.i, label %exit, label %loop.i.header\n\nexit:                                             ; preds = %loop.i.latch\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nested_loop_nuw",
+          "test_body": "define void @nested_loop_nuw(ptr %a, i64 %begin0, i64 %end0, i64 %begin1, i64 %end1) {\nentry:\n  %guard.i.0 = icmp slt i64 0, %begin0\n  %guard.i.1 = icmp slt i64 %begin0, %end0\n  %guard.i.2 = icmp slt i64 0, %end0\n  %and.i.0 = and i1 %guard.i.0, %guard.i.1\n  %and.i.1 = and i1 %and.i.0, %guard.i.2\n  br i1 %and.i.1, label %loop.i.header, label %exit\n\nloop.i.header:                                    ; preds = %loop.i.latch, %entry\n  %i = phi i64 [ %begin0, %entry ], [ %i.inc, %loop.i.latch ]\n  br label %loop.j.preheader\n\nloop.j.preheader:                                 ; preds = %loop.i.header\n  %guard.j.0 = icmp slt i64 0, %begin1\n  %guard.j.1 = icmp slt i64 %begin1, %end1\n  %guard.j.2 = icmp slt i64 0, %end1\n  %and.j.0 = and i1 %guard.j.0, %guard.j.1\n  %and.j.1 = and i1 %and.j.0, %guard.j.2\n  br i1 %and.j.1, label %loop.j, label %loop.i.latch\n\nloop.j:                                           ; preds = %loop.j, %loop.j.preheader\n  %j = phi i64 [ %begin1, %loop.j.preheader ], [ %j.inc, %loop.j ]\n  %offset = add nuw i64 %i, %j\n  %idx = getelementptr i8, ptr %a, i64 %offset\n  store i8 0, ptr %idx, align 1\n  %j.inc = add nsw i64 %j, 1\n  %exitcond.j = icmp eq i64 %j.inc, %end1\n  br i1 %exitcond.j, label %loop.i.latch, label %loop.j\n\nloop.i.latch:                                     ; preds = %loop.j, %loop.j.preheader\n  %i.inc = add nsw i64 %i, 1\n  %exitcond.i = icmp eq i64 %i.inc, %end0\n  br i1 %exitcond.i, label %exit, label %loop.i.header\n\nexit:                                             ; preds = %loop.i.latch, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "step_is_variant2",
+          "test_body": "define void @step_is_variant2(ptr %a) {\nentry:\n  br label %loop.i.header\n\nloop.i.header:                                    ; preds = %loop.i.latch, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop.i.latch ]\n  %offset.i = phi i64 [ 0, %entry ], [ %offset.i.next, %loop.i.latch ]\n  %step.i.0 = phi i64 [ -1, %entry ], [ %step.i.1, %loop.i.latch ]\n  %step.i.1 = phi i64 [ 3, %entry ], [ %step.i.0, %loop.i.latch ]\n  br label %loop.j\n\nloop.j:                                           ; preds = %loop.j, %loop.i.header\n  %j = phi i64 [ 0, %loop.i.header ], [ %j.inc, %loop.j ]\n  %offset = add nsw i64 %offset.i, %j\n  %idx = getelementptr inbounds i8, ptr %a, i64 %offset\n  store i8 0, ptr %idx, align 1\n  %j.inc = add nsw i64 %j, 1\n  %exitcond.j = icmp eq i64 %j.inc, 100\n  br i1 %exitcond.j, label %loop.i.latch, label %loop.j\n\nloop.i.latch:                                     ; preds = %loop.j\n  %i.inc = add nsw i64 %i, 1\n  %offset.i.next = add nsw i64 %offset.i, %step.i.0\n  %exitcond.i = icmp eq i64 %i.inc, 100\n  br i1 %exitcond.i, label %exit, label %loop.i.header\n\nexit:                                             ; preds = %loop.i.latch\n  ret void\n}\n"
+        },
+        {
+          "test_name": "outer_loop_may_wrap",
+          "test_body": "define void @outer_loop_may_wrap(ptr %a) {\nentry:\n  br label %loop.i.header\n\nloop.i.header:                                    ; preds = %loop.i.latch, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.inc, %loop.i.latch ]\n  %subscript.i = phi i64 [ 9223372036854775552, %entry ], [ %subscript.i.next, %loop.i.latch ]\n  br label %loop.j.header\n\nloop.j.header:                                    ; preds = %loop.j.latch, %loop.i.header\n  %j = phi i64 [ 0, %loop.i.header ], [ %j.inc, %loop.j.latch ]\n  %subscript = phi i64 [ %subscript.i, %loop.i.header ], [ %subscript.next, %loop.j.latch ]\n  %cond = icmp sge i64 %subscript, 0\n  br i1 %cond, label %if.then, label %loop.j.latch\n\nif.then:                                          ; preds = %loop.j.header\n  %gep = getelementptr inbounds i8, ptr %a, i64 %subscript\n  store i8 0, ptr %gep, align 1\n  br label %loop.j.latch\n\nloop.j.latch:                                     ; preds = %if.then, %loop.j.header\n  %j.inc = add nuw nsw i64 %j, 1\n  %subscript.next = add nuw nsw i64 %subscript, 1\n  %ec.j = icmp eq i64 %j.inc, 32\n  br i1 %ec.j, label %loop.i.latch, label %loop.j.header\n\nloop.i.latch:                                     ; preds = %loop.j.latch\n  %i.inc = add nuw nsw i64 %i, 1\n  %subscript.i.next = add i64 %subscript.i, 1024\n  %ec.i = icmp eq i64 %i.inc, 4611686018427387904\n  br i1 %ec.i, label %exit, label %loop.i.header\n\nexit:                                             ; preds = %loop.i.latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Analysis/DependenceAnalysis/non-monotonic.ll",
+      "commands": [
+        "opt < %s -disable-output -passes=\"print<da>\" -da-dump-monotonicity-report 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "define void @f(ptr %A) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.next, %loop.latch ]\n  %idx.0 = getelementptr inbounds i8, ptr %A, i64 %i\n  store i8 1, ptr %idx.0, align 1\n  %offset.tmp = mul i64 %i, 32\n  %offset = add i64 %offset.tmp, 4611686018427387904\n  %if.cond = icmp sge i64 %offset, 0\n  br i1 %if.cond, label %if.then, label %loop.latch\n\nif.then:                                          ; preds = %loop.header\n  %idx.1 = getelementptr inbounds i8, ptr %A, i64 %offset\n  store i8 2, ptr %idx.1, align 1\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %if.then, %loop.header\n  %i.next = add nuw nsw i64 %i, 1\n  %exit.cond = icmp eq i64 %i.next, 1152921504606846976\n  br i1 %exit.cond, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis"
+  ],
+  "comments": [
+    {
+      "author": "kasuga-fj",
+      "body": "> [!WARNING]\n> <b>This pull request is not mergeable via GitHub because a downstack PR is open. Once all requirements are satisfied, merge this PR as a stack <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176369?utm_source=stack-comment-downstack-mergeability-warning\" >on Graphite</a>.</b>\n> <a href=\"https://graphite.dev/docs/merge-pull-requests\">Learn more</a>\n\n* **#176371** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176371?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176370** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176370?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176369** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176369?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176369?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#176368** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176368?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176367** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176367?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-16T13:16:10Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/DependenceAnalysis.cpp": [
+      [
+        155,
+        167
+      ],
+      [
+        330,
+        340
+      ],
+      [
+        3367,
+        3385
+      ],
+      [
+        3639,
+        3652
+      ]
+    ],
+    "llvm/test/Analysis/DependenceAnalysis/monotonicity-cast.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        45,
+        50
+      ],
+      [
+        58,
+        64
+      ],
+      [
+        135,
+        141
+      ],
+      [
+        160,
+        165
+      ],
+      [
+        173,
+        179
+      ],
+      [
+        199,
+        204
+      ],
+      [
+        212,
+        218
+      ]
+    ],
+    "llvm/test/Analysis/DependenceAnalysis/monotonicity-delinearize.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        16,
+        21
+      ],
+      [
+        29,
+        35
+      ]
+    ],
+    "llvm/test/Analysis/DependenceAnalysis/monotonicity-invariant.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        35,
+        40
+      ],
+      [
+        48,
+        54
+      ]
+    ],
+    "llvm/test/Analysis/DependenceAnalysis/monotonicity-loop-guard.ll": [
+      [
+        1,
+        6
+      ]
+    ],
+    "llvm/test/Analysis/DependenceAnalysis/monotonicity-no-wrap-flags.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        40,
+        45
+      ],
+      [
+        53,
+        59
+      ],
+      [
+        234,
+        240
+      ],
+      [
+        348,
+        354
+      ],
+      [
+        402,
+        408
+      ],
+      [
+        454,
+        460
+      ],
+      [
+        567,
+        572
+      ],
+      [
+        580,
+        586
+      ]
+    ],
+    "llvm/test/Analysis/DependenceAnalysis/non-monotonic.ll": [
+      [
+        1,
+        9
+      ],
+      [
+        24,
+        29
+      ],
+      [
+        45,
+        61
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/DependenceAnalysis.cpp": [
+      "DependenceInfo::depends",
+      "DependenceInfo::tryDelinearize"
+    ]
+  }
+}

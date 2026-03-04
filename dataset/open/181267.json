@@ -1,0 +1,79 @@
+{
+  "pr_id": 181267,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181267",
+  "state": "open",
+  "title": "[LoopUnroll] Enable allowexpensivetripcounts when user provides pragma",
+  "author": "adelejjeh",
+  "base_commit": "c6f24719afa3d76f12a26604936898cbfc4568a5",
+  "fix_commit": "5f69896be969826c3c87ecf8e630b6c044b3a909",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp b/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\nindex 40d8043d01e02..e33dad3a0b60b 100644\n--- a/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\n+++ b/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\n@@ -965,18 +965,22 @@ bool llvm::computeUnrollCount(\n     UP.Runtime = false;\n     return true;\n   }\n+  // If a user provided an explicit unroll pragma (with or without count),\n+  // enable runtime unrolling and override expensive trip count checks.\n+  if (PragmaEnableUnroll || PragmaCount > 0) {\n+    UP.AllowExpensiveTripCount = true;\n+    UP.Runtime = true;\n+  }\n   // Check for explicit Count.\n   // 1st priority is unroll count set by \"unroll-count\" option.\n   // 2nd priority is unroll count set by pragma.\n   if (auto UnrollFactor = shouldPragmaUnroll(L, PInfo, TripMultiple, TripCount,\n                                              MaxTripCount, UCE, UP)) {\n     UP.Count = *UnrollFactor;\n-\n     if (UserUnrollCount || (PragmaCount > 0)) {\n       UP.AllowExpensiveTripCount = true;\n       UP.Force = true;\n     }\n-    UP.Runtime |= (PragmaCount > 0);\n     return ExplicitUnroll;\n   } else {\n     if (ExplicitUnroll && TripCount != 0) {\n@@ -1103,7 +1107,6 @@ bool llvm::computeUnrollCount(\n         UP.AllowExpensiveTripCount = true;\n     }\n   }\n-  UP.Runtime |= PragmaEnableUnroll || PragmaCount > 0 || UserUnrollCount;\n   if (!UP.Runtime) {\n     LLVM_DEBUG(dbgs().indent(2)\n                << \"will not try to unroll loop with runtime trip count \"\n",
+  "components": [
+    "LoopUnrollPass"
+  ],
+  "description": "This PR replaces #180961, which I closed after community feedback that the pragma should just work by default rather than requiring a new flag.\r\n \r\nLoops with an explicit unroll pragma (without a specified unroll factor) and a runtime trip count currently don't get unrolled because UP.AllowExpensiveTripCount defaults to false. The pragma is silently ignored. This is not the case for when an unroll factor is specified and PragmaCount > 0 where the pass currently sets UP.AllowExpensiveTripCount to true.\r\n \r\nWith this change, when any explicit unroll pragma is present, UP.AllowExpensiveTripCount is set to true, which allows the compiler to attempt to unroll the loop even if it has an expensive trip count. I also added a new lit test (expensive-tripcount.ll).\r\n \r\nThe change showed no meaningful regressions across a few different workloads from Composable Kernels (CK) and llama.cpp as well as Pytorch kernels on AMDGPU gfx950. Additionally, the change improves the performance of PyTorch reduction loops on AMDGPU targets.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/expensive-tripcount.ll",
+      "commands": [
+        "opt < %s -S -passes=loop-unroll"
+      ],
+      "tests": [
+        {
+          "test_name": "complex_loop_unroll",
+          "test_body": "define dso_local void @complex_loop_unroll(i64 noundef %input_offset, i64 noundef %step, i64 noundef %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %0 = phi i64 [ 0, %entry ], [ %add, %for.body ]\n  %indvars.iv = phi i64 [ %input_offset, %entry ], [ %indvars.iv.next, %for.body ]\n  %add = add i64 %0, %indvars.iv\n  %indvars.iv.next = add nsw i64 %indvars.iv, %step\n  %cmp = icmp slt i64 %indvars.iv.next, %n\n  br i1 %cmp, label %for.body, label %for.end14, !llvm.loop !0\n\nfor.end14:                                        ; preds = %for.body\n  ret void\n}\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.mustprogress\"}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "adelejjeh",
+      "body": "@nikic I refactored the setting of AllowExpensiveTripCount out of the if(shouldPragmaUnroll). This makes the code cleaner and easier to maintain since we want to set the option when we have an explicit pragma regardless of whether we are in the if() or else() branch."
+    },
+    {
+      "author": "adelejjeh",
+      "body": "@nikic I'm experimenting with the conditions, and I see two options:\r\n\r\nOption 1: Keep the existing code that sets AllowExpensiveTripCounts in the if(shouldPragmaUnroll) case (https://github.com/llvm/llvm-project/blob/1b1840dd13cd89f9816e264e9ae0379d32e15078/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp#L975) and then set AllowExpensiveTripCounts again where we set UP.Runtime using the same conditions (here: https://github.com/llvm/llvm-project/blob/1b1840dd13cd89f9816e264e9ae0379d32e15078/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp#L1105).\r\n\r\nOption 2: Refactor the code that sets AllowExpensiveTripCounts to do it once outside the if(shouldPragmaUnroll) because setting it once will cover all cases (similar to current state of PR but with modified condition check to not include Full Unroll). However, I don't feel comfortable moving the UP.Runtime to also get set at the same place because there is a lot of complex logic between the check of shouldPragmaUnroll and the place where we set UP.Runtime, which may or may not affect the conditions in which Runtime should be set.\r\n\r\nIf we really want to keep the AllowExpensiveTripCounts and Runtime together we will need to go with Option 1. But I think Option 2 is cleaner. What do you think?"
+    },
+    {
+      "author": "adelejjeh",
+      "body": "@AaronBallman Since this change affects general loop unrolling behavior triggered by `#pragma unroll` across all targets, I'd like to get broader feedback before it goes in. Would you be able to loop in any appropriate Intel maintainers or stakeholders who might have opinions on how this interacts with Intel targets or use cases? I want to make sure this is well-reviewed from multiple target perspectives before merging."
+    },
+    {
+      "author": "adelejjeh",
+      "body": "@nikic ping \u2014 any thoughts on the two options I outlined above? Also, do you have recommendations for other reviewers who would provide good coverage for non-AMD targets?"
+    },
+    {
+      "author": "nikic",
+      "body": "> Option 2: Refactor the code that sets AllowExpensiveTripCounts to do it once outside the if(shouldPragmaUnroll) because setting it once will cover all cases (similar to current state of PR but with modified condition check to not include Full Unroll). However, I don't feel comfortable moving the UP.Runtime to also get set at the same place because there is a lot of complex logic between the check of shouldPragmaUnroll and the place where we set UP.Runtime, which may or may not affect the conditions in which Runtime should be set.\r\n\r\nI prefer this option. And I'd also move the setting of UP.Runtime. I don't really see how setting it early would cause problems here, so as long as it doesn't break any tests, it should be fine."
+    },
+    {
+      "author": "adelejjeh",
+      "body": "@nikic lit tests are failing if we move UP.Runtime up. My best guess is that one of the return's that are happening before we would set UP.Runtime is expecting Runtime to be false. I will look into what the failures are and see if it's something we can reason about or not."
+    },
+    {
+      "author": "adelejjeh",
+      "body": "@nikic Moving `UP.Runtime` to the early block caused failures in tests that use `-unroll-count`, since the original `shouldPragmaUnroll()` path only sets `UP.Runtime` for pragma-specified counts (`UP.Runtime |= (PragmaCount > 0)`), not for the command-line flag. Setting it early for `UserUnrollCount` triggered runtime unrolling (and prologue/epilogue generation) in cases that previously didn't do it.\r\n\r\nFailing tests were:\r\n- `2011-08-08-PhiUpdate.ll`\r\n- `branch-weights-freq/unroll-partial.ll`\r\n- `followup.ll`\r\n- `loop-probability-one.ll`\r\n- `unroll-dont-copy-latch-loop-id.ll`\r\n\r\nTo fix that, I narrowed the early block to only pragma cases (`PragmaEnableUnroll || PragmaCount > 0`), excluding `UserUnrollCount`.\r\n\r\nThat resolved those failures but exposed a subtlety: **`AllowExpensiveTripCount` and `Runtime` are not always set together in the original code**. Specifically, `UserUnrollCount` sets `AllowExpensiveTripCount = true` inside `shouldPragmaUnroll()`, but does not set `Runtime = true` there. Removing `AllowExpensiveTripCount` from that path broke `runtime-li.ll` and `runtime-loop-multiexit-dom-verify.ll`.\r\n\r\nMy final solution is to keep `AllowExpensiveTripCount = true` inside `shouldPragmaUnroll()` for `UserUnrollCount || (PragmaCount > 0)` (restoring original behavior), and keep `Runtime` being set in the early pragma block. The final diff vs main:\r\n1. New early block sets `AllowExpensiveTripCount = true` and `Runtime = true` for `PragmaEnableUnroll || PragmaCount > 0`\r\n2. `shouldPragmaUnroll()` path retains `AllowExpensiveTripCount = true` for `UserUnrollCount || (PragmaCount > 0)`\r\n3. Remove the late `UP.Runtime |= PragmaEnableUnroll || PragmaCount > 0 || UserUnrollCount` (redundant for pragma cases; `UserUnrollCount` reaches that site via `shouldPragmaUnroll()` early return anyway)\r\n\r\nI have updated my PR with this change, please let me know if you have any other concerns."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-12T23:24:44Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp": [
+      [
+        965,
+        982
+      ],
+      [
+        1103,
+        1109
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp": [
+      "llvm::computeUnrollCount"
+    ]
+  }
+}
