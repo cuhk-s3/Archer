@@ -95,6 +95,11 @@ def fetch_pr(pr_id, state_filter="closed"):
       if pr_date > before_date:
         return False
 
+  # Check title: exclude PRs with "NFC" (No Functional Change)
+  title = pr.get("title", "")
+  if "NFC" in title:
+    return False
+
   # Check labels: require llvm:transforms or llvm:analysis, exclude all backend:* labels
   labels = pr.get("labels", [])
   label_names = [label["name"] for label in labels]

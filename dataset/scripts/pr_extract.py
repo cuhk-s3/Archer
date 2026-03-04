@@ -91,6 +91,10 @@ def extract_tests_from_patch(full_patch: str) -> list:
     if not file.path.startswith("llvm/test/"):
       continue
 
+    # Skip removed files (they don't exist after applying patch)
+    if file.is_removed_file:
+      continue
+
     # Read file from working directory (patch has been applied)
     test_file_path = os.path.join(llvm_dir, file.path)
     try:
@@ -309,6 +313,9 @@ def main():
   try:
     patchset = PatchSet(patch)
     for file in patchset:
+      # Skip removed files and added files (no meaningful location in base commit)
+      if file.is_removed_file or file.is_added_file:
+        continue
       location = hints.get_line_loc(file)
       if len(location) != 0:
         patch_location_lineno[file.path] = location
@@ -332,6 +339,12 @@ def main():
   print("Extracting tests from patch...")
   tests = extract_tests_from_patch(patch)
   print(f"Extracted {len(tests)} test file(s)")
+
+  # Check if tests are empty - skip PRs without tests
+  if not tests or len(tests) == 0:
+    print("No tests found in this PR. Skipping.")
+    llvm_helper.reset("main")
+    exit(1)
 
   # Filter out test files from patch
   code_only_patch = filter_patch_exclude_tests(patch)
