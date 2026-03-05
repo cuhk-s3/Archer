@@ -1,0 +1,78 @@
+{
+  "pr_id": 179289,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179289",
+  "state": "closed",
+  "title": "Revert \"[CoroCleanup] Noop coroutine elision for load-and-call pattern\"",
+  "author": "NewSigma",
+  "base_commit": "cf9ed463afd4c2c97eef22514574c14b67095f5f",
+  "fix_commit": "17392af48318209eead6c8f7eccfee5c4cf80f3f",
+  "patch": "diff --git a/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp b/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp\nindex fa342fd4717ea..6b68cf5bc2c20 100644\n--- a/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp\n+++ b/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp\n@@ -8,7 +8,6 @@\n \n #include \"llvm/Transforms/Coroutines/CoroCleanup.h\"\n #include \"CoroInternal.h\"\n-#include \"llvm/Analysis/PtrUseVisitor.h\"\n #include \"llvm/IR/DIBuilder.h\"\n #include \"llvm/IR/Function.h\"\n #include \"llvm/IR/IRBuilder.h\"\n@@ -16,7 +15,6 @@\n #include \"llvm/IR/Module.h\"\n #include \"llvm/IR/PassManager.h\"\n #include \"llvm/Transforms/Scalar/SimplifyCFG.h\"\n-#include \"llvm/Transforms/Utils/Local.h\"\n \n using namespace llvm;\n \n@@ -32,27 +30,9 @@ struct Lowerer : coro::LowererBase {\n   bool lower(Function &F);\n \n private:\n+  void elideCoroNoop(IntrinsicInst *II);\n   void lowerCoroNoop(IntrinsicInst *II);\n };\n-\n-// Recursively walk and eliminate resume/destroy call on noop coro\n-class NoopCoroElider : public PtrUseVisitor<NoopCoroElider> {\n-  using Base = PtrUseVisitor<NoopCoroElider>;\n-\n-  IRBuilder<> Builder;\n-\n-public:\n-  NoopCoroElider(const DataLayout &DL, LLVMContext &C) : Base(DL), Builder(C) {}\n-\n-  void run(IntrinsicInst *II);\n-\n-  void visitLoadInst(LoadInst &I) { enqueueUsers(I); }\n-  void visitCallBase(CallBase &CB);\n-  void visitIntrinsicInst(IntrinsicInst &II);\n-\n-private:\n-  bool tryEraseCallInvoke(Instruction *I);\n-};\n }\n \n static void lowerSubFn(IRBuilder<> &Builder, CoroSubFnInst *SubFn) {\n@@ -93,7 +73,6 @@ bool Lowerer::lower(Function &F) {\n   bool IsPrivateAndUnprocessed = F.isPresplitCoroutine() && F.hasLocalLinkage();\n   bool Changed = false;\n \n-  NoopCoroElider NCE(F.getDataLayout(), F.getContext());\n   SmallPtrSet<Instruction *, 8> DeadInsts{};\n   for (Instruction &I : instructions(F)) {\n     if (auto *II = dyn_cast<IntrinsicInst>(&I)) {\n@@ -121,7 +100,7 @@ bool Lowerer::lower(Function &F) {\n         II->replaceAllUsesWith(ConstantTokenNone::get(Context));\n         break;\n       case Intrinsic::coro_noop:\n-        NCE.run(II);\n+        elideCoroNoop(II);\n         if (!II->user_empty())\n           lowerCoroNoop(II);\n         break;\n@@ -163,6 +142,28 @@ bool Lowerer::lower(Function &F) {\n   return Changed;\n }\n \n+void Lowerer::elideCoroNoop(IntrinsicInst *II) {\n+  for (User *U : make_early_inc_range(II->users())) {\n+    auto *Fn = dyn_cast<CoroSubFnInst>(U);\n+    if (Fn == nullptr)\n+      continue;\n+\n+    auto *User = Fn->getUniqueUndroppableUser();\n+    if (auto *Call = dyn_cast<CallInst>(User)) {\n+      Call->eraseFromParent();\n+      Fn->eraseFromParent();\n+      continue;\n+    }\n+\n+    if (auto *I = dyn_cast<InvokeInst>(User)) {\n+      Builder.SetInsertPoint(I);\n+      Builder.CreateBr(I->getNormalDest());\n+      I->eraseFromParent();\n+      Fn->eraseFromParent();\n+    }\n+  }\n+}\n+\n void Lowerer::lowerCoroNoop(IntrinsicInst *II) {\n   if (!NoopCoro) {\n     LLVMContext &C = Builder.getContext();\n@@ -199,47 +200,6 @@ void Lowerer::lowerCoroNoop(IntrinsicInst *II) {\n   II->replaceAllUsesWith(NoopCoroVoidPtr);\n }\n \n-void NoopCoroElider::run(IntrinsicInst *II) {\n-  visitPtr(*II);\n-\n-  Worklist.clear();\n-  VisitedUses.clear();\n-}\n-\n-void NoopCoroElider::visitCallBase(CallBase &CB) {\n-  auto *V = U->get();\n-  bool ResumeOrDestroy = V == CB.getCalledOperand();\n-  if (ResumeOrDestroy) {\n-    [[maybe_unused]] bool Success = tryEraseCallInvoke(&CB);\n-    assert(Success && \"Unexpected CallBase\");\n-    RecursivelyDeleteTriviallyDeadInstructions(V);\n-  }\n-}\n-\n-void NoopCoroElider::visitIntrinsicInst(IntrinsicInst &II) {\n-  if (auto *SubFn = dyn_cast<CoroSubFnInst>(&II)) {\n-    auto *User = SubFn->getUniqueUndroppableUser();\n-    if (!tryEraseCallInvoke(cast<Instruction>(User)))\n-      return;\n-    SubFn->eraseFromParent();\n-  }\n-}\n-\n-bool NoopCoroElider::tryEraseCallInvoke(Instruction *I) {\n-  if (auto *Call = dyn_cast<CallInst>(I)) {\n-    Call->eraseFromParent();\n-    return true;\n-  }\n-\n-  if (auto *II = dyn_cast<InvokeInst>(I)) {\n-    Builder.SetInsertPoint(II);\n-    Builder.CreateBr(II->getNormalDest());\n-    II->eraseFromParent();\n-    return true;\n-  }\n-  return false;\n-}\n-\n static bool declaresCoroCleanupIntrinsics(const Module &M) {\n   return coro::declaresIntrinsics(\n       M,\n",
+  "components": [
+    "Coroutines"
+  ],
+  "description": "There is a CI fail. Reverts llvm/llvm-project#179154",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Coroutines/coro-cleanup-noop-erase.ll",
+      "commands": [
+        "opt < %s -S -passes='coro-cleanup'"
+      ],
+      "tests": [
+        {
+          "test_name": "fn",
+          "test_body": "define void @fn() personality i32 0 {\n  %frame = call noundef ptr @llvm.coro.noop()\n  %resume = call ptr @llvm.coro.subfn.addr(ptr %frame, i8 0)\n  call fastcc void %resume(ptr %frame)\n  %destroy = call ptr @llvm.coro.subfn.addr(ptr %frame, i8 1)\n  invoke fastcc void %destroy(ptr %frame)\n          to label %done unwind label %unwind\n\ndone:                                             ; preds = %0\n  ret void\n\nunwind:                                           ; preds = %0\n  %pad = landingpad { ptr, i32 }\n          catch ptr null\n  unreachable\n}\n\n; Function Attrs: nounwind memory(none)\ndeclare ptr @llvm.coro.noop() #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare ptr @llvm.coro.subfn.addr(ptr nocapture readonly, i8) #1\n\nattributes #0 = { nounwind memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "coroutines",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-02T17:19:52Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Coroutines/CoroCleanup.cpp": [
+      [
+        8,
+        14
+      ],
+      [
+        16,
+        22
+      ],
+      [
+        32,
+        58
+      ],
+      [
+        93,
+        99
+      ],
+      [
+        121,
+        127
+      ],
+      [
+        163,
+        168
+      ],
+      [
+        199,
+        245
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Coroutines/CoroCleanup.cpp": [
+      "Lowerer::lowerCoroNoop",
+      "NoopCoroElider::run",
+      "NoopCoroElider::tryEraseCallInvoke",
+      "NoopCoroElider::visitCallBase",
+      "NoopCoroElider::visitIntrinsicInst",
+      "declaresCoroCleanupIntrinsics",
+      "lowerSubFn",
+      "visitLoadInst"
+    ]
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "pr_id": 182647,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182647",
+  "state": "closed",
+  "title": "[InstCombine] Fix non-convergence with freeze/phi folding",
+  "author": "rahulana-quic",
+  "base_commit": "a2b7f1fcad77b506d469c1ed171e3c93cf1bc2b1",
+  "fix_commit": "0778102e09243ad8164e9e1226af13b6d30dfad0",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex c4beacdd12684..3a44253f8ecb1 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -1980,6 +1980,12 @@ Instruction *InstCombinerImpl::foldOpIntoPhi(Instruction &I, PHINode *PN,\n     Value *InVal = PN->getIncomingValue(i);\n     BasicBlock *InBB = PN->getIncomingBlock(i);\n \n+    // Avoid repeatedly sinking a freeze into a PHI only for some of the newly\n+    // created incoming freezes to be trivially removable again. That pattern\n+    // can cause oscillation between freeze(phi(...)) and phi(..., freeze(x), ...).\n+    if (isa<FreezeInst>(&I) && isGuaranteedNotToBeUndefOrPoison(InVal))\n+      return nullptr;\n+\n     if (auto *NewVal = simplifyInstructionWithPHI(I, PN, InVal, InBB, DL, SQ)) {\n       NewPhiValues.push_back(NewVal);\n       continue;\n@@ -5214,6 +5220,11 @@ InstCombinerImpl::pushFreezeToPreventPoisonFromPropagating(FreezeInst &OrigFI) {\n     if (!isa<Instruction>(V) || isa<PHINode>(V))\n       return false;\n \n+    // Don't push through an existing freeze. Otherwise we can repeatedly\n+    // create redundant freeze instructions during instcombine iterations.\n+    if (isa<FreezeInst>(V))\n+      return false;\n+\n     // We can't push the freeze through an instruction which can itself create\n     // poison.  If the only source of new poison is flags, we can simply\n     // strip them (since we know the only use is the freeze and nothing can\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "InstCombine can fail to reach a fixpoint due to oscillation between\r\nfreeze(phi(...)) and phi(..., freeze(x), ...) when the newly introduced\r\nincoming freezes are immediately simplified away again.\r\n\r\nAdd a guard in foldOpIntoPhi() to avoid sinking a FreezeInst into a phi\r\nwhen an incoming freeze would simplify to the incoming value. Also treat\r\nFreezeInst as a boundary for pushFreezeToPreventPoisonFromPropagating()\r\nto avoid stacking up freezes when pushing them.\r\n\r\nfixes #182475 ",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/freeze-phi.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "vec_undef",
+          "test_body": "define <2 x i32> @vec_undef(i1 %cond) {\n  br i1 %cond, label %A, label %B\n\nA:                                                ; preds = %0\n  br label %C\n\nB:                                                ; preds = %0\n  br label %C\n\nC:                                                ; preds = %B, %A\n  %y = phi <2 x i32> [ <i32 0, i32 1>, %A ], [ <i32 2, i32 undef>, %B ]\n  %y.fr = freeze <2 x i32> %y\n  ret <2 x i32> %y.fr\n}\n"
+        },
+        {
+          "test_name": "vec",
+          "test_body": "define <2 x i32> @vec(i1 %cond) {\n  br i1 %cond, label %A, label %B\n\nA:                                                ; preds = %0\n  br label %C\n\nB:                                                ; preds = %0\n  br label %C\n\nC:                                                ; preds = %B, %A\n  %y = phi <2 x i32> [ <i32 0, i32 1>, %A ], [ <i32 2, i32 3>, %B ]\n  %y.fr = freeze <2 x i32> %y\n  ret <2 x i32> %y.fr\n}\n"
+        },
+        {
+          "test_name": "one_undef",
+          "test_body": "define i32 @one_undef(i8 %cond) {\n  switch i8 %cond, label %A [\n    i8 0, label %B\n    i8 1, label %C\n  ]\n\nA:                                                ; preds = %0\n  br label %D\n\nB:                                                ; preds = %0\n  br label %D\n\nC:                                                ; preds = %0\n  br label %D\n\nD:                                                ; preds = %C, %B, %A\n  %y = phi i32 [ undef, %A ], [ 32, %B ], [ 0, %C ]\n  %y.fr = freeze i32 %y\n  ret i32 %y.fr\n}\n"
+        },
+        {
+          "test_name": "one_constexpr",
+          "test_body": "@glb = external global i8\n\ndefine i32 @one_constexpr(i8 %cond, i32 %x) {\n  switch i8 %cond, label %A [\n    i8 0, label %B\n    i8 1, label %C\n  ]\n\nA:                                                ; preds = %0\n  br label %D\n\nB:                                                ; preds = %0\n  br label %D\n\nC:                                                ; preds = %0\n  br label %D\n\nD:                                                ; preds = %C, %B, %A\n  %y = phi i32 [ ptrtoint (ptr getelementptr inbounds (i8, ptr @glb, i64 2) to i32), %A ], [ 32, %B ], [ 0, %C ]\n  %y.fr = freeze i32 %y\n  ret i32 %y.fr\n}\n"
+        },
+        {
+          "test_name": "pr161524",
+          "test_body": "define float @pr161524(float noundef %arg) {\nentry:\n  %cond = tail call i1 @llvm.is.fpclass.f32(float %arg, i32 144)\n  br i1 %cond, label %if.then, label %if.exit\n\nif.then:                                          ; preds = %entry\n  %fadd = fadd float %arg, 1.000000e+00\n  br label %if.exit\n\nif.exit:                                          ; preds = %if.then, %entry\n  %ret = phi ninf float [ %fadd, %if.then ], [ %arg, %entry ]\n  %ret.fr = freeze float %ret\n  ret float %ret.fr\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "one",
+          "test_body": "define i32 @one(i1 %cond, i32 %x) {\n  br i1 %cond, label %A, label %B\n\nA:                                                ; preds = %0\n  br label %C\n\nB:                                                ; preds = %0\n  br label %C\n\nC:                                                ; preds = %B, %A\n  %y = phi i32 [ 0, %A ], [ %x, %B ]\n  %y.fr = freeze i32 %y\n  ret i32 %y.fr\n}\n"
+        },
+        {
+          "test_name": "trivial_incoming",
+          "test_body": "define i32 @trivial_incoming(i1 %cond, i32 %x) {\n  br i1 %cond, label %A, label %B\n\nA:                                                ; preds = %0\n  br label %C\n\nB:                                                ; preds = %0\n  br label %C\n\nC:                                                ; preds = %B, %A\n  %p = phi i32 [ 52, %A ], [ %x, %B ]\n  %fr = freeze i32 %p\n  %cmp = icmp slt i32 %fr, 1\n  %dec = add nsw i32 %fr, -1\n  %sel = select i1 %cmp, i32 54, i32 %dec\n  ret i32 %sel\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {undef deprecator}-->\n\n\n:warning: undef deprecator found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff -U0 --pickaxe-regex -S '([^a-zA-Z0-9#_-]undef([^a-zA-Z0-9_-]|$)|UndefValue::get)' 'HEAD~1' HEAD llvm/lib/Transforms/InstCombine/InstructionCombining.cpp llvm/test/Transforms/InstCombine/freeze-phi.ll\n``````````\n\n</details>\n\n\nThe following files introduce new uses of undef:\n - llvm/test/Transforms/InstCombine/freeze-phi.ll\n\n[Undef](https://llvm.org/docs/LangRef.html#undefined-values) is now deprecated and should only be used in the rare cases where no replacement is possible. For example, a load of uninitialized memory yields `undef`. You should use `poison` values for placeholders instead.\n\nIn tests, avoid using `undef` and having tests that trigger undefined behavior. If you need an operand with some unimportant value, you can add a new argument to the function and use that instead.\n\nFor example, this is considered a bad practice:\n```llvm\ndefine void @fn() {\n  ...\n  br i1 undef, ...\n}\n```\n\nPlease use the following instead:\n```llvm\ndefine void @fn(i1 %cond) {\n  ...\n  br i1 %cond, ...\n}\n```\n\nPlease refer to the [Undefined Behavior Manual](https://llvm.org/docs/UndefinedBehavior.html) for more information.\n\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions cpp -- llvm/lib/Transforms/InstCombine/InstructionCombining.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 3a44253f8..a8e98a451 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -1982,7 +1982,8 @@ Instruction *InstCombinerImpl::foldOpIntoPhi(Instruction &I, PHINode *PN,\n \n     // Avoid repeatedly sinking a freeze into a PHI only for some of the newly\n     // created incoming freezes to be trivially removable again. That pattern\n-    // can cause oscillation between freeze(phi(...)) and phi(..., freeze(x), ...).\n+    // can cause oscillation between freeze(phi(...)) and phi(..., freeze(x),\n+    // ...).\n     if (isa<FreezeInst>(&I) && isGuaranteedNotToBeUndefOrPoison(InVal))\n       return nullptr;\n \n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "rahulana-quic",
+      "body": "As mentioned in the issue, I was trying to reduce the testcase but I end up hitting the following from llvm-reduce after a few steps:\r\n\r\nwarning: input module no longer interesting after counting chunks"
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "> warning: input module no longer interesting after counting chunks\r\n\r\nPerhaps InstCombine will finally exit within a few seconds. It looks like a slow-compile issue like https://github.com/llvm/llvm-project/issues/164779 and https://github.com/llvm/llvm-project/issues/168849.\r\n"
+    },
+    {
+      "author": "rahulana-quic",
+      "body": "> > warning: input module no longer interesting after counting chunks\r\n> \r\n> Perhaps InstCombine will finally exit within a few seconds. It looks like a slow-compile issue like #164779 and #168849.\r\n\r\nI have confirmed this case to be an infinite compile by running opt -passes=instcombine on the module where we found the issue. From the [bug ](https://github.com/llvm/llvm-project/issues/182475)I filed:\r\n\r\n> This issue was found while running spec2000/crafty with Ofast and thin-lto (in the function InitializeRandomHash from evaluate.c during the lto step).\r\n\r\n> Flags we use to build spec2000/crafty:\r\n --target=arm-linux-gnueabi -mfloat-abi=softfp -mfpu=crypto-neon-fp-armv8 -mcpu=cortex-a53 -Ofast -flto=thin -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -fdebug-default-version=4 -fcommon\r\n "
+    },
+    {
+      "author": "nikic",
+      "body": "> As mentioned in the issue, I was trying to reduce the testcase but I end up hitting the following from llvm-reduce after a few steps:\r\n> \r\n> warning: input module no longer interesting after counting chunks\r\n\r\nThis sounds like you reduced it to a test case that is right on the edge of your timeout value, so it will be interesting or not depending on noise.\r\n\r\n> I have confirmed this case to be an infinite compile by running opt -passes=instcombine on the module where we found the issue.\r\n\r\nHow long did you wait?\r\n\r\n-----\r\n\r\nIn any case, I'm personally inclined to revert https://github.com/llvm/llvm-project/pull/154336. This clearly has problematic interactions with other folds right now, and they are tricky to properly fix."
+    },
+    {
+      "author": "rahulana-quic",
+      "body": "> > I have confirmed this case to be an infinite compile by running opt -passes=instcombine on the module where we found the issue.\r\n> \r\n> How long did you wait?\r\n> \r\n\r\nI waited for more than 2 days and opt didn't terminate.\r\n\r\n> In any case, I'm personally inclined to revert #154336. This clearly has problematic interactions with other folds right now, and they are tricky to properly fix.\r\n\r\nMakes sense, I saw some related PRs too where you have discussed this (https://github.com/llvm/llvm-project/pull/157678, https://github.com/llvm/llvm-project/pull/171435, etc.). Can we please get this reverted and possibly get the revert into the release branch as well?"
+    },
+    {
+      "author": "apazos",
+      "body": "Hi @nikic, the release is on Tuesday Feb 24th, it would be great if we can push a patch to revert [#154336] in the release 22.x branch (https://github.com/llvm/llvm-project/pull/154336) till a proper fix is merged."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-21T02:50:27Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        1980,
+        1985
+      ],
+      [
+        5214,
+        5219
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/freeze-phi.ll": [
+      [
+        23,
+        28
+      ],
+      [
+        53,
+        59
+      ],
+      [
+        73,
+        83
+      ],
+      [
+        159,
+        165
+      ],
+      [
+        187,
+        200
+      ],
+      [
+        224,
+        230
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "InstCombinerImpl::foldOpIntoPhi",
+      "InstCombinerImpl::pushFreezeToPreventPoisonFromPropagating"
+    ]
+  }
+}

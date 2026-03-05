@@ -1,0 +1,125 @@
+{
+  "pr_id": 180148,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180148",
+  "state": "closed",
+  "title": "[InstCombine] fold `gepi _, (srem x, y)` to `gepi _, (urem x, y)` if `y` is power-of-2",
+  "author": "imkiva",
+  "base_commit": "aa808967eb96995f58288bb3bc0f37516ca70cbe",
+  "fix_commit": "55454b6e72e629abda2229aa6c219dcd12a0a142",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex e2bda2450c66f..1f1ac0c890d6e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -3671,6 +3671,25 @@ Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {\n   if (Instruction *R = foldSelectGEP(GEP, Builder))\n     return R;\n \n+  // srem -> (and/urem) for inbounds+nuw GEP\n+  if (Indices.size() == 1 && GEP.isInBounds() && GEP.hasNoUnsignedWrap()) {\n+    Value *X, *Y;\n+\n+    // Match: idx = srem X, Y -- where Y is a power-of-two value.\n+    if (match(Indices[0], m_OneUse(m_SRem(m_Value(X), m_Value(Y)))) &&\n+        isKnownToBeAPowerOfTwo(Y, /*OrZero=*/true, &GEP)) {\n+      // If GEP is inbounds+nuw, the offset cannot be negative\n+      // -> srem by power-of-two can be treated as urem,\n+      // and urem by power-of-two folds to 'and' later.\n+      // OrZero=true is fine here because division by zero is UB.\n+      Instruction *OldIdxI = cast<Instruction>(Indices[0]);\n+      Value *NewIdx = Builder.CreateURem(X, Y, OldIdxI->getName());\n+\n+      return GetElementPtrInst::Create(GEPEltType, PtrOp, {NewIdx},\n+                                       GEP.getNoWrapFlags());\n+    }\n+  }\n+\n   return nullptr;\n }\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This PR adds a small, targeted InstCombine fold for the pattern:\r\n```\r\n%idx = srem i64 %x, 2^k\r\n%p   = getelementptr inbounds nuw i8, ptr %base, i64 %idx\r\n```\r\n\r\nWhen the GEP is inbounds + nuw, and the divisor is a non-zero power-of-two constant, the signed remainder cannot produce a negative offset without violating the inbounds/nuw constraints. In that case we can canonicalize the index to a non-negative form and expose the common power-of-two rewrite:\r\n\r\n- Rewrite the GEP index from `srem %x, 2^k` to `urem %x, 2^k`\r\n- Create a new GEP with the new index and replace the original GEP\r\n- the `urem %x, 2^k` will further folds to `and %x (2^k-1)`\r\n\r\nresulting the following pattern\r\n\r\n```\r\n%idx = and i64 %x, (2^k-1)\r\n%p   = getelementptr inbounds nuw i8, ptr %base, i64 %idx\r\n```\r\n\r\nFixes #180097.\r\ngeneralized alive2 proof: https://alive2.llvm.org/ce/z/8EBxug",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/gep-srem-to-and-deref.ll",
+      "commands": [
+        "opt -passes=instcombine %s -S"
+      ],
+      "tests": [
+        {
+          "test_name": "pos_not_i8",
+          "test_body": "define ptr @pos_not_i8(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 4\n  %p = getelementptr inbounds nuw i32, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "neg_missing_nuw",
+          "test_body": "define ptr @neg_missing_nuw(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 4\n  %p = getelementptr inbounds i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "pos_pow2_4",
+          "test_body": "define ptr @pos_pow2_4(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 4\n  %p = getelementptr inbounds nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "neg_non_pow2_6",
+          "test_body": "define ptr @neg_non_pow2_6(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 6\n  %p = getelementptr inbounds nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "neg_missing_inbounds",
+          "test_body": "define ptr @neg_missing_inbounds(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 4\n  %p = getelementptr nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "neg_multi_use",
+          "test_body": "declare void @use(i8)\n\ndefine ptr @neg_multi_use(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 4\n  call void @use(i64 %idx)\n  %p = getelementptr inbounds nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "neg_nonconst_divisor",
+          "test_body": "define ptr @neg_nonconst_divisor(ptr %foo, i64 %x, i64 %d) {\n  %idx = srem i64 %x, %d\n  %p = getelementptr inbounds nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "pos_pow2_8",
+          "test_body": "define ptr @pos_pow2_8(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 8\n  %p = getelementptr inbounds nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "pos_pow2_1",
+          "test_body": "define ptr @pos_pow2_1(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 1\n  %p = getelementptr inbounds nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        },
+        {
+          "test_name": "pos_pow2_2",
+          "test_body": "define ptr @pos_pow2_2(ptr %foo, i64 %x) {\n  %idx = srem i64 %x, 2\n  %p = getelementptr inbounds nuw i8, ptr %foo, i64 %idx\n  ret ptr %p\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "nikic",
+      "body": "Generalized proof: https://alive2.llvm.org/ce/z/8EBxug"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189774 tests passed\n* 5065 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "imkiva",
+      "body": "> Generalized proof: https://alive2.llvm.org/ce/z/8EBxug\r\n\r\nThank you for the generalized proof. It seems inbounds + nuw + positive power-of-2 index is enough to prove to correctness.\r\n\r\n```\r\n%ctpop = call i8 @llvm.ctpop(i8 %C)\r\n%pow2 = icmp eq i8 %ctpop, 1\r\n```\r\n\r\nBut the ctpop here doesn't check `%C` is positive --- Can we relax the condition to all power-of-2 index? I am confused why negative indices can still be \"inbounds\".\r\n\r\nhttps://alive2.llvm.org/ce/z/BW5TpE"
+    },
+    {
+      "author": "nikic",
+      "body": "> Can we relax the condition to all power-of-2 index? \r\n\r\nYes.\r\n\r\n> I am confused why negative indices can still be \"inbounds\".\r\n\r\nNegative indices can be inbounds (if the pointer doesn't point to the base of the object) but they can't be inbounds and nuw at the same time. getelementptr returns poison in that case, and we can replace the poison with any other value."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "imkiva",
+      "body": "I replaced the pattern matching on index from `m_ConstantInt` to `m_Value`, and used `isKnownToBeAPowerOfTwo` to check if we can transform the srem to urem, according to the generalized proof.\r\n\r\n"
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "@imkiva Sorry I forgot you have the commit access..."
+    },
+    {
+      "author": "imkiva",
+      "body": "@dtcxzyw Thanks for merging; it's okay.\r\n\r\n"
+    },
+    {
+      "author": "nagisa",
+      "body": "> Looks like we can always convert srem x, pow2 to urem if we can prove the result is non-negative\r\n\r\nCorrect, but I could not come up with any other sequence of instructions where this sort of proof would come up naturally without assumes. I tried various `nuw` tagged arithmetics for example and alive wasn't happy with it. gepi was my direct use-case so I went with that. If there's a more general way to match the same requirements, it would be even better ig."
+    },
+    {
+      "author": "nagisa",
+      "body": "> Looks like we can always convert srem x, pow2 to urem if we can prove the result is non-negative\r\n\r\nCorrect, but I could not come up with any other sequence of instructions where this sort of proof would come up naturally without assumes. I tried various `nuw` tagged arithmetics for example and alive wasn't happy with it. gepi was my direct use-case so I went with that. If there's a more general way to match the same requirements, it would be even better ig."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-06T09:19:08Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        3671,
+        3676
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "InstCombinerImpl::visitGetElementPtrInst",
+      "isNeverEqualToUnescapedAlloc"
+    ]
+  }
+}

@@ -1,0 +1,180 @@
+{
+  "pr_id": 180570,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180570",
+  "state": "closed",
+  "title": "[LoopIdiomVectorize] Avoid wrapping in find_first_of loops.",
+  "author": "rj-jesus",
+  "base_commit": "fa1cda8f091f34301d956bcf6c789865e619a5ee",
+  "fix_commit": "b3f960b2ba7e9057fa2474e874cbed3b60c20ef8",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp\nindex cca7a3f5ef007..3468d0674b785 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp\n@@ -1015,6 +1015,13 @@ bool LoopIdiomVectorize::recognizeFindFirstByte() {\n       DisableFindFirstByte)\n     return false;\n \n+  // We exclude loops with trip counts > minimum page size via runtime checks,\n+  // so make sure that the minimum page size is something sensible such that\n+  // induction variables cannot overflow.\n+  if (uint64_t(*TTI->getMinPageSize()) >\n+      (std::numeric_limits<uint64_t>::max() / 2))\n+    return false;\n+\n   // Define some constants we need throughout.\n   BasicBlock *Header = CurLoop->getHeader();\n   LLVMContext &Ctx = Header->getContext();\n@@ -1288,10 +1295,20 @@ Value *LoopIdiomVectorize::expandFindFirstByte(\n       Builder.CreatePtrToInt(SearchStart, I64Ty, \"search_start_int\");\n   Value *ISearchEnd =\n       Builder.CreatePtrToInt(SearchEnd, I64Ty, \"search_end_int\");\n+  Value *SearchIdxInit = Constant::getNullValue(I64Ty);\n+  Value *SearchTripCount =\n+      Builder.CreateZExt(Builder.CreatePtrDiff(CharTy, SearchEnd, SearchStart,\n+                                               \"search_trip_count\"),\n+                         I64Ty);\n   Value *INeedleStart =\n       Builder.CreatePtrToInt(NeedleStart, I64Ty, \"needle_start_int\");\n   Value *INeedleEnd =\n       Builder.CreatePtrToInt(NeedleEnd, I64Ty, \"needle_end_int\");\n+  Value *NeedleIdxInit = Constant::getNullValue(I64Ty);\n+  Value *NeedleTripCount =\n+      Builder.CreateZExt(Builder.CreatePtrDiff(CharTy, NeedleEnd, NeedleStart,\n+                                               \"needle_trip_count\"),\n+                         I64Ty);\n   Value *PredVF =\n       Builder.CreateIntrinsic(Intrinsic::get_active_lane_mask, {PredVTy, I64Ty},\n                               {ConstantInt::get(I64Ty, 0), ConstVF});\n@@ -1321,12 +1338,12 @@ Value *LoopIdiomVectorize::expandFindFirstByte(\n \n   // (1) Load the search array and branch to the inner loop.\n   Builder.SetInsertPoint(BB1);\n-  PHINode *Search = Builder.CreatePHI(PtrTy, 2, \"psearch\");\n+  PHINode *SearchIdx = Builder.CreatePHI(I64Ty, 2, \"search_idx\");\n   Value *PredSearch = Builder.CreateIntrinsic(\n       Intrinsic::get_active_lane_mask, {PredVTy, I64Ty},\n-      {Builder.CreatePtrToInt(Search, I64Ty), ISearchEnd}, nullptr,\n-      \"search_pred\");\n+      {SearchIdx, SearchTripCount}, nullptr, \"search_pred\");\n   PredSearch = Builder.CreateAnd(PredVF, PredSearch, \"search_masked\");\n+  Value *Search = Builder.CreateGEP(CharTy, SearchStart, SearchIdx, \"psearch\");\n   Value *LoadSearch = Builder.CreateMaskedLoad(\n       CharVTy, Search, Align(1), PredSearch, Passthru, \"search_load_vec\");\n   Value *MatchInit = Constant::getNullValue(PredVTy);\n@@ -1335,15 +1352,15 @@ Value *LoopIdiomVectorize::expandFindFirstByte(\n \n   // (2) Inner loop.\n   Builder.SetInsertPoint(BB2);\n-  PHINode *Needle = Builder.CreatePHI(PtrTy, 2, \"pneedle\");\n+  PHINode *NeedleIdx = Builder.CreatePHI(I64Ty, 2, \"needle_idx\");\n   PHINode *Match = Builder.CreatePHI(PredVTy, 2, \"pmatch\");\n \n   // (2.a) Load the needle array.\n   Value *PredNeedle = Builder.CreateIntrinsic(\n       Intrinsic::get_active_lane_mask, {PredVTy, I64Ty},\n-      {Builder.CreatePtrToInt(Needle, I64Ty), INeedleEnd}, nullptr,\n-      \"needle_pred\");\n+      {NeedleIdx, NeedleTripCount}, nullptr, \"needle_pred\");\n   PredNeedle = Builder.CreateAnd(PredVF, PredNeedle, \"needle_masked\");\n+  Value *Needle = Builder.CreateGEP(CharTy, NeedleStart, NeedleIdx, \"pneedle\");\n   Value *LoadNeedle = Builder.CreateMaskedLoad(\n       CharVTy, Needle, Align(1), PredNeedle, Passthru, \"needle_load_vec\");\n \n@@ -1362,9 +1379,10 @@ Value *LoopIdiomVectorize::expandFindFirstByte(\n       Intrinsic::experimental_vector_match, {CharVTy, LoadNeedle->getType()},\n       {LoadSearch, LoadNeedle, PredSearch}, nullptr, \"match_segment\");\n   Value *MatchAcc = Builder.CreateOr(Match, MatchSeg, \"match_accumulator\");\n-  Value *NextNeedle =\n-      Builder.CreateGEP(CharTy, Needle, ConstVF, \"needle_next_vec\");\n-  Builder.CreateCondBr(Builder.CreateICmpULT(NextNeedle, NeedleEnd), BB2, BB3);\n+  Value *NextNeedleIdx =\n+      Builder.CreateAdd(NeedleIdx, ConstVF, \"needle_idx_next\");\n+  Builder.CreateCondBr(Builder.CreateICmpULT(NextNeedleIdx, NeedleTripCount),\n+                       BB2, BB3);\n   DTU.applyUpdates(\n       {{DominatorTree::Insert, BB2, BB2}, {DominatorTree::Insert, BB2, BB3}});\n \n@@ -1391,18 +1409,18 @@ Value *LoopIdiomVectorize::expandFindFirstByte(\n \n   // (5) Check if we've reached the end of the search array.\n   Builder.SetInsertPoint(BB5);\n-  Value *NextSearch =\n-      Builder.CreateGEP(CharTy, Search, ConstVF, \"search_next_vec\");\n-  Builder.CreateCondBr(Builder.CreateICmpULT(NextSearch, SearchEnd), BB1,\n-                       ExitFail);\n+  Value *NextSearchIdx =\n+      Builder.CreateAdd(SearchIdx, ConstVF, \"search_idx_next\");\n+  Builder.CreateCondBr(Builder.CreateICmpULT(NextSearchIdx, SearchTripCount),\n+                       BB1, ExitFail);\n   DTU.applyUpdates({{DominatorTree::Insert, BB5, BB1},\n                     {DominatorTree::Insert, BB5, ExitFail}});\n \n   // Set up the PHI nodes.\n-  Search->addIncoming(SearchStart, BB0);\n-  Search->addIncoming(NextSearch, BB5);\n-  Needle->addIncoming(NeedleStart, BB1);\n-  Needle->addIncoming(NextNeedle, BB2);\n+  SearchIdx->addIncoming(SearchIdxInit, BB0);\n+  SearchIdx->addIncoming(NextSearchIdx, BB5);\n+  NeedleIdx->addIncoming(NeedleIdxInit, BB1);\n+  NeedleIdx->addIncoming(NextNeedleIdx, BB2);\n   Match->addIncoming(MatchInit, BB1);\n   Match->addIncoming(MatchAcc, BB2);\n   // These are needed to retain LCSSA form.\n",
+  "components": [
+    "LoopIdiomVectorize"
+  ],
+  "description": "As noted in https://github.com/llvm/llvm-project/pull/179298#discussion_r2757948654, use integer induction variables to avoid potential pointer wrap.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopIdiom/AArch64/find-first-byte.ll",
+      "commands": [
+        "opt -mtriple=aarch64 -mattr=+sve -passes='loop(loop-idiom-vectorize)' -verify-loop-info -verify-dom-info -S < %s",
+        "opt -mtriple=aarch64 -mattr=+sve -passes='loop(loop-idiom-vectorize)' -disable-loop-idiom-vectorize-find-first-byte -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ensure_not_found_successors_fixed2",
+          "test_body": "define ptr @ensure_not_found_successors_fixed2(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %dummy_val = getelementptr i8, ptr %search_start, i64 1\n  br label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %found_match, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %not_found, label %header\n\nfound_match:                                      ; preds = %match_check\n  ret ptr %search_ptr\n\nnot_found:                                        ; preds = %search_check\n  %unused = phi ptr [ %dummy_val, %search_check ]\n  ret ptr null\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n"
+        },
+        {
+          "test_name": "find_first_of_i8",
+          "test_body": "define ptr @find_first_of_i8(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %search_test = icmp eq ptr %search_start, %search_end\n  %needle_test = icmp eq ptr %needle_start, %needle_end\n  %combined_test = or i1 %search_test, %needle_test\n  br i1 %combined_test, label %exit, label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr inbounds i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %exit, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr inbounds i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %exit, label %header\n\nexit:                                             ; preds = %search_check, %match_check, %entry\n  %res = phi ptr [ %search_end, %entry ], [ %search_ptr, %match_check ], [ %search_end, %search_check ]\n  ret ptr %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n"
+        },
+        {
+          "test_name": "find_first_of_i8_multi_exit",
+          "test_body": "define ptr @find_first_of_i8_multi_exit(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %search_test = icmp eq ptr %search_start, %search_end\n  %needle_test = icmp eq ptr %needle_start, %needle_end\n  %combined_test = or i1 %search_test, %needle_test\n  br i1 %combined_test, label %exit_fail, label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr inbounds i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %exit_succ, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr inbounds i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %exit_fail, label %header\n\nexit_succ:                                        ; preds = %match_check\n  %res_succ = phi ptr [ %search_ptr, %match_check ]\n  br label %exit\n\nexit_fail:                                        ; preds = %search_check, %entry\n  %res_fail = phi ptr [ %search_end, %entry ], [ %search_end, %search_check ]\n  br label %exit\n\nexit:                                             ; preds = %exit_fail, %exit_succ\n  %res = phi ptr [ %res_succ, %exit_succ ], [ %res_fail, %exit_fail ]\n  ret ptr %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n"
+        },
+        {
+          "test_name": "find_first_of_i16",
+          "test_body": "define ptr @find_first_of_i16(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %search_test = icmp eq ptr %search_start, %search_end\n  %needle_test = icmp eq ptr %needle_start, %needle_end\n  %combined_test = or i1 %search_test, %needle_test\n  br i1 %combined_test, label %exit, label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i16, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr inbounds i16, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i16, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i16 %search_load, %needle_load\n  br i1 %match_cmp, label %exit, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr inbounds i16, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %exit, label %header\n\nexit:                                             ; preds = %search_check, %match_check, %entry\n  %res = phi ptr [ %search_end, %entry ], [ %search_ptr, %match_check ], [ %search_end, %search_check ]\n  ret ptr %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n"
+        },
+        {
+          "test_name": "ensure_not_found_successors_fixed",
+          "test_body": "define ptr @ensure_not_found_successors_fixed(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  br label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %found_match, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %not_found, label %header\n\nfound_match:                                      ; preds = %match_check\n  ret ptr %search_ptr\n\nnot_found:                                        ; preds = %search_check\n  %unused = phi i64 [ 0, %search_check ]\n  ret ptr null\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 190329 tests passed\n* 5079 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "rj-jesus",
+      "body": "Rebased on #179298."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 131125 tests passed\n* 2947 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-09T17:40:49Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp": [
+      [
+        1015,
+        1020
+      ],
+      [
+        1288,
+        1297
+      ],
+      [
+        1321,
+        1332
+      ],
+      [
+        1335,
+        1349
+      ],
+      [
+        1362,
+        1370
+      ],
+      [
+        1391,
+        1408
+      ]
+    ],
+    "llvm/test/Transforms/LoopIdiom/AArch64/find-first-byte.ll": [
+      [
+        23,
+        31
+      ],
+      [
+        35,
+        52
+      ],
+      [
+        55,
+        67
+      ],
+      [
+        69,
+        77
+      ],
+      [
+        182,
+        190
+      ],
+      [
+        194,
+        211
+      ],
+      [
+        214,
+        226
+      ],
+      [
+        228,
+        236
+      ],
+      [
+        341,
+        349
+      ],
+      [
+        353,
+        370
+      ],
+      [
+        373,
+        385
+      ],
+      [
+        387,
+        395
+      ],
+      [
+        507,
+        515
+      ],
+      [
+        519,
+        536
+      ],
+      [
+        539,
+        551
+      ],
+      [
+        553,
+        561
+      ],
+      [
+        661,
+        669
+      ],
+      [
+        673,
+        690
+      ],
+      [
+        693,
+        705
+      ],
+      [
+        707,
+        715
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp": [
+      "LoopIdiomVectorize::expandFindFirstByte",
+      "LoopIdiomVectorize::recognizeFindFirstByte"
+    ]
+  }
+}

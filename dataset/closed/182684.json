@@ -1,0 +1,137 @@
+{
+  "pr_id": 182684,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182684",
+  "state": "closed",
+  "title": "[InstCombine] Fold icmp (vreduce_(or|and) %x), (0|-1)",
+  "author": "artagnon",
+  "base_commit": "d7fac0f42a3a8a6d6cf827d1f8b38663f872fe0f",
+  "fix_commit": "defc006741a7b4e362f1c1998e29edea292904fb",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex ec6ac25bb8b9c..546b3e11a075f 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -7523,6 +7523,44 @@ static Instruction *foldICmpInvariantGroup(ICmpInst &I) {\n   return nullptr;\n }\n \n+static Instruction *foldICmpOfVectorReduce(ICmpInst &I, const DataLayout &DL,\n+                                           IRBuilderBase &Builder) {\n+  if (!ICmpInst::isEquality(I.getPredicate()))\n+    return nullptr;\n+\n+  // The caller puts constants after non-constants.\n+  Value *Op = I.getOperand(0);\n+  Value *Const = I.getOperand(1);\n+\n+  // For Cond an equality condition, fold\n+  //\n+  //   icmp (eq|ne) (vreduce_(or|and) Op), (Zero|AllOnes) ->\n+  //   icmp (eq|ne) Op, (Zero|AllOnes)\n+  //\n+  // with a bitcast.\n+  Value *Vec;\n+  if ((match(Const, m_ZeroInt()) &&\n+       match(Op, m_Intrinsic<Intrinsic::vector_reduce_or>(m_Value(Vec)))) ||\n+      (match(Const, m_AllOnes()) &&\n+       match(Op, m_Intrinsic<Intrinsic::vector_reduce_and>(m_Value(Vec))))) {\n+    auto *VecTy = dyn_cast<FixedVectorType>(Vec->getType());\n+    if (!VecTy)\n+      return nullptr;\n+    Type *VecEltTy = VecTy->getElementType();\n+    unsigned ScalarBW =\n+        DL.getTypeSizeInBits(VecEltTy) * VecTy->getNumElements();\n+    if (!DL.fitsInLegalInteger(ScalarBW))\n+      return nullptr;\n+    Type *ScalarTy = IntegerType::get(I.getContext(), ScalarBW);\n+    Value *NewConst = match(Const, m_ZeroInt())\n+                          ? ConstantInt::get(ScalarTy, 0)\n+                          : ConstantInt::getAllOnesValue(ScalarTy);\n+    return CmpInst::Create(Instruction::ICmp, I.getPredicate(),\n+                           Builder.CreateBitCast(Vec, ScalarTy), NewConst);\n+  }\n+  return nullptr;\n+}\n+\n /// This function folds patterns produced by lowering of reduce idioms, such as\n /// llvm.vector.reduce.and which are lowered into instruction chains. This code\n /// attempts to generate fewer number of scalar comparisons instead of vector\n@@ -7998,6 +8036,9 @@ Instruction *InstCombinerImpl::visitICmpInst(ICmpInst &I) {\n   if (Instruction *Res = foldICmpOfUAddOv(I))\n     return Res;\n \n+  if (Instruction *Res = foldICmpOfVectorReduce(I, DL, Builder))\n+    return Res;\n+\n   // The 'cmpxchg' instruction returns an aggregate containing the old value and\n   // an i1 which indicates whether or not we successfully did the swap.\n   //\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "We can just compare the entire bitcasted value against Zero or AllOnes in this case.\r\n\r\nIt is profitable on all major targets: https://godbolt.org/z/o7ecKjbsK",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-vector-bitwise-reductions.ll",
+      "commands": [
+        "opt -p instcombine -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "vreduce_or_ne",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @vreduce_or_ne(<4 x i8> %v) {\n  %red = call i8 @llvm.vector.reduce.or.v4i8(<4 x i8> %v)\n  %cmp = icmp ne i8 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.or.v4i8(<4 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "vector_elt_type_legality",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @vector_elt_type_legality(<4 x i32> %v) {\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %v)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "loaded_value",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @loaded_value(ptr %p) {\n  %v = load <4 x i8>, ptr %p, align 4\n  %red = call i8 @llvm.vector.reduce.and.v4i8(<4 x i8> %v)\n  %cmp = icmp eq i8 %red, -1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.and.v4i8(<4 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "vreduce_or_eq",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @vreduce_or_eq(<4 x i8> %v) {\n  %red = call i8 @llvm.vector.reduce.or.v4i8(<4 x i8> %v)\n  %cmp = icmp eq i8 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.or.v4i8(<4 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "vreduce_and_eq",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @vreduce_and_eq(<4 x i8> %v) {\n  %red = call i8 @llvm.vector.reduce.and.v4i8(<4 x i8> %v)\n  %cmp = icmp eq i8 %red, -1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.and.v4i8(<4 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "scalable",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @scalable(<vscale x 4 x i8> %v) {\n  %red = call i8 @llvm.vector.reduce.and.nxv4i8(<vscale x 4 x i8> %v)\n  %cmp = icmp eq i8 %red, -1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.and.nxv4i8(<vscale x 4 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "vreduce_and_ne",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @vreduce_and_ne(<4 x i8> %v) {\n  %red = call i8 @llvm.vector.reduce.and.v4i8(<4 x i8> %v)\n  %cmp = icmp ne i8 %red, -1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.and.v4i8(<4 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "vreduce_and_sgt",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i1 @vreduce_and_sgt(<4 x i8> %v) {\n  %red = call i8 @llvm.vector.reduce.and.v4i8(<4 x i8> %v)\n  %cmp = icmp sgt i8 %red, -1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.and.v4i8(<4 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 169939 tests passed\n* 3071 tests skipped\n* 1 test failed\n\n## Failed Tests\n(click on a test name to see its output)\n\n### LLVM\n<details>\n<summary>LLVM.Transforms/InstCombine/select-fcmp-fmul-zero-absorbing-value.ll (Likely Already Failing)</summary>\nThis test is already failing at the base commit.\n\n```\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 2\n/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/opt -S -p=instcombine < /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/select-fcmp-fmul-zero-absorbing-value.ll | /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/FileCheck /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/select-fcmp-fmul-zero-absorbing-value.ll\n# executed command: /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/opt -S -p=instcombine\n# note: command had no output on stdout or stderr\n# executed command: /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/FileCheck /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/select-fcmp-fmul-zero-absorbing-value.ll\n# .---command stderr------------\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/select-fcmp-fmul-zero-absorbing-value.ll:376:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[MUL_FABS_X:%.*]] = fmul float [[FABS_X]], 0x4170000000000000\n# |               ^\n# | <stdin>:179:52: note: scanning from here\n# |  %fabs.x = call nnan float @llvm.fabs.f32(float %x)\n# |                                                    ^\n# | <stdin>:179:52: note: with \"FABS_X\" equal to \"%fabs.x\"\n# |  %fabs.x = call nnan float @llvm.fabs.f32(float %x)\n# |                                                    ^\n# | <stdin>:180:21: note: possible intended match here\n# |  %mul.fabs.x = fmul nnan float %fabs.x, 0x4170000000000000\n# |                     ^\n# | \n# | Input file: <stdin>\n# | Check file: /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/select-fcmp-fmul-zero-absorbing-value.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n# |             .\n# |             .\n# |             .\n# |           174:  %select = select i1 %x.is.zero, float %mul.fabs.x, float %fabs.x \n# |           175:  ret float %select \n# |           176: } \n# |           177:  \n# |           178: define float @cmp_one_nnan_fabs(float %x) { \n# |           179:  %fabs.x = call nnan float @llvm.fabs.f32(float %x) \n# | next:376'0                                                        X error: no match found\n# | next:376'1                                                          with \"FABS_X\" equal to \"%fabs.x\"\n# |           180:  %mul.fabs.x = fmul nnan float %fabs.x, 0x4170000000000000 \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:376'2                         ?                                       possible intended match\n# |           181:  %x.is.not.zero = fcmp one float %x, 0.000000e+00 \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |           182:  %select = select i1 %x.is.not.zero, float %fabs.x, float %mul.fabs.x \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |           183:  ret float %select \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~\n# |           184: } \n# | next:376'0     ~~\n# |           185:  \n# | next:376'0     ~\n# |             .\n# |             .\n# |             .\n# | >>>>>>\n# `-----------------------------\n# error: command failed with exit status: 1\n\n--\n\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 131152 tests passed\n* 2949 tests skipped\n* 1 test failed\n\n## Failed Tests\n(click on a test name to see its output)\n\n### LLVM\n<details>\n<summary>LLVM.Transforms/InstCombine/select-fcmp-fmul-zero-absorbing-value.ll</summary>\n\n```\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 2\nc:\\_work\\llvm-project\\llvm-project\\build\\bin\\opt.exe -S -p=instcombine < C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\InstCombine\\select-fcmp-fmul-zero-absorbing-value.ll | c:\\_work\\llvm-project\\llvm-project\\build\\bin\\filecheck.exe C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\InstCombine\\select-fcmp-fmul-zero-absorbing-value.ll\n# executed command: 'c:\\_work\\llvm-project\\llvm-project\\build\\bin\\opt.exe' -S -p=instcombine\n# note: command had no output on stdout or stderr\n# executed command: 'c:\\_work\\llvm-project\\llvm-project\\build\\bin\\filecheck.exe' 'C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\InstCombine\\select-fcmp-fmul-zero-absorbing-value.ll'\n# .---command stderr------------\n# | C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\InstCombine\\select-fcmp-fmul-zero-absorbing-value.ll:376:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[MUL_FABS_X:%.*]] = fmul float [[FABS_X]], 0x4170000000000000\n# |               ^\n# | <stdin>:179:52: note: scanning from here\n# |  %fabs.x = call nnan float @llvm.fabs.f32(float %x)\n# |                                                    ^\n# | <stdin>:179:52: note: with \"FABS_X\" equal to \"%fabs.x\"\n# |  %fabs.x = call nnan float @llvm.fabs.f32(float %x)\n# |                                                    ^\n# | <stdin>:180:21: note: possible intended match here\n# |  %mul.fabs.x = fmul nnan float %fabs.x, 0x4170000000000000\n# |                     ^\n# | \n# | Input file: <stdin>\n# | Check file: C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\InstCombine\\select-fcmp-fmul-zero-absorbing-value.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n# |             .\n# |             .\n# |             .\n# |           174:  %select = select i1 %x.is.zero, float %mul.fabs.x, float %fabs.x \n# |           175:  ret float %select \n# |           176: } \n# |           177:  \n# |           178: define float @cmp_one_nnan_fabs(float %x) { \n# |           179:  %fabs.x = call nnan float @llvm.fabs.f32(float %x) \n# | next:376'0                                                        X error: no match found\n# | next:376'1                                                          with \"FABS_X\" equal to \"%fabs.x\"\n# |           180:  %mul.fabs.x = fmul nnan float %fabs.x, 0x4170000000000000 \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:376'2                         ?                                       possible intended match\n# |           181:  %x.is.not.zero = fcmp one float %x, 0.000000e+00 \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |           182:  %select = select i1 %x.is.not.zero, float %fabs.x, float %mul.fabs.x \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |           183:  ret float %select \n# | next:376'0     ~~~~~~~~~~~~~~~~~~~\n# |           184: } \n# | next:376'0     ~~\n# |           185:  \n# | next:376'0     ~\n# |             .\n# |             .\n# |             .\n# | >>>>>>\n# `-----------------------------\n# error: command failed with exit status: 1\n\n--\n\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    },
+    {
+      "author": "lukel97",
+      "body": "I think we're seeing regressions on llvm-test-suite with -march=rva23u64 -O3 with this patch unfortunately.\r\n\r\n```diff\r\n--- build.rva23u64-O3-a/MultiSource/Benchmarks/nbench/CMakeFiles/nbench.dir/emfloat.s   2026-02-23 18:31:33\r\n+++ build.rva23u64-O3-b//MultiSource/Benchmarks/nbench/CMakeFiles/nbench.dir/emfloat.s  2026-02-23 18:26:08\r\n@@ -1796,11 +1832,16 @@\r\n        .cfi_offset s0, -16\r\n        .cfi_offset s1, -24\r\n        addi    s0, a0, 4\r\n-       vsetivli        zero, 4, e16, mf2, ta, ma\r\n-       vle16.v v8, (s0)\r\n-       vredor.vs       v8, v8, v8\r\n-       vmv.x.s a2, v8\r\n-       slli    a2, a2, 48\r\n+       lhu     a2, 2(s0)\r\n+       lhu     a3, 0(s0)\r\n+       lhu     a4, 4(s0)\r\n+       lhu     a5, 6(s0)\r\n+       slli    a2, a2, 16\r\n+       or      a2, a2, a3\r\n+       slli    a4, a4, 32\r\n+       slli    a5, a5, 48\r\n+       or      a4, a4, a5\r\n+       or      a2, a2, a4\r\n        beqz    a2, .LBB4_5\r\n```\r\n\r\nWe remove the domain crossing but we go from 5 instructions to 10. AFAIK all of the vector instructions are single uops at this LMUL. \r\n\r\nFor RISC-V the single vector reduction is cheaper than the series of binary ops I think, and the scalarization inadvertently causes multiple scalar loads because of alignment I'm guessing. Would it be possible to look at doing this in VectorCombine instead?"
+    },
+    {
+      "author": "artagnon",
+      "body": "> I think we're seeing regressions on llvm-test-suite with -march=rva23u64 -O3 with this patch unfortunately.\r\n> \r\n> ```diff\r\n> --- build.rva23u64-O3-a/MultiSource/Benchmarks/nbench/CMakeFiles/nbench.dir/emfloat.s   2026-02-23 18:31:33\r\n> +++ build.rva23u64-O3-b//MultiSource/Benchmarks/nbench/CMakeFiles/nbench.dir/emfloat.s  2026-02-23 18:26:08\r\n> @@ -1796,11 +1832,16 @@\r\n>         .cfi_offset s0, -16\r\n>         .cfi_offset s1, -24\r\n>         addi    s0, a0, 4\r\n> -       vsetivli        zero, 4, e16, mf2, ta, ma\r\n> -       vle16.v v8, (s0)\r\n> -       vredor.vs       v8, v8, v8\r\n> -       vmv.x.s a2, v8\r\n> -       slli    a2, a2, 48\r\n> +       lhu     a2, 2(s0)\r\n> +       lhu     a3, 0(s0)\r\n> +       lhu     a4, 4(s0)\r\n> +       lhu     a5, 6(s0)\r\n> +       slli    a2, a2, 16\r\n> +       or      a2, a2, a3\r\n> +       slli    a4, a4, 32\r\n> +       slli    a5, a5, 48\r\n> +       or      a4, a4, a5\r\n> +       or      a2, a2, a4\r\n>         beqz    a2, .LBB4_5\r\n> ```\r\n\r\nStrange, I wonder where all the extra operations are coming from? Don't we simply fold it into an icmp bitcast(%vec), (AllOnes|Zero), removing the or altogether? Let's try to make sure we have the correct diff? I will also run it on my end."
+    },
+    {
+      "author": "artagnon",
+      "body": "Ah yes, we're probably missing a one-use constraint :/"
+    },
+    {
+      "author": "lukel97",
+      "body": "> Ah yes, we're probably missing a one-use constraint :/\r\n\r\nI'm not sure if this is related to a one-use constraint. The reduction in that code snippet only has one use, it just happens to be lowered to `vredror.vs v8, v8, v8`. I think the IR for it is something like\r\n\r\n```llvm\r\n%v = load <4 x i16>\r\n%red = call i16 @llvm.vector.reduce.or(<4 x i16> %v)\r\n%cmp = icmp eq i16 %red, ...\r\n```"
+    },
+    {
+      "author": "artagnon",
+      "body": "> I'm not sure if this is related to a one-use constraint.\r\n\r\nHm, my reading of the snippet is that we're branching on `a2` (so that would be the icmp operand, which matches the intrinsic vredor + vmx.x.s), and it has the `slli` use? What am I missing?\r\n\r\n> I think the IR for it is something like\r\n\r\nI checked this already (https://godbolt.org/z/Mh9zx43es), and the InstCombine patch should  be doing the right thing in for the middle-end with one-use constraint?"
+    },
+    {
+      "author": "lukel97",
+      "body": "> > I'm not sure if this is related to a one-use constraint.\r\n> \r\n> Hm, my reading of the snippet is that we're branching on `a2` (so that would be the icmp operand, which matches the intrinsic vredor + vmx.x.s), and it has the `slli` use? What am I missing?\r\n\r\n\r\nThe slli writes to a2 so it's still one use, the original codegen is:\r\n\r\n```asm\r\n       vsetivli        zero, 4, e16, mf2, ta, ma\r\n       vle16.v v8, (s0)\r\n       vredor.vs       v8, v8, v8\r\n       vmv.x.s a2, v8\r\n       slli    a2, a2, 48\r\n       beqz    a2, .LBB4_5\r\n```"
+    },
+    {
+      "author": "artagnon",
+      "body": "> The slli writes to a2 so it's still one use\r\n\r\nAh yes, but there must be something else going on in DAGCombine or something -- I just codegen'ed emfloat with the one-use patch, and I don't see the snippet in the diff: do you have some script to filter the diff for regressions or something? Can you kindly verify on your end?"
+    },
+    {
+      "author": "artagnon",
+      "body": "I finally found it, but the diff is inverted for me!\r\n\r\n```diff\r\n-       .loc    1 256 12                        # MultiSource/Benchmarks/nbench/emfloat.\r\nc:256:12 @[ MultiSource/Benchmarks/nbench/emfloat.c:441:5 @[ MultiSource/Benchmarks/nben\r\nch/emfloat.c:482:9 ] ]\r\n-       lhu     a2, 2(s0)\r\n-       lhu     a3, 0(s0)\r\n-       lhu     a4, 4(s0)\r\n-       lhu     a5, 6(s0)\r\n-       slli    a2, a2, 16\r\n-       or      a2, a2, a3\r\n-       slli    a4, a4, 32\r\n-       slli    a5, a5, 48\r\n-       or      a4, a4, a5\r\n-       or      a2, a2, a4\r\n-.Ltmp634:\r\n+       vle16.v v8, (s0)\r\n+       .loc    1 256 10 is_stmt 0              # MultiSource/Benchmarks/nbench/emfloat.\r\nc:256:10 @[ MultiSource/Benchmarks/nbench/emfloat.c:441:5 @[ MultiSource/Benchmarks/nben\r\nch/emfloat.c:482:9 ] ]\r\n+       vredor.vs       v8, v8, v8\r\n+       vmv.x.s a2, v8\r\n+.Ltmp639:\r\n        #DEBUG_VALUE: IsMantissaZero:i <- 4\r\n        .loc    1 441 5 is_stmt 1               # MultiSource/Benchmarks/nbench/emfloat.\r\nc:441:5 @[ MultiSource/Benchmarks/nbench/emfloat.c:482:9 ]\r\n+       slli    a2, a2, 48\r\n        beqz    a2, .LBB4_5\r\n```\r\n\r\n... I double-checked my before and after, and it seems you inverted them on your end?"
+    },
+    {
+      "author": "lukel97",
+      "body": "I just double checked my diff and recreated it from scratch, it's not inverted unfortunately. I'm comparing f02aadc9456c05b17aaf2cef975212bacfe15357 (before) and 279b3dbec65c8bc898e254f373b4f443a7e106b9 (after), with the flags `-march=rva23u64 -O3` \n\nI also checked #182833 and it doesn't seem to fix the regression either.\n"
+    },
+    {
+      "author": "lukel97",
+      "body": "I see the issue now, InstCombine scalarizes the vector load from <4 x i16> to i64, even though the alignment is 2:\n\n```\nattributes #0 = { \"target-features\"=\"+v\" }\n; *** IR Dump After PromotePass on after ***\ndefine i1 @after(ptr %p) local_unnamed_addr #0 {\n  %v = load <4 x i16>, ptr %p, align 2\n  %cast = bitcast <4 x i16> %v to i64\n  %cmp = icmp ne i64 %cast, 0\n  ret i1 %cmp\n}\n; *** IR Dump After InstCombinePass on after ***\ndefine i1 @after(ptr %p) local_unnamed_addr #0 {\n  %v1 = load i64, ptr %p, align 2\n  %cmp = icmp ne i64 %v1, 0\n  ret i1 %cmp\n}\n```\n\nMy guess is that instcombine sees both loads as \"unaligned\" so it decides to scalarize it. But in fact the <4 x i16> is aligned, we just don't have a way of expressing this in the datalayout string yet.\n\nhttps://discourse.llvm.org/t/rfc-add-a-data-layout-specifier-for-element-aligned-vectors/89764 is relevant here"
+    },
+    {
+      "author": "artagnon",
+      "body": "Hm, interesting. Looks like the patch exposed yet another opportunity for this sub-optimal fold?"
+    },
+    {
+      "author": "topperc",
+      "body": "> My guess is that instcombine sees both loads as \"unaligned\" so it decides to scalarize it. But in fact the <4 x i16> is aligned, we just don't have a way of expressing this in the datalayout string yet.\r\n\r\nIt's probably done by `combineLoadToOperationType` in InstCombineLoadStoreAlloca.cpp. I don't think that function considers alignment."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-21T15:54:43Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      [
+        7523,
+        7528
+      ],
+      [
+        7998,
+        8003
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      "InstCombinerImpl::visitICmpInst",
+      "foldICmpInvariantGroup"
+    ]
+  }
+}

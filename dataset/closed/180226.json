@@ -1,0 +1,190 @@
+{
+  "pr_id": 180226,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180226",
+  "state": "closed",
+  "title": "[VPlan] Propagate FastMathFlags from phis to blends",
+  "author": "lukel97",
+  "base_commit": "bd4784a913cd53f42ff8c2a3ddfff2e106c5070a",
+  "fix_commit": "d0cc739d9a2bd41237b3e0b8e80dba416c302115",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\nindex 38ede9fff3650..0b8796f646ae3 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n@@ -233,15 +233,13 @@ class VPBuilder {\n     return createNaryOp(VPInstruction::LogicalAnd, {LHS, RHS}, DL, Name);\n   }\n \n-  VPInstruction *\n-  createSelect(VPValue *Cond, VPValue *TrueVal, VPValue *FalseVal,\n-               DebugLoc DL = DebugLoc::getUnknown(), const Twine &Name = \"\",\n-               std::optional<FastMathFlags> FMFs = std::nullopt) {\n-    if (!FMFs)\n-      return createNaryOp(Instruction::Select, {Cond, TrueVal, FalseVal}, DL,\n-                          Name);\n+  VPInstruction *createSelect(VPValue *Cond, VPValue *TrueVal,\n+                              VPValue *FalseVal,\n+                              DebugLoc DL = DebugLoc::getUnknown(),\n+                              const Twine &Name = \"\",\n+                              const VPIRFlags &Flags = {}) {\n     return tryInsertInstruction(new VPInstruction(\n-        Instruction::Select, {Cond, TrueVal, FalseVal}, *FMFs, {}, DL, Name));\n+        Instruction::Select, {Cond, TrueVal, FalseVal}, Flags, {}, DL, Name));\n   }\n \n   /// Create a new ICmp VPInstruction with predicate \\p Pred and operands \\p A\n@@ -291,9 +289,10 @@ class VPBuilder {\n                           GEPNoWrapFlags::none(), {}, DL, Name));\n   }\n \n-  VPPhi *createScalarPhi(ArrayRef<VPValue *> IncomingValues, DebugLoc DL,\n-                         const Twine &Name = \"\") {\n-    return tryInsertInstruction(new VPPhi(IncomingValues, DL, Name));\n+  VPPhi *createScalarPhi(ArrayRef<VPValue *> IncomingValues,\n+                         DebugLoc DL = DebugLoc::getUnknown(),\n+                         const Twine &Name = \"\", const VPIRFlags &Flags = {}) {\n+    return tryInsertInstruction(new VPPhi(IncomingValues, Flags, DL, Name));\n   }\n \n   VPValue *createElementCount(Type *Ty, ElementCount EC) {\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 46882ebf7f4a7..36a728d861048 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8472,12 +8472,11 @@ void LoopVectorizationPlanner::addReductionResultComputation(\n     if (!PhiR->isInLoop() && CM.foldTailByMasking() &&\n         (!RR || !RR->isPartialReduction())) {\n       VPValue *Cond = vputils::findHeaderMask(*Plan);\n-      std::optional<FastMathFlags> FMFs =\n-          PhiTy->isFloatingPointTy()\n-              ? std::make_optional(RdxDesc.getFastMathFlags())\n-              : std::nullopt;\n+      VPIRFlags Flags = PhiTy->isFloatingPointTy()\n+                            ? VPIRFlags(RdxDesc.getFastMathFlags())\n+                            : VPIRFlags();\n       NewExitingVPV =\n-          Builder.createSelect(Cond, OrigExitingVPV, PhiR, {}, \"\", FMFs);\n+          Builder.createSelect(Cond, OrigExitingVPV, PhiR, {}, \"\", Flags);\n       OrigExitingVPV->replaceUsesWithIf(NewExitingVPV, [](VPUser &U, unsigned) {\n         using namespace VPlanPatternMatch;\n         return match(\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex 8b82f24c1cad5..eac5b58841e80 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -1046,7 +1046,8 @@ struct VPRecipeWithIRFlags : public VPSingleDefRecipe, public VPIRFlags {\n       : VPSingleDefRecipe(SC, Operands, DL), VPIRFlags(Flags) {}\n \n   static inline bool classof(const VPRecipeBase *R) {\n-    return R->getVPRecipeID() == VPRecipeBase::VPInstructionSC ||\n+    return R->getVPRecipeID() == VPRecipeBase::VPBlendSC ||\n+           R->getVPRecipeID() == VPRecipeBase::VPInstructionSC ||\n            R->getVPRecipeID() == VPRecipeBase::VPWidenSC ||\n            R->getVPRecipeID() == VPRecipeBase::VPWidenGEPSC ||\n            R->getVPRecipeID() == VPRecipeBase::VPWidenCallSC ||\n@@ -1560,8 +1561,9 @@ class VPPhiAccessors {\n };\n \n struct LLVM_ABI_FOR_TEST VPPhi : public VPInstruction, public VPPhiAccessors {\n-  VPPhi(ArrayRef<VPValue *> Operands, DebugLoc DL, const Twine &Name = \"\")\n-      : VPInstruction(Instruction::PHI, Operands, {}, {}, DL, Name) {}\n+  VPPhi(ArrayRef<VPValue *> Operands, const VPIRFlags &Flags, DebugLoc DL,\n+        const Twine &Name = \"\")\n+      : VPInstruction(Instruction::PHI, Operands, Flags, {}, DL, Name) {}\n \n   static inline bool classof(const VPUser *U) {\n     auto *VPI = dyn_cast<VPInstruction>(U);\n@@ -1579,7 +1581,7 @@ struct LLVM_ABI_FOR_TEST VPPhi : public VPInstruction, public VPPhiAccessors {\n   }\n \n   VPPhi *clone() override {\n-    auto *PhiR = new VPPhi(operands(), getDebugLoc(), getName());\n+    auto *PhiR = new VPPhi(operands(), *this, getDebugLoc(), getName());\n     PhiR->setUnderlyingValue(getUnderlyingValue());\n     return PhiR;\n   }\n@@ -2690,20 +2692,22 @@ class VPReductionPHIRecipe : public VPHeaderPHIRecipe,\n \n /// A recipe for vectorizing a phi-node as a sequence of mask-based select\n /// instructions.\n-class LLVM_ABI_FOR_TEST VPBlendRecipe : public VPSingleDefRecipe {\n+class LLVM_ABI_FOR_TEST VPBlendRecipe : public VPRecipeWithIRFlags {\n public:\n   /// The blend operation is a User of the incoming values and of their\n   /// respective masks, ordered [I0, M0, I1, M1, I2, M2, ...]. Note that M0 can\n   /// be omitted (implied by passing an odd number of operands) in which case\n   /// all other incoming values are merged into it.\n-  VPBlendRecipe(PHINode *Phi, ArrayRef<VPValue *> Operands, DebugLoc DL)\n-      : VPSingleDefRecipe(VPRecipeBase::VPBlendSC, Operands, Phi, DL) {\n+  VPBlendRecipe(PHINode *Phi, ArrayRef<VPValue *> Operands,\n+                const VPIRFlags &Flags, DebugLoc DL)\n+      : VPRecipeWithIRFlags(VPRecipeBase::VPBlendSC, Operands, Flags, DL) {\n     assert(Operands.size() >= 2 && \"Expected at least two operands!\");\n+    setUnderlyingValue(Phi);\n   }\n \n   VPBlendRecipe *clone() override {\n     return new VPBlendRecipe(cast_or_null<PHINode>(getUnderlyingValue()),\n-                             operands(), getDebugLoc());\n+                             operands(), *this, getDebugLoc());\n   }\n \n   VP_CLASSOF_IMPL(VPRecipeBase::VPBlendSC)\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex d22e8c100529e..91d73671cf26a 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -221,7 +221,8 @@ void PlainCFGBuilder::createVPInstructionsForVPBB(VPBasicBlock *VPBB,\n       // Phi node's operands may not have been visited at this point. We create\n       // an empty VPInstruction that we will fix once the whole plain CFG has\n       // been built.\n-      NewR = VPIRBuilder.createScalarPhi({}, Phi->getDebugLoc(), \"vec.phi\");\n+      NewR =\n+          VPIRBuilder.createScalarPhi({}, Phi->getDebugLoc(), \"vec.phi\", *Phi);\n       NewR->setUnderlyingValue(Phi);\n       if (isHeaderBB(Phi->getParent(), LI->getLoopFor(Phi->getParent()))) {\n         // Header phis need to be fixed after the VPBB for the latch has been\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp b/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\nindex f91bf986bda9e..216efaf4b2fe9 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\n@@ -256,7 +256,7 @@ void VPPredicator::convertPhisToBlends(VPBasicBlock *VPBB) {\n     }\n     PHINode *IRPhi = cast_or_null<PHINode>(PhiR->getUnderlyingValue());\n     auto *Blend =\n-        new VPBlendRecipe(IRPhi, OperandsWithMask, PhiR->getDebugLoc());\n+        new VPBlendRecipe(IRPhi, OperandsWithMask, *PhiR, PhiR->getDebugLoc());\n     Builder.insert(Blend);\n     PhiR->replaceAllUsesWith(Blend);\n     PhiR->eraseFromParent();\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 4a5145b092d6c..6a95804c1c5f0 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -583,7 +583,9 @@ Value *VPInstruction::generate(VPTransformState &State) {\n                   OnlyFirstLaneUsed || vputils::isSingleScalar(getOperand(0)));\n     Value *Op1 = State.get(getOperand(1), OnlyFirstLaneUsed);\n     Value *Op2 = State.get(getOperand(2), OnlyFirstLaneUsed);\n-    return Builder.CreateSelect(Cond, Op1, Op2, Name);\n+    FastMathFlags FMFs =\n+        hasFastMathFlags() ? getFastMathFlags() : FastMathFlags();\n+    return Builder.CreateSelectFMF(Cond, Op1, Op2, FMFs, Name);\n   }\n   case VPInstruction::ActiveLaneMask: {\n     // Get first lane of vector induction variable.\n@@ -1619,7 +1621,8 @@ void VPPhi::printRecipe(raw_ostream &O, const Twine &Indent,\n                         VPSlotTracker &SlotTracker) const {\n   O << Indent << \"EMIT\" << (isSingleScalar() ? \"-SCALAR\" : \"\") << \" \";\n   printAsOperand(O, SlotTracker);\n-  O << \" = phi \";\n+  O << \" = phi\";\n+  printFlags(O);\n   printPhiOperands(O, SlotTracker);\n }\n #endif\n@@ -2128,7 +2131,8 @@ bool VPIRFlags::flagsValidForOpcode(unsigned Opcode) const {\n            Opcode == Instruction::FMul || Opcode == Instruction::FSub ||\n            Opcode == Instruction::FNeg || Opcode == Instruction::FDiv ||\n            Opcode == Instruction::FRem || Opcode == Instruction::FPExt ||\n-           Opcode == Instruction::FPTrunc || Opcode == Instruction::Select ||\n+           Opcode == Instruction::FPTrunc || Opcode == Instruction::PHI ||\n+           Opcode == Instruction::Select ||\n            Opcode == VPInstruction::WideIVStep ||\n            Opcode == VPInstruction::ReductionStartVector;\n   case OperationType::FCmp:\n@@ -2739,14 +2743,15 @@ void VPBlendRecipe::printRecipe(raw_ostream &O, const Twine &Indent,\n   O << Indent << \"BLEND \";\n   printAsOperand(O, SlotTracker);\n   O << \" =\";\n+  printFlags(O);\n   if (getNumIncomingValues() == 1) {\n     // Not a User of any mask: not really blending, this is a\n     // single-predecessor phi.\n-    O << \" \";\n     getIncomingValue(0)->printAsOperand(O, SlotTracker);\n   } else {\n     for (unsigned I = 0, E = getNumIncomingValues(); I < E; ++I) {\n-      O << \" \";\n+      if (I != 0)\n+        O << \" \";\n       getIncomingValue(I)->printAsOperand(O, SlotTracker);\n       if (I == 0)\n         continue;\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex cdddb183c02b0..839b4cdf4219c 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -1796,7 +1796,7 @@ static void simplifyBlends(VPlan &Plan) {\n \n       auto *NewBlend =\n           new VPBlendRecipe(cast_or_null<PHINode>(Blend->getUnderlyingValue()),\n-                            OperandsWithMask, Blend->getDebugLoc());\n+                            OperandsWithMask, *Blend, Blend->getDebugLoc());\n       NewBlend->insertBefore(&R);\n \n       VPValue *DeadMask = Blend->getMask(StartIndex);\n@@ -3898,7 +3898,7 @@ void VPlanTransforms::convertToConcreteRecipes(VPlan &Plan) {\n         for (unsigned I = 1; I != Blend->getNumIncomingValues(); ++I)\n           Select = Builder.createSelect(Blend->getMask(I),\n                                         Blend->getIncomingValue(I), Select,\n-                                        R.getDebugLoc(), \"predphi\");\n+                                        R.getDebugLoc(), \"predphi\", *Blend);\n         Blend->replaceAllUsesWith(Select);\n         ToRemove.push_back(Blend);\n       }\ndiff --git a/llvm/unittests/Transforms/Vectorize/VPlanTest.cpp b/llvm/unittests/Transforms/Vectorize/VPlanTest.cpp\nindex 52634abcfb670..5f33f0593e05f 100644\n--- a/llvm/unittests/Transforms/Vectorize/VPlanTest.cpp\n+++ b/llvm/unittests/Transforms/Vectorize/VPlanTest.cpp\n@@ -1147,7 +1147,7 @@ TEST_F(VPRecipeTest, CastVPBlendRecipeToVPUser) {\n   Args.push_back(I1);\n   Args.push_back(I2);\n   Args.push_back(M2);\n-  VPBlendRecipe Recipe(Phi, Args, {});\n+  VPBlendRecipe Recipe(Phi, Args, {}, {});\n \n   checkVPRecipeCastImpl<VPBlendRecipe, VPUser>(&Recipe);\n \ndiff --git a/llvm/unittests/Transforms/Vectorize/VPlanVerifierTest.cpp b/llvm/unittests/Transforms/Vectorize/VPlanVerifierTest.cpp\nindex eeae72920854b..f07ee94105ff8 100644\n--- a/llvm/unittests/Transforms/Vectorize/VPlanVerifierTest.cpp\n+++ b/llvm/unittests/Transforms/Vectorize/VPlanVerifierTest.cpp\n@@ -113,7 +113,7 @@ TEST_F(VPVerifierTest, VPBlendUseBeforeDefDifferentBB) {\n   auto *CanIV = new VPCanonicalIVPHIRecipe(Zero, {});\n   VPInstruction *BranchOnCond =\n       new VPInstruction(VPInstruction::BranchOnCond, {CanIV});\n-  auto *Blend = new VPBlendRecipe(Phi, {DefI, Plan.getTrue()}, {});\n+  auto *Blend = new VPBlendRecipe(Phi, {DefI, Plan.getTrue()}, {}, {});\n \n   VPBasicBlock *VPBB1 = Plan.getEntry();\n   VPBasicBlock *VPBB2 = Plan.createVPBasicBlock(\"\");\n@@ -166,7 +166,7 @@ TEST_F(VPVerifierTest, VPPhiIncomingValueDoesntDominateIncomingBlock) {\n   VPInstruction *DefI =\n       new VPInstruction(Instruction::Add, {Zero, Zero},\n                         VPIRFlags::getDefaultFlags(Instruction::Add));\n-  VPPhi *Phi = new VPPhi({DefI}, {});\n+  VPPhi *Phi = new VPPhi({DefI}, {}, {});\n   VPBB2->appendRecipe(Phi);\n   VPBB2->appendRecipe(DefI);\n   auto *CanIV = new VPCanonicalIVPHIRecipe(Zero, {});\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "If a phi has fast math flags, we can propagate it to the widened select. To do this, this patch makes VPPhi and VPBlendRecipe subclasses of VPRecipeWithIRFlags, and propagates it through PlainCFGBuilder and VPPredicator.\n\nAlive2 proofs for some of the FMFs (it looks like it can't reason about the full \"fast\" set yet)\nnnan: https://alive2.llvm.org/ce/z/f0bRd4\nnsz: https://alive2.llvm.org/ce/z/u9P96T\n\nThe actual motivation for this to eventually be able to move the special casing for tail folding in LoopVectorizationPlanner::addReductionResultComputation into the CFG in #176143, which requires passing through FMFs.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -debug-only=loop-vectorize -disable-output -S %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "define void @f(ptr noalias %p, i1 %c) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %latch ]\n  %gep = getelementptr float, ptr %p, i32 %iv\n  %x = load float, ptr %gep, align 4\n  br i1 %c, label %then, label %latch\n\nthen:                                             ; preds = %loop\n  br label %latch\n\nlatch:                                            ; preds = %then, %loop\n  %phi = phi fast float [ %x, %loop ], [ 0.000000e+00, %then ]\n  store float %phi, ptr %gep, align 4\n  %iv.next = add i32 %iv, 1\n  %done = icmp eq i32 %iv.next, 1024\n  br i1 %done, label %exit, label %loop\n\nexit:                                             ; preds = %latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/phi-with-fastflags.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "define void @f(ptr noalias %p, i1 %c) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %latch ]\n  %gep = getelementptr float, ptr %p, i32 %iv\n  %x = load float, ptr %gep, align 4\n  br i1 %c, label %then, label %latch\n\nthen:                                             ; preds = %loop\n  br label %latch\n\nlatch:                                            ; preds = %then, %loop\n  %phi = phi fast float [ %x, %loop ], [ 0.000000e+00, %then ]\n  store float %phi, ptr %gep, align 4\n  %iv.next = add i32 %iv, 1\n  %done = icmp eq i32 %iv.next, 1024\n  br i1 %done, label %exit, label %loop\n\nexit:                                             ; preds = %latch\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189771 tests passed\n* 5065 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130618 tests passed\n* 2925 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `fuchsia-x86_64-linux` running on `fuchsia-debian-64-us-central1-b-1` while building `llvm` at step 4 \"annotate\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/11/builds/33293\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 4 (annotate) failure: 'python ../llvm-zorg/zorg/buildbot/builders/annotated/fuchsia-linux.py ...' (failure)\n...\n  Passed           : 48957 (97.11%)\n  Expectedly Failed:    24 (0.05%)\n[1501/1503] Linking CXX executable unittests/Frontend/LLVMFrontendTests\n[1502/1503] Running the LLVM regression tests\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/ld.lld\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/lld-link\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/ld64.lld\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/wasm-ld\n-- Testing: 63501 tests, 60 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. 60.. 70.. \nFAIL: LLVM :: Transforms/LoopVectorize/phi-with-fastflags-vplan.ll (51343 of 63501)\n******************** TEST 'LLVM :: Transforms/LoopVectorize/phi-with-fastflags-vplan.ll' FAILED ********************\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 2\n/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt -p loop-vectorize -force-vector-width=4 -debug-only=loop-vectorize -disable-output -S /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll 2>&1 | /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/FileCheck /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# executed command: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt -p loop-vectorize -force-vector-width=4 -debug-only=loop-vectorize -disable-output -S /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# note: command had no output on stdout or stderr\n# error: command failed with exit status: 1\n# executed command: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/FileCheck /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# .---command stderr------------\n# | /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll:5:16: error: CHECK-LABEL: expected string not found in input\n# | ; CHECK-LABEL: 'f'\n# |                ^\n# | <stdin>:1:1: note: scanning from here\n# | opt: Unknown command line argument '-debug-only=loop-vectorize'. Try: '/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt --help'\n# | ^\n# | <stdin>:1:34: note: possible intended match here\n# | opt: Unknown command line argument '-debug-only=loop-vectorize'. Try: '/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt --help'\n# |                                  ^\n# | \n# | Input file: <stdin>\n# | Check file: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n# |            1: opt: Unknown command line argument '-debug-only=loop-vectorize'. Try: '/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt --help' \n# | label:5'0     X~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ error: no match found\n# | label:5'1                                      ?                                                                                                                       possible intended match\n# |            2: opt: Did you mean '--debug-pass=loop-vectorize'? \n# | label:5'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | >>>>>>\n# `-----------------------------\n# error: command failed with exit status: 1\n\nStep 7 (check) failure: check (failure)\n...\n  Passed           : 48957 (97.11%)\n  Expectedly Failed:    24 (0.05%)\n[1501/1503] Linking CXX executable unittests/Frontend/LLVMFrontendTests\n[1502/1503] Running the LLVM regression tests\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/ld.lld\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/lld-link\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/ld64.lld\nllvm-lit: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/wasm-ld\n-- Testing: 63501 tests, 60 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. 60.. 70.. \nFAIL: LLVM :: Transforms/LoopVectorize/phi-with-fastflags-vplan.ll (51343 of 63501)\n******************** TEST 'LLVM :: Transforms/LoopVectorize/phi-with-fastflags-vplan.ll' FAILED ********************\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 2\n/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt -p loop-vectorize -force-vector-width=4 -debug-only=loop-vectorize -disable-output -S /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll 2>&1 | /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/FileCheck /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# executed command: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt -p loop-vectorize -force-vector-width=4 -debug-only=loop-vectorize -disable-output -S /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# note: command had no output on stdout or stderr\n# error: command failed with exit status: 1\n# executed command: /var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/FileCheck /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# .---command stderr------------\n# | /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll:5:16: error: CHECK-LABEL: expected string not found in input\n# | ; CHECK-LABEL: 'f'\n# |                ^\n# | <stdin>:1:1: note: scanning from here\n# | opt: Unknown command line argument '-debug-only=loop-vectorize'. Try: '/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt --help'\n# | ^\n# | <stdin>:1:34: note: possible intended match here\n# | opt: Unknown command line argument '-debug-only=loop-vectorize'. Try: '/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt --help'\n# |                                  ^\n# | \n# | Input file: <stdin>\n# | Check file: /var/lib/buildbot/fuchsia-x86_64-linux/llvm-project/llvm/test/Transforms/LoopVectorize/phi-with-fastflags-vplan.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n# |            1: opt: Unknown command line argument '-debug-only=loop-vectorize'. Try: '/var/lib/buildbot/fuchsia-x86_64-linux/build/llvm-build-_sp_i2to/bin/opt --help' \n# | label:5'0     X~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ error: no match found\n# | label:5'1                                      ?                                                                                                                       possible intended match\n# |            2: opt: Did you mean '--debug-pass=loop-vectorize'? \n# | label:5'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | >>>>>>\n# `-----------------------------\n# error: command failed with exit status: 1\n\n\n```\n\n</details>"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-06T16:28:27Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+      [
+        233,
+        247
+      ],
+      [
+        291,
+        299
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        8472,
+        8483
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      [
+        1046,
+        1052
+      ],
+      [
+        1560,
+        1567
+      ],
+      [
+        1579,
+        1585
+      ],
+      [
+        2690,
+        2709
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        221,
+        227
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp": [
+      [
+        256,
+        262
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        583,
+        589
+      ],
+      [
+        1619,
+        1625
+      ],
+      [
+        2128,
+        2134
+      ],
+      [
+        2739,
+        2752
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        1796,
+        1802
+      ],
+      [
+        3898,
+        3904
+      ]
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanTest.cpp": [
+      [
+        1147,
+        1153
+      ]
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanVerifierTest.cpp": [
+      [
+        113,
+        119
+      ],
+      [
+        166,
+        172
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+      "createElementCount",
+      "createLogicalAnd",
+      "createScalarPhi",
+      "createSelect",
+      "createWidePtrAdd"
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationPlanner::addReductionResultComputation"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      "VPSingleDefRecipe",
+      "classof",
+      "clone"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "PlainCFGBuilder::createVPInstructionsForVPBB"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp": [
+      "VPPredicator::convertPhisToBlends"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPBlendRecipe::printRecipe",
+      "VPIRFlags::flagsValidForOpcode",
+      "VPInstruction::generate",
+      "VPPhi::printRecipe"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::convertToConcreteRecipes",
+      "simplifyBlends"
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanTest.cpp": [
+      "TEST_F"
+    ],
+    "llvm/unittests/Transforms/Vectorize/VPlanVerifierTest.cpp": [
+      "TEST_F"
+    ]
+  }
+}

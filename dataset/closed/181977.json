@@ -1,0 +1,77 @@
+{
+  "pr_id": 181977,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181977",
+  "state": "closed",
+  "title": "[InstCombine] Allow simplifying FP selects of cmpxchg instructions.",
+  "author": "rj-jesus",
+  "base_commit": "8f378ea7e6fa31179266c69368be56a866b631e1",
+  "fix_commit": "b9465b2d2b8e3e298159596ce405d132a633c9f0",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex e57be1dce7b46..3eb0b1d767727 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -2765,6 +2765,16 @@ static Value *foldSelectCmpXchg(SelectInst &SI) {\n   // to I. If such conditions are true, the helper returns the cmpxchg\n   // instruction; otherwise, a nullptr is returned.\n   auto isExtractFromCmpXchg = [](Value *V, unsigned I) -> AtomicCmpXchgInst * {\n+    // When extracting the value loaded by a cmpxchg, allow peeking through a\n+    // bitcast. These are inserted for floating-point cmpxchg, for example:\n+    //   %bc = bitcast float %compare to i32\n+    //   %cmpxchg = cmpxchg ptr %ptr, i32 %bc, i32 %new_value seq_cst seq_cst\n+    //   %val = extractvalue { i32, i1 } %cmpxchg, 0\n+    //   %success = extractvalue { i32, i1 } %cmpxchg, 1\n+    //   %val.bc = bitcast i32 %val to float\n+    //   %sel = select i1 %success, float %compare, float %val.bc\n+    if (auto *BI = dyn_cast<BitCastInst>(V); BI && I == 0)\n+      V = BI->getOperand(0);\n     auto *Extract = dyn_cast<ExtractValueInst>(V);\n     if (!Extract)\n       return nullptr;\n@@ -2773,6 +2783,18 @@ static Value *foldSelectCmpXchg(SelectInst &SI) {\n     return dyn_cast<AtomicCmpXchgInst>(Extract->getAggregateOperand());\n   };\n \n+  // Check if the compare value of a cmpxchg matches another value.\n+  auto isCompareSameAsValue = [](Value *CmpVal, Value *SelVal) {\n+    // The values match if they are the same or %CmpVal = bitcast %SelVal (see\n+    // above).\n+    if (CmpVal == SelVal || match(CmpVal, m_BitCast(m_Specific(SelVal))))\n+      return true;\n+    // For FP constants, the value may have been bitcast to Int directly.\n+    auto *IntC = dyn_cast<ConstantInt>(CmpVal);\n+    auto *FpC = dyn_cast<ConstantFP>(SelVal);\n+    return IntC && FpC && IntC->getValue() == FpC->getValue().bitcastToAPInt();\n+  };\n+\n   // If the select has a single user, and this user is a select instruction that\n   // we can simplify, skip the cmpxchg simplification for now.\n   if (SI.hasOneUse())\n@@ -2791,14 +2813,16 @@ static Value *foldSelectCmpXchg(SelectInst &SI) {\n   // value of the same cmpxchg used by the condition, and the false value is the\n   // cmpxchg instruction's compare operand.\n   if (auto *X = isExtractFromCmpXchg(SI.getTrueValue(), 0))\n-    if (X == CmpXchg && X->getCompareOperand() == SI.getFalseValue())\n+    if (X == CmpXchg &&\n+        isCompareSameAsValue(X->getCompareOperand(), SI.getFalseValue()))\n       return SI.getFalseValue();\n \n   // Check the false value case: The false value of the select is the returned\n   // value of the same cmpxchg used by the condition, and the true value is the\n   // cmpxchg instruction's compare operand.\n   if (auto *X = isExtractFromCmpXchg(SI.getFalseValue(), 0))\n-    if (X == CmpXchg && X->getCompareOperand() == SI.getTrueValue())\n+    if (X == CmpXchg &&\n+        isCompareSameAsValue(X->getCompareOperand(), SI.getTrueValue()))\n       return SI.getFalseValue();\n \n   return nullptr;\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "We already simplify selects that test the flag returned by a cmpxchg and select between the value the cmpxchg loaded and the compare operand.\r\n\r\nThis patch extends the fold to FP (and vector) compare-exchange operations, where the compare operand and loaded value are bitcast.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-cmpxchg.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "cmpxchg_v2i32_const",
+          "test_body": "define <2 x i32> @cmpxchg_v2i32_const(ptr %ptr, i64 %new_value) {\n  %t0 = cmpxchg ptr %ptr, i64 0, i64 %new_value acq_rel monotonic, align 8\n  %t1 = extractvalue { i64, i1 } %t0, 1\n  %t2 = extractvalue { i64, i1 } %t0, 0\n  %t3 = bitcast i64 %t2 to <2 x i32>\n  %t4 = select i1 %t1, <2 x i32> zeroinitializer, <2 x i32> %t3\n  ret <2 x i32> %t4\n}\n"
+        },
+        {
+          "test_name": "cmpxchg_fp",
+          "test_body": "define double @cmpxchg_fp(ptr %ptr, double %compare, i64 %new_value) {\n  %bc = bitcast double %compare to i64\n  %t0 = cmpxchg ptr %ptr, i64 %bc, i64 %new_value acq_rel monotonic, align 8\n  %t1 = extractvalue { i64, i1 } %t0, 1\n  %t2 = extractvalue { i64, i1 } %t0, 0\n  %t3 = bitcast i64 %t2 to double\n  %t4 = select i1 %t1, double %compare, double %t3\n  ret double %t4\n}\n"
+        },
+        {
+          "test_name": "cmpxchg_2",
+          "test_body": "define i64 @cmpxchg_2(ptr %ptr, i64 %compare, i64 %new_value) {\n  %t0 = cmpxchg ptr %ptr, i64 %compare, i64 %new_value acq_rel monotonic, align 8\n  %t1 = extractvalue { i64, i1 } %t0, 1\n  %t2 = extractvalue { i64, i1 } %t0, 0\n  %t3 = select i1 %t1, i64 %compare, i64 %t2\n  %t4 = select i1 %t1, i64 %t3, i64 %compare\n  ret i64 %t4\n}\n"
+        },
+        {
+          "test_name": "cmpxchg_fp_const",
+          "test_body": "define double @cmpxchg_fp_const(ptr %ptr, i64 %new_value) {\n  %t0 = cmpxchg ptr %ptr, i64 0, i64 %new_value acq_rel monotonic, align 8\n  %t1 = extractvalue { i64, i1 } %t0, 1\n  %t2 = extractvalue { i64, i1 } %t0, 0\n  %t3 = bitcast i64 %t2 to double\n  %t4 = select i1 %t1, double 0.000000e+00, double %t3\n  ret double %t4\n}\n"
+        },
+        {
+          "test_name": "cmpxchg_v2i32",
+          "test_body": "define <2 x i32> @cmpxchg_v2i32(ptr %ptr, <2 x i32> %compare, i64 %new_value) {\n  %bc = bitcast <2 x i32> %compare to i64\n  %t0 = cmpxchg ptr %ptr, i64 %bc, i64 %new_value acq_rel monotonic, align 8\n  %t1 = extractvalue { i64, i1 } %t0, 1\n  %t2 = extractvalue { i64, i1 } %t0, 0\n  %t3 = bitcast i64 %t2 to <2 x i32>\n  %t4 = select i1 %t1, <2 x i32> %compare, <2 x i32> %t3\n  ret <2 x i32> %t4\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-18T09:17:48Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        2765,
+        2770
+      ],
+      [
+        2773,
+        2778
+      ],
+      [
+        2791,
+        2804
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/select-cmpxchg.ll": [
+      [
+        38,
+        40
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "foldSelectCmpXchg"
+    ]
+  }
+}

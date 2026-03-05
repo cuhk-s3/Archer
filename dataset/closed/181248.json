@@ -1,0 +1,84 @@
+{
+  "pr_id": 181248,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181248",
+  "state": "closed",
+  "title": "[ProfCheck][Matrix] Propagate profile information for selects",
+  "author": "boomanaiden154",
+  "base_commit": "c1e90fa663ca46c70d079503b83340d5e38105a4",
+  "fix_commit": "284c647d7b9c4728ebee3cb10868f57c32e6934d",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/LowerMatrixIntrinsics.cpp b/llvm/lib/Transforms/Scalar/LowerMatrixIntrinsics.cpp\nindex ecf295dc75c3a..65c6330d7bdd5 100644\n--- a/llvm/lib/Transforms/Scalar/LowerMatrixIntrinsics.cpp\n+++ b/llvm/lib/Transforms/Scalar/LowerMatrixIntrinsics.cpp\n@@ -104,6 +104,10 @@ static cl::opt<unsigned> SplitMatmulRemainderOverThreshold(\n              \"in the inner loop of matmul\"),\n     cl::init(0));\n \n+namespace llvm {\n+extern cl::opt<bool> ProfcheckDisableMetadataFixes;\n+} // end namespace llvm\n+\n /// Helper function to either return Scope, if it is a subprogram or the\n /// attached subprogram for a local scope.\n static DISubprogram *getSubprogram(DIScope *Scope) {\n@@ -2459,16 +2463,23 @@ class LowerMatrixIntrinsics {\n     MatrixTy B = getMatrix(OpB, Shape, Builder);\n \n     SmallVector<Value*> CondV;\n+    Instruction *MDFrom = nullptr;\n     if (isa<FixedVectorType>(Cond->getType())) {\n       MatrixTy C = getMatrix(Cond, Shape, Builder);\n       llvm::copy(C.vectors(), std::back_inserter(CondV));\n     } else {\n       CondV.resize(A.getNumVectors());\n       llvm::fill(CondV, Cond);\n+      if (!ProfcheckDisableMetadataFixes)\n+        MDFrom = Inst;\n     }\n \n-    for (auto [CV, AV, BV] : llvm::zip_equal(CondV, A.vectors(), B.vectors()))\n-      Result.addVector(Builder.CreateSelect(CV, AV, BV));\n+    for (auto [CV, AV, BV] : llvm::zip_equal(CondV, A.vectors(), B.vectors())) {\n+      assert(!(isa<VectorType>(CV->getType()) && static_cast<bool>(MDFrom)) &&\n+             \"If we have a vector conditional, we should be propagating \"\n+             \"profile information.\");\n+      Result.addVector(Builder.CreateSelect(CV, AV, BV, \"\", MDFrom));\n+    }\n \n     return Result.addNumComputeOps(getNumOps(Result.getVectorTy()) *\n                                    Result.getNumVectors());\ndiff --git a/llvm/utils/profcheck-xfail.txt b/llvm/utils/profcheck-xfail.txt\nindex 454f3d8f8fe00..63b1cf9696c65 100644\n--- a/llvm/utils/profcheck-xfail.txt\n+++ b/llvm/utils/profcheck-xfail.txt\n@@ -190,7 +190,6 @@ Transforms/LowerMatrixIntrinsics/multiply-fused-loops.ll\n Transforms/LowerMatrixIntrinsics/multiply-fused-loops-large-matrixes.ll\n Transforms/LowerMatrixIntrinsics/multiply-fused-multiple-blocks.ll\n Transforms/LowerMatrixIntrinsics/multiply-fused-volatile.ll\n-Transforms/LowerMatrixIntrinsics/select.ll\n Transforms/LowerSwitch/2003-05-01-PHIProblem.ll\n Transforms/LowerSwitch/2004-03-13-SwitchIsDefaultCrash.ll\n Transforms/LowerSwitch/2014-06-10-SwitchContiguousOpt.ll\n",
+  "components": [
+    "LowerMatrixIntrinsics"
+  ],
+  "description": "LowerMatrixIntrinsics creates new selects in the process of lowering\nmatrix intrinsics. The condition of such selects remains the same as\nbefore. Because of this, we can directly propagate the profile\ninformation for all selects on scalar conditions.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LowerMatrixIntrinsics/select.ll",
+      "commands": [
+        "opt -passes='lower-matrix-intrinsics' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "select_2x2_vcond_shape5",
+          "test_body": "define void @select_2x2_vcond_shape5(ptr %cond, ptr %lhs, ptr %rhs, ptr %out) {\n  %lhsv = load <4 x float>, ptr %lhs, align 16\n  %condv = call <4 x i1> @llvm.matrix.column.major.load.v4i1.i64(ptr %cond, i64 1, i1 false, i32 1, i32 4)\n  %rhsv = call <4 x float> @llvm.matrix.column.major.load.v4f32.i64(ptr %rhs, i64 1, i1 false, i32 1, i32 4)\n  %op = select <4 x i1> %condv, <4 x float> %lhsv, <4 x float> %rhsv\n  store <4 x float> %op, ptr %out, align 16\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <4 x float> @llvm.matrix.column.major.load.v4f32.i64(ptr nocapture, i64, i1 immarg, i32 immarg, i32 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <4 x i1> @llvm.matrix.column.major.load.v4i1.i64(ptr nocapture, i64, i1 immarg, i32 immarg, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        },
+        {
+          "test_name": "select_2x2_bot",
+          "test_body": "define void @select_2x2_bot(i1 %cond, ptr %lhs, ptr %rhs, ptr %out) !prof !0 {\n  %lhsv = load <4 x float>, ptr %lhs, align 16\n  %rhsv = load <4 x float>, ptr %rhs, align 16\n  %op = select i1 %cond, <4 x float> %lhsv, <4 x float> %rhsv, !prof !1\n  call void @llvm.matrix.column.major.store.v4f32.i64(<4 x float> %op, ptr %out, i64 2, i1 false, i32 2, i32 2)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)\ndeclare void @llvm.matrix.column.major.store.v4f32.i64(<4 x float>, ptr nocapture writeonly, i64, i1 immarg, i32 immarg, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }\n\n!0 = !{!\"function_entry_count\", i64 1000}\n!1 = !{!\"branch_weights\", i32 2, i32 3}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-12T21:44:05Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/LowerMatrixIntrinsics.cpp": [
+      [
+        104,
+        109
+      ],
+      [
+        2459,
+        2474
+      ]
+    ],
+    "llvm/test/Transforms/LowerMatrixIntrinsics/select.ll": [
+      [
+        1,
+        7
+      ],
+      [
+        9,
+        16
+      ],
+      [
+        18,
+        24
+      ],
+      [
+        205,
+        207
+      ]
+    ],
+    "llvm/utils/profcheck-xfail.txt": [
+      [
+        190,
+        196
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/LowerMatrixIntrinsics.cpp": [
+      "VisitSelectInst",
+      "getSubprogram"
+    ]
+  }
+}

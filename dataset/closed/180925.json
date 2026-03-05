@@ -1,0 +1,75 @@
+{
+  "pr_id": 180925,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180925",
+  "state": "closed",
+  "title": "[VPlan] Use ExitingIVValue for pointer inductions as well.",
+  "author": "fhahn",
+  "base_commit": "17b4a72daa896311e78bba473dd6481600ab5ba5",
+  "fix_commit": "78199eb25e9f50dd326346f12c870480b7a110c9",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex 80847fcbb77fb..e56691b1c960e 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -623,9 +623,37 @@ createWidenInductionRecipe(PHINode *Phi, VPPhi *PhiR, VPIRValue *Start,\n   VPValue *Step =\n       vputils::getOrCreateVPValueForSCEVExpr(Plan, IndDesc.getStep());\n \n-  if (IndDesc.getKind() == InductionDescriptor::IK_PtrInduction)\n-    return new VPWidenPointerInductionRecipe(Phi, Start, Step, &Plan.getVFxUF(),\n-                                             IndDesc, DL);\n+  VPValue *BackedgeVal = PhiR->getOperand(1);\n+  // Replace live-out extracts of WideIV's backedge value by ExitingIVValue\n+  // recipes. optimizeInductionExitUsers will later compute the proper\n+  // DerivedIV.\n+  auto ReplaceExtractsWithExitingIVValue = [&](VPHeaderPHIRecipe *WideIV) {\n+    for (VPUser *U : to_vector(BackedgeVal->users())) {\n+      if (!match(U, m_ExtractLastPart(m_VPValue())))\n+        continue;\n+      auto *ExtractLastPart = cast<VPInstruction>(U);\n+      VPUser *ExtractLastPartUser = ExtractLastPart->getSingleUser();\n+      assert(ExtractLastPartUser && \"must have a single user\");\n+      if (!match(ExtractLastPartUser, m_ExtractLastLane(m_VPValue())))\n+        continue;\n+      auto *ExtractLastLane = cast<VPInstruction>(ExtractLastPartUser);\n+      assert(is_contained(ExtractLastLane->getParent()->successors(),\n+                          Plan.getScalarPreheader()) &&\n+             \"last lane must be extracted in the middle block\");\n+      VPBuilder Builder(ExtractLastLane);\n+      ExtractLastLane->replaceAllUsesWith(Builder.createNaryOp(\n+          VPInstruction::ExitingIVValue, {WideIV, BackedgeVal}));\n+      ExtractLastLane->eraseFromParent();\n+      ExtractLastPart->eraseFromParent();\n+    }\n+  };\n+\n+  if (IndDesc.getKind() == InductionDescriptor::IK_PtrInduction) {\n+    auto *WideIV = new VPWidenPointerInductionRecipe(\n+        Phi, Start, Step, &Plan.getVFxUF(), IndDesc, DL);\n+    ReplaceExtractsWithExitingIVValue(WideIV);\n+    return WideIV;\n+  }\n \n   assert((IndDesc.getKind() == InductionDescriptor::IK_IntInduction ||\n           IndDesc.getKind() == InductionDescriptor::IK_FpInduction) &&\n@@ -634,9 +662,8 @@ createWidenInductionRecipe(PHINode *Phi, VPPhi *PhiR, VPIRValue *Start,\n   // Update wide induction increments to use the same step as the corresponding\n   // wide induction. This enables detecting induction increments directly in\n   // VPlan and removes redundant splats.\n-  using namespace llvm::VPlanPatternMatch;\n-  if (match(PhiR->getOperand(1), m_Add(m_Specific(PhiR), m_VPValue())))\n-    PhiR->getOperand(1)->getDefiningRecipe()->setOperand(1, Step);\n+  if (match(BackedgeVal, m_Add(m_Specific(PhiR), m_VPValue())))\n+    BackedgeVal->getDefiningRecipe()->setOperand(1, Step);\n \n   // It is always safe to copy over the NoWrap and FastMath flags. In\n   // particular, when folding tail by masking, the masked-off lanes are never\n@@ -646,27 +673,7 @@ createWidenInductionRecipe(PHINode *Phi, VPPhi *PhiR, VPIRValue *Start,\n   auto *WideIV = new VPWidenIntOrFpInductionRecipe(\n       Phi, Start, Step, &Plan.getVF(), IndDesc, Flags, DL);\n \n-  // Replace live-out extracts of WideIV's backedge value by ExitingIVValue\n-  // recipes.\n-  VPValue *BackedgeVal = PhiR->getOperand(1);\n-  for (VPUser *U : to_vector(BackedgeVal->users())) {\n-    if (!match(U, m_ExtractLastPart(m_VPValue())))\n-      continue;\n-    auto *ExtractLastPart = cast<VPInstruction>(U);\n-    if (!match(ExtractLastPart->getSingleUser(),\n-               m_ExtractLastLane(m_VPValue())))\n-      continue;\n-    auto *ExtractLastLane =\n-        cast<VPInstruction>(ExtractLastPart->getSingleUser());\n-    assert(is_contained(ExtractLastLane->getParent()->successors(),\n-                        Plan.getScalarPreheader()) &&\n-           \"last lane must be extracted in the middle block\");\n-    VPBuilder Builder(ExtractLastLane);\n-    ExtractLastLane->replaceAllUsesWith(Builder.createNaryOp(\n-        VPInstruction::ExitingIVValue, {WideIV, BackedgeVal}));\n-    ExtractLastLane->eraseFromParent();\n-    ExtractLastPart->eraseFromParent();\n-  }\n+  ReplaceExtractsWithExitingIVValue(WideIV);\n   return WideIV;\n }\n \n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Use ExitingIVValue from https://github.com/llvm/llvm-project/pull/175651 also for pointer inductions.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/pointer-induction.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -S",
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -lv-strided-pointer-ivs=true -S"
+      ],
+      "tests": [
+        {
+          "test_name": "ivopt_widen_ptr_indvar_3",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i64 @ivopt_widen_ptr_indvar_3(ptr noalias %a, i64 %stride, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvar = phi i64 [ %indvar.next, %for.body ], [ 0, %entry ]\n  %ptr.iv = phi ptr [ %ptr.iv.next, %for.body ], [ null, %entry ]\n  %arrayidx = getelementptr i64, ptr %a, i64 %indvar\n  %0 = load i64, ptr %arrayidx, align 8\n  %ptr.iv.next = getelementptr i64, ptr %ptr.iv, i64 %stride\n  %indvar.next = add i64 %indvar, 1\n  %exitcond.not = icmp eq i64 %indvar, %n\n  br i1 %exitcond.not, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  %cast.ptr = ptrtoint ptr %ptr.iv.next to i64\n  %result = add i64 %cast.ptr, %0\n  ret i64 %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-11T12:02:24Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        623,
+        631
+      ],
+      [
+        634,
+        642
+      ],
+      [
+        646,
+        672
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/pointer-induction.ll": [
+      [
+        641,
+        659
+      ],
+      [
+        676,
+        682
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "VPlanTransforms::createHeaderPhiRecipes",
+      "createWidenInductionRecipe"
+    ],
+    "llvm/test/Transforms/LoopVectorize/pointer-induction.ll": [
+      "ivopt_widen_ptr_indvar_1"
+    ]
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "pr_id": 179851,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179851",
+  "state": "closed",
+  "title": "[msan] Switch switch() from strict handling to (icmp eq)-style handling",
+  "author": "thurstond",
+  "base_commit": "72119384923c23b99193f2988b843619e2b1cfcc",
+  "fix_commit": "1c0b35b24179beac3f17ea25f89cac1821f6f4f4",
+  "patch": "diff --git a/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp b/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp\nindex c304efa9cb21d..98e4d1b3476e8 100644\n--- a/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp\n+++ b/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp\n@@ -2460,6 +2460,47 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {\n     return Si;\n   }\n \n+  // Instrument:\n+  //     switch i32 %Val, label %else [ i32 0, label %A\n+  //                                    i32 1, label %B\n+  //                                    i32 2, label %C ]\n+  //\n+  // Typically, the switch input value (%Val) is fully initialized.\n+  //\n+  // Sometimes the compiler may convert (icmp + br) into a switch statement.\n+  // MSan allows icmp eq/ne with partly initialized inputs to still result in a\n+  // fully initialized output, if there exists a bit that is initialized in\n+  // both inputs with a differing value. For compatibility, we support this in\n+  // the switch instrumentation as well. Note that this edge case only applies\n+  // if the switch input value does not match *any* of the cases (matching any\n+  // of the cases requires an exact, fully initialized match).\n+  //\n+  //     ShadowCases =   0\n+  //                   | propagateEqualityComparison(Val, 0)\n+  //                   | propagateEqualityComparison(Val, 1)\n+  //                   | propagateEqualityComparison(Val, 2))\n+  void visitSwitchInst(SwitchInst &SI) {\n+    IRBuilder<> IRB(&SI);\n+\n+    Value *Val = SI.getCondition();\n+    Value *ShadowVal = getShadow(Val);\n+\n+    Value *ShadowCases = nullptr;\n+    for (auto Case : SI.cases()) {\n+      Value *Comparator = Case.getCaseValue();\n+      Value *ComparisonShadow = propagateEqualityComparison(\n+          IRB, Val, Comparator, ShadowVal, getShadow(Comparator));\n+\n+      if (ShadowCases)\n+        ShadowCases = IRB.CreateOr(ShadowCases, ComparisonShadow);\n+      else\n+        ShadowCases = ComparisonShadow;\n+    }\n+\n+    if (ShadowCases)\n+      insertCheckShadow(ShadowCases, getOrigin(Val), &SI);\n+  }\n+\n   // Vector manipulation.\n   void visitExtractElementInst(ExtractElementInst &I) {\n     insertCheckShadowOf(I.getOperand(1), &I);\n",
+  "components": [
+    "Instrumentation"
+  ],
+  "description": "Currently, the SwitchInst:\r\n```\r\nswitch i32 %Val, label %else [ i32 0, label %A\r\n                               i32 1, label %B\r\n                               i32 2, label %C ]\r\n```\r\nis strictly handled i.e., MSan will check that %Val is fully initialized. This is appropriate nearly all the time.\r\n\r\nHowever, sometimes the compiler may convert (icmp + br) into a switch statement. (icmp + br) has different semantics: MSan allows icmp eq/ne with partly initialized inputs to still result in a fully initialized output, if there exists a bit that is initialized in both inputs with a differing value e.g., suppose:\r\n```\r\n%A   = 00000000 00001010\r\n%B   = 00000000 00000110\r\n%C   = 00000000 00000011\r\n\r\n%Val = 00000001 ???????? (where ? denotes an uninitialized bit)\r\n```\r\nEven though %Val has uninitialized bits, the initialized '1' bit immediately to the left, compared to the corresponding initialized '0' bit in %A/%B/%C suffices to prove that %Val does not match any of those cases. This is similar to a real-world case with std::optional (where the has_value bit may be initialized but the value is not).\r\n\r\nThis patch adds this relaxed icmp logic to the switch instrumentation as well, to make MSan's behavior equivalent under optimization.\r\n\r\nNote that this edge case only applies if the switch input value definitively does not match *any* of the cases (matching any of the cases requires an exact, fully initialized match). If it is uncertain whether the switch input value could, depending on the uninitialized bits, match one of the cases or not, MSan will report use-of-uninitialized memory.",
+  "tests": [
+    {
+      "file": "llvm/test/Instrumentation/MemorySanitizer/switch-icmp.ll",
+      "commands": [
+        "opt < %s -S -passes=msan 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "switch_test",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: sanitize_memory\ndefine i64 @switch_test(i32 %wii) #0 {\n  switch i32 %wii, label %u [\n    i32 42, label %snes\n    i32 43, label %nes\n  ]\n\nsnes:                                             ; preds = %0\n  ret i64 420\n\nnes:                                              ; preds = %0\n  ret i64 430\n\nu:                                                ; preds = %0\n  ret i64 0\n}\n\nattributes #0 = { sanitize_memory }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "compiler-rt:sanitizer",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "vitalybuka",
+      "body": "The title could be more informative"
+    },
+    {
+      "author": "thurstond",
+      "body": "> The title could be more informative\r\n\r\nRenamed"
+    },
+    {
+      "author": "qinkunbao",
+      "body": "HI @alazarev , it looks like the PR breaks the msan buildbot.\r\n\r\nPrevious failure\r\n```\r\n[4798/8399] Building CXX object lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o\r\nFAILED: lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o \r\nCCACHE_CPP2=yes CCACHE_HASHDIR=yes CCACHE_SLOPPINESS=pch_defines,time_macros /usr/bin/ccache /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build0/bin/clang++ -D_DEBUG -D_GLIBCXX_ASSERTIONS -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build_msan/lib/Target/AMDGPU/MCTargetDesc -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/lib/Target/AMDGPU/MCTargetDesc -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/lib/Target/AMDGPU -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build_msan/lib/Target/AMDGPU -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build_msan/include -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/include -nostdinc++ -isystem /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/include -isystem /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/include/c++/v1 -fsanitize=memory -Wl,--rpath=/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/lib -L/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/lib -w -stdlib=libc++ -fPIC -fno-semantic-interposition -fvisibility-inlines-hidden -Werror=date-time -Werror=unguarded-availability-new -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wmissing-field-initializers -pedantic -Wno-long-long -Wc++98-compat-extra-semi -Wimplicit-fallthrough -Wcovered-switch-default -Wno-noexcept-type -Wnon-virtual-dtor -Wdelete-non-virtual-dtor -Wsuggest-override -Wstring-conversion -Wno-pass-failed -Wmisleading-indentation -Wctad-maybe-unsupported -fno-omit-frame-pointer -gline-tables-only -fsanitize=memory -fdiagnostics-color -ffunction-sections -fdata-sections -O3 -DNDEBUG -std=c++17 -fvisibility=hidden -UNDEBUG -fno-exceptions -funwind-tables -fno-rtti -MD -MT lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o -MF lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o.d -o lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o -c /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUMCCodeEmitter.cpp\r\n[4799/8399] Building CXX object lib/Target/LoongArch/MCTargetDesc/CMakeFiles/LLVMLoongArchDesc.dir/LoongArchMCAsmInfo.cpp.o\r\n```\r\n\r\n```\r\ngit revert bd19bfeb267e2eac39533443445bd5cc04d7c058\r\nBUILDBOT_MONO_REPO_PATH=/usr/local/google/home/qinkun/llvm-project llvm-zorg/zorg/buildbot/builders/sanitizers/buildbot_bootstrap_msan.sh (Passed)\r\n```\r\n\r\n"
+    },
+    {
+      "author": "vitalybuka",
+      "body": "> HI @alazarev , it looks like the PR breaks the msan buildbot.\r\n\r\nWhat is actual error? or URL?"
+    },
+    {
+      "author": "qinkunbao",
+      "body": "https://lab.llvm.org/buildbot/#/builders/164/builds/18380 is the link.\r\n\r\nThere are two PRs in the link that can cause the error. \r\nhttps://github.com/llvm/llvm-project/commit/c32cde4182f02df7a67455ff0567ddcc1cf9bfb7\r\nand\r\nhttps://github.com/llvm/llvm-project/commit/bd19bfeb267e2eac39533443445bd5cc04d7c058\r\n\r\nOnce the error in https://github.com/llvm/llvm-project/commit/c32cde4182f02df7a67455ff0567ddcc1cf9bfb7\r\n is fixed, we got the error (e.g., https://lab.llvm.org/buildbot/#/builders/164/builds/18522/steps/2/logs/stdio)\r\n```\r\n[4798/8399] Building CXX object lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o\r\nFAILED: lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o \r\nCCACHE_CPP2=yes CCACHE_HASHDIR=yes CCACHE_SLOPPINESS=pch_defines,time_macros /usr/bin/ccache /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build0/bin/clang++ -D_DEBUG -D_GLIBCXX_ASSERTIONS -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build_msan/lib/Target/AMDGPU/MCTargetDesc -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/lib/Target/AMDGPU/MCTargetDesc -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/lib/Target/AMDGPU -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build_msan/lib/Target/AMDGPU -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm_build_msan/include -I/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/include -nostdinc++ -isystem /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/include -isystem /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/include/c++/v1 -fsanitize=memory -Wl,--rpath=/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/lib -L/home/b/sanitizer-aarch64-linux-bootstrap-msan/build/libcxx_install_msan/lib -w -stdlib=libc++ -fPIC -fno-semantic-interposition -fvisibility-inlines-hidden -Werror=date-time -Werror=unguarded-availability-new -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wmissing-field-initializers -pedantic -Wno-long-long -Wc++98-compat-extra-semi -Wimplicit-fallthrough -Wcovered-switch-default -Wno-noexcept-type -Wnon-virtual-dtor -Wdelete-non-virtual-dtor -Wsuggest-override -Wstring-conversion -Wno-pass-failed -Wmisleading-indentation -Wctad-maybe-unsupported -fno-omit-frame-pointer -gline-tables-only -fsanitize=memory -fdiagnostics-color -ffunction-sections -fdata-sections -O3 -DNDEBUG -std=c++17 -fvisibility=hidden -UNDEBUG -fno-exceptions -funwind-tables -fno-rtti -MD -MT lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o -MF lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o.d -o lib/Target/AMDGPU/MCTargetDesc/CMakeFiles/LLVMAMDGPUDesc.dir/AMDGPUMCCodeEmitter.cpp.o -c /home/b/sanitizer-aarch64-linux-bootstrap-msan/build/llvm-project/llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUMCCodeEmitter.cpp\r\n[4799/8399] Building CXX object lib/Target/LoongArch/MCTargetDesc/CMakeFiles/LLVMLoongArchDesc.dir/LoongArchMCAsmInfo.cpp.o\r\n```\r\nRevert this PR can fix the issue.\r\n"
+    },
+    {
+      "author": "vitalybuka",
+      "body": "Anything in sanitizer_logs dir?"
+    },
+    {
+      "author": "vitalybuka",
+      "body": "> Anything in sanitizer_logs dir?\r\n\r\nWe expose this logs if it happen in run_ninja state\r\nbut here it's in cmake\r\n\r\nhttps://github.com/llvm/llvm-zorg/blob/main/zorg/buildbot/builders/sanitizers/buildbot_functions.sh#L173C10-L173C19"
+    },
+    {
+      "author": "qinkunbao",
+      "body": "`time.txt.` does not have much userful information.\r\n\r\n```\r\n[hi on] qinkun@qinkun:~$ cat time.txt\r\nCommand exited with non-zero status 1\r\n87323.86user 4131.41system 13:04.03elapsed 11664%CPU (0avgtext+0avgdata 6019528maxresident)k\r\n0inputs+18311792outputs (1482major+474606839minor)pagefaults 0swaps\r\n```\r\n"
+    },
+    {
+      "author": "thurstond",
+      "body": "@qinkunbao @alazarev Thanks for the triaging and revert!\r\n\r\nFWIW I think my patch is exposing a pre-existing bug in the jump-threading pass; I will reduce it and file a bug. (Reverting this patch to unblock the buildbots was the correct move.)"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-05T03:10:20Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp": [
+      [
+        2460,
+        2465
+      ]
+    ],
+    "llvm/test/Instrumentation/MemorySanitizer/switch-icmp.ll": [
+      [
+        8,
+        16
+      ],
+      [
+        20,
+        27
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp": [
+      "propagateEqualityComparison",
+      "visitExtractElementInst"
+    ]
+  }
+}

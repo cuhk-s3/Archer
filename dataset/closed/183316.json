@@ -1,0 +1,123 @@
+{
+  "pr_id": 183316,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183316",
+  "state": "closed",
+  "title": "[GVN] Forward store values through select addresses in findDominatingValue",
+  "author": "SavchenkoValeriy",
+  "base_commit": "3d251288df0642762d1bd86efa05e190005c2539",
+  "fix_commit": "0beb4a1a94d6cac575742e3a7eaf00bccd9166a2",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/GVN.cpp b/llvm/lib/Transforms/Scalar/GVN.cpp\nindex 3bc535595730e..cd76ccd32c695 100644\n--- a/llvm/lib/Transforms/Scalar/GVN.cpp\n+++ b/llvm/lib/Transforms/Scalar/GVN.cpp\n@@ -1298,8 +1298,9 @@ static void reportMayClobberedLoad(LoadInst *Load, MemDepResult DepInfo,\n   ORE->emit(R);\n }\n \n-// Find non-clobbered value for Loc memory location in extended basic block\n+// Find a dominating value for Loc memory location in the extended basic block\n // (chain of basic blocks with single predecessors) starting From instruction.\n+// Returns the value from a matching load or a simple store to the same pointer.\n static Value *findDominatingValue(const MemoryLocation &Loc, Type *LoadTy,\n                                   Instruction *From, AAResults *AA) {\n   uint32_t NumVisitedInsts = 0;\n@@ -1311,8 +1312,14 @@ static Value *findDominatingValue(const MemoryLocation &Loc, Type *LoadTy,\n       // Stop the search if limit is reached.\n       if (++NumVisitedInsts > MaxNumVisitedInsts)\n         return nullptr;\n-      if (isModSet(BatchAA.getModRefInfo(Inst, Loc)))\n+      if (isModSet(BatchAA.getModRefInfo(Inst, Loc))) {\n+        // A simple store to the exact location can forward its value.\n+        if (auto *SI = dyn_cast<StoreInst>(Inst))\n+          if (SI->isSimple() && SI->getPointerOperand() == Loc.Ptr &&\n+              SI->getValueOperand()->getType() == LoadTy)\n+            return SI->getValueOperand();\n         return nullptr;\n+      }\n       if (auto *LI = dyn_cast<LoadInst>(Inst))\n         if (LI->getPointerOperand() == Loc.Ptr && LI->getType() == LoadTy)\n           return LI;\n",
+  "components": [
+    "GVN"
+  ],
+  "description": "## Alive2 proof\r\n\r\nhttps://alive2.llvm.org/ce/z/v6pX7C",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-load-through-select.ll",
+      "commands": [
+        "opt -passes='require<domtree>,loop(loop-simplifycfg),gvn' -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_pointer_phi_select_simp_store_clobber_10",
+          "test_body": "define i32 @test_pointer_phi_select_simp_store_clobber_10(ptr %a, ptr %b, i1 %cond) {\nentry:\n  br i1 %cond, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %l.1 = load i32, ptr %a, align 4\n  store i32 99, ptr %a, align 4\n  %l.2 = load i32, ptr %b, align 4\n  %cmp.i.i.i = icmp ult i32 %l.1, %l.2\n  %min.select = select i1 %cmp.i.i.i, ptr %a, ptr %b\n  %res.0 = load i32, ptr %b, align 4\n  br label %exit\n\nelse:                                             ; preds = %entry\n  br label %exit\n\nexit:                                             ; preds = %else, %then\n  %p = phi ptr [ %min.select, %then ], [ %a, %else ]\n  %v = phi i32 [ %res.0, %then ], [ 10, %else ]\n  %res.2 = load i32, ptr %p, align 4\n  %add = add i32 %res.2, %v\n  ret i32 %res.2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-loop-load-through-select.ll",
+      "commands": [
+        "opt -passes='require<domtree>,loop(loop-simplifycfg),gvn' -enable-split-backedge-in-load-pre -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_pointer_phi_select_same_object_store_1",
+          "test_body": "define i32 @test_pointer_phi_select_same_object_store_1(ptr %ptr, ptr %end) {\nentry:\n  %start.ptr = getelementptr inbounds i32, ptr %ptr, i64 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %ptr.iv = phi ptr [ %start.ptr, %entry ], [ %ptr.iv.next, %loop ]\n  %min.ptr = phi ptr [ %ptr, %entry ], [ %min.select, %loop ]\n  store i32 3, ptr %min.ptr, align 4\n  %l.1 = load i32, ptr %ptr.iv, align 4\n  %l.2 = load i32, ptr %min.ptr, align 4\n  %cmp.i.i.i = icmp ult i32 %l.1, %l.2\n  %min.select = select i1 %cmp.i.i.i, ptr %ptr.iv, ptr %min.ptr\n  %ptr.iv.next = getelementptr inbounds i32, ptr %ptr.iv, i64 1\n  %ec = icmp eq ptr %ptr.iv.next, %end\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %res = load i32, ptr %min.select, align 4\n  ret i32 %res\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/load-select-addr-store-fwd.ll",
+      "commands": [
+        "opt -passes='gvn' -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "negative_volatile_store",
+          "test_body": "define i32 @negative_volatile_store(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\n  store volatile i32 10, ptr %p1, align 4\n  store volatile i32 20, ptr %p2, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "negative_clobber_between",
+          "test_body": "define i32 @negative_clobber_between(i1 %cond, ptr %p1, ptr %p2) {\n  store i32 10, ptr %p1, align 4\n  store i32 20, ptr %p2, align 4\n  call void @clobber()\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n\ndeclare void @clobber()\n"
+        },
+        {
+          "test_name": "store_both_arms",
+          "test_body": "define i32 @store_both_arms(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\n  store i32 10, ptr %p1, align 4\n  store i32 20, ptr %p2, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "negative_store_one_arm_only",
+          "test_body": "define i32 @negative_store_one_arm_only(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\n  store i32 10, ptr %p1, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "store_and_load",
+          "test_body": "define i32 @store_and_load(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\n  store i32 10, ptr %p1, align 4\n  %v1 = load i32, ptr %p2, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  %sum = add i32 %v, %v1\n  ret i32 %sum\n}\n"
+        },
+        {
+          "test_name": "negative_may_alias_stores",
+          "test_body": "define i32 @negative_may_alias_stores(i1 %cond, ptr %p1, ptr %p2) {\n  store i32 10, ptr %p1, align 4\n  store i32 20, ptr %p2, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "store_in_pred",
+          "test_body": "define i32 @store_in_pred(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\nentry:\n  store i32 10, ptr %p1, align 4\n  store i32 20, ptr %p2, align 4\n  br label %bb\n\nbb:                                               ; preds = %entry\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "negative_type_mismatch",
+          "test_body": "define i32 @negative_type_mismatch(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\n  store i64 10, ptr %p1, align 4\n  store i64 20, ptr %p2, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "negative_atomic_store",
+          "test_body": "define i32 @negative_atomic_store(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\n  store atomic i32 10, ptr %p1 unordered, align 4\n  store atomic i32 20, ptr %p2 unordered, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "store_then_load",
+          "test_body": "define i32 @store_then_load(i1 %cond, ptr noalias %p1, ptr noalias %p2) {\n  store i32 10, ptr %p1, align 4\n  %v1 = load i32, ptr %p1, align 4\n  store i32 20, ptr %p2, align 4\n  %v2 = load i32, ptr %p2, align 4\n  %addr = select i1 %cond, ptr %p1, ptr %p2\n  %v = load i32, ptr %addr, align 4\n  ret i32 %v\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-25T15:49:40Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/GVN.cpp": [
+      [
+        1298,
+        1305
+      ],
+      [
+        1311,
+        1318
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-load-through-select.ll": [
+      [
+        609,
+        622
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-loop-load-through-select.ll": [
+      [
+        389,
+        400
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/GVN.cpp": [
+      "findDominatingValue",
+      "reportMayClobberedLoad"
+    ]
+  }
+}

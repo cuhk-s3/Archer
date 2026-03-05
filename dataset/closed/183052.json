@@ -1,0 +1,91 @@
+{
+  "pr_id": 183052,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183052",
+  "state": "closed",
+  "title": "[PtrUseVisitor] Support llvm.structured.gep",
+  "author": "Keenuts",
+  "base_commit": "0ad19bcceaa3798197a2f9760b9cc0c1e4fbe954",
+  "fix_commit": "486277494c944c51697eb2621d20417b3a32437d",
+  "patch": "diff --git a/llvm/include/llvm/Analysis/PtrUseVisitor.h b/llvm/include/llvm/Analysis/PtrUseVisitor.h\nindex 0858d8aee2186..27b8ca9ebef98 100644\n--- a/llvm/include/llvm/Analysis/PtrUseVisitor.h\n+++ b/llvm/include/llvm/Analysis/PtrUseVisitor.h\n@@ -175,6 +175,12 @@ class PtrUseVisitorBase {\n   /// This routine does the heavy lifting of the pointer walk by computing\n   /// offsets and looking through GEPs.\n   bool adjustOffsetForGEP(GetElementPtrInst &GEPI);\n+\n+  /// Walk the operands of a StructuredGEP and adjust the offset as appropriate.\n+  /// The returned offset can be compared against other offsets during an\n+  /// analysis, but should not be stored as constant in the IR as it may not\n+  /// represent the actual physical offset.\n+  bool adjustOffsetForSGEP(StructuredGEPInst &SGEP);\n };\n \n } // end namespace detail\n@@ -283,10 +289,24 @@ class PtrUseVisitor : protected InstVisitor<DerivedT>,\n     enqueueUsers(GEPI);\n   }\n \n+  void visitStructuredGEPInst(StructuredGEPInst &SGEP) {\n+    if (SGEP.use_empty())\n+      return;\n+\n+    if (!adjustOffsetForSGEP(SGEP)) {\n+      IsOffsetKnown = false;\n+      Offset = APInt();\n+    }\n+    enqueueUsers(SGEP);\n+  }\n+\n   // No-op intrinsics which we know don't escape the pointer to logic in\n   // some other function.\n   void visitMemIntrinsic(MemIntrinsic &I) {}\n   void visitIntrinsicInst(IntrinsicInst &II) {\n+    if (auto *SGEP = dyn_cast<StructuredGEPInst>(&II))\n+      return visitStructuredGEPInst(*SGEP);\n+\n     switch (II.getIntrinsicID()) {\n     default:\n       return Base::visitIntrinsicInst(II);\ndiff --git a/llvm/lib/Analysis/PtrUseVisitor.cpp b/llvm/lib/Analysis/PtrUseVisitor.cpp\nindex 9c79546f491ef..cce18b9ab626f 100644\n--- a/llvm/lib/Analysis/PtrUseVisitor.cpp\n+++ b/llvm/lib/Analysis/PtrUseVisitor.cpp\n@@ -41,3 +41,36 @@ bool detail::PtrUseVisitorBase::adjustOffsetForGEP(GetElementPtrInst &GEPI) {\n \n   return false;\n }\n+\n+bool detail::PtrUseVisitorBase::adjustOffsetForSGEP(StructuredGEPInst &SGEP) {\n+  if (!IsOffsetKnown)\n+    return false;\n+\n+  Type *CurrentType = SGEP.getBaseType();\n+  unsigned int OffsetBitWidth = DL.getIndexTypeSizeInBits(SGEP.getType());\n+  APInt TmpOffset(OffsetBitWidth, 0);\n+\n+  for (unsigned I = 0; I < SGEP.getNumIndices(); I++) {\n+    Value *V = SGEP.getIndexOperand(I);\n+    ConstantInt *CI = dyn_cast<ConstantInt>(V);\n+    if (!CI) {\n+      IsOffsetKnown = false;\n+      return false;\n+    }\n+\n+    if (ArrayType *AT = dyn_cast<ArrayType>(CurrentType)) {\n+      uint32_t EltTypeSize = DL.getTypeSizeInBits(AT->getElementType()) / 8;\n+      TmpOffset += CI->getZExtValue() * EltTypeSize;\n+      CurrentType = AT->getElementType();\n+    } else if (StructType *ST = dyn_cast<StructType>(CurrentType)) {\n+      const auto &STL = DL.getStructLayout(ST);\n+      TmpOffset += STL->getElementOffset(CI->getZExtValue());\n+      CurrentType = ST->getElementType(CI->getZExtValue());\n+    } else {\n+      llvm_unreachable(\"unimplemented\");\n+    }\n+  }\n+\n+  Offset += TmpOffset;\n+  return true;\n+}\n",
+  "components": [
+    "PtrUseVisitor"
+  ],
+  "description": "This commit adds support the @llvm.structued.gep instruction when computing a pointer offset. Even if the physical layout of the pointed element is not yet known (hence SGEP), we can still determine which element is being accessed. So the offset value here is coherent in the context of LLVM, which is the important part.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SROA/structured-gep.ll",
+      "commands": [
+        "opt < %s -passes='sroa' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_escape",
+          "test_body": "target datalayout = \"e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%struct.S = type { i32, float }\n\ndeclare ptr @llvm.structured.gep.p0(ptr, ...)\n\ndefine void @test_escape(ptr %escape) {\nentry:\n  %alloca = alloca %struct.S, align 4\n  %gep = call ptr (ptr, ...) @llvm.structured.gep.p0(ptr elementtype(%struct.S) %alloca, i32 1)\n  store ptr %gep, ptr %escape, align 8\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_dynamic_index",
+          "test_body": "target datalayout = \"e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare ptr @llvm.structured.gep.p0(ptr, ...)\n\ndefine i32 @test_dynamic_index(i32 %idx) {\nentry:\n  %a = alloca [10 x i32], align 4\n  %ptr = call ptr (ptr, ...) @llvm.structured.gep.p0(ptr elementtype([10 x i32]) %a, i32 %idx)\n  store i32 42, ptr %ptr, align 4\n  %val = load i32, ptr %ptr, align 4\n  ret i32 %val\n}\n"
+        },
+        {
+          "test_name": "test_struct_extern",
+          "test_body": "target datalayout = \"e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%struct.S = type { i32, float }\n\ndeclare ptr @llvm.structured.gep.p0(ptr, ...)\n\ndefine float @test_struct_extern(ptr %memory) {\nentry:\n  %gep1 = call ptr (ptr, ...) @llvm.structured.gep.p0(ptr elementtype(%struct.S) %memory, i32 1)\n  store float 2.000000e+00, ptr %gep1, align 4\n  %val = load float, ptr %gep1, align 4\n  ret float %val\n}\n"
+        },
+        {
+          "test_name": "test_array",
+          "test_body": "target datalayout = \"e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare ptr @llvm.structured.gep.p0(ptr, ...)\n\ndefine i16 @test_array() {\nentry:\n  %a = alloca [4 x i8], align 1\n  store float 0.000000e+00, ptr %a, align 4\n  %ptr = call ptr (ptr, ...) @llvm.structured.gep.p0(ptr elementtype([4 x i8]) %a, i32 2)\n  %val = load i16, ptr %ptr, align 2\n  ret i16 %val\n}\n"
+        },
+        {
+          "test_name": "test_struct",
+          "test_body": "target datalayout = \"e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n%struct.S = type { i32, float }\n\ndeclare ptr @llvm.structured.gep.p0(ptr, ...)\n\ndefine float @test_struct() {\nentry:\n  %alloca = alloca %struct.S, align 4\n  %gep0 = call ptr (ptr, ...) @llvm.structured.gep.p0(ptr elementtype(%struct.S) %alloca, i32 0)\n  store i32 1, ptr %gep0, align 4\n  %gep1 = call ptr (ptr, ...) @llvm.structured.gep.p0(ptr elementtype(%struct.S) %alloca, i32 1)\n  store float 2.000000e+00, ptr %gep1, align 4\n  %val = load float, ptr %gep1, align 4\n  ret float %val\n}\n"
+        },
+        {
+          "test_name": "test_nested_struct",
+          "test_body": "target datalayout = \"e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare ptr @llvm.structured.gep.p0(ptr, ...)\n\ndefine i32 @test_nested_struct() {\nentry:\n  %X = alloca { i32, { float, i32 } }, align 4\n  %Y = call ptr (ptr, ...) @llvm.structured.gep.p0(ptr elementtype({ i32, { float, i32 } }) %X, i32 1, i32 1)\n  store i32 0, ptr %Y, align 4\n  %Z = load i32, ptr %Y, align 4\n  ret i32 %Z\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "Keenuts",
+      "body": "@s-perron: for now only requesting your review, but will request an owner review once we agree on the direction."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-24T13:19:15Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Analysis/PtrUseVisitor.h": [
+      [
+        175,
+        180
+      ],
+      [
+        283,
+        292
+      ]
+    ],
+    "llvm/lib/Analysis/PtrUseVisitor.cpp": [
+      [
+        41,
+        43
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Analysis/PtrUseVisitor.h": [
+      "visitGetElementPtrInst",
+      "visitIntrinsicInst",
+      "visitMemIntrinsic"
+    ],
+    "llvm/lib/Analysis/PtrUseVisitor.cpp": [
+      "detail::PtrUseVisitorBase::adjustOffsetForGEP"
+    ]
+  }
+}

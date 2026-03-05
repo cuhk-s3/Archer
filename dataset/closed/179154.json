@@ -1,0 +1,107 @@
+{
+  "pr_id": 179154,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179154",
+  "state": "closed",
+  "title": "[CoroCleanup] Noop coroutine elision for load-and-call pattern",
+  "author": "NewSigma",
+  "base_commit": "dc152f0d2d085dcfb7542d0e71e19ebfa1aa3794",
+  "fix_commit": "8db2d86dd0531b7a8a09c064fcc354fe7ea11cd2",
+  "patch": "diff --git a/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp b/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp\nindex 6b68cf5bc2c20..fa342fd4717ea 100644\n--- a/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp\n+++ b/llvm/lib/Transforms/Coroutines/CoroCleanup.cpp\n@@ -8,6 +8,7 @@\n \n #include \"llvm/Transforms/Coroutines/CoroCleanup.h\"\n #include \"CoroInternal.h\"\n+#include \"llvm/Analysis/PtrUseVisitor.h\"\n #include \"llvm/IR/DIBuilder.h\"\n #include \"llvm/IR/Function.h\"\n #include \"llvm/IR/IRBuilder.h\"\n@@ -15,6 +16,7 @@\n #include \"llvm/IR/Module.h\"\n #include \"llvm/IR/PassManager.h\"\n #include \"llvm/Transforms/Scalar/SimplifyCFG.h\"\n+#include \"llvm/Transforms/Utils/Local.h\"\n \n using namespace llvm;\n \n@@ -30,9 +32,27 @@ struct Lowerer : coro::LowererBase {\n   bool lower(Function &F);\n \n private:\n-  void elideCoroNoop(IntrinsicInst *II);\n   void lowerCoroNoop(IntrinsicInst *II);\n };\n+\n+// Recursively walk and eliminate resume/destroy call on noop coro\n+class NoopCoroElider : public PtrUseVisitor<NoopCoroElider> {\n+  using Base = PtrUseVisitor<NoopCoroElider>;\n+\n+  IRBuilder<> Builder;\n+\n+public:\n+  NoopCoroElider(const DataLayout &DL, LLVMContext &C) : Base(DL), Builder(C) {}\n+\n+  void run(IntrinsicInst *II);\n+\n+  void visitLoadInst(LoadInst &I) { enqueueUsers(I); }\n+  void visitCallBase(CallBase &CB);\n+  void visitIntrinsicInst(IntrinsicInst &II);\n+\n+private:\n+  bool tryEraseCallInvoke(Instruction *I);\n+};\n }\n \n static void lowerSubFn(IRBuilder<> &Builder, CoroSubFnInst *SubFn) {\n@@ -73,6 +93,7 @@ bool Lowerer::lower(Function &F) {\n   bool IsPrivateAndUnprocessed = F.isPresplitCoroutine() && F.hasLocalLinkage();\n   bool Changed = false;\n \n+  NoopCoroElider NCE(F.getDataLayout(), F.getContext());\n   SmallPtrSet<Instruction *, 8> DeadInsts{};\n   for (Instruction &I : instructions(F)) {\n     if (auto *II = dyn_cast<IntrinsicInst>(&I)) {\n@@ -100,7 +121,7 @@ bool Lowerer::lower(Function &F) {\n         II->replaceAllUsesWith(ConstantTokenNone::get(Context));\n         break;\n       case Intrinsic::coro_noop:\n-        elideCoroNoop(II);\n+        NCE.run(II);\n         if (!II->user_empty())\n           lowerCoroNoop(II);\n         break;\n@@ -142,28 +163,6 @@ bool Lowerer::lower(Function &F) {\n   return Changed;\n }\n \n-void Lowerer::elideCoroNoop(IntrinsicInst *II) {\n-  for (User *U : make_early_inc_range(II->users())) {\n-    auto *Fn = dyn_cast<CoroSubFnInst>(U);\n-    if (Fn == nullptr)\n-      continue;\n-\n-    auto *User = Fn->getUniqueUndroppableUser();\n-    if (auto *Call = dyn_cast<CallInst>(User)) {\n-      Call->eraseFromParent();\n-      Fn->eraseFromParent();\n-      continue;\n-    }\n-\n-    if (auto *I = dyn_cast<InvokeInst>(User)) {\n-      Builder.SetInsertPoint(I);\n-      Builder.CreateBr(I->getNormalDest());\n-      I->eraseFromParent();\n-      Fn->eraseFromParent();\n-    }\n-  }\n-}\n-\n void Lowerer::lowerCoroNoop(IntrinsicInst *II) {\n   if (!NoopCoro) {\n     LLVMContext &C = Builder.getContext();\n@@ -200,6 +199,47 @@ void Lowerer::lowerCoroNoop(IntrinsicInst *II) {\n   II->replaceAllUsesWith(NoopCoroVoidPtr);\n }\n \n+void NoopCoroElider::run(IntrinsicInst *II) {\n+  visitPtr(*II);\n+\n+  Worklist.clear();\n+  VisitedUses.clear();\n+}\n+\n+void NoopCoroElider::visitCallBase(CallBase &CB) {\n+  auto *V = U->get();\n+  bool ResumeOrDestroy = V == CB.getCalledOperand();\n+  if (ResumeOrDestroy) {\n+    [[maybe_unused]] bool Success = tryEraseCallInvoke(&CB);\n+    assert(Success && \"Unexpected CallBase\");\n+    RecursivelyDeleteTriviallyDeadInstructions(V);\n+  }\n+}\n+\n+void NoopCoroElider::visitIntrinsicInst(IntrinsicInst &II) {\n+  if (auto *SubFn = dyn_cast<CoroSubFnInst>(&II)) {\n+    auto *User = SubFn->getUniqueUndroppableUser();\n+    if (!tryEraseCallInvoke(cast<Instruction>(User)))\n+      return;\n+    SubFn->eraseFromParent();\n+  }\n+}\n+\n+bool NoopCoroElider::tryEraseCallInvoke(Instruction *I) {\n+  if (auto *Call = dyn_cast<CallInst>(I)) {\n+    Call->eraseFromParent();\n+    return true;\n+  }\n+\n+  if (auto *II = dyn_cast<InvokeInst>(I)) {\n+    Builder.SetInsertPoint(II);\n+    Builder.CreateBr(II->getNormalDest());\n+    II->eraseFromParent();\n+    return true;\n+  }\n+  return false;\n+}\n+\n static bool declaresCoroCleanupIntrinsics(const Module &M) {\n   return coro::declaresIntrinsics(\n       M,\n",
+  "components": [
+    "Coroutines"
+  ],
+  "description": "We assume that the resume/destroy functions of coroutines follow the `fastcc` convention. If the convention mismatches, `InstCombine` would remove the function call. Specifically for the noop coroutine, the following code gives an inconsistent result between -O0 and -O1. This patch proposes that we carry out elision for this pattern.\r\n\r\n``` C++\r\nvoid load_and_call() {\r\n  using Fn = void (*)(void *);\r\n  void *frame = __builtin_coro_noop();\r\n  Fn x = *reinterpret_cast<Fn *>(frame);\r\n  x(frame);\r\n  __builtin_printf(\"1\\n\");\r\n}\r\n```\r\n\r\nhttps://godbolt.org/z/5ovdEqa9f\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Coroutines/coro-cleanup-noop-elide.ll",
+      "commands": [
+        "opt < %s -S -passes='coro-cleanup'"
+      ],
+      "tests": [
+        {
+          "test_name": "load",
+          "test_body": "define void @load() personality i32 0 {\n  %frame = call noundef ptr @llvm.coro.noop()\n  %resume = load ptr, ptr %frame, align 8\n  call void %resume(ptr %frame)\n  %destroy.addr = getelementptr inbounds nuw i8, ptr %frame, i64 8\n  %destroy = load ptr, ptr %destroy.addr, align 8\n  invoke void %destroy(ptr %frame)\n          to label %done unwind label %unwind\n\ndone:                                             ; preds = %0\n  ret void\n\nunwind:                                           ; preds = %0\n  %pad = landingpad { ptr, i32 }\n          catch ptr null\n  call void @terminate()\n  unreachable\n}\n\n; Function Attrs: noreturn\ndeclare void @terminate() #0\n\n; Function Attrs: nounwind memory(none)\ndeclare ptr @llvm.coro.noop() #1\n\nattributes #0 = { noreturn }\nattributes #1 = { nounwind memory(none) }\n"
+        },
+        {
+          "test_name": "erase",
+          "test_body": "define void @erase() personality i32 0 {\n  %frame = call noundef ptr @llvm.coro.noop()\n  %resume = call ptr @llvm.coro.subfn.addr(ptr %frame, i8 0)\n  call fastcc void %resume(ptr %frame)\n  %destroy = call ptr @llvm.coro.subfn.addr(ptr %frame, i8 1)\n  invoke fastcc void %destroy(ptr %frame)\n          to label %done unwind label %unwind\n\ndone:                                             ; preds = %0\n  ret void\n\nunwind:                                           ; preds = %0\n  %pad = landingpad { ptr, i32 }\n          catch ptr null\n  call void @terminate()\n  unreachable\n}\n\n; Function Attrs: noreturn\ndeclare void @terminate() #0\n\n; Function Attrs: nounwind memory(none)\ndeclare ptr @llvm.coro.noop() #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare ptr @llvm.coro.subfn.addr(ptr nocapture readonly, i8) #2\n\nattributes #0 = { noreturn }\nattributes #1 = { nounwind memory(none) }\nattributes #2 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "coroutines",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "NewSigma",
+      "body": "Thanks for the code review."
+    },
+    {
+      "author": "NewSigma",
+      "body": "cc @bgra8 . I tested your repro. Could you please confirm if it resolved the problem?"
+    },
+    {
+      "author": "bgra8",
+      "body": "> cc @bgra8 . I tested your repro. Could you please confirm if it resolved the problem?\r\n\r\nConfirmed! Thanks for the fix @NewSigma !!"
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `llvm-clang-aarch64-darwin` running on `doug-worker-4` while building `llvm` at step 6 \"test-build-unified-tree-check-all\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/190/builds/35545\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 6 (test-build-unified-tree-check-all) failure: test (failure)\n******************** TEST 'LLVM :: Transforms/Coroutines/coro-cleanup-noop-elide.ll' FAILED ********************\nExit Code: 2\n\nCommand Output (stdout):\n--\n# RUN: at line 2\n/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt < /Users/buildbot/buildbot-root/llvm-project/llvm/test/Transforms/Coroutines/coro-cleanup-noop-elide.ll -S -passes='coro-cleanup' | /Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/FileCheck /Users/buildbot/buildbot-root/llvm-project/llvm/test/Transforms/Coroutines/coro-cleanup-noop-elide.ll\n# executed command: /Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt -S -passes=coro-cleanup\n# .---command stderr------------\n# | Assertion failed: (Val && \"isa<> used on a null pointer\"), function doit, file Casting.h, line 109.\n# | PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.\n# | Stack dump:\n# | 0.\tProgram arguments: /Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt -S -passes=coro-cleanup\n# | 1.\tRunning pass \"coro-cleanup\" on module \"<stdin>\"\n# |  #0 0x00000001039dad78 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x101882d78)\n# |  #1 0x00000001039d8b40 llvm::sys::RunSignalHandlers() (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x101880b40)\n# |  #2 0x00000001039db878 SignalHandler(int, __siginfo*, void*) (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x101883878)\n# |  #3 0x000000018f133584 (/usr/lib/system/libsystem_platform.dylib+0x18047b584)\n# |  #4 0x000000018f102bc8 (/usr/lib/system/libsystem_pthread.dylib+0x18044abc8)\n# |  #5 0x000000018f00fa40 (/usr/lib/system/libsystem_c.dylib+0x180357a40)\n# |  #6 0x000000018f00ed30 (/usr/lib/system/libsystem_c.dylib+0x180356d30)\n# |  #7 0x0000000104b4702c llvm::CoroCleanupPass::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (.cold.18) (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x1029ef02c)\n# |  #8 0x00000001030ce458 llvm::CoroCleanupPass::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x100f76458)\n# |  #9 0x0000000103059348 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x100f01348)\n# | #10 0x0000000103eea7c0 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::__1::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool, bool) (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x101d927c0)\n# | #11 0x0000000103ef5a84 optMain (/Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/opt+0x101d9da84)\n# | #12 0x000000018ed77154\n# `-----------------------------\n# error: command failed with exit status: -6\n# executed command: /Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/FileCheck /Users/buildbot/buildbot-root/llvm-project/llvm/test/Transforms/Coroutines/coro-cleanup-noop-elide.ll\n# .---command stderr------------\n# | FileCheck error: '<stdin>' is empty.\n# | FileCheck command line:  /Volumes/RAMDisk/buildbot-root/aarch64-darwin/build/bin/FileCheck /Users/buildbot/buildbot-root/llvm-project/llvm/test/Transforms/Coroutines/coro-cleanup-noop-elide.ll\n# `-----------------------------\n# error: command failed with exit status: 2\n\n--\n\n********************\n\n\n```\n\n</details>"
+    },
+    {
+      "author": "bgra8",
+      "body": "@NewSigma any ETA to reland the fix?"
+    },
+    {
+      "author": "NewSigma",
+      "body": "> @NewSigma any ETA to reland the fix?\r\n\r\nSee #179431"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-02T02:15:02Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Coroutines/CoroCleanup.cpp": [
+      [
+        8,
+        13
+      ],
+      [
+        15,
+        20
+      ],
+      [
+        30,
+        38
+      ],
+      [
+        73,
+        78
+      ],
+      [
+        100,
+        106
+      ],
+      [
+        142,
+        169
+      ],
+      [
+        200,
+        205
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Coroutines/CoroCleanup.cpp": [
+      "Lowerer::elideCoroNoop",
+      "Lowerer::lowerCoroNoop",
+      "declaresCoroCleanupIntrinsics",
+      "lowerSubFn"
+    ]
+  }
+}

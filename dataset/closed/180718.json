@@ -1,0 +1,69 @@
+{
+  "pr_id": 180718,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180718",
+  "state": "closed",
+  "title": "[SCEV] Don't create SCEVPtrToAddr for unstable pointer representations.",
+  "author": "fhahn",
+  "base_commit": "b46d6dcac1d710e1d0ad4062b64686819a24b05d",
+  "fix_commit": "f822e20f3f95bc92e0769ce42cc3b936e57a00af",
+  "patch": "diff --git a/llvm/lib/Analysis/ScalarEvolution.cpp b/llvm/lib/Analysis/ScalarEvolution.cpp\nindex 0603b9feaa860..45f1b543b8fc7 100644\n--- a/llvm/lib/Analysis/ScalarEvolution.cpp\n+++ b/llvm/lib/Analysis/ScalarEvolution.cpp\n@@ -1127,6 +1127,12 @@ const SCEV *ScalarEvolution::getLosslessPtrToIntExpr(const SCEV *Op) {\n \n const SCEV *ScalarEvolution::getPtrToAddrExpr(const SCEV *Op) {\n   assert(Op->getType()->isPointerTy() && \"Op must be a pointer\");\n+\n+  // Treat pointers with unstable representation conservatively, since the\n+  // address bits may change.\n+  if (DL.hasUnstableRepresentation(Op->getType()))\n+    return getCouldNotCompute();\n+\n   Type *Ty = DL.getAddressType(Op->getType());\n \n   // Use the rewriter to sink the cast down to SCEVUnknown leaves.\n@@ -8175,8 +8181,12 @@ const SCEV *ScalarEvolution::createSCEV(Value *V) {\n       return getSCEV(U->getOperand(0));\n     break;\n \n-  case Instruction::PtrToAddr:\n-    return getPtrToAddrExpr(getSCEV(U->getOperand(0)));\n+  case Instruction::PtrToAddr: {\n+    const SCEV *IntOp = getPtrToAddrExpr(getSCEV(U->getOperand(0)));\n+    if (isa<SCEVCouldNotCompute>(IntOp))\n+      return getUnknown(V);\n+    return IntOp;\n+  }\n \n   case Instruction::PtrToInt: {\n     // Pointer to integer cast is straight-forward, so do model it.\n",
+  "components": [
+    "ScalarEvolution"
+  ],
+  "description": "Conservatively treat unstable pointers as SCEVCouldNotCompute in getPtrToAddrExpr, and return SCEVUnknown when constructing from IR.\r\n\r\nThis surfaced as part of the discussion in\r\nhttps://github.com/llvm/llvm-project/pull/178861.",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/ScalarEvolution/ptrtoaddr.ll",
+      "commands": [
+        "opt -passes='print<scalar-evolution>' -disable-output %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\n; Address space 2 has unstable pointer representation.\n; Address space 3 has external state but stable representation.\ntarget datalayout=\"p:64:64:64:64-pu2:64:64:64:64-pe3:64:64:64:64\"\n\ndefine void @ptrtoaddr(ptr %in, ptr %out0, ptr %out1, ptr %out2, ptr %out3) {\n;\n  %p0 = ptrtoaddr ptr %in to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_as1(ptr addrspace(1) %in, ptr %out0, ptr %out1, ptr %out2, ptr %out3) {\n;\n  %p0 = ptrtoaddr ptr addrspace(1) %in to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_bitcast(ptr %in, ptr %out0) {\n;\n  %in_casted = bitcast ptr %in to ptr\n  %p0 = ptrtoaddr ptr %in_casted to i64\n  store i64 %p0, ptr %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_nullptr(ptr %out0) {\n;\n  %p0 = ptrtoaddr ptr null to i64\n  store i64 %p0, ptr %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_gep(ptr %in, ptr %out0) {\n;\n  %in_adj = getelementptr inbounds i8, ptr %in, i64 42\n  %p0 = ptrtoaddr ptr %in_adj to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_gep_with_unknown_int(ptr %in, ptr %out0, ptr %offset) {\n;\n  %l = load i64, ptr %offset\n  %in_adj = getelementptr inbounds i8, ptr %in, i64 %l\n  %p0 = ptrtoaddr ptr %in_adj to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}\n\n; ptrtoaddr of a pointer with unstable representation should return SCEVUnknown.\ndefine void @ptrtoaddr_unstable(ptr addrspace(2) %in, ptr %out) {\n;\n  %p = ptrtoaddr ptr addrspace(2) %in to i64\n  store i64 %p, ptr %out\n  ret void\n}\n\n; ptrtoaddr of GEP on unstable pointer should return SCEVUnknown.\ndefine void @ptrtoaddr_unstable_gep(ptr addrspace(2) %in, ptr %out) {\n;\n  %gep = getelementptr inbounds i8, ptr addrspace(2) %in, i64 42\n  %p = ptrtoaddr ptr addrspace(2) %gep to i64\n  store i64 %p, ptr %out\n  ret void\n}\n\n; ptrtoaddr of nullptr in unstable address space should return SCEVUnknown.\ndefine void @ptrtoaddr_unstable_null(ptr %out) {\n;\n  %p = ptrtoaddr ptr addrspace(2) null to i64\n  store i64 %p, ptr %out\n  ret void\n}\n\n; Address space 3 is non-integral with external state but stable representation.\ndefine void @ptrtoaddr_nonintegral_stable(ptr addrspace(3) %in, ptr %out) {\n;\n  %p = ptrtoaddr ptr addrspace(3) %in to i64\n  store i64 %p, ptr %out\n  ret void\n}\n\ndefine void @ptrtoaddr_nonintegral_stable_gep(ptr addrspace(3) %in, ptr %out) {\n;\n  %gep = getelementptr inbounds i8, ptr addrspace(3) %in, i64 42\n  %p = ptrtoaddr ptr addrspace(3) %gep to i64\n  store i64 %p, ptr %out\n  ret void\n}"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-10T10:46:17Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ScalarEvolution.cpp": [
+      [
+        1127,
+        1132
+      ],
+      [
+        8175,
+        8182
+      ]
+    ],
+    "llvm/test/Analysis/ScalarEvolution/ptrtoaddr.ll": [
+      [
+        89,
+        101
+      ],
+      [
+        103,
+        109
+      ],
+      [
+        111,
+        117
+      ],
+      [
+        120,
+        132
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ScalarEvolution.cpp": [
+      "ScalarEvolution::createSCEV",
+      "ScalarEvolution::getPtrToAddrExpr"
+    ]
+  }
+}

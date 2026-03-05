@@ -1,0 +1,51 @@
+{
+  "pr_id": 180882,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180882",
+  "state": "closed",
+  "title": "[CHR] Skip regions containing convergent calls",
+  "author": "yxsamliu",
+  "base_commit": "8362c0382936f0231d2c762f6e1e97957423b4cf",
+  "fix_commit": "b1b0916640fd7e47dc06e76377b7bf7ba064b06c",
+  "patch": "diff --git a/llvm/lib/Transforms/Instrumentation/ControlHeightReduction.cpp b/llvm/lib/Transforms/Instrumentation/ControlHeightReduction.cpp\nindex c7b941319f8b9..11e028f1feb3b 100644\n--- a/llvm/lib/Transforms/Instrumentation/ControlHeightReduction.cpp\n+++ b/llvm/lib/Transforms/Instrumentation/ControlHeightReduction.cpp\n@@ -744,10 +744,29 @@ CHRScope * CHR::findScope(Region *R) {\n     // FIXME: This could lead to less optimal codegen, because the region is\n     // excluded, it can prevent CHR from merging adjacent regions into bigger\n     // scope and hoisting more branches.\n-    for (Instruction &I : *BB)\n+    for (Instruction &I : *BB) {\n       if (auto *II = dyn_cast<IntrinsicInst>(&I))\n         if (II->getIntrinsicID() == Intrinsic::coro_id)\n           return nullptr;\n+      // Can't clone regions containing convergent or noduplicate calls.\n+      //\n+      // CHR clones a region into hot/cold paths guarded by a merged\n+      // speculative branch. On GPU targets, this branch may be divergent\n+      // (different threads evaluate it differently), splitting the set of\n+      // threads that reach each copy. A convergent call (e.g. a cross-lane\n+      // operation like ds_bpermute on AMDGPU) requires a specific set of\n+      // threads to be active; when CHR places a copy on the hot path, only\n+      // the threads that took the hot branch are active, so the operation\n+      // reads stale values from threads that went to the cold path.\n+      //\n+      // Similarly, noduplicate calls must not be duplicated by definition.\n+      //\n+      // This matches SimplifyCFG's block-duplication guard.\n+      if (auto *CB = dyn_cast<CallBase>(&I)) {\n+        if (CB->cannotDuplicate() || CB->isConvergent())\n+          return nullptr;\n+      }\n+    }\n   }\n \n   if (Exit) {\n",
+  "components": [
+    "Instrumentation"
+  ],
+  "description": "CHR (Control Height Reduction) merges multiple biased branches into a\nsingle speculative check, cloning the region into hot/cold paths. On\nGPU targets, the merged branch may be divergent (evaluated per-thread),\nsplitting the wavefront: some threads take the hot path, others the\ncold path.\n\nA convergent call like ds_bpermute (a cross-lane operation on AMDGPU)\nrequires a specific set of threads to be active \u2014 when thread X reads\nfrom thread Y, thread Y must be active and participating in the same\ncall. After CHR cloning, thread Y may have gone to the cold path while\nthread X is on the hot path, so the hot-path ds_bpermute reads a stale\nregister value from thread Y instead of the intended value.\n\nThis caused a miscompilation in rocPRIM's lookback scan: CHR duplicated\na region containing ds_bpermute, and the hot-path copy executed with a\ndifferent set of active threads, reading incorrect cross-lane data and\ncausing a memory access fault.\n\nThe fix skips any region containing convergent or noduplicate calls,\nfollowing the same pattern as SimplifyCFG's block-duplication guard.\n\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/PGOProfile/chr-convergent.ll",
+      "commands": [
+        "opt < %s -passes='require<profile-summary>,function(chr)' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_chr_convergent",
+          "test_body": "; Function Attrs: convergent nounwind willreturn memory(none)\ndeclare i32 @convergent_callee(i32, i32) #0\n\ndefine void @test_chr_convergent(ptr %input, ptr %output, i32 %tid) !prof !14 {\nentry:\n  %gep_in = getelementptr inbounds i32, ptr %input, i32 %tid\n  %val = load i32, ptr %gep_in, align 4\n  %cond1 = icmp sgt i32 %val, 0\n  br i1 %cond1, label %bb1, label %merge1, !prof !15\n\nbb1:                                              ; preds = %entry\n  %lane_idx = shl i32 %tid, 2\n  %perm = call i32 @convergent_callee(i32 %lane_idx, i32 %val)\n  br label %merge1\n\nmerge1:                                           ; preds = %bb1, %entry\n  %result = phi i32 [ %perm, %bb1 ], [ 0, %entry ]\n  %cond2 = icmp slt i32 %val, 100\n  br i1 %cond2, label %bb2, label %merge2, !prof !15\n\nbb2:                                              ; preds = %merge1\n  %gep_out = getelementptr inbounds i32, ptr %output, i32 %tid\n  store i32 %result, ptr %gep_out, align 4\n  br label %merge2\n\nmerge2:                                           ; preds = %bb2, %merge1\n  ret void\n}\n\nattributes #0 = { convergent nounwind willreturn memory(none) }\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"ProfileSummary\", !1}\n!1 = !{!2, !3, !4, !5, !6, !7, !8, !9}\n!2 = !{!\"ProfileFormat\", !\"InstrProf\"}\n!3 = !{!\"TotalCount\", i64 10000}\n!4 = !{!\"MaxCount\", i64 10}\n!5 = !{!\"MaxInternalCount\", i64 1}\n!6 = !{!\"MaxFunctionCount\", i64 1000}\n!7 = !{!\"NumCounts\", i64 3}\n!8 = !{!\"NumFunctions\", i64 2}\n!9 = !{!\"DetailedSummary\", !10}\n!10 = !{!11, !12, !13}\n!11 = !{i32 10000, i64 100, i32 1}\n!12 = !{i32 999000, i64 100, i32 1}\n!13 = !{i32 999999, i64 1, i32 2}\n!14 = !{!\"function_entry_count\", i64 100}\n!15 = !{!\"branch_weights\", i32 999, i32 1}\n"
+        },
+        {
+          "test_name": "test_chr_noduplicate",
+          "test_body": "; Function Attrs: noduplicate nounwind\ndeclare void @noduplicate_callee() #0\n\ndefine void @test_chr_noduplicate(ptr %input, ptr %output, i32 %tid) !prof !14 {\nentry:\n  %gep_in = getelementptr inbounds i32, ptr %input, i32 %tid\n  %val = load i32, ptr %gep_in, align 4\n  %cond1 = icmp sgt i32 %val, 0\n  br i1 %cond1, label %bb1, label %merge1, !prof !15\n\nbb1:                                              ; preds = %entry\n  call void @noduplicate_callee()\n  br label %merge1\n\nmerge1:                                           ; preds = %bb1, %entry\n  %cond2 = icmp slt i32 %val, 100\n  br i1 %cond2, label %bb2, label %merge2, !prof !15\n\nbb2:                                              ; preds = %merge1\n  %gep_out = getelementptr inbounds i32, ptr %output, i32 %tid\n  store i32 %val, ptr %gep_out, align 4\n  br label %merge2\n\nmerge2:                                           ; preds = %bb2, %merge1\n  ret void\n}\n\nattributes #0 = { noduplicate nounwind }\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"ProfileSummary\", !1}\n!1 = !{!2, !3, !4, !5, !6, !7, !8, !9}\n!2 = !{!\"ProfileFormat\", !\"InstrProf\"}\n!3 = !{!\"TotalCount\", i64 10000}\n!4 = !{!\"MaxCount\", i64 10}\n!5 = !{!\"MaxInternalCount\", i64 1}\n!6 = !{!\"MaxFunctionCount\", i64 1000}\n!7 = !{!\"NumCounts\", i64 3}\n!8 = !{!\"NumFunctions\", i64 2}\n!9 = !{!\"DetailedSummary\", !10}\n!10 = !{!11, !12, !13}\n!11 = !{i32 10000, i64 100, i32 1}\n!12 = !{i32 999000, i64 100, i32 1}\n!13 = !{i32 999999, i64 1, i32 2}\n!14 = !{!\"function_entry_count\", i64 100}\n!15 = !{!\"branch_weights\", i32 999, i32 1}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "PGO",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-11T04:33:25Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Instrumentation/ControlHeightReduction.cpp": [
+      [
+        744,
+        753
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Instrumentation/ControlHeightReduction.cpp": [
+      "CHR::findScope"
+    ]
+  }
+}

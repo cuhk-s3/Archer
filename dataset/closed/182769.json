@@ -1,0 +1,389 @@
+{
+  "pr_id": 182769,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182769",
+  "state": "closed",
+  "title": "Revert \"[InstCombine] Allow freezing multiple operands (#154336)\"",
+  "author": "efriedma-quic",
+  "base_commit": "d999f94aee4e630804214812d81e6916ca67c7bf",
+  "fix_commit": "bec98ed2e6709575ee092fe6a937ff4da306931a",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex c4beacdd12684..813565ad1b5dd 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -5199,68 +5199,63 @@ Instruction *InstCombinerImpl::visitLandingPadInst(LandingPadInst &LI) {\n Value *\n InstCombinerImpl::pushFreezeToPreventPoisonFromPropagating(FreezeInst &OrigFI) {\n   // Try to push freeze through instructions that propagate but don't produce\n-  // poison as far as possible. If an operand of freeze does not produce poison\n-  // then push the freeze through to the operands that are not guaranteed\n-  // non-poison. The actual transform is as follows.\n-  //   Op1 = ...                        ; Op1 can be poison\n-  //   Op0 = Inst(Op1, NonPoisonOps...)\n+  // poison as far as possible.  If an operand of freeze follows three\n+  // conditions 1) one-use, 2) does not produce poison, and 3) has all but one\n+  // guaranteed-non-poison operands then push the freeze through to the one\n+  // operand that is not guaranteed non-poison.  The actual transform is as\n+  // follows.\n+  //   Op1 = ...                        ; Op1 can be posion\n+  //   Op0 = Inst(Op1, NonPoisonOps...) ; Op0 has only one use and only have\n+  //                                    ; single guaranteed-non-poison operands\n   //   ... = Freeze(Op0)\n   // =>\n   //   Op1 = ...\n   //   Op1.fr = Freeze(Op1)\n   //   ... = Inst(Op1.fr, NonPoisonOps...)\n+  auto *OrigOp = OrigFI.getOperand(0);\n+  auto *OrigOpInst = dyn_cast<Instruction>(OrigOp);\n \n-  auto CanPushFreeze = [](Value *V) {\n-    if (!isa<Instruction>(V) || isa<PHINode>(V))\n-      return false;\n-\n-    // We can't push the freeze through an instruction which can itself create\n-    // poison.  If the only source of new poison is flags, we can simply\n-    // strip them (since we know the only use is the freeze and nothing can\n-    // benefit from them.)\n-    return !canCreateUndefOrPoison(cast<Operator>(V),\n-                                   /*ConsiderFlagsAndMetadata*/ false);\n-  };\n+  // While we could change the other users of OrigOp to use freeze(OrigOp), that\n+  // potentially reduces their optimization potential, so let's only do this iff\n+  // the OrigOp is only used by the freeze.\n+  if (!OrigOpInst || !OrigOpInst->hasOneUse() || isa<PHINode>(OrigOp))\n+    return nullptr;\n \n-  // Pushing freezes up long instruction chains can be expensive. Instead,\n-  // we directly push the freeze all the way to the leaves. However, we leave\n-  // deduplication of freezes on the same value for freezeOtherUses().\n-  Use *OrigUse = &OrigFI.getOperandUse(0);\n-  SmallPtrSet<Instruction *, 8> Visited;\n-  SmallVector<Use *, 8> Worklist;\n-  Worklist.push_back(OrigUse);\n-  while (!Worklist.empty()) {\n-    auto *U = Worklist.pop_back_val();\n-    Value *V = U->get();\n-    if (!CanPushFreeze(V)) {\n-      // If we can't push through the original instruction, abort the transform.\n-      if (U == OrigUse)\n-        return nullptr;\n+  // We can't push the freeze through an instruction which can itself create\n+  // poison.  If the only source of new poison is flags, we can simply\n+  // strip them (since we know the only use is the freeze and nothing can\n+  // benefit from them.)\n+  if (canCreateUndefOrPoison(cast<Operator>(OrigOp),\n+                             /*ConsiderFlagsAndMetadata*/ false))\n+    return nullptr;\n \n-      auto *UserI = cast<Instruction>(U->getUser());\n-      Builder.SetInsertPoint(UserI);\n-      Value *Frozen = Builder.CreateFreeze(V, V->getName() + \".fr\");\n-      U->set(Frozen);\n+  // If operand is guaranteed not to be poison, there is no need to add freeze\n+  // to the operand. So we first find the operand that is not guaranteed to be\n+  // poison.\n+  Value *MaybePoisonOperand = nullptr;\n+  for (Value *V : OrigOpInst->operands()) {\n+    if (isa<MetadataAsValue>(V) || isGuaranteedNotToBeUndefOrPoison(V) ||\n+        // Treat identical operands as a single operand.\n+        (MaybePoisonOperand && MaybePoisonOperand == V))\n       continue;\n-    }\n+    if (!MaybePoisonOperand)\n+      MaybePoisonOperand = V;\n+    else\n+      return nullptr;\n+  }\n \n-    auto *I = cast<Instruction>(V);\n-    if (!Visited.insert(I).second)\n-      continue;\n+  OrigOpInst->dropPoisonGeneratingAnnotations();\n \n-    // reverse() to emit freezes in a more natural order.\n-    for (Use &Op : reverse(I->operands())) {\n-      Value *OpV = Op.get();\n-      if (isa<MetadataAsValue>(OpV) || isGuaranteedNotToBeUndefOrPoison(OpV))\n-        continue;\n-      Worklist.push_back(&Op);\n-    }\n+  // If all operands are guaranteed to be non-poison, we can drop freeze.\n+  if (!MaybePoisonOperand)\n+    return OrigOp;\n \n-    I->dropPoisonGeneratingAnnotations();\n-    this->Worklist.add(I);\n-  }\n+  Builder.SetInsertPoint(OrigOpInst);\n+  Value *FrozenMaybePoisonOperand = Builder.CreateFreeze(\n+      MaybePoisonOperand, MaybePoisonOperand->getName() + \".fr\");\n \n-  return OrigUse->get();\n+  OrigOpInst->replaceUsesOfWith(MaybePoisonOperand, FrozenMaybePoisonOperand);\n+  return OrigOp;\n }\n \n Instruction *InstCombinerImpl::foldFreezeIntoRecurrence(FreezeInst &FI,\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This reverts commit f8f6965ceece9e330ddb66db5f402ecfb5e3ad34.\r\n\r\nThis is causing infinte loops interacting with other transforms.  See discussion on #182647 .",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/freeze-fp-ops.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "freeze_powi",
+          "test_body": "define float @freeze_powi(float %arg0, i32 %arg1) {\n  %op = call float @llvm.powi.f32.i32(float %arg0, i32 %arg1)\n  %freeze = freeze float %op\n  ret float %freeze\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.powi.f32.i32(float, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "freeze_sqrt",
+          "test_body": "define float @freeze_sqrt(float %arg) {\n  %op = call float @llvm.sqrt.f32(float %arg)\n  %freeze = freeze float %op\n  ret float %freeze\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.sqrt.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/freeze.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "partial_undef_vec",
+          "test_body": "define <3 x i4> @partial_undef_vec() {\n  %f = freeze <3 x i4> <i4 poison, i4 1, i4 undef>\n  ret <3 x i4> %f\n}\n"
+        },
+        {
+          "test_name": "fold_phi_gep_phi_offset_multiple",
+          "test_body": "define void @fold_phi_gep_phi_offset_multiple(ptr %init, ptr %end, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi ptr [ %init, %entry ], [ %i.next.fr, %loop ]\n  %off = phi i64 [ %n, %entry ], [ %off.next, %loop ]\n  %off.next = shl i64 %off, 3\n  %i.next = getelementptr inbounds i8, ptr %i, i64 %off.next\n  %i.next.fr = freeze ptr %i.next\n  %cond = icmp eq ptr %i.next.fr, %end\n  br i1 %cond, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_phi_gep_phi_offset",
+          "test_body": "define void @fold_phi_gep_phi_offset(ptr %init, ptr %end, i64 noundef %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi ptr [ %init, %entry ], [ %i.next.fr, %loop ]\n  %off = phi i64 [ %n, %entry ], [ %off.next, %loop ]\n  %off.next = shl i64 %off, 3\n  %i.next = getelementptr i8, ptr %i, i64 %off.next\n  %i.next.fr = freeze ptr %i.next\n  %cond = icmp eq ptr %i.next.fr, %end\n  br i1 %cond, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_phi_gep_inbounds_phi_offset",
+          "test_body": "define void @fold_phi_gep_inbounds_phi_offset(ptr %init, ptr %end, i64 noundef %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi ptr [ %init, %entry ], [ %i.next.fr, %loop ]\n  %off = phi i64 [ %n, %entry ], [ %off.next, %loop ]\n  %off.next = shl i64 %off, 3\n  %i.next = getelementptr inbounds i8, ptr %i, i64 %off.next\n  %i.next.fr = freeze ptr %i.next\n  %cond = icmp eq ptr %i.next.fr, %end\n  br i1 %cond, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "pr171435_2",
+          "test_body": "declare ptr @get_ptr()\n\ndefine i32 @pr171435_2(ptr noundef %arg, i32 noundef %arg1) #0 {\nbb.1:\n  %call = call ptr @get_ptr()\n  br label %bb.2\n\nbb.2:                                             ; preds = %bb.13, %bb.1\n  %phi = phi i32 [ 8, %bb.1 ], [ %phi14, %bb.13 ]\n  %phi3 = phi i32 [ 8, %bb.1 ], [ 0, %bb.13 ]\n  %icmp = icmp eq i32 %phi3, 0\n  br i1 %icmp, label %bb.13, label %bb.4\n\nbb.4:                                             ; preds = %bb.2\n  br i1 true, label %bb.5, label %bb.7\n\nbb.5:                                             ; preds = %bb.4\n  %load = load i32, ptr %call, align 1\n  %call6 = call i32 @llvm.bswap.i32(i32 %load)\n  br label %bb.8\n\nbb.7:                                             ; preds = %bb.4\n  br label %bb.8\n\nbb.8:                                             ; preds = %bb.7, %bb.5\n  %phi9 = phi i32 [ %call6, %bb.5 ], [ 0, %bb.7 ]\n  %and = and i32 %phi9, 1\n  %ashr = ashr i32 %phi9, 1\n  %add = add nsw i32 %ashr, %and\n  %add10 = add nsw i32 %phi, %add\n  %and11 = and i32 %add10, 255\n  %icmp12 = icmp eq i32 %and11, 0\n  %freeze = freeze i1 %icmp12\n  %select = select i1 %freeze, i32 %phi, i32 %and11\n  br label %bb.13\n\nbb.13:                                            ; preds = %bb.8, %bb.2\n  %phi14 = phi i32 [ %phi, %bb.2 ], [ %select, %bb.8 ]\n  br label %bb.2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.bswap.i32(i32) #1\n\nattributes #0 = { \"instcombine-no-verify-fixpoint\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "early_freeze_test1",
+          "test_body": "define i32 @early_freeze_test1(i32 %x, i32 %y) {\n  %v1 = add i32 %x, %y\n  %v2 = shl i32 %v1, 1\n  %v3 = and i32 %v2, 2\n  %v3.fr = freeze i32 %v3\n  ret i32 %v3.fr\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_freeze_sext",
+          "test_body": "target datalayout = \"e-p:64:64:64-p1:16:16:16-p2:32:32:32-p3:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i1 @icmp_freeze_sext(i16 %x, i16 %y) {\n  %cmp1 = icmp uge i16 %x, %y\n  %ext = sext i1 %cmp1 to i16\n  %ext.fr = freeze i16 %ext\n  %cmp2 = icmp uge i16 %ext.fr, %y\n  ret i1 %cmp2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/nsw.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "sub_sub1_nsw_nsw",
+          "test_body": "define i32 @sub_sub1_nsw_nsw(i32 %a, i32 %b, i32 %c) {\n  %s1 = sub nsw i32 %a, %b\n  %s2 = sub nsw i32 %c, %s1\n  ret i32 %s2\n}\n"
+        },
+        {
+          "test_name": "neg_nsw_freeze",
+          "test_body": "define i8 @neg_nsw_freeze(i8 %a1, i8 %a2) {\n  %a = sub nsw i8 %a1, %a2\n  %fr = freeze i8 %a\n  %neg = sub nsw i8 0, %fr\n  ret i8 %neg\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-gep.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "ptr_eq_replace_freeze1",
+          "test_body": "define ptr @ptr_eq_replace_freeze1(ptr %p, ptr %q) {\n  %p.fr = freeze ptr %p\n  %q.fr = freeze ptr %q\n  %cmp = icmp eq ptr %p.fr, %q.fr\n  %select = select i1 %cmp, ptr %p.fr, ptr %q.fr\n  ret ptr %select\n}\n"
+        },
+        {
+          "test_name": "ptr_eq_replace_freeze2",
+          "test_body": "define ptr @ptr_eq_replace_freeze2(ptr %p, ptr %q) {\n  %gep1 = getelementptr i32, ptr %p, i64 4\n  %gep2 = getelementptr i32, ptr %q, i64 4\n  %cmp = icmp eq ptr %p, %q\n  %cmp.fr = freeze i1 %cmp\n  %select = select i1 %cmp.fr, ptr %gep1, ptr %gep2\n  ret ptr %select\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "select_freeze_icmp_multuses",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndeclare void @use_i1_i32(i1, i32)\n\ndefine void @select_freeze_icmp_multuses(i32 %x, i32 %y) {\n  %c = icmp ne i32 %x, %y\n  %c.fr = freeze i1 %c\n  %v = select i1 %c.fr, i32 %x, i32 %y\n  call void @use_i1_i32(i1 %c.fr, i32 %v)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "select_freeze_icmp_ne",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @select_freeze_icmp_ne(i32 %x, i32 %y) {\n  %c = icmp ne i32 %x, %y\n  %c.fr = freeze i1 %c\n  %v = select i1 %c.fr, i32 %x, i32 %y\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "select_freeze_icmp_eq",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @select_freeze_icmp_eq(i32 %x, i32 %y) {\n  %c = icmp eq i32 %x, %y\n  %c.fr = freeze i1 %c\n  %v = select i1 %c.fr, i32 %x, i32 %y\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "select_freeze_icmp_else",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @select_freeze_icmp_else(i32 %x, i32 %y) {\n  %c = icmp ult i32 %x, %y\n  %c.fr = freeze i1 %c\n  %v = select i1 %c.fr, i32 %x, i32 %y\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "cond_freeze_multipleuses",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndeclare void @foo2(i8, i8)\n\ndefine void @cond_freeze_multipleuses(i8 %x, i8 %y) {\n  %cond.fr = freeze i1 undef\n  %s = select i1 %cond.fr, i8 %x, i8 %y\n  %s2 = select i1 %cond.fr, i8 %y, i8 %x\n  call void @foo2(i8 %s, i8 %s2)\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/sub-of-negatible-inseltpoison.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "negate_freeze_extrause",
+          "test_body": "declare void @use4(i4)\n\ndefine i4 @negate_freeze_extrause(i4 %x, i4 %y, i4 %z) {\n  %t0 = sub i4 %x, %y\n  %t1 = freeze i4 %t0\n  call void @use4(i4 %t1)\n  %t2 = sub i4 %z, %t1\n  ret i4 %t2\n}\n"
+        },
+        {
+          "test_name": "negate_freeze",
+          "test_body": "define i4 @negate_freeze(i4 %x, i4 %y, i4 %z) {\n  %t0 = sub i4 %x, %y\n  %t1 = freeze i4 %t0\n  %t2 = sub i4 %z, %t1\n  ret i4 %t2\n}\n"
+        },
+        {
+          "test_name": "dont_negate_ordinary_select",
+          "test_body": "define i8 @dont_negate_ordinary_select(i8 %x, i8 %y, i8 %z, i1 %c) {\n  %t0 = select i1 %c, i8 %x, i8 %y\n  %t1 = sub i8 %z, %t0\n  ret i8 %t1\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/sub-of-negatible.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "negate_freeze_extrause",
+          "test_body": "declare void @use4(i4)\n\ndefine i4 @negate_freeze_extrause(i4 %x, i4 %y, i4 %z) {\n  %t0 = sub i4 %x, %y\n  %t1 = freeze i4 %t0\n  call void @use4(i4 %t1)\n  %t2 = sub i4 %z, %t1\n  ret i4 %t2\n}\n"
+        },
+        {
+          "test_name": "negate_freeze",
+          "test_body": "define i4 @negate_freeze(i4 %x, i4 %y, i4 %z) {\n  %t0 = sub i4 %x, %y\n  %t1 = freeze i4 %t0\n  %t2 = sub i4 %z, %t1\n  ret i4 %t2\n}\n"
+        },
+        {
+          "test_name": "negate_select_of_negation_poison",
+          "test_body": "define <2 x i32> @negate_select_of_negation_poison(<2 x i1> %c, <2 x i32> %x) {\n  %neg = sub <2 x i32> <i32 0, i32 poison>, %x\n  %sel = select <2 x i1> %c, <2 x i32> %neg, <2 x i32> %x\n  %neg2 = sub <2 x i32> zeroinitializer, %sel\n  ret <2 x i32> %neg2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/urem-via-cmp-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "urem_without_assume",
+          "test_body": "define i8 @urem_without_assume(i8 %arg, i8 %arg2) {\n  %x = urem i8 %arg, %arg2\n  %add = add i8 %x, 1\n  %out = urem i8 %add, %arg2\n  ret i8 %out\n}\n"
+        },
+        {
+          "test_name": "urem_assume_with_unexpected_const",
+          "test_body": "define i8 @urem_assume_with_unexpected_const(i8 %x, i8 %n) {\n  %cmp = icmp ult i8 %x, %n\n  tail call void @llvm.assume(i1 %cmp)\n  %add = add i8 %x, 2\n  %out = urem i8 %add, %n\n  ret i8 %out\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/forked-pointers.ll",
+      "commands": [
+        "opt -passes=loop-vectorize,instcombine -force-vector-width=4 -S < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "forked_ptrs_different_base_same_offset",
+          "test_body": "target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128\"\n\ndefine dso_local void @forked_ptrs_different_base_same_offset(ptr nocapture readonly %Base1, ptr nocapture readonly %Base2, ptr nocapture %Dest, ptr nocapture readonly %Preds) {\nentry:\n  br label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %Preds, i64 %indvars.iv\n  %0 = load i32, ptr %arrayidx, align 4\n  %cmp1.not = icmp eq i32 %0, 0\n  %spec.select = select i1 %cmp1.not, ptr %Base2, ptr %Base1\n  %.sink.in = getelementptr inbounds float, ptr %spec.select, i64 %indvars.iv\n  %.sink = load float, ptr %.sink.in, align 4\n  %1 = getelementptr inbounds float, ptr %Dest, i64 %indvars.iv\n  store float %.sink, ptr %1, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, 100\n  br i1 %exitcond.not, label %for.cond.cleanup, label %for.body\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PGOProfile/chr.ll",
+      "commands": [
+        "opt < %s -passes='require<profile-summary>,function(chr,instcombine,simplifycfg)' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_chr_14",
+          "test_body": "declare void @foo()\n\ndefine i32 @test_chr_14(ptr %i, ptr %j, i32 %sum0, i1 %pred, i32 %z) !prof !14 {\nentry:\n  %i0 = load i32, ptr %i, align 4\n  %v0 = icmp eq i32 %z, 0\n  %v1 = icmp ne i32 %z, 1\n  %v2 = select i1 %v1, i1 %pred, i1 true, !prof !15\n  %v3 = and i1 %v0, %pred\n  br i1 %v3, label %bb0, label %bb1, !prof !15\n\nbb0:                                              ; preds = %entry\n  call void @foo()\n  br label %bb1\n\nbb1:                                              ; preds = %bb0, %entry\n  %j0 = load i32, ptr %j, align 4\n  %v6 = and i32 %i0, 2\n  %v4 = icmp eq i32 %v6, %j0\n  %v8 = add i32 %sum0, 43\n  %sum2 = select i1 %v4, i32 %sum0, i32 %v8, !prof !15\n  %v5 = icmp eq i32 %i0, %j0\n  %sum3 = select i1 %v5, i32 %sum0, i32 %v8, !prof !15\n  call void @foo()\n  %v9 = and i32 %i0, 4\n  %v10 = icmp eq i32 %v9, 0\n  br i1 %v10, label %bb3, label %bb2\n\nbb2:                                              ; preds = %bb1\n  call void @foo()\n  br label %bb3\n\nbb3:                                              ; preds = %bb2, %bb1\n  %v11 = add i32 %i0, %sum3\n  ret i32 %v11\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"ProfileSummary\", !1}\n!1 = !{!2, !3, !4, !5, !6, !7, !8, !9}\n!2 = !{!\"ProfileFormat\", !\"InstrProf\"}\n!3 = !{!\"TotalCount\", i64 10000}\n!4 = !{!\"MaxCount\", i64 10}\n!5 = !{!\"MaxInternalCount\", i64 1}\n!6 = !{!\"MaxFunctionCount\", i64 1000}\n!7 = !{!\"NumCounts\", i64 3}\n!8 = !{!\"NumFunctions\", i64 3}\n!9 = !{!\"DetailedSummary\", !10}\n!10 = !{!11, !12, !13}\n!11 = !{i32 10000, i64 100, i32 1}\n!12 = !{i32 999000, i64 100, i32 1}\n!13 = !{i32 999999, i64 1, i32 2}\n!14 = !{!\"function_entry_count\", i64 100}\n!15 = !{!\"branch_weights\", i32 0, i32 1}\n"
+        },
+        {
+          "test_name": "test_chr_21",
+          "test_body": "declare void @foo()\n\ndefine i32 @test_chr_21(i64 %i, i64 %k, i64 %j) #0 !prof !14 {\nentry:\n  %cmp0 = icmp eq i64 %j, %k\n  br i1 %cmp0, label %bb10, label %bb1, !prof !15\n\nbb1:                                              ; preds = %entry\n  %cmp2 = icmp eq i64 %i, 2\n  br i1 %cmp2, label %bb3, label %bb2, !prof !15\n\nbb2:                                              ; preds = %bb1\n  call void @foo()\n  br label %bb3\n\nbb3:                                              ; preds = %bb2, %bb1\n  %cmp.i = icmp eq i64 %i, 86\n  br i1 %cmp.i, label %bb5, label %bb4, !prof !15\n\nbb4:                                              ; preds = %bb3\n  call void @foo()\n  br label %bb5\n\nbb5:                                              ; preds = %bb4, %bb3\n  br label %bb6\n\nbb6:                                              ; preds = %bb5\n  %cmp3 = icmp eq i64 %j, %i\n  br i1 %cmp3, label %bb8, label %bb7, !prof !15\n\nbb7:                                              ; preds = %bb6\n  call void @foo()\n  br label %bb8\n\nbb8:                                              ; preds = %bb7, %bb6\n  br i1 %cmp.i, label %bb10, label %bb9, !prof !15\n\nbb9:                                              ; preds = %bb8\n  call void @foo()\n  br label %bb10\n\nbb10:                                             ; preds = %bb9, %bb8, %entry\n  ret i32 45\n}\n\nattributes #0 = { \"instcombine-no-verify-fixpoint\" }\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 1, !\"ProfileSummary\", !1}\n!1 = !{!2, !3, !4, !5, !6, !7, !8, !9}\n!2 = !{!\"ProfileFormat\", !\"InstrProf\"}\n!3 = !{!\"TotalCount\", i64 10000}\n!4 = !{!\"MaxCount\", i64 10}\n!5 = !{!\"MaxInternalCount\", i64 1}\n!6 = !{!\"MaxFunctionCount\", i64 1000}\n!7 = !{!\"NumCounts\", i64 3}\n!8 = !{!\"NumFunctions\", i64 3}\n!9 = !{!\"DetailedSummary\", !10}\n!10 = !{!11, !12, !13}\n!11 = !{i32 10000, i64 100, i32 1}\n!12 = !{i32 999000, i64 100, i32 1}\n!13 = !{i32 999999, i64 1, i32 2}\n!14 = !{!\"function_entry_count\", i64 100}\n!15 = !{!\"branch_weights\", i32 0, i32 1}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/X86/vector-reductions-logical.ll",
+      "commands": [
+        "opt -O2 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_merge_anyof_v4si",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64--\"\n\ndefine float @test_merge_anyof_v4si(<4 x i32> %t) {\nentry:\n  %vecext = extractelement <4 x i32> %t, i32 0\n  %cmp = icmp slt i32 %vecext, 1\n  br i1 %cmp, label %if.then, label %lor.lhs.false\n\nlor.lhs.false:                                    ; preds = %entry\n  %vecext1 = extractelement <4 x i32> %t, i32 1\n  %cmp2 = icmp slt i32 %vecext1, 1\n  br i1 %cmp2, label %if.then, label %lor.lhs.false3\n\nlor.lhs.false3:                                   ; preds = %lor.lhs.false\n  %vecext4 = extractelement <4 x i32> %t, i32 2\n  %cmp5 = icmp slt i32 %vecext4, 1\n  br i1 %cmp5, label %if.then, label %lor.lhs.false6\n\nlor.lhs.false6:                                   ; preds = %lor.lhs.false3\n  %vecext7 = extractelement <4 x i32> %t, i32 3\n  %cmp8 = icmp slt i32 %vecext7, 1\n  br i1 %cmp8, label %if.then, label %lor.lhs.false9\n\nlor.lhs.false9:                                   ; preds = %lor.lhs.false6\n  %vecext10 = extractelement <4 x i32> %t, i32 0\n  %cmp11 = icmp sgt i32 %vecext10, 255\n  br i1 %cmp11, label %if.then, label %lor.lhs.false12\n\nlor.lhs.false12:                                  ; preds = %lor.lhs.false9\n  %vecext13 = extractelement <4 x i32> %t, i32 1\n  %cmp14 = icmp sgt i32 %vecext13, 255\n  br i1 %cmp14, label %if.then, label %lor.lhs.false15\n\nlor.lhs.false15:                                  ; preds = %lor.lhs.false12\n  %vecext16 = extractelement <4 x i32> %t, i32 2\n  %cmp17 = icmp sgt i32 %vecext16, 255\n  br i1 %cmp17, label %if.then, label %lor.lhs.false18\n\nlor.lhs.false18:                                  ; preds = %lor.lhs.false15\n  %vecext19 = extractelement <4 x i32> %t, i32 3\n  %cmp20 = icmp sgt i32 %vecext19, 255\n  br i1 %cmp20, label %if.then, label %if.end\n\nif.then:                                          ; preds = %lor.lhs.false18, %lor.lhs.false15, %lor.lhs.false12, %lor.lhs.false9, %lor.lhs.false6, %lor.lhs.false3, %lor.lhs.false, %entry\n  br label %return\n\nif.end:                                           ; preds = %lor.lhs.false18\n  %vecext21 = extractelement <4 x i32> %t, i32 0\n  %vecext22 = extractelement <4 x i32> %t, i32 1\n  %add = add nsw i32 %vecext21, %vecext22\n  %conv = sitofp i32 %add to float\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval.0 = phi float [ 0.000000e+00, %if.then ], [ %conv, %if.end ]\n  ret float %retval.0\n}\n"
+        },
+        {
+          "test_name": "test_merge_anyof_v4sf",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64--\"\n\ndefine float @test_merge_anyof_v4sf(<4 x float> %t) {\nentry:\n  %vecext = extractelement <4 x float> %t, i32 0\n  %conv = fpext float %vecext to double\n  %cmp = fcmp olt double %conv, 0.000000e+00\n  br i1 %cmp, label %if.then, label %lor.lhs.false\n\nlor.lhs.false:                                    ; preds = %entry\n  %vecext2 = extractelement <4 x float> %t, i32 1\n  %conv3 = fpext float %vecext2 to double\n  %cmp4 = fcmp olt double %conv3, 0.000000e+00\n  br i1 %cmp4, label %if.then, label %lor.lhs.false6\n\nlor.lhs.false6:                                   ; preds = %lor.lhs.false\n  %vecext7 = extractelement <4 x float> %t, i32 2\n  %conv8 = fpext float %vecext7 to double\n  %cmp9 = fcmp olt double %conv8, 0.000000e+00\n  br i1 %cmp9, label %if.then, label %lor.lhs.false11\n\nlor.lhs.false11:                                  ; preds = %lor.lhs.false6\n  %vecext12 = extractelement <4 x float> %t, i32 3\n  %conv13 = fpext float %vecext12 to double\n  %cmp14 = fcmp olt double %conv13, 0.000000e+00\n  br i1 %cmp14, label %if.then, label %lor.lhs.false16\n\nlor.lhs.false16:                                  ; preds = %lor.lhs.false11\n  %vecext17 = extractelement <4 x float> %t, i32 0\n  %conv18 = fpext float %vecext17 to double\n  %cmp19 = fcmp ogt double %conv18, 1.000000e+00\n  br i1 %cmp19, label %if.then, label %lor.lhs.false21\n\nlor.lhs.false21:                                  ; preds = %lor.lhs.false16\n  %vecext22 = extractelement <4 x float> %t, i32 1\n  %conv23 = fpext float %vecext22 to double\n  %cmp24 = fcmp ogt double %conv23, 1.000000e+00\n  br i1 %cmp24, label %if.then, label %lor.lhs.false26\n\nlor.lhs.false26:                                  ; preds = %lor.lhs.false21\n  %vecext27 = extractelement <4 x float> %t, i32 2\n  %conv28 = fpext float %vecext27 to double\n  %cmp29 = fcmp ogt double %conv28, 1.000000e+00\n  br i1 %cmp29, label %if.then, label %lor.lhs.false31\n\nlor.lhs.false31:                                  ; preds = %lor.lhs.false26\n  %vecext32 = extractelement <4 x float> %t, i32 3\n  %conv33 = fpext float %vecext32 to double\n  %cmp34 = fcmp ogt double %conv33, 1.000000e+00\n  br i1 %cmp34, label %if.then, label %if.end\n\nif.then:                                          ; preds = %lor.lhs.false31, %lor.lhs.false26, %lor.lhs.false21, %lor.lhs.false16, %lor.lhs.false11, %lor.lhs.false6, %lor.lhs.false, %entry\n  br label %return\n\nif.end:                                           ; preds = %lor.lhs.false31\n  %vecext36 = extractelement <4 x float> %t, i32 0\n  %vecext37 = extractelement <4 x float> %t, i32 1\n  %add = fadd float %vecext36, %vecext37\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval.0 = phi float [ 0.000000e+00, %if.then ], [ %add, %if.end ]\n  ret float %retval.0\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "release:cherry-pick-failed",
+    "PGO",
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-22T19:52:20Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        5199,
+        5266
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/freeze-fp-ops.ll": [
+      [
+        163,
+        171
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/freeze.ll": [
+      [
+        108,
+        116
+      ],
+      [
+        944,
+        957
+      ],
+      [
+        978,
+        990
+      ],
+      [
+        1011,
+        1024
+      ],
+      [
+        1671,
+        1683
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/icmp.ll": [
+      [
+        5835,
+        5843
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/nsw.ll": [
+      [
+        255,
+        264
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/select-gep.ll": [
+      [
+        304,
+        313
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/select.ll": [
+      [
+        2847,
+        2854
+      ],
+      [
+        2859,
+        2866
+      ],
+      [
+        2871,
+        2879
+      ],
+      [
+        2887,
+        2895
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/sub-of-negatible-inseltpoison.ll": [
+      [
+        1446,
+        1454
+      ],
+      [
+        1460,
+        1468
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/sub-of-negatible.ll": [
+      [
+        1543,
+        1551
+      ],
+      [
+        1557,
+        1565
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/urem-via-cmp-select.ll": [
+      [
+        96,
+        106
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/forked-pointers.ll": [
+      [
+        17,
+        38
+      ]
+    ],
+    "llvm/test/Transforms/PGOProfile/chr.ll": [
+      [
+        1288,
+        1294
+      ],
+      [
+        1301,
+        1326
+      ],
+      [
+        1328,
+        1334
+      ],
+      [
+        1922,
+        1939
+      ],
+      [
+        1956,
+        1968
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/X86/vector-reductions-logical.ll": [
+      [
+        86,
+        96
+      ],
+      [
+        400,
+        410
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "InstCombinerImpl::foldFreezeIntoRecurrence",
+      "InstCombinerImpl::pushFreezeToPreventPoisonFromPropagating"
+    ],
+    "llvm/test/Transforms/InstCombine/freeze.ll": [
+      "partial_undef_vec"
+    ]
+  }
+}

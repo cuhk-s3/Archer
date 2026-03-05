@@ -1,0 +1,111 @@
+{
+  "pr_id": 180950,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180950",
+  "state": "closed",
+  "title": "[SLP]Do not increase depth for type-changing nodes and NotProfitableForVectorization removal",
+  "author": "alexey-bataev",
+  "base_commit": "7be392e0ea13f96aae8e7082a3c0206e09cd2f03",
+  "fix_commit": "e5b499882ec63c72abdcc7b9bcbeda838ef25b35",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 5e912ebeb5cbf..d97faa59a483f 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -11798,70 +11798,13 @@ BoUpSLP::ScalarsVectorizationLegality BoUpSLP::getScalarsVectorizationLegality(\n     }\n   }\n \n-  // If all of the operands are identical or constant we have a simple solution.\n-  // If we deal with insert/extract instructions, they all must have constant\n-  // indices, otherwise we should gather them, not try to vectorize.\n-  // If alternate op node with 2 elements with gathered operands - do not\n-  // vectorize.\n-  auto NotProfitableForVectorization = [&S, this, Depth](ArrayRef<Value *> VL) {\n-    if (!S || !S.isAltShuffle() || VL.size() > 2)\n-      return false;\n-    if (VectorizableTree.size() < MinTreeSize)\n-      return false;\n-    if (Depth >= RecursionMaxDepth - 1)\n-      return true;\n-    // Check if all operands are extracts, part of vector node or can build a\n-    // regular vectorize node.\n-    SmallVector<unsigned, 8> InstsCount;\n-    for (Value *V : VL) {\n-      auto *I = cast<Instruction>(V);\n-      InstsCount.push_back(count_if(I->operand_values(), [](Value *Op) {\n-        return isa<Instruction>(Op) || isVectorLikeInstWithConstOps(Op);\n-      }));\n-    }\n-    bool IsCommutative =\n-        isCommutative(S.getMainOp()) || isCommutative(S.getAltOp());\n-    if ((IsCommutative &&\n-         std::accumulate(InstsCount.begin(), InstsCount.end(), 0) < 2) ||\n-        (!IsCommutative &&\n-         all_of(InstsCount, [](unsigned ICnt) { return ICnt < 2; })))\n-      return true;\n-    assert(VL.size() == 2 && \"Expected only 2 alternate op instructions.\");\n-    SmallVector<SmallVector<std::pair<Value *, Value *>>> Candidates;\n-    auto *I1 = cast<Instruction>(VL.front());\n-    auto *I2 = cast<Instruction>(VL.back());\n-    for (int Op : seq<int>(S.getMainOp()->getNumOperands()))\n-      Candidates.emplace_back().emplace_back(I1->getOperand(Op),\n-                                             I2->getOperand(Op));\n-    if (static_cast<unsigned>(count_if(\n-            Candidates, [this](ArrayRef<std::pair<Value *, Value *>> Cand) {\n-              return findBestRootPair(Cand, LookAheadHeuristics::ScoreSplat);\n-            })) >= S.getMainOp()->getNumOperands() / 2)\n-      return false;\n-    if (S.getMainOp()->getNumOperands() > 2)\n-      return true;\n-    if (IsCommutative) {\n-      // Check permuted operands.\n-      Candidates.clear();\n-      for (int Op = 0, E = S.getMainOp()->getNumOperands(); Op < E; ++Op)\n-        Candidates.emplace_back().emplace_back(I1->getOperand(Op),\n-                                               I2->getOperand((Op + 1) % E));\n-      if (any_of(\n-              Candidates, [this](ArrayRef<std::pair<Value *, Value *>> Cand) {\n-                return findBestRootPair(Cand, LookAheadHeuristics::ScoreSplat);\n-              }))\n-        return false;\n-    }\n-    return true;\n-  };\n   bool AreAllSameBlock = !AreScatterAllGEPSameBlock;\n   bool AreAllSameInsts = AreAllSameBlock || AreScatterAllGEPSameBlock;\n   if (!AreAllSameInsts || isSplat(VL) ||\n       (isa<InsertElementInst, ExtractValueInst, ExtractElementInst>(\n            S.getMainOp()) &&\n-       !all_of(VL, isVectorLikeInstWithConstOps)) ||\n-      NotProfitableForVectorization(VL)) {\n-    LLVM_DEBUG(dbgs() << \"SLP: Gathering due to C,S,B,O, small shuffle. \\n\";\n+       !all_of(VL, isVectorLikeInstWithConstOps))) {\n+    LLVM_DEBUG(dbgs() << \"SLP: Gathering due to C,S,B,O conditions. \\n\";\n                dbgs() << \"[\";\n                interleaveComma(VL, dbgs(), [&](Value *V) { dbgs() << *V; });\n                dbgs() << \"]\\n\");\n@@ -12270,7 +12213,7 @@ void BoUpSLP::buildTreeRec(ArrayRef<Value *> VLRef, unsigned Depth,\n \n       TE->setOperands(Operands);\n       for (unsigned I : seq<unsigned>(VL0->getNumOperands()))\n-        buildTreeRec(TE->getOperand(I), Depth + 1, {TE, I});\n+        buildTreeRec(TE->getOperand(I), Depth, {TE, I});\n       if (ShuffleOrOp == Instruction::Trunc) {\n         ExtraBitWidthNodes.insert(getOperandEntry(TE, 0)->Idx);\n       } else if (ShuffleOrOp == Instruction::SIToFP ||\n@@ -12316,8 +12259,8 @@ void BoUpSLP::buildTreeRec(ArrayRef<Value *> VLRef, unsigned Depth,\n         }\n       }\n       TE->setOperands(Operands);\n-      buildTreeRec(Operands.front(), Depth + 1, {TE, 0});\n-      buildTreeRec(Operands.back(), Depth + 1, {TE, 1});\n+      buildTreeRec(Operands.front(), Depth, {TE, 0});\n+      buildTreeRec(Operands.back(), Depth, {TE, 1});\n       if (ShuffleOrOp == Instruction::ICmp) {\n         unsigned NumSignBits0 =\n             ComputeNumSignBits(VL0->getOperand(0), *DL, AC, nullptr, DT);\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "The patch changes the maximum tree size analysis. 1. Do not increase\ndepth for type changing nodes (like casts and compares), allowing more\ndeeper trees to be built. 2. Removes NotProfitableForVectorization\nworkaround, not needed anymore after throttling enabled\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/external-bin-op-user.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=znver4 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(ptr %0, ptr %1, double %2) {\niter.check:\n  br label %.lr.ph383.us.us.us.us\n\n.lr.ph383.us.us.us.us:                            ; preds = %._crit_edge384.us.us.us.us, %iter.check\n  %.2277404.us.us.us.us = phi double [ %.4279.us.us.us.us, %._crit_edge384.us.us.us.us ], [ 0.000000e+00, %iter.check ]\n  %.2287402.us.us.us.us = phi double [ %.4289.us.us.us.us, %._crit_edge384.us.us.us.us ], [ 0.000000e+00, %iter.check ]\n  %.2292401.us.us.us.us = phi double [ %.4294.us.us.us.us, %._crit_edge384.us.us.us.us ], [ 0.000000e+00, %iter.check ]\n  %.2297400.us.us.us.us = phi double [ %.4299.us.us.us.us, %._crit_edge384.us.us.us.us ], [ 0.000000e+00, %iter.check ]\n  br i1 false, label %._crit_edge384.us.us.us.us, label %3\n\n3:                                                ; preds = %.lr.ph383.us.us.us.us\n  %4 = load double, ptr %0, align 8\n  %5 = fmul double %4, 0.000000e+00\n  %6 = load double, ptr %1, align 8\n  %7 = fadd double %6, %5\n  %8 = fadd double %6, %5\n  %9 = fadd double %4, 0.000000e+00\n  %10 = fadd double %2, 0.000000e+00\n  %11 = load double, ptr %0, align 8\n  %12 = fadd double %10, %11\n  br label %13\n\n13:                                               ; preds = %3\n  br label %14\n\n14:                                               ; preds = %13\n  %15 = fmul double %7, 0.000000e+00\n  %16 = fadd double %15, %.2277404.us.us.us.us\n  %17 = fmul double %8, 0.000000e+00\n  %18 = fadd double %17, %.2297400.us.us.us.us\n  %19 = fadd double %9, %.2287402.us.us.us.us\n  %20 = fadd double %12, %.2292401.us.us.us.us\n  br label %._crit_edge384.us.us.us.us\n\n._crit_edge384.us.us.us.us:                       ; preds = %14, %.lr.ph383.us.us.us.us\n  %.4299.us.us.us.us = phi double [ %18, %14 ], [ 0.000000e+00, %.lr.ph383.us.us.us.us ]\n  %.4294.us.us.us.us = phi double [ %20, %14 ], [ 0.000000e+00, %.lr.ph383.us.us.us.us ]\n  %.4289.us.us.us.us = phi double [ %19, %14 ], [ 0.000000e+00, %.lr.ph383.us.us.us.us ]\n  %.4279.us.us.us.us = phi double [ %16, %14 ], [ 0.000000e+00, %.lr.ph383.us.us.us.us ]\n  br label %.lr.ph383.us.us.us.us\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/gather-node-same-reduced.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test1",
+          "test_body": "define i64 @test1(ptr %p) {\n  %1 = getelementptr i8, ptr %p, i64 13\n  %2 = getelementptr i8, ptr %p, i64 14\n  %3 = getelementptr i8, ptr %p, i64 15\n  %4 = getelementptr i8, ptr %p, i64 12\n  %5 = zext i8 0 to i32\n  %6 = and i32 %5, 0\n  %.not866 = icmp eq i32 %6, 0\n  %7 = select i1 %.not866, i32 0, i32 0\n  %8 = xor i32 0, %7\n  %9 = zext i8 0 to i32\n  %10 = and i32 %9, 0\n  %.not869 = icmp eq i32 %10, 0\n  %11 = select i1 %.not869, i32 0, i32 0\n  %12 = xor i32 0, %11\n  %13 = zext i8 0 to i32\n  %14 = and i32 %13, 0\n  %.not871 = icmp eq i32 %14, 0\n  %15 = select i1 %.not871, i32 0, i32 0\n  %16 = xor i32 0, %15\n  %17 = zext i8 0 to i32\n  %18 = and i32 %17, 0\n  %.not874 = icmp eq i32 %18, 0\n  %19 = select i1 %.not874, i32 0, i32 0\n  %20 = xor i32 0, %19\n  %21 = xor i32 %13, 0\n  %22 = xor i32 %21, 0\n  %23 = xor i32 %22, 0\n  %24 = xor i32 %23, 0\n  %25 = xor i32 %24, 0\n  %26 = xor i32 %25, 0\n  %27 = xor i32 %26, %8\n  %28 = xor i32 %27, 0\n  %29 = xor i32 %28, 0\n  %30 = xor i32 %29, 0\n  %31 = trunc i32 %30 to i8\n  store i8 %31, ptr %4, align 1\n  %32 = xor i32 %13, 0\n  %33 = xor i32 %32, 0\n  %34 = xor i32 %33, 0\n  %35 = xor i32 %34, 0\n  %36 = xor i32 %35, 0\n  %37 = xor i32 %36, 0\n  %38 = xor i32 %37, %20\n  %39 = xor i32 %38, 0\n  %40 = xor i32 %39, 0\n  %41 = xor i32 %40, 0\n  %42 = trunc i32 %41 to i8\n  store i8 %42, ptr %1, align 1\n  %43 = xor i32 %9, 0\n  %44 = xor i32 %43, 0\n  %45 = xor i32 %44, 0\n  %46 = xor i32 %45, 0\n  %47 = xor i32 %46, 0\n  %48 = xor i32 %47, 0\n  %49 = xor i32 %48, %16\n  %50 = xor i32 %49, 0\n  %51 = xor i32 %50, 0\n  %52 = xor i32 %51, 0\n  %53 = trunc i32 %52 to i8\n  store i8 %53, ptr %2, align 1\n  %54 = xor i32 %43, 0\n  %55 = xor i32 %54, 0\n  %56 = xor i32 %55, 0\n  %57 = xor i32 %56, 0\n  %58 = xor i32 %57, 0\n  %59 = xor i32 %58, %12\n  %60 = xor i32 %59, 0\n  %61 = xor i32 %60, 0\n  %62 = xor i32 %61, 0\n  %63 = trunc i32 %62 to i8\n  store i8 %63, ptr %3, align 1\n  ret i64 0\n}\n"
+        },
+        {
+          "test_name": "test",
+          "test_body": "define i64 @test(ptr %p) {\n  %1 = getelementptr i8, ptr %p, i64 13\n  %2 = getelementptr i8, ptr %p, i64 14\n  %3 = getelementptr i8, ptr %p, i64 15\n  %4 = getelementptr i8, ptr %p, i64 12\n  %5 = zext i8 0 to i32\n  %6 = and i32 %5, 0\n  %.not866 = icmp eq i32 %6, 0\n  %7 = select i1 %.not866, i32 0, i32 0\n  %8 = xor i32 0, %7\n  %9 = zext i8 0 to i32\n  %10 = and i32 %9, 0\n  %.not871 = icmp eq i32 %10, 0\n  %11 = select i1 %.not871, i32 0, i32 0\n  %12 = xor i32 0, %11\n  %13 = xor i32 %9, 0\n  %14 = xor i32 %13, 0\n  %15 = xor i32 %14, 0\n  %16 = xor i32 %15, 0\n  %17 = xor i32 %16, 0\n  %18 = xor i32 %17, %12\n  %19 = xor i32 %18, 0\n  %20 = xor i32 %19, 0\n  %21 = xor i32 %20, 0\n  %22 = xor i32 %21, 0\n  %23 = trunc i32 %22 to i8\n  store i8 %23, ptr %4, align 1\n  %24 = xor i32 %9, 0\n  %25 = xor i32 %24, 0\n  %26 = xor i32 %25, 0\n  %27 = xor i32 %26, 0\n  %28 = xor i32 %27, 0\n  %29 = xor i32 %28, %8\n  %30 = xor i32 %29, 0\n  %31 = xor i32 %30, 0\n  %32 = xor i32 %31, 0\n  %33 = xor i32 %32, 0\n  %34 = trunc i32 %33 to i8\n  store i8 %34, ptr %1, align 1\n  %35 = xor i32 0, %5\n  %36 = xor i32 %35, 0\n  %37 = xor i32 %36, 0\n  %38 = xor i32 %37, 0\n  %39 = xor i32 %38, 0\n  %40 = xor i32 %39, %8\n  %41 = xor i32 %40, 0\n  %42 = xor i32 %41, 0\n  %43 = xor i32 %42, 0\n  %44 = xor i32 %43, 0\n  %45 = trunc i32 %44 to i8\n  store i8 %45, ptr %2, align 1\n  %46 = xor i32 %35, 0\n  %47 = xor i32 %46, 0\n  %48 = xor i32 %47, 0\n  %49 = xor i32 %48, 0\n  %50 = xor i32 %49, %8\n  %51 = xor i32 %50, 0\n  %52 = xor i32 %51, 0\n  %53 = xor i32 %52, 0\n  %54 = xor i32 %53, 0\n  %55 = trunc i32 %54 to i8\n  store i8 %55, ptr %3, align 1\n  ret i64 0\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation4.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=icelake-server < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "@dequant_coef = external constant [6 x [4 x [4 x i32]]]\n\ndefine fastcc i32 @test(ptr %0, i16 %1, i32 %2) {\nentry:\n  %conv.2 = zext i16 %1 to i32\n  %3 = load i16, ptr %0, align 2\n  %add68 = add i32 %2, 1\n  %conv.3.1 = zext i16 %3 to i32\n  %add68.1 = add i32 %conv.3.1, -1\n  %add118.1 = or i32 %add68, %add68.1\n  %cmp16.i = icmp slt i32 %add118.1, 0\n  %sub2.i2 = sub i32 0, %2\n  %add56.1 = or i32 %2, %conv.3.1\n  %add37.1 = add i32 %conv.2, 1\n  %mul137 = shl i32 %add56.1, 1\n  %sub138 = sub i32 %add37.1, %mul137\n  %cmp16.i45 = icmp slt i32 %sub138, 0\n  %sub2.i44 = sub i32 0, %add56.1\n  %retval.0.i46 = select i1 %cmp16.i45, i32 %sub2.i44, i32 0\n  %4 = load i32, ptr getelementptr inbounds nuw (i8, ptr @dequant_coef, i64 12), align 4\n  %mul175.3635 = mul i32 %retval.0.i46, %4\n  %retval.0.i = select i1 %cmp16.i, i32 %sub2.i2, i32 0\n  %5 = load i32, ptr getelementptr inbounds nuw (i8, ptr @dequant_coef, i64 16), align 16\n  %mul175.1 = mul i32 %retval.0.i, %5\n  %add300 = or i32 %mul175.3635, %mul175.1\n  ret i32 %add300\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-11T14:30:59Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        11798,
+        11867
+      ],
+      [
+        12270,
+        12276
+      ],
+      [
+        12316,
+        12323
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/external-bin-op-user.ll": [
+      [
+        11,
+        23
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/gather-node-same-reduced.ll": [
+      [
+        5,
+        22
+      ],
+      [
+        87,
+        104
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation4.ll": [
+      [
+        7,
+        32
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::buildTreeRec",
+      "BoUpSLP::getScalarsVectorizationLegality"
+    ]
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "pr_id": 182322,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182322",
+  "state": "closed",
+  "title": "[LV] Allow tail folding with IVs with outside users",
+  "author": "lukel97",
+  "base_commit": "2ef175980390aa1bca711621e37f5c55372e689c",
+  "fix_commit": "589512f07ecd59555fd8a8b0ff4f9cb41edcc708",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp\nindex e57e0cf636501..65e89f5795c2c 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp\n@@ -2118,19 +2118,6 @@ bool LoopVectorizationLegality::canFoldTailByMasking() const {\n   for (const auto &Reduction : getReductionVars())\n     ReductionLiveOuts.insert(Reduction.second.getLoopExitInstr());\n \n-  for (const auto &Entry : getInductionVars()) {\n-    PHINode *OrigPhi = Entry.first;\n-    for (User *U : OrigPhi->users()) {\n-      auto *UI = cast<Instruction>(U);\n-      if (!TheLoop->contains(UI)) {\n-        LLVM_DEBUG(dbgs() << \"LV: Cannot fold tail by masking, loop IV has an \"\n-                             \"outside user for \"\n-                          << *UI << \"\\n\");\n-        return false;\n-      }\n-    }\n-  }\n-\n   // The list of pointers that we can safely read and write to remains empty.\n   SmallPtrSet<Value *, 8> SafePointers;\n \n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "#149042 added last-active-lane and removed the restriction that we couldn't tail fold loops that had outside users (in AllowedExit).\r\n\r\nHowever we still have a restriction that IVs can't have outside users. This was added separately to the AllowedExit restriction in #81609, but it looks like #149042 didn't remove it.\r\n\r\nAFAICT we currently extract the correct lane for IVs, so this PR relaxes the restriction. This helps a good few loops get tail folded in llvm-test-suite.\r\n\r\n-force-tail-folding-style=none was added to pr5881-scev-expansion.ll to preserve the original scev expansion, since otherwise we end up with a cttz.elts(false, false, true, true) that blocks SCEV analysis. We should probably teach ConstantFolding to fold it.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/no-fold-tail-by-masking-iv-external-uses.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i32 @test(ptr %arr, i64 %n) {\nentry:\n  %cmp1 = icmp ugt i64 %n, 1\n  br i1 %cmp1, label %preheader, label %done\n\npreheader:                                        ; preds = %entry\n  br label %loop\n\nloop:                                             ; preds = %loop, %preheader\n  %conv = phi i64 [ %conv2, %loop ], [ 1, %preheader ]\n  %i = phi i8 [ %inc, %loop ], [ 1, %preheader ]\n  %sub = add nsw i64 %conv, -1\n  %ptr = getelementptr inbounds i32, ptr %arr, i64 %sub\n  store i32 65, ptr %ptr, align 4\n  %inc = add i8 %i, 1\n  %conv2 = zext i8 %inc to i64\n  %cmp2 = icmp ult i64 %conv2, %n\n  br i1 %cmp2, label %loop, label %load_val, !llvm.loop !0\n\nload_val:                                         ; preds = %loop\n  %final = phi i64 [ %conv, %loop ]\n  %ptr2 = getelementptr inbounds i32, ptr %arr, i64 %final\n  %val = load i32, ptr %ptr2, align 4\n  br label %done\n\ndone:                                             ; preds = %load_val, %entry\n  %value = phi i32 [ %val, %load_val ], [ 0, %entry ]\n  ret i32 %value\n}\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.unroll.disable\"}\n!2 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n!3 = !{!\"llvm.loop.vectorize.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/pr58811-scev-expansion.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-width=2 -force-vector-interleave=1 -force-tail-folding-style=none -S %s",
+        "opt -passes=loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -force-tail-folding-style=none -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "iv_start_from_shl_of_previous_iv",
+          "test_body": "define void @iv_start_from_shl_of_previous_iv(ptr %dst) {\nentry:\n  br label %loop.1\n\nloop.1:                                           ; preds = %loop.1, %entry\n  %iv.1 = phi i64 [ 0, %entry ], [ %iv.1.next, %loop.1 ]\n  %gep.1 = getelementptr i8, ptr %dst, i64 %iv.1\n  store i8 0, ptr %gep.1, align 1\n  %iv.1.next = add i64 %iv.1, 1\n  %cmp.1 = icmp eq i64 %iv.1, 0\n  br i1 %cmp.1, label %loop.1, label %loop.1.exit\n\nloop.1.exit:                                      ; preds = %loop.1\n  %iv.1.shl = shl i64 %iv.1, 1\n  br label %loop.2\n\nloop.2:                                           ; preds = %loop.2, %loop.1.exit\n  %iv.2 = phi i64 [ %iv.1.shl, %loop.1.exit ], [ %iv.2.next, %loop.2 ]\n  %gep.2 = getelementptr i8, ptr %dst, i64 %iv.2\n  store i8 1, ptr %gep.2, align 1\n  %iv.2.next = add i64 %iv.2, 1\n  %cmp.2 = icmp eq i64 %iv.2, 100\n  br i1 %cmp.2, label %exit, label %loop.2\n\nexit:                                             ; preds = %loop.2\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test1_pr58811",
+          "test_body": "define void @test1_pr58811(ptr %dst) {\nentry:\n  br label %loop.1.preheader\n\nloop.1.preheader:                                 ; preds = %unreachable.bb, %entry\n  %iv.1.ph = phi i32 [ %sub93.2, %unreachable.bb ], [ 0, %entry ]\n  br label %loop.1\n\nloop.1:                                           ; preds = %loop.1, %loop.1.preheader\n  %iv.1 = phi i32 [ %iv.1.next, %loop.1 ], [ %iv.1.ph, %loop.1.preheader ]\n  %iv.2 = phi i32 [ %iv.2.next, %loop.1 ], [ 0, %loop.1.preheader ]\n  %iv.2.next = add i32 %iv.2, 1\n  %iv.1.next = add i32 %iv.2, %iv.1\n  br i1 false, label %loop.1, label %loop.2.preheader\n\nloop.2.preheader:                                 ; preds = %loop.1\n  %iv.1.lcssa = phi i32 [ %iv.1, %loop.1 ]\n  br label %loop.2\n\nloop.2:                                           ; preds = %loop.2, %loop.2.preheader\n  %iv.3 = phi i16 [ %iv.3.next, %loop.2 ], [ 0, %loop.2.preheader ]\n  %iv.4 = phi i32 [ %iv.4.next, %loop.2 ], [ 0, %loop.2.preheader ]\n  %gep.dst = getelementptr inbounds i32, ptr %dst, i16 %iv.3\n  store i32 %iv.4, ptr %gep.dst, align 4\n  %iv.4.next = sub i32 %iv.4, %iv.1.lcssa\n  %iv.3.next = add i16 %iv.3, 1\n  %cmp88.1 = icmp ult i16 %iv.3, 198\n  br i1 %cmp88.1, label %loop.2, label %loop.3.preheader\n\nloop.3.preheader:                                 ; preds = %loop.2\n  %iv.4.lcssa = phi i32 [ %iv.4, %loop.2 ]\n  br label %loop.3\n\nloop.3:                                           ; preds = %loop.3, %loop.3.preheader\n  %iv.5 = phi i32 [ %sub93.2, %loop.3 ], [ 0, %loop.3.preheader ]\n  %sub93.2 = sub i32 %iv.5, %iv.4.lcssa\n  br label %loop.3\n\nunreachable.bb:                                   ; No predecessors!\n  br label %loop.1.preheader\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/tail-folding-iv-outside-user.ll",
+      "commands": [
+        "opt < %s -S -p loop-vectorize -force-vector-width=4 -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "define i32 @f(ptr noalias %p, i32 %start, i32 %step, i32 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv2 = phi i32 [ %start, %entry ], [ %iv2.next, %loop ]\n  %iv.next = add i32 %iv, 1\n  %iv2.next = add i32 %iv2, %step\n  %ec = icmp eq i32 %iv, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %iv2\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 190310 tests passed\n* 5086 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-19T17:25:35Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp": [
+      [
+        2118,
+        2136
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/no-fold-tail-by-masking-iv-external-uses.ll": [
+      [
+        2,
+        12
+      ],
+      [
+        15,
+        22
+      ],
+      [
+        24,
+        57
+      ],
+      [
+        60,
+        66
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/pr58811-scev-expansion.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        523,
+        563
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationLegality.cpp": [
+      "LoopVectorizationLegality::canFoldTailByMasking"
+    ]
+  }
+}

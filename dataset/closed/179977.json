@@ -1,0 +1,76 @@
+{
+  "pr_id": 179977,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179977",
+  "state": "closed",
+  "title": "[LV] Fix issue in VPFirstOrderRecurrencePHIRecipe::usesFirstLaneOnly",
+  "author": "david-arm",
+  "base_commit": "964651ad515b61df56ce51cdc9978b2bcc8d0a7b",
+  "fix_commit": "03ebdd3f7873180c26df9e1a957eb481a6dd39ff",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 1d0c3d7a61f94..7e123a9b732d4 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -807,7 +807,7 @@ Value *VPInstruction::generate(VPTransformState &State) {\n     return Builder.CreateLogicalAnd(A, B, Name);\n   }\n   case VPInstruction::PtrAdd: {\n-    assert(vputils::onlyFirstLaneUsed(this) &&\n+    assert((State.VF.isScalar() || vputils::onlyFirstLaneUsed(this)) &&\n            \"can only generate first lane for PtrAdd\");\n     Value *Ptr = State.get(getOperand(0), VPLane(0));\n     Value *Addend = State.get(getOperand(1), VPLane(0));\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanUnroll.cpp b/llvm/lib/Transforms/Vectorize/VPlanUnroll.cpp\nindex e065140019ee6..53cac9fcd80d6 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanUnroll.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanUnroll.cpp\n@@ -587,6 +587,9 @@ cloneForLane(VPlan &Plan, VPBuilder &Builder, Type *IdxTy,\n }\n \n void VPlanTransforms::replicateByVF(VPlan &Plan, ElementCount VF) {\n+  if (Plan.hasScalarVFOnly())\n+    return;\n+\n   Type *IdxTy = IntegerType::get(\n       Plan.getScalarHeader()->getIRBasicBlock()->getContext(), 32);\n \n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "In some cases we decide to vectorise loops with first-order recurrences using VF=1, IC>1. We then attempt to unroll a vplan in replicateByVF, however when trying to erase the list of values from the parent we trigger the following assert:\r\n\r\n```\r\nvirtual llvm::VPRecipeValue::~VPRecipeValue(): Assertion `Users.empty()\r\n  && \"trying to delete a VPRecipeValue with remaining users\"' failed.\r\n```\r\n\r\nThe problem seems to stem from this code:\r\n\r\n```\r\n  DefR->replaceUsesWithIf(LaneDefs[0], [DefR](VPUser &U, unsigned) {\r\n    return U.usesFirstLaneOnly(DefR);\r\n  });\r\n```\r\n\r\nsince usesFirstLaneOnly returns false and we fail to replace uses of DefR with LaneDefs[0]. Upon inspection the only VPUser objects that return false are VPInstruction::FirstOrderRecurrenceSplice and VPFirstOrderRecurrencePHIRecipe. Since the values are all scalar it's simply not possible for us to be using anything other than the first lane. In general, I think this code seems fragile - what can we sensibly expect to happen when usesFirstLaneOnly returns false given that it's going to be added to the remove list? I wonder if instead we should simply be asserting that usesFirstLaneOnly returns true?\r\n\r\nFixes https://github.com/llvm/llvm-project/issues/179671",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/interleave-and-scalarize-only.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-width=1 -force-vector-interleave=2 -debug -disable-output %s 2>&1",
+        "opt -passes=loop-vectorize -force-vector-width=1 -force-vector-interleave=2 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pr179671",
+          "test_body": "define void @pr179671(ptr align 8 dereferenceable(120) %p, ptr %a, i32 %b) {\nentry:\n  %inv_ptr = getelementptr inbounds nuw i8, ptr %p, i64 24\n  %inv_ptr2 = getelementptr inbounds nuw i8, ptr %p, i64 40\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.5, %entry\n  %load23 = phi i32 [ %b, %entry ], [ %sadd_val, %loop.5 ]\n  %load12 = phi ptr [ %a, %entry ], [ %phi_ptr1, %loop.5 ]\n  %phi_ptr1 = phi ptr [ null, %entry ], [ %phi_ptr_next, %loop.5 ]\n  %phi_ptr_next = getelementptr i8, ptr %phi_ptr1, i64 128\n  store ptr %load12, ptr %phi_ptr1, align 8\n  br label %loop.3\n\nloop.3:                                           ; preds = %loop.header\n  store ptr %phi_ptr1, ptr %inv_ptr, align 8\n  %sadd_val = add i32 %load23, 3\n  %sadd_ov = icmp eq i32 %sadd_val, 8\n  br i1 %sadd_ov, label %exit.0, label %loop.5\n\nloop.5:                                           ; preds = %loop.3\n  store i32 %sadd_val, ptr %inv_ptr2, align 8\n  br label %loop.header\n\nexit.0:                                           ; preds = %loop.3\n  store i32 0, ptr %p, align 4\n  ret void\n\nexit:                                             ; No predecessors!\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "david-arm",
+      "body": "Thanks for all the comments! Hopefully I've addressed them now. :)"
+    },
+    {
+      "author": "MacDue",
+      "body": "Created #180526 as a follow-up (to reland the PR that exposed this issue). "
+    },
+    {
+      "author": "MacDue",
+      "body": "Issue: https://github.com/llvm/llvm-project/issues/184317\r\n\r\nThis change seems to break building the llvm-test-suite with `force-vector-interleave`:\r\n```llvm\r\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\"\r\ntarget triple = \"aarch64-unknown-linux-gnu\"\r\n\r\n%struct.GOP_DATA = type { i32, i32, i32, i32, i32, i32 }\r\n\r\ndefine void @create_hierarchy(ptr %0, ptr %1, i64 %wide.trip.count225) {\r\nentry:\r\n  br label %for.body\r\n\r\nfor.body:                                         ; preds = %for.inc, %entry\r\n  %indvars.iv218 = phi i64 [ 0, %entry ], [ %indvars.iv.next219, %for.inc ]\r\n  %arrayidx = getelementptr %struct.GOP_DATA, ptr %1, i64 %indvars.iv218\r\n  %reference_idc = getelementptr i8, ptr %arrayidx, i64 8\r\n  br i1 false, label %if.then4, label %if.else\r\n\r\nif.then4:                                         ; preds = %for.body\r\n  store i32 0, ptr %reference_idc, align 4\r\n  %2 = load i32, ptr %0, align 8\r\n  br label %for.inc\r\n\r\nif.else:                                          ; preds = %for.body\r\n  store i32 0, ptr %reference_idc, align 4\r\n  br label %for.inc\r\n\r\nfor.inc:                                          ; preds = %if.else, %if.then4\r\n  %indvars.iv.next219 = add i64 %indvars.iv218, 1\r\n  %exitcond226.not = icmp eq i64 %indvars.iv218, %wide.trip.count225\r\n  br i1 %exitcond226.not, label %for.end, label %for.body\r\n\r\nfor.end:                                          ; preds = %for.inc\r\n  ret void\r\n}\r\n```\r\n\r\nOpt: `opt reduced.ll  -force-vector-interleave=2 -passes=loop-vectorize -S`\r\n\r\nHits assert:\r\n```\r\nllvm::VPReplicateRecipe::execute(VPTransformState &): Assertion `IsSingleScalar && \"VPReplicateRecipes outside replicate regions must have already been unrolled\"' failed.\r\n```"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-05T16:51:26Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        807,
+        813
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanUnroll.cpp": [
+      [
+        587,
+        592
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/interleave-and-scalarize-only.ll": [
+      [
+        380,
+        382
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPInstruction::generate"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanUnroll.cpp": [
+      "VPlanTransforms::replicateByVF"
+    ]
+  }
+}
