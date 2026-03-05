@@ -123,6 +123,7 @@ class DiffTestTool(FuncToolBase):
           "found": is_bug,
           "tool": "difftest",
           "action": "confirm",
+          "args": args,
           "thoughts": thoughts,
         }
       )
@@ -145,6 +146,7 @@ class DiffTestTool(FuncToolBase):
                 "found": True,
                 "tool": "difftest",
                 "action": "test",
+                "args": args,
                 "original_ir": crash_data.get("original_ir", "<unknown>"),
                 "transformed_ir": "<crash during transformation>",
                 "log": crash_data.get("log", "opt crashed"),
@@ -246,6 +248,7 @@ class DiffTestTool(FuncToolBase):
             "found": False,
             "tool": "difftest",
             "action": "test",
+            "args": args,
             "original_ir": original_program,
             "transformed_ir": transformed_program,
             "log": {

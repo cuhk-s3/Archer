@@ -60,6 +60,7 @@ def transform(orig_ir: str, args: str, build_dir: str) -> str:
             "is_crash": True,
             "found": True,
             "tool": "trans",
+            "args": args,
             "original_ir": orig_ir_code,
             "transformed_ir": "<crash during transformation>",
             "log": f"opt crashed during transformation:\n{err_msg.strip()}",
@@ -113,6 +114,7 @@ class TransTool(FuncToolBase):
         if crash_data.get("is_crash"):
           # Add thoughts to the crash report
           crash_data["thoughts"] = thoughts
+          crash_data["args"] = args
           return json.dumps(crash_data)
       except (json.JSONDecodeError, KeyError):
         pass

@@ -830,12 +830,152 @@ def parse_args():
     help="Path to a JSON file containing the chat history of the agent (default: None).",
   )
   parser.add_argument(
+    "--review",
+    type=str,
+    default=None,
+    help="Path to save the generated review as a Markdown file (default: None).",
+  )
+  parser.add_argument(
     "--debug",
     action="store_true",
     default=False,
     help="Enable debug mode for more verbose output (default: False).",
   )
   return parser.parse_args()
+
+
+def generate_review(pr_info: PRInfo, stats: RunStats) -> str:
+  """Generate a markdown review from the PR review results"""
+  report_lines = []
+
+  # Title
+  report_lines.append(f"# PR Review Report: #{pr_info.pr_id}\n")
+
+  # PR Information
+  report_lines.append("## PR Information\n")
+  report_lines.append(f"- **Title**: {pr_info.title}")
+  report_lines.append(f"- **Author**: {pr_info.author}")
+  report_lines.append(f"- **State**: {pr_info.state}")
+  report_lines.append(f"- **URL**: {pr_info.pr_url}")
+  report_lines.append(f"- **Base Commit**: `{pr_info.base_commit[:10]}`")
+  report_lines.append(f"- **Fix Commit**: `{pr_info.fix_commit[:10]}`")
+  report_lines.append(f"- **Components**: {', '.join(pr_info.components)}\n")
+
+  # Executive Summary
+  report_lines.append("## Executive Summary\n")
+  report_lines.append(f"- **Bugs Found**: {len(stats.bugs)}")
+  report_lines.append(f"- **Total Time**: {stats.total_time_sec:.2f} seconds")
+  report_lines.append(
+    f"- **Chat Rounds**: {stats.chat_rounds} (Phase 1: {stats.phase1_round}, Phase 2: {stats.phase2_round})"
+  )
+  report_lines.append(
+    f"- **Tokens Used**: {stats.total_tokens:,} (Input: {stats.input_tokens:,}, Output: {stats.output_tokens:,}, Cached: {stats.cached_tokens:,})"
+  )
+  report_lines.append(f"- **Estimated Cost**: ${stats.chat_cost:.4f}\n")
+
+  # Test Strategies
+  if stats.strategies:
+    report_lines.append("## Test Strategies\n")
+    for idx, strategy in enumerate(stats.strategies, 1):
+      report_lines.append(f"### Strategy {idx}: {strategy['name']}\n")
+      report_lines.append(f"- **Target**: {strategy['target']}")
+      report_lines.append(f"- **Rationale**: {strategy['rationale']}")
+      report_lines.append(f"- **Expected Issue**: {strategy['expected_issue']}\n")
+
+  # Bugs Found
+  if stats.bugs:
+    report_lines.append("## Bugs Found\n")
+    for idx, bug in enumerate(stats.bugs, 1):
+      report_lines.append(f"### Bug #{idx}\n")
+
+      if bug.thoughts:
+        report_lines.append(f"**Analysis:**\n{bug.thoughts}\n")
+
+      report_lines.append("**Original LLVM IR:**")
+      report_lines.append("```llvm")
+      report_lines.append(bug.original_ir)
+      report_lines.append("```\n")
+
+      report_lines.append("**Transformed LLVM IR:**")
+      report_lines.append("```llvm")
+      report_lines.append(bug.transformed_ir)
+      report_lines.append("```\n")
+
+      report_lines.append("**Verification Log:**")
+      report_lines.append("```")
+      report_lines.append(bug.log)
+      report_lines.append("```\n")
+  else:
+    report_lines.append("## Bugs Found\n")
+    report_lines.append("No bugs were found during the review.\n")
+
+  # Agent Report
+  if stats.report:
+    report_lines.append("## Agent Review\n")
+    parsed_report = None
+    if isinstance(stats.report, str):
+      try:
+        parsed_report = json_repair.loads(stats.report)
+      except Exception:
+        parsed_report = None
+
+    if isinstance(parsed_report, dict):
+      test_payload = parsed_report.get("test")
+      if isinstance(test_payload, list) and len(test_payload) >= 2:
+        report_lines.append("### Reproducer\n")
+        report_lines.append("**LLVM IR:**")
+        ir_text = test_payload[0]
+        if isinstance(ir_text, str):
+          if ir_text.strip().startswith("```"):
+            report_lines.append(ir_text.strip())
+          else:
+            report_lines.append("```llvm")
+            report_lines.append(ir_text.strip())
+            report_lines.append("```")
+        report_lines.append("")
+        report_lines.append("**Command:**")
+        report_lines.append("```bash")
+        report_lines.append(str(test_payload[1]).strip())
+        report_lines.append("```\n")
+
+      args_text = parsed_report.get("args")
+      if args_text is not None:
+        report_lines.append(f"- **Args**: `{args_text}`")
+
+      force_flag = parsed_report.get("force")
+      if force_flag is not None:
+        report_lines.append(f"- **Force Stop**: {force_flag}")
+
+      thoughts_text = parsed_report.get("thoughts")
+      if thoughts_text:
+        report_lines.append("\n### Analysis\n")
+        report_lines.append(thoughts_text.strip())
+        report_lines.append("\n")
+    else:
+      report_lines.append(str(stats.report))
+      report_lines.append("\n")
+
+  # Tool Usage Statistics
+  if stats.tool_usage:
+    report_lines.append("## Tool Usage\n")
+    report_lines.append("| Tool | Usage Count |")
+    report_lines.append("|------|-------------|")
+    for tool in stats.tool_usage:
+      report_lines.append(f"| {tool['name']} | {tool['usage']} |")
+    report_lines.append("\n")
+
+  # Errors (if any)
+  if stats.error:
+    report_lines.append("## Errors\n")
+    report_lines.append(f"**Error Type**: {stats.error}\n")
+    report_lines.append(f"**Error Message**: {stats.errmsg}\n")
+    if stats.traceback:
+      report_lines.append("**Traceback:**")
+      report_lines.append("```")
+      report_lines.append(stats.traceback)
+      report_lines.append("```\n")
+
+  return "\n".join(report_lines)
 
 
 def main():
@@ -943,6 +1083,12 @@ def main():
     if history_path.exists():
       panic(f"History file {history_path} already exists.")
 
+  review_path = None
+  if args.review:
+    review_path = Path(args.review)
+    if review_path.exists():
+      panic(f"Review file {review_path} already exists.")
+
   llvm = LLVM()
 
   # Create PR environment
@@ -994,6 +1140,12 @@ def main():
       with history_path.open("w") as fout:
         json.dump([asdict(m) for m in agent.get_history()], fout, indent=2)
       console.print(f"Chat history saved to {history_path}.")
+
+    if review_path:
+      review_content = generate_review(pr_info, stats)
+      with review_path.open("w", encoding="utf-8") as fout:
+        fout.write(review_content)
+      console.print(f"Review saved to {review_path}.")
 
   console.print("Bugs Found")
   console.print("----------")

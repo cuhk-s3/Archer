@@ -86,6 +86,7 @@ class VerifyTool(FuncToolBase):
             {
               "found": True,
               "tool": "verify",
+              "args": args,
               "original_ir": orig_ir_code,
               "transformed_ir": "<crash during transformation>",
               "log": f"opt crashed during transformation:\n{err_msg}",
@@ -109,6 +110,7 @@ class VerifyTool(FuncToolBase):
           {
             "found": m and int(m.group(1)) > 0,
             "tool": "verify",
+            "args": args,
             "original_ir": orig_ir_code,
             "transformed_ir": transformed_ir_code,
             "log": verification_result,
