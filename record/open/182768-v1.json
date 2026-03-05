@@ -1,0 +1,102 @@
+{
+  "command": {
+    "pr": 182768,
+    "model": "google/gemini-3.1-pro-preview-customtools",
+    "driver": "openai",
+    "stats": "record/182768.json",
+    "history": "record/182768-history.json",
+    "debug": true
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1072072,
+  "output_tokens": 108996,
+  "cached_tokens": 847759,
+  "total_tokens": 1181068,
+  "chat_cost": 1.9261298000000002,
+  "chat_rounds": 50,
+  "phase1_round": 35,
+  "phase2_round": 0,
+  "total_time_sec": 1133.716899394989,
+  "tool_usage": [
+    {
+      "name": "find250",
+      "usage": 0
+    },
+    {
+      "name": "grep250",
+      "usage": 0
+    },
+    {
+      "name": "list250",
+      "usage": 0
+    },
+    {
+      "name": "read250",
+      "usage": 0
+    },
+    {
+      "name": "langref",
+      "usage": 0
+    },
+    {
+      "name": "trans",
+      "usage": 5
+    },
+    {
+      "name": "verify",
+      "usage": 0
+    },
+    {
+      "name": "difftest",
+      "usage": 2
+    },
+    {
+      "name": "report",
+      "usage": 1
+    },
+    {
+      "name": "tests_manager",
+      "usage": 3
+    }
+  ],
+  "strategies": [
+    {
+      "name": "Dominance Violation across Independent Blocks",
+      "target": "Create a function with two independent basic blocks (e.g., `if.then` and `if.else`). In both blocks, place a pattern that `VectorCombine` folds into a shuffle (e.g., `foldShuffleOfIntrinsics`) using the same operands `V0` and `V1` (which dominate both blocks) and the same mask.",
+      "rationale": "When `VectorCombine` processes a fold, it caches the created shuffle globally using `{V0, V1, Mask}` as the key. If `V0` and `V1` are in the same block, it inserts the shuffle in that block. If the same fold pattern appears in two independent basic blocks (e.g., two branches of an `if` statement) that do not dominate each other, the pass will create and cache the shuffle in the first block it processes. When it processes the second block, it will reuse the cached shuffle from the first block. Since the first block does not dominate the second, this results in a dominance violation.",
+      "expected_issue": "LLVM IR dominance verification failure (instruction does not dominate all uses)."
+    },
+    {
+      "name": "Dominance Violation due to Different-Block Fallback",
+      "target": "Create a function where `V0` is in `block1` and `V1` is in `block2`. Place a foldable pattern using `V0` and `V1` in `block3` (dominated by `block1` and `block2`). Place another identical foldable pattern in `block4` (also dominated by `block1` and `block2`, but not dominated by `block3`).",
+      "rationale": "When `V0` and `V1` are instructions located in different basic blocks, `findEarliestInsertionPoint` falls back to returning the current insertion point (`Builder.GetInsertPoint()`). The created shuffle is then cached globally. If another fold later requests a shuffle with the same `V0`, `V1`, and `Mask` in a different block that is not dominated by the first insertion point, it will reuse the cached shuffle, leading to a dominance violation.",
+      "expected_issue": "LLVM IR dominance verification failure (instruction does not dominate all uses)."
+    },
+    {
+      "name": "Invalid Insertion Among PHI Nodes",
+      "target": "Create a basic block with at least three PHI nodes. Use the first two PHI nodes as operands `V0` and `V1` in a pattern that `VectorCombine` will fold into a shuffle within the same block.",
+      "rationale": "If `V0` and/or `V1` are PHI nodes in the same basic block, `findEarliestInsertionPoint` determines the later of the two PHI nodes and simply increments the iterator (`++It`) to find the insertion point. If there are additional PHI nodes after the chosen one, the `shufflevector` will be inserted before those subsequent PHI nodes. This violates the LLVM IR requirement that all PHI nodes must be grouped contiguously at the beginning of a basic block.",
+      "expected_issue": "LLVM IR verification failure (non-PHI instruction inserted before PHI instructions)."
+    },
+    {
+      "name": "Invalid Insertion After Invoke Terminator",
+      "target": "Create a function with an `invoke` instruction that returns a vector. In the normal destination block, use the result of the `invoke` as an operand in a pattern that `VectorCombine` folds into a shuffle.",
+      "rationale": "An `invoke` instruction produces a value but is also a terminator. If the result of an `invoke` is used as `V0` or `V1`, `findEarliestInsertionPoint` will attempt to insert the new shuffle immediately after the `invoke` by incrementing its iterator (`++It`). Since `invoke` is a terminator, this iterator will point to the end of the basic block (`end()`), and inserting there is invalid. Furthermore, the result of an `invoke` is only available in its normal destination block, not in the block containing the `invoke`.",
+      "expected_issue": "Compiler crash (dereferencing end iterator) or LLVM IR verification failure (instruction inserted after a terminator)."
+    },
+    {
+      "name": "Invalid Insertion After CallBr Terminator",
+      "target": "Create a function with a `callbr` instruction that returns a vector. Use its result as an operand in a pattern that `VectorCombine` folds into a shuffle.",
+      "rationale": "Similar to `invoke`, a `callbr` instruction can produce a value and is a terminator. If its result is used as an operand for a cached shuffle, `findEarliestInsertionPoint` will try to insert the shuffle immediately after the `callbr` instruction in the same block, which is invalid because terminators must be the last instruction in a block.",
+      "expected_issue": "Compiler crash or LLVM IR verification failure (instruction inserted after a terminator)."
+    }
+  ],
+  "reason_thou": "### 1. Fix Understanding\nThe patch introduces a global `ShuffleCache` in `VectorCombine` to deduplicate `shufflevector` instructions that have identical operands (`V0`, `V1`) and masks. It replaces the local cache in `foldShuffleOfIntrinsics` with a global `getOrCreateShuffle` method. To ensure the cached shuffle can be reused across the function, it attempts to insert the newly created shuffle at the \"earliest safe insertion point\" using `findEarliestInsertionPoint`.\n\n### 2. Formal Semantic Modeling\n- **Before the fix**: Shuffles were created at the current insertion point (usually right before the instruction being folded). Deduplication only happened locally within a single fold (e.g., `foldShuffleOfIntrinsics`), so dominance was naturally satisfied.\n- **After the fix**: Shuffles are created at an \"earliest\" point and cached globally for the entire function.\n- **Conditions for difference**: If the same shuffle is needed in multiple places, it is only created once. The insertion point must dominate all uses.\n- **Numerical Instantiation**: If `V0` and `V1` are arguments, the shuffle is inserted at the entry block. If they are instructions in the same block, it's inserted after the later one.\n\n### 3. Assumptions and Preconditions Identified\n1. **Dominance of Fallback**: The fix assumes that if `V0` and `V1` are in different blocks, the current insertion point is a safe \"earliest\" point that will dominate all future reuses of the cached shuffle.\n2. **Iterator Increment Safety**: The fix assumes that `++It` on an instruction always yields a valid insertion point for a regular instruction.\n3. **Terminator Handling**: The fix assumes that `V0` and `V1` are not terminators (like `invoke` or `callbr`), or if they are, that inserting after them in the same block is valid.\n4. **PHI Node Contiguity**: The fix assumes that inserting after a PHI node will not interleave non-PHI instructions among PHI nodes.\n\n### 4. Potential Cases to Break Assumptions\n- **Assumption 1 (Dominance)**: Broken if `V0` and `V1` are in different blocks, and the fold is triggered in two independent blocks (e.g., `if.then` and `if.else`). The shuffle is created in `if.then` and reused in `if.else`, causing a dominance violation.\n- **Assumption 2 & 4 (PHI Nodes)**: Broken if `V0` and `V1` are PHI nodes, and there are other PHI nodes after them. `++It` will insert the shuffle before the subsequent PHI nodes, resulting in invalid IR.\n- **Assumption 3 (Terminators)**: Broken if `V0` or `V1` is an `invoke` instruction. `++It` will point past the terminator, causing a crash or invalid IR, and the value of `invoke` is not even available in that block.",
+  "bugs": [],
+  "test_traj": [
+    "{\"found\": false, \"tool\": \"difftest\", \"action\": \"test\", \"original_ir\": \"\\ndefine <8 x i32> @test3(<4 x i32> %0, <4 x i32> %1, <4 x i32> %2, <4 x i32> %3) {\\nentry:\\n  br i1 true, label %bb1, label %bb2\\n\\nbb1:\\n  %4 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %0, <4 x i32> %1)\\n  %5 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %2, <4 x i32> %3)\\n  %6 = shufflevector <4 x i32> %4, <4 x i32> %5, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\\n  br label %end\\n\\nbb2:\\n  %7 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %0, <4 x i32> %1)\\n  %8 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %2, <4 x i32> %3)\\n  %9 = shufflevector <4 x i32> %7, <4 x i32> %8, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\\n  br label %end\\n\\nend:\\n  %res = phi <8 x i32> [ %6, %bb1 ], [ %9, %bb2 ]\\n  ret <8 x i32> %res\\n}\\n\\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>)\\n\\ndefine <8 x i32> @main(i32 %argc, ptr %argv) {\\nentry:\\n  %r = call <8 x i32> @test3(<4 x i32> <i32 1, i32 2, i32 3, i32 4>, <4 x i32> <i32 5, i32 6, i32 7, i32 8>, <4 x i32> <i32 9, i32 10, i32 11, i32 12>, <4 x i32> <i32 13, i32 14, i32 15, i32 16>)\\n  ret <8 x i32> %r\\n}\\n\", \"transformed_ir\": \"\\n; ModuleID = '/data/tmp/tmp6dnfhvlh/orig.ll'\\nsource_filename = \\\"/data/tmp/tmp6dnfhvlh/orig.ll\\\"\\n\\ndefine <8 x i32> @test3(<4 x i32> %0, <4 x i32> %1, <4 x i32> %2, <4 x i32> %3) {\\nentry:\\n  %4 = shufflevector <4 x i32> %1, <4 x i32> %3, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\\n  %5 = shufflevector <4 x i32> %0, <4 x i32> %2, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\\n  br i1 true, label %bb1, label %bb2\\n\\nbb1:                                              ; preds = %entry\\n  %6 = call <8 x i32> @llvm.smax.v8i32(<8 x i32> %5, <8 x i32> %4)\\n  br label %end\\n\\nbb2:                                              ; preds = %entry\\n  %7 = call <8 x i32> @llvm.smax.v8i32(<8 x i32> %5, <8 x i32> %4)\\n  br label %end\\n\\nend:                                              ; preds = %bb2, %bb1\\n  %res = phi <8 x i32> [ %6, %bb1 ], [ %7, %bb2 ]\\n  ret <8 x i32> %res\\n}\\n\\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\\n\\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\\ndeclare <8 x i32> @llvm.smax.v8i32(<8 x i32>, <8 x i32>) #0\\n\\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\\n\\ndefine <8 x i32> @main(i32 %argc, ptr %argv) {\\nentry:\\n  %r = call <8 x i32> @test3(<4 x i32> <i32 1, i32 2, i32 3, i32 4>, <4 x i32> <i32 5, i32 6, i32 7, i32 8>, <4 x i32> <i32 9, i32 10, i32 11, i32 12>, <4 x i32> <i32 13, i32 14, i32 15, i32 16>)\\n  ret <8 x i32> %r\\n}\\n\", \"log\": {\"original_test_output\": {\"timed_out\": false, \"return_code\": -6, \"stdout\": \"\", \"stderr\": \"PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.\\nStack dump:\\n0.\\tProgram arguments: /data/yunboni/projects/Archer/deps/llvm-ub-aware-interpreter/build/llubi /data/tmp/tmpv78czcz7/orig.ll\\n #0 0x000072a87767bc68 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/data/yunboni/utils/compilers/llvm_latest/lib/libLLVM.so.23.0git+0x87bc68)\\n #1 0x000072a8776792a5 llvm::sys::RunSignalHandlers() (/data/yunboni/utils/compilers/llvm_latest/lib/libLLVM.so.23.0git+0x8792a5)\\n #2 0x000072a87767ca31 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\\n #3 0x000072a876645330 (/lib/x86_64-linux-gnu/libc.so.6+0x45330)\\n #4 0x000072a87669eb2c __pthread_kill_implementation ./nptl/pthread_kill.c:44:76\\n #5 0x000072a87669eb2c __pthread_kill_internal ./nptl/pthread_kill.c:78:10\\n #6 0x000072a87669eb2c pthread_kill ./nptl/pthread_kill.c:89:10\\n #7 0x000072a87664527e raise ./signal/../sysdeps/posix/raise.c:27:6\\n #8 0x000072a8766288ff abort ./stdlib/abort.c:81:7\\n #9 0x000056f766bf4b0c postProcess(AnyValue&, llvm::function_ref<void (std::variant<llvm::APInt, llvm::APFloat, Pointer, std::monostate>&)> const&) (.cold) ubi.cpp:0:0\\n#10 0x000056f766bf5ab6 UBAwareInterpreter::runMain() (.cold) ubi.cpp:0:0\\n#11 0x000056f766bf7ea8 main (/data/yunboni/projects/Archer/deps/llvm-ub-aware-interpreter/build/llubi+0xfea8)\\n#12 0x000072a87662a1ca __libc_start_call_main ./csu/../sysdeps/nptl/libc_start_call_main.h:74:3\\n#13 0x000072a87662a28b call_init ./csu/../csu/libc-start.c:128:20\\n#14 0x000072a87662a28b __libc_start_main ./csu/../csu/libc-start.c:347:5\\n#15 0x000056f766bf8155 _start (/data/yunboni/projects/Archer/deps/llvm-ub-aware-interpreter/build/llubi+0x10155)\", \"executor\": \"llubi\"}, \"transformed_test_output\": {\"timed_out\": false, \"return_code\": -6, \"stdout\": \"\", \"stderr\": \"PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.\\nStack dump:\\n0.\\tProgram arguments: /data/yunboni/projects/Archer/deps/llvm-ub-aware-interpreter/build/llubi /data/tmp/tmpv78czcz7/transformed.ll\\n #0 0x000074482bc7bc68 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/data/yunboni/utils/compilers/llvm_latest/lib/libLLVM.so.23.0git+0x87bc68)\\n #1 0x000074482bc792a5 llvm::sys::RunSignalHandlers() (/data/yunboni/utils/compilers/llvm_latest/lib/libLLVM.so.23.0git+0x8792a5)\\n #2 0x000074482bc7ca31 SignalHandler(int, siginfo_t*, void*) Signals.cpp:0:0\\n #3 0x000074482ac45330 (/lib/x86_64-linux-gnu/libc.so.6+0x45330)\\n #4 0x000074482ac9eb2c __pthread_kill_implementation ./nptl/pthread_kill.c:44:76\\n #5 0x000074482ac9eb2c __pthread_kill_internal ./nptl/pthread_kill.c:78:10\\n #6 0x000074482ac9eb2c pthread_kill ./nptl/pthread_kill.c:89:10\\n #7 0x000074482ac4527e raise ./signal/../sysdeps/posix/raise.c:27:6\\n #8 0x000074482ac288ff abort ./stdlib/abort.c:81:7\\n #9 0x0000592161706b0c postProcess(AnyValue&, llvm::function_ref<void (std::variant<llvm::APInt, llvm::APFloat, Pointer, std::monostate>&)> const&) (.cold) ubi.cpp:0:0\\n#10 0x0000592161707ab6 UBAwareInterpreter::runMain() (.cold) ubi.cpp:0:0\\n#11 0x0000592161709ea8 main (/data/yunboni/projects/Archer/deps/llvm-ub-aware-interpreter/build/llubi+0xfea8)\\n#12 0x000074482ac2a1ca __libc_start_call_main ./csu/../sysdeps/nptl/libc_start_call_main.h:74:3\\n#13 0x000074482ac2a28b call_init ./csu/../csu/libc-start.c:128:20\\n#14 0x000074482ac2a28b __libc_start_main ./csu/../csu/libc-start.c:347:5\\n#15 0x000059216170a155 _start (/data/yunboni/projects/Archer/deps/llvm-ub-aware-interpreter/build/llubi+0x10155)\", \"executor\": \"llubi\"}}, \"thoughts\": \"CRITICAL INSTRUCTION 1: I must use specific tools when available.\\nCRITICAL INSTRUCTION 2: I am using `difftest` to test the mutated IR.\\n\\nI will mutate `test3` to test the \\\"Dominance Violation across Independent Blocks\\\" strategy. I will create two independent basic blocks (`bb1` and `bb2`) that both contain the same foldable pattern. The pass should cache the shuffle created in `bb1` and reuse it in `bb2`, leading to a dominance violation.\", \"test_index\": 0, \"covered_strategy\": \"Dominance Violation across Independent Blocks\"}"
+  ],
+  "report": null
+}
