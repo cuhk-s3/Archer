@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
@@ -5,6 +6,19 @@ from tempfile import TemporaryDirectory
 from llvm.llvm_helper import strip_llvm_fence
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
 from utils import cmdline
+
+
+def is_opt_crash(error_message: str) -> bool:
+  """Detect if the error is an opt crash (which indicates a bug)."""
+  crash_indicators = [
+    "LLVM ERROR",
+    "compilation aborted",
+    "Stack dump:",
+    "Broken module found",
+    "does not dominate all uses",
+    "PLEASE submit a bug report",
+  ]
+  return any(indicator in error_message for indicator in crash_indicators)
 
 
 def transform(orig_ir: str, args: str, build_dir: str) -> str:
@@ -37,10 +51,25 @@ def transform(orig_ir: str, args: str, build_dir: str) -> str:
         err_msg = e.stdout.decode("utf-8", errors="replace")
       else:
         err_msg = str(e)
+
+      # Check if this is an opt crash (bug found)
+      if is_opt_crash(err_msg):
+        # Return JSON indicating a crash bug was found
+        return json.dumps(
+          {
+            "is_crash": True,
+            "found": True,
+            "tool": "trans",
+            "original_ir": orig_ir_code,
+            "transformed_ir": "<crash during transformation>",
+            "log": f"opt crashed during transformation:\n{err_msg.strip()}",
+          }
+        )
+
+      # Not a crash, regular error
       raise FuncToolCallException(
         f"Failed to transform the LLVM IR code. {err_msg.strip()}"
       )
-  return f"```llvm\n{transformed_ir}\n```"
 
 
 class TransTool(FuncToolBase):
@@ -75,4 +104,17 @@ class TransTool(FuncToolBase):
     )
 
   def _call(self, *, orig_ir: str, args: str, thoughts: str, **kwargs) -> str:
-    return transform(orig_ir, args, self.build_dir)
+    result = transform(orig_ir, args, self.build_dir)
+
+    # Check if result is a crash report (JSON string starting with {)
+    if isinstance(result, str) and result.strip().startswith("{"):
+      try:
+        crash_data = json.loads(result)
+        if crash_data.get("is_crash"):
+          # Add thoughts to the crash report
+          crash_data["thoughts"] = thoughts
+          return json.dumps(crash_data)
+      except (json.JSONDecodeError, KeyError):
+        pass
+
+    return result

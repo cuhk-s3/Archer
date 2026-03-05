@@ -525,6 +525,24 @@ def generate_test_for_pr(
       except Exception:
         return (True, res)
 
+    if name == "trans":
+      try:
+        trans_result = json.loads(res)
+        # Check if trans returned a crash (bug found)
+        if trans_result.get("is_crash") and trans_result.get("found"):
+          stats.test_traj.append(res)
+          stats.bugs.append(
+            Bug(
+              original_ir=trans_result["original_ir"],
+              transformed_ir=trans_result.get("transformed_ir", "<crash>"),
+              log=trans_result["log"],
+              thoughts=trans_result.get("thoughts"),
+            )
+          )
+          return (True, res)
+      except Exception:
+        pass
+
     if name == "difftest":
       try:
         diff_result = json.loads(res)
@@ -591,33 +609,25 @@ def generate_test_for_pr(
         f"Report called. force={force_stop}, all_tested={all_tested}, bugs_found={len(stats.bugs)}"
       )
 
+      # If force=True, allow immediate stop without any checks
+      if force_stop:
+        console.print("Force stopping the process as requested.")
+        stats.report = report_data.get("thoughts", None)
+        return False, res
+
       # If all tests have been completed, allow the report regardless of bugs found
       if all_tested:
         stats.report = report_data.get("thoughts", None)
         return False, res
 
       # If not all tests are done and no force stop, require continuing
-      if not force_stop:
-        return True, (
-          "Error: You cannot call `report` yet "
-          "because not all tests have been marked as tested (which requires covering all strategies per test). "
-          "Please use `tests_manager` to check untested tests, "
-          "test them, and mark them as tested. "
-          "If you have already found at least one bug and want to stop immediately, set `force=True` in `report`."
-        )
-
-      # Force stop requested but not all tests done - must have found bugs
-      if not stats.bugs:
-        return True, (
-          "Error: You cannot use `force=True` in `report` because no bugs have been found yet. "
-          "Please verify the bug using `verify` or `difftest` tools first."
-        )
-
-      console.print("Force stopping the process with bugs found. Generating report...")
-
-      # Force stop with bugs found - allow early termination
-      stats.report = report_data.get("thoughts", None)
-      return False, res
+      return True, (
+        "Error: You cannot call `report` yet "
+        "because not all tests have been marked as tested (which requires covering all strategies per test). "
+        "Please use `tests_manager` to check untested tests, "
+        "test them, and mark them as tested. "
+        "If you want to stop immediately without further testing, set `force=True` in `report`."
+      )
 
     return True, res  # Continue the process for other tools
 

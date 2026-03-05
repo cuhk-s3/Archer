@@ -9,6 +9,19 @@ from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
 from utils import cmdline
 
 
+def is_opt_crash(error_message: str) -> bool:
+  """Detect if the error is an opt crash (which indicates a bug)."""
+  crash_indicators = [
+    "LLVM ERROR",
+    "compilation aborted",
+    "Stack dump:",
+    "Broken module found",
+    "does not dominate all uses",
+    "PLEASE submit a bug report",
+  ]
+  return any(indicator in error_message for indicator in crash_indicators)
+
+
 class VerifyTool(FuncToolBase):
   def __init__(self, build_dir: str, alive_path: str):
     self.build_dir = Path(build_dir).resolve().absolute()
@@ -63,8 +76,25 @@ class VerifyTool(FuncToolBase):
       try:
         cmdline.check_output(cmd)
       except CalledProcessError as e:
+        err_msg = (
+          e.stderr.decode("utf-8", errors="replace").strip() if e.stderr else str(e)
+        )
+
+        # Check if this is an opt crash (bug found)
+        if is_opt_crash(err_msg):
+          return json.dumps(
+            {
+              "found": True,
+              "tool": "verify",
+              "original_ir": orig_ir_code,
+              "transformed_ir": "<crash during transformation>",
+              "log": f"opt crashed during transformation:\n{err_msg}",
+            }
+          )
+
+        # Not a crash, regular error
         raise FuncToolCallException(
-          f"Failed to transform the LLVM IR code with opt. {e.stderr.decode('utf-8').strip() if e.stderr else str(e)}"
+          f"Failed to transform the LLVM IR code with opt. {err_msg}"
         )
 
       with open(transformed_ir_path, "r") as f:

@@ -37,7 +37,8 @@ class ReportTool(FuncToolBase):
           "force",
           "boolean",
           False,
-          "Set to true ONLY if you have already found at least one bug AND you are certain that no further testing is required.",
+          "Set to true to force stop immediately without additional checks. "
+          "When false or not provided, the tool will check that all tests have been completed before allowing the report.",
         ),
       ],
     )

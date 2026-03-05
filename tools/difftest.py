@@ -134,6 +134,28 @@ class DiffTestTool(FuncToolBase):
 
       transformed_ir = transform(orig_ir, args, self.build_dir)
 
+      # Check if transform returned a crash report
+      if isinstance(transformed_ir, str) and transformed_ir.strip().startswith("{"):
+        try:
+          crash_data = json.loads(transformed_ir)
+          if crash_data.get("is_crash"):
+            # Return crash as a bug found by difftest
+            return json.dumps(
+              {
+                "found": True,
+                "tool": "difftest",
+                "action": "test",
+                "original_ir": crash_data.get("original_ir", "<unknown>"),
+                "transformed_ir": "<crash during transformation>",
+                "log": crash_data.get("log", "opt crashed"),
+                "thoughts": thoughts,
+                "test_index": test_index,
+                "covered_strategy": covered_strategy,
+              }
+            )
+        except (json.JSONDecodeError, KeyError):
+          pass
+
       # Require a single call (no leading "%r ="); main will assign it to %r.
       call_regex = (
         r'\s*call\s+(.+?)\s+@(?:[-$._A-Za-z0-9]+|"(?:[^"\\]|\\.)+")\s*\(.*\)\s*$'
