@@ -116,6 +116,10 @@ def fetch_pr(pr_id, state_filter="closed"):
   if has_backend_label:
     return False
 
+  has_runtime_label = any(label.startswith("compiler-rt:") for label in label_names)
+  if has_runtime_label:
+    return False
+
   # Check if it modifies LLVM files
   files_url = pr["url"] + "/files"
   files = session.get(files_url).json()
