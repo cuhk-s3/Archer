@@ -841,6 +841,12 @@ def parse_args():
     default=False,
     help="Enable debug mode for more verbose output (default: False).",
   )
+  parser.add_argument(
+    "--force",
+    action="store_true",
+    default=False,
+    help="Force overwrite existing stats/history/review files (default: False).",
+  )
   return parser.parse_args()
 
 
@@ -1074,19 +1080,19 @@ def main():
   stats_path = None
   if args.stats:
     stats_path = Path(args.stats)
-    if stats_path.exists():
+    if stats_path.exists() and not args.force:
       panic(f"Stats file {stats_path} already exists.")
 
   history_path = None
   if args.history:
     history_path = Path(args.history)
-    if history_path.exists():
+    if history_path.exists() and not args.force:
       panic(f"History file {history_path} already exists.")
 
   review_path = None
   if args.review:
     review_path = Path(args.review)
-    if review_path.exists():
+    if review_path.exists() and not args.force:
       panic(f"Review file {review_path} already exists.")
 
   llvm = LLVM()
