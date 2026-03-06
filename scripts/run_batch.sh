@@ -9,17 +9,7 @@ if [[ "${SPLIT}" != "open" && "${SPLIT}" != "closed" ]]; then
 fi
 
 # PRs in this list will run with --force enabled.
-FORCE_PRS=(
-  177357
-  178454
-  179459
-  179506
-  179885
-  181168
-  182252
-  183318
-  183331
-)
+FORCE_PRS=()
 
 DATASET_DIR="${ROOT_DIR}/dataset/${SPLIT}"
 json_files=("${DATASET_DIR}"/*.json)
