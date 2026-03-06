@@ -1,0 +1,392 @@
+[
+  {
+    "type": "message",
+    "role": "system",
+    "content": "You are an LLVM compiler expert specializing in test case generation and bug detection. You are conducting LLVM code review now.\n\n## Context\nMaintainers provided a patch, but patches often have edge cases or introduce new issues.\n\n## Your Task\nYou will work in two phases:\n- Phase 1: Analyze the fix to identify potential issues, gaps, and edge cases. Propose test strategies.\n- Phase 2: Generate targeted test cases by modifying existing tests to target identified issues\n\n## You Will Receive\n- Original patch description and related test case(s)\n- The code region that was modified (the patch)\n- Information about the optimization pass and component involved\n\n## Tools You Can Use\n\nYou have multiple tools for each phase, but you should try to avoid using them with same inputs repeatedly to reduce redundant calls.\n\n**CRITICAL**: You MUST use tool call every action in Phase 1 and Phase 2.\n"
+  },
+  {
+    "type": "message",
+    "role": "user",
+    "content": "# Phase 1: Analyze the Fix\n\nThis is a patch for IROutliner:\n\n[IROutliner] Correctly Replace Outlined Constants with Arguments\nChanges in a80a802d2f07 seem to have caused problems in the associated testcase. In this testcase, the block has two uses of `ptr null`, one in a load, and one in a GEP (within a `ConstantExpr`). The GEP is identical between the two outlined regions, so we should not be replacing its ConstantExpr with something based off an argument. The load is different between the outlined region, so its use of `ptr null` should be updated to use the argument.\r\n\r\nUsing a ValueMapper was not correct because the valuemapper maps all instances of a given value (in this case a constant), but we only want to modify some occurences of the constant.\r\n\r\nThe new code does not use the constant's use list (which the buggy change avoided), and instead assumes that GVN is only numbering operands of instructions, rather than iterating into ConstantExprs to number the entire expression.\r\n\r\nFixes #178874\ndiff --git a/llvm/lib/Transforms/IPO/IROutliner.cpp b/llvm/lib/Transforms/IPO/IROutliner.cpp\nindex 6e1ca9c4cd2d6..c52a227c40e5c 100644\n--- a/llvm/lib/Transforms/IPO/IROutliner.cpp\n+++ b/llvm/lib/Transforms/IPO/IROutliner.cpp\n@@ -24,7 +24,6 @@\n #include \"llvm/IR/PassManager.h\"\n #include \"llvm/Support/CommandLine.h\"\n #include \"llvm/Transforms/IPO.h\"\n-#include \"llvm/Transforms/Utils/ValueMapper.h\"\n #include <optional>\n #include <vector>\n \n@@ -1915,7 +1914,6 @@ replaceArgumentUses(OutlinableRegion &Region,\n void replaceConstants(OutlinableRegion &Region) {\n   OutlinableGroup &Group = *Region.Parent;\n   Function *OutlinedFunction = Group.OutlinedFunction;\n-  ValueToValueMapTy VMap;\n \n   // Iterate over the constants that need to be elevated into arguments\n   for (std::pair<unsigned, Constant *> &Const : Region.AggArgToConstant) {\n@@ -1923,16 +1921,23 @@ void replaceConstants(OutlinableRegion &Region) {\n     assert(OutlinedFunction && \"Overall Function is not defined?\");\n     Constant *CST = Const.second;\n     Argument *Arg = Group.OutlinedFunction->getArg(AggArgIdx);\n-    // Identify the argument it will be elevated to, and replace instances of\n-    // that constant in the function.\n-    VMap[CST] = Arg;\n-    LLVM_DEBUG(dbgs() << \"Replacing uses of constant \" << *CST\n+    LLVM_DEBUG(dbgs() << \"Replacing instruction uses of constant \" << *CST\n                       << \" in function \" << *OutlinedFunction << \" with \"\n                       << *Arg << '\\n');\n-  }\n \n-  RemapFunction(*OutlinedFunction, VMap,\n-                RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);\n+    for (auto &BB : *OutlinedFunction) {\n+      for (Instruction &I : BB) {\n+        // We specifically iterate over the direct operands of instructions, to\n+        // avoid replacing constants that appear in `ConstantExpr`s\n+        for (auto &U : I.operands()) {\n+          if (auto *CCandidate = dyn_cast<Constant>(U)) {\n+            if (CCandidate == CST)\n+              U = Arg;\n+          }\n+        }\n+      }\n+    }\n+  }\n }\n \n /// It is possible that there is a basic block that already performs the same\n\n\n---\n\n## Subsystem Knowledge for IROutliner\n\nFor reference, here are some key points about the IROutliner you should consider (but do not limit to these) in your analysis:\n\nNo specific knowledge provided for this component.\n\n**CRITICAL**: Subsystem knowledge is **ONLY** a reference for you to understand this component.\nDo NOT start your analysis from these patterns. Start from the patch semantics. Use these **ONLY** to cross-check your reasoning.\n\n## Your Task for Phase 1\n\nIn this phase, you will review and analyze the fix above carefully and identify potential issues, edge cases, or gaps that the fix might miss. According to the analysis, propose mutation strategies for exposing the issue. These strategies will be used in Phase 2 to mutate existing test cases to target the identified issues.\n\nFollow this structured workflow:\n\n### Step 1: Context Gathering\nIn this step, you should gather enough context to construct semantics model of this fix for future analysis. Your goal is to understand the complete flow of this optimization. To achieve this, you should look at the nearby code regions, or try to find similar code regions in the LLVM codebase to understand the semantics of this fix.\n\nYou can use search tools:\n- Use the `find` and `list` tools to find relevant files in the LLVM code.\n- Use the `read` and `grep` tools to understand the context of the fix.\n\n### Step 2: Fix Segmentation and Analysis\nBased on the model built for this fix, you should segment the fix into smaller parts and analyze the semantics of each part. Follow this structured workflow for segmentation and analysis:\n\n- **Segmentation**: Break down the fix into smaller segments or key changes, especially focusing on code regions related to semantics changes.\n- **Analysis**: For each segment, analyze the semantics and identify any assumptions or preconditions that the fix relies on.\n\n#### Tips for this step\n- You can use the `langref` tool to query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.\n- You can pay attention to the commit message and annotations in the code, such as comments or specific patterns that indicate important semantics or assumptions.\n\n### Step 3: Formal Semantic Modeling\n- Define the exact semantic contract that this fix claims to satisfy.\n- Explicitly list the preconditions under which the contract is assumed to hold.\n- Identify how these preconditions may be violated.\n\n### Step 4: Identify Potential Issues and Propose Test Strategies\nBased on your analysis, propose around 5 specific test strategies that can be used to expose the issue. When proposing test strategies, consider the following:\n- **Focus**: Focus on the assumptions and preconditions you identified.\n- **Scenarios**: Think about specific input characteristics or scenarios that could violate these assumptions.\n- **Mutations**: Propose mutations that can be applied to existing test cases to create new test cases targeting these scenarios.\n\nOnce you have analyzed the fix and identified potential issues or edge cases, use the `stop` tool to specify proposed test strategies along with detailed reasoning. \nFollow this structure for reasoning:\n\n### 1. Fix Understanding\n- What optimization or transformation does this fix enable or correct?\n- What are the key changes made in the patch?\n\n### 2. Formal Semantic Modeling\n- What is the exact semantic function before the fix?\n- What is the exact semantic function after the fix?\n- Under what conditions might they differ?\n- Provide at least one concrete numerical instantiation to illustrate the difference.\n\n### 3. Assumptions and Preconditions Identified\n- What assumptions does the fix make about the input?\n- What preconditions must hold for this fix to be correct?\n\n### 4. Potential Cases to Break Assumptions\nFor each assumption and precondition identified, describe specific scenarios or input characteristics that could violate them. The potential cases should only focus on the semantics related to the analysis above.\n\n### 5. Test Strategies\nFor each potential issue you identified, propose specific test strategies with the following structure:\n\n- Name: [Name]\n- Target: [What to mutate]\n- Rationale: [Why this might expose an issue]\n- Expected Issue: [What incorrect behavior might occur]\n\n---\n\n## Tools that you can use\n\n- `findN`: Search for files in the LLVM codebase related to the component or optimization pass to understand the context of the fix and find relevant tests.\n- `listN`: List files in the LLVM codebase to find relevant tests or code regions.\n- `readN`: Read the content of a file in the LLVM codebase to understand existing tests or the fix.\n- `grepN`: Search for specific patterns in the codebase to find relevant tests or code regions.\n- `langref`: Query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.\n- `stop`: End Phase 1 by submitting the identified issues and proposed test strategies.\n\n"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_read250_VZiSYtxABJLJ71FHPZTa",
+    "name": "read250",
+    "arguments": "{\"position\":1850,\"file\":\"llvm/lib/Transforms/IPO/IROutliner.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_read250_VZiSYtxABJLJ71FHPZTa",
+    "output": "file: llvm/lib/Transforms/IPO/IROutliner.cpp:1850-2100\n------------------------------------------------------\n1850       NewI->insertInto(OutputBB, OutputBB->end());\n1851       LLVM_DEBUG(dbgs() << \"Move store for instruction \" << *I << \" to \"\n1852                         << *OutputBB << \"\\n\");\n1853 \n1854       // If this is storing a PHINode, we must make sure it is included in the\n1855       // overall function.\n1856       if (!isa<PHINode>(ValueOperand) ||\n1857           Region.Candidate->getGVN(ValueOperand).has_value()) {\n1858         if (FirstFunction)\n1859           continue;\n1860         Value *CorrVal =\n1861             Region.findCorrespondingValueIn(*Group.Regions[0], ValueOperand);\n1862         assert(CorrVal && \"Value is nullptr?\");\n1863         NewI->setOperand(0, CorrVal);\n1864         continue;\n1865       }\n1866       PHINode *PN = cast<PHINode>(SI->getValueOperand());\n1867       // If it has a value, it was not split by the code extractor, which\n1868       // is what we are looking for.\n1869       if (Region.Candidate->getGVN(PN))\n1870         continue;\n1871 \n1872       // We record the parent block for the PHINode in the Region so that\n1873       // we can exclude it from checks later on.\n1874       Region.PHIBlocks.insert(std::make_pair(RetVal, PN->getParent()));\n1875 \n1876       // If this is the first function, we do not need to worry about mergiing\n1877       // this with any other block in the overall outlined function, so we can\n1878       // just continue.\n1879       if (FirstFunction) {\n1880         BasicBlock *PHIBlock = PN->getParent();\n1881         Group.PHIBlocks.insert(std::make_pair(RetVal, PHIBlock));\n1882         continue;\n1883       }\n1884 \n1885       // We look for the aggregate block that contains the PHINodes leading into\n1886       // this exit path. If we can't find one, we create one.\n1887       BasicBlock *OverallPhiBlock = findOrCreatePHIBlock(Group, RetVal);\n1888 \n1889       // For our PHINode, we find the combined canonical numbering, and\n1890       // attempt to find a matching PHINode in the overall PHIBlock.  If we\n1891       // cannot, we copy the PHINode and move it into this new block.\n1892       PHINode *NewPN = findOrCreatePHIInBlock(*PN, Region, OverallPhiBlock,\n1893                                               OutputMappings, UsedPHIs);\n1894       NewI->setOperand(0, NewPN);\n1895     }\n1896 \n1897     // If we added an edge for basic blocks without a predecessor, we remove it\n1898     // here.\n1899     if (EdgeAdded)\n1900       DT.deleteEdge(&DominatingFunction->getEntryBlock(), BB);\n1901     I->eraseFromParent();\n1902 \n1903     LLVM_DEBUG(dbgs() << \"Replacing uses of output \" << *Arg << \" in function \"\n1904                       << *Region.ExtractedFunction << \" with \" << *AggArg\n1905                       << \" in function \" << *Group.OutlinedFunction << \"\\n\");\n1906     Arg->replaceAllUsesWith(AggArg);\n1907   }\n1908 }\n1909 \n1910 /// Within an extracted function, replace the constants that need to be lifted\n1911 /// into arguments with the actual argument.\n1912 ///\n1913 /// \\param Region [in] - The region of extracted code to be changed.\n1914 void replaceConstants(OutlinableRegion &Region) {\n1915   OutlinableGroup &Group = *Region.Parent;\n1916   Function *OutlinedFunction = Group.OutlinedFunction;\n1917 \n1918   // Iterate over the constants that need to be elevated into arguments\n1919   for (std::pair<unsigned, Constant *> &Const : Region.AggArgToConstant) {\n1920     unsigned AggArgIdx = Const.first;\n1921     assert(OutlinedFunction && \"Overall Function is not defined?\");\n1922     Constant *CST = Const.second;\n1923     Argument *Arg = Group.OutlinedFunction->getArg(AggArgIdx);\n1924     LLVM_DEBUG(dbgs() << \"Replacing instruction uses of constant \" << *CST\n1925                       << \" in function \" << *OutlinedFunction << \" with \"\n1926                       << *Arg << '\\n');\n1927 \n1928     for (auto &BB : *OutlinedFunction) {\n1929       for (Instruction &I : BB) {\n1930         // We specifically iterate over the direct operands of instructions, to\n1931         // avoid replacing constants that appear in `ConstantExpr`s\n1932         for (auto &U : I.operands()) {\n1933           if (auto *CCandidate = dyn_cast<Constant>(U)) {\n1934             if (CCandidate == CST)\n1935               U = Arg;\n1936           }\n1937         }\n1938       }\n1939     }\n1940   }\n1941 }\n1942 \n1943 /// It is possible that there is a basic block that already performs the same\n1944 /// stores. This returns a duplicate block, if it exists\n1945 ///\n1946 /// \\param OutputBBs [in] the blocks we are looking for a duplicate of.\n1947 /// \\param OutputStoreBBs [in] The existing output blocks.\n1948 /// \\returns an optional value with the number output block if there is a match.\n1949 std::optional<unsigned> findDuplicateOutputBlock(\n1950     DenseMap<Value *, BasicBlock *> &OutputBBs,\n1951     std::vector<DenseMap<Value *, BasicBlock *>> &OutputStoreBBs) {\n1952 \n1953   bool Mismatch = false;\n1954   unsigned MatchingNum = 0;\n1955   // We compare the new set output blocks to the other sets of output blocks.\n1956   // If they are the same number, and have identical instructions, they are\n1957   // considered to be the same.\n1958   for (DenseMap<Value *, BasicBlock *> &CompBBs : OutputStoreBBs) {\n1959     Mismatch = false;\n1960     for (std::pair<Value *, BasicBlock *> &VToB : CompBBs) {\n1961       DenseMap<Value *, BasicBlock *>::iterator OutputBBIt =\n1962           OutputBBs.find(VToB.first);\n1963       if (OutputBBIt == OutputBBs.end()) {\n1964         Mismatch = true;\n1965         break;\n1966       }\n1967 \n1968       BasicBlock *CompBB = VToB.second;\n1969       BasicBlock *OutputBB = OutputBBIt->second;\n1970       if (CompBB->size() - 1 != OutputBB->size()) {\n1971         Mismatch = true;\n1972         break;\n1973       }\n1974 \n1975       BasicBlock::iterator NIt = OutputBB->begin();\n1976       for (Instruction &I : *CompBB) {\n1977         if (isa<BranchInst>(&I))\n1978           continue;\n1979 \n1980         if (!I.isIdenticalTo(&(*NIt))) {\n1981           Mismatch = true;\n1982           break;\n1983         }\n1984 \n1985         NIt++;\n1986       }\n1987     }\n1988 \n1989     if (!Mismatch)\n1990       return MatchingNum;\n1991 \n1992     MatchingNum++;\n1993   }\n1994 \n1995   return std::nullopt;\n1996 }\n1997 \n1998 /// Remove empty output blocks from the outlined region.\n1999 ///\n2000 /// \\param BlocksToPrune - Mapping of return values output blocks for the \\p\n2001 /// Region.\n2002 /// \\param Region - The OutlinableRegion we are analyzing.\n2003 static bool\n2004 analyzeAndPruneOutputBlocks(DenseMap<Value *, BasicBlock *> &BlocksToPrune,\n2005                             OutlinableRegion &Region) {\n2006   bool AllRemoved = true;\n2007   Value *RetValueForBB;\n2008   BasicBlock *NewBB;\n2009   SmallVector<Value *, 4> ToRemove;\n2010   // Iterate over the output blocks created in the outlined section.\n2011   for (std::pair<Value *, BasicBlock *> &VtoBB : BlocksToPrune) {\n2012     RetValueForBB = VtoBB.first;\n2013     NewBB = VtoBB.second;\n2014   \n2015     // If there are no instructions, we remove it from the module, and also\n2016     // mark the value for removal from the return value to output block mapping.\n2017     if (NewBB->size() == 0) {\n2018       NewBB->eraseFromParent();\n2019       ToRemove.push_back(RetValueForBB);\n2020       continue;\n2021     }\n2022     \n2023     // Mark that we could not remove all the blocks since they were not all\n2024     // empty.\n2025     AllRemoved = false;\n2026   }\n2027 \n2028   // Remove the return value from the mapping.\n2029   for (Value *V : ToRemove)\n2030     BlocksToPrune.erase(V);\n2031 \n2032   // Mark the region as having the no output scheme.\n2033   if (AllRemoved)\n2034     Region.OutputBlockNum = -1;\n2035   \n2036   return AllRemoved;\n2037 }\n2038 \n2039 /// For the outlined section, move needed the StoreInsts for the output\n2040 /// registers into their own block. Then, determine if there is a duplicate\n2041 /// output block already created.\n2042 ///\n2043 /// \\param [in] OG - The OutlinableGroup of regions to be outlined.\n2044 /// \\param [in] Region - The OutlinableRegion that is being analyzed.\n2045 /// \\param [in,out] OutputBBs - the blocks that stores for this region will be\n2046 /// placed in.\n2047 /// \\param [in] EndBBs - the final blocks of the extracted function.\n2048 /// \\param [in] OutputMappings - OutputMappings the mapping of values that have\n2049 /// been replaced by a new output value.\n2050 /// \\param [in,out] OutputStoreBBs - The existing output blocks.\n2051 static void alignOutputBlockWithAggFunc(\n2052     OutlinableGroup &OG, OutlinableRegion &Region,\n2053     DenseMap<Value *, BasicBlock *> &OutputBBs,\n2054     DenseMap<Value *, BasicBlock *> &EndBBs,\n2055     const DenseMap<Value *, Value *> &OutputMappings,\n2056     std::vector<DenseMap<Value *, BasicBlock *>> &OutputStoreBBs) {\n2057   // If none of the output blocks have any instructions, this means that we do\n2058   // not have to determine if it matches any of the other output schemes, and we\n2059   // don't have to do anything else.\n2060   if (analyzeAndPruneOutputBlocks(OutputBBs, Region))\n2061     return;\n2062 \n2063   // Determine is there is a duplicate set of blocks.\n2064   std::optional<unsigned> MatchingBB =\n2065       findDuplicateOutputBlock(OutputBBs, OutputStoreBBs);\n2066 \n2067   // If there is, we remove the new output blocks.  If it does not,\n2068   // we add it to our list of sets of output blocks.\n2069   if (MatchingBB) {\n2070     LLVM_DEBUG(dbgs() << \"Set output block for region in function\"\n2071                       << Region.ExtractedFunction << \" to \" << *MatchingBB);\n2072 \n2073     Region.OutputBlockNum = *MatchingBB;\n2074     for (std::pair<Value *, BasicBlock *> &VtoBB : OutputBBs)\n2075       VtoBB.second->eraseFromParent();\n2076     return;\n2077   }\n2078 \n2079   Region.OutputBlockNum = OutputStoreBBs.size();\n2080 \n2081   Value *RetValueForBB;\n2082   BasicBlock *NewBB;\n2083   OutputStoreBBs.push_back(DenseMap<Value *, BasicBlock *>());\n2084   for (std::pair<Value *, BasicBlock *> &VtoBB : OutputBBs) {\n2085     RetValueForBB = VtoBB.first;\n2086     NewBB = VtoBB.second;\n2087     DenseMap<Value *, BasicBlock *>::iterator VBBIt =\n2088         EndBBs.find(RetValueForBB);\n2089     LLVM_DEBUG(dbgs() << \"Create output block for region in\"\n2090                       << Region.ExtractedFunction << \" to \"\n2091                       << *NewBB);\n2092     BranchInst::Create(VBBIt->second, NewBB);\n2093     OutputStoreBBs.back().insert(std::make_pair(RetValueForBB, NewBB));\n2094   }\n2095 }\n2096 \n2097 /// Takes in a mapping, \\p OldMap of ConstantValues to BasicBlocks, sorts keys,\n2098 /// before creating a basic block for each \\p NewMap, and inserting into the new\n2099 /// block. Each BasicBlock is named with the scheme \"<basename>_<key_idx>\".\n------------------------------------------------------"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_bPjKsfTBE9FcASRw0lj7",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'replaceConstants'\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_bPjKsfTBE9FcASRw0lj7",
+    "output": "llvm/lib/Transforms/IPO/IROutliner.cpp:1914:void replaceConstants(OutlinableRegion &Region) {\nllvm/lib/Transforms/IPO/IROutliner.cpp:2249:  replaceConstants(*CurrentOS);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_read250_IBxXiamIFNs2bQsiInLz",
+    "name": "read250",
+    "arguments": "{\"position\":2200,\"file\":\"llvm/lib/Transforms/IPO/IROutliner.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_read250_IBxXiamIFNs2bQsiInLz",
+    "output": "file: llvm/lib/Transforms/IPO/IROutliner.cpp:2200-2450\n------------------------------------------------------\n2200       BasicBlock *OutputBB = VBPair.second;\n2201       Instruction *Term = OutputBB->getTerminator();\n2202       Term->eraseFromParent();\n2203       Term = EndBB->getTerminator();\n2204       moveBBContents(*OutputBB, *EndBB);\n2205       Term->moveBefore(*EndBB, EndBB->end());\n2206       OutputBB->eraseFromParent();\n2207     }\n2208   }\n2209 }\n2210 \n2211 /// Fill the new function that will serve as the replacement function for all of\n2212 /// the extracted regions of a certain structure from the first region in the\n2213 /// list of regions.  Replace this first region's extracted function with the\n2214 /// new overall function.\n2215 ///\n2216 /// \\param [in] M - The module we are outlining from.\n2217 /// \\param [in] CurrentGroup - The group of regions to be outlined.\n2218 /// \\param [in,out] OutputStoreBBs - The output blocks for each different\n2219 /// set of stores needed for the different functions.\n2220 /// \\param [in,out] FuncsToRemove - Extracted functions to erase from module\n2221 /// once outlining is complete.\n2222 /// \\param [in] OutputMappings - Extracted functions to erase from module\n2223 /// once outlining is complete.\n2224 static void fillOverallFunction(\n2225     Module &M, OutlinableGroup &CurrentGroup,\n2226     std::vector<DenseMap<Value *, BasicBlock *>> &OutputStoreBBs,\n2227     std::vector<Function *> &FuncsToRemove,\n2228     const DenseMap<Value *, Value *> &OutputMappings) {\n2229   OutlinableRegion *CurrentOS = CurrentGroup.Regions[0];\n2230 \n2231   // Move first extracted function's instructions into new function.\n2232   LLVM_DEBUG(dbgs() << \"Move instructions from \"\n2233                     << *CurrentOS->ExtractedFunction << \" to instruction \"\n2234                     << *CurrentGroup.OutlinedFunction << \"\\n\");\n2235   moveFunctionData(*CurrentOS->ExtractedFunction,\n2236                    *CurrentGroup.OutlinedFunction, CurrentGroup.EndBBs);\n2237 \n2238   // Transfer the attributes from the function to the new function.\n2239   for (Attribute A : CurrentOS->ExtractedFunction->getAttributes().getFnAttrs())\n2240     CurrentGroup.OutlinedFunction->addFnAttr(A);\n2241 \n2242   // Create a new set of output blocks for the first extracted function.\n2243   DenseMap<Value *, BasicBlock *> NewBBs;\n2244   createAndInsertBasicBlocks(CurrentGroup.EndBBs, NewBBs,\n2245                              CurrentGroup.OutlinedFunction, \"output_block_0\");\n2246   CurrentOS->OutputBlockNum = 0;\n2247 \n2248   replaceArgumentUses(*CurrentOS, NewBBs, OutputMappings, true);\n2249   replaceConstants(*CurrentOS);\n2250 \n2251   // We first identify if any output blocks are empty, if they are we remove\n2252   // them. We then create a branch instruction to the basic block to the return\n2253   // block for the function for each non empty output block.\n2254   if (!analyzeAndPruneOutputBlocks(NewBBs, *CurrentOS)) {\n2255     OutputStoreBBs.push_back(DenseMap<Value *, BasicBlock *>());\n2256     for (std::pair<Value *, BasicBlock *> &VToBB : NewBBs) {\n2257       DenseMap<Value *, BasicBlock *>::iterator VBBIt =\n2258           CurrentGroup.EndBBs.find(VToBB.first);\n2259       BasicBlock *EndBB = VBBIt->second;\n2260       BranchInst::Create(EndBB, VToBB.second);\n2261       OutputStoreBBs.back().insert(VToBB);\n2262     }\n2263   }\n2264 \n2265   // Replace the call to the extracted function with the outlined function.\n2266   CurrentOS->Call = replaceCalledFunction(M, *CurrentOS);\n2267 \n2268   // We only delete the extracted functions at the end since we may need to\n2269   // reference instructions contained in them for mapping purposes.\n2270   FuncsToRemove.push_back(CurrentOS->ExtractedFunction);\n2271 }\n2272 \n2273 void IROutliner::deduplicateExtractedSections(\n2274     Module &M, OutlinableGroup &CurrentGroup,\n2275     std::vector<Function *> &FuncsToRemove, unsigned &OutlinedFunctionNum) {\n2276   createFunction(M, CurrentGroup, OutlinedFunctionNum);\n2277 \n2278   std::vector<DenseMap<Value *, BasicBlock *>> OutputStoreBBs;\n2279 \n2280   OutlinableRegion *CurrentOS;\n2281 \n2282   fillOverallFunction(M, CurrentGroup, OutputStoreBBs, FuncsToRemove,\n2283                       OutputMappings);\n2284 \n2285   for (unsigned Idx = 1; Idx < CurrentGroup.Regions.size(); Idx++) {\n2286     CurrentOS = CurrentGroup.Regions[Idx];\n2287     AttributeFuncs::mergeAttributesForOutlining(*CurrentGroup.OutlinedFunction,\n2288                                                *CurrentOS->ExtractedFunction);\n2289 \n2290     // Create a set of BasicBlocks, one for each return block, to hold the\n2291     // needed store instructions.\n2292     DenseMap<Value *, BasicBlock *> NewBBs;\n2293     createAndInsertBasicBlocks(CurrentGroup.EndBBs, NewBBs,\n2294                                CurrentGroup.OutlinedFunction,\n2295                                \"output_block_\" + Twine(Idx));\n2296     replaceArgumentUses(*CurrentOS, NewBBs, OutputMappings);\n2297     alignOutputBlockWithAggFunc(CurrentGroup, *CurrentOS, NewBBs,\n2298                                 CurrentGroup.EndBBs, OutputMappings,\n2299                                 OutputStoreBBs);\n2300 \n2301     CurrentOS->Call = replaceCalledFunction(M, *CurrentOS);\n2302     FuncsToRemove.push_back(CurrentOS->ExtractedFunction);\n2303   }\n2304 \n2305   // Create a switch statement to handle the different output schemes.\n2306   createSwitchStatement(M, CurrentGroup, CurrentGroup.EndBBs, OutputStoreBBs);\n2307 \n2308   OutlinedFunctionNum++;\n2309 }\n2310 \n2311 /// Checks that the next instruction in the InstructionDataList matches the\n2312 /// next instruction in the module.  If they do not, there could be the\n2313 /// possibility that extra code has been inserted, and we must ignore it.\n2314 ///\n2315 /// \\param ID - The IRInstructionData to check the next instruction of.\n2316 /// \\returns true if the InstructionDataList and actual instruction match.\n2317 static bool nextIRInstructionDataMatchesNextInst(IRInstructionData &ID) {\n2318   // We check if there is a discrepancy between the InstructionDataList\n2319   // and the actual next instruction in the module.  If there is, it means\n2320   // that an extra instruction was added, likely by the CodeExtractor.\n2321 \n2322   // Since we do not have any similarity data about this particular\n2323   // instruction, we cannot confidently outline it, and must discard this\n2324   // candidate.\n2325   IRInstructionDataList::iterator NextIDIt = std::next(ID.getIterator());\n2326   Instruction *NextIDLInst = NextIDIt->Inst;\n2327   Instruction *NextModuleInst = nullptr;\n2328   if (!ID.Inst->isTerminator())\n2329     NextModuleInst = ID.Inst->getNextNode();\n2330   else if (NextIDLInst != nullptr)\n2331     NextModuleInst =\n2332         &*NextIDIt->Inst->getParent()->instructionsWithoutDebug().begin();\n2333 \n2334   if (NextIDLInst && NextIDLInst != NextModuleInst)\n2335     return false;\n2336 \n2337   return true;\n2338 }\n2339 \n2340 bool IROutliner::isCompatibleWithAlreadyOutlinedCode(\n2341     const OutlinableRegion &Region) {\n2342   IRSimilarityCandidate *IRSC = Region.Candidate;\n2343   unsigned StartIdx = IRSC->getStartIdx();\n2344   unsigned EndIdx = IRSC->getEndIdx();\n2345 \n2346   // A check to make sure that we are not about to attempt to outline something\n2347   // that has already been outlined.\n2348   for (unsigned Idx = StartIdx; Idx <= EndIdx; Idx++)\n2349     if (Outlined.contains(Idx))\n2350       return false;\n2351 \n2352   // We check if the recorded instruction matches the actual next instruction,\n2353   // if it does not, we fix it in the InstructionDataList.\n2354   if (!Region.Candidate->backInstruction()->isTerminator()) {\n2355     Instruction *NewEndInst =\n2356         Region.Candidate->backInstruction()->getNextNode();\n2357     assert(NewEndInst && \"Next instruction is a nullptr?\");\n2358     if (Region.Candidate->end()->Inst != NewEndInst) {\n2359       IRInstructionDataList *IDL = Region.Candidate->front()->IDL;\n2360       IRInstructionData *NewEndIRID = new (InstDataAllocator.Allocate())\n2361           IRInstructionData(*NewEndInst,\n2362                             InstructionClassifier.visit(*NewEndInst), *IDL);\n2363 \n2364       // Insert the first IRInstructionData of the new region after the\n2365       // last IRInstructionData of the IRSimilarityCandidate.\n2366       IDL->insert(Region.Candidate->end(), *NewEndIRID);\n2367     }\n2368   }\n2369 \n2370   return none_of(*IRSC, [this](IRInstructionData &ID) {\n2371     if (!nextIRInstructionDataMatchesNextInst(ID))\n2372       return true;\n2373 \n2374     return !this->InstructionClassifier.visit(ID.Inst);\n2375   });\n2376 }\n2377 \n2378 void IROutliner::pruneIncompatibleRegions(\n2379     std::vector<IRSimilarityCandidate> &CandidateVec,\n2380     OutlinableGroup &CurrentGroup) {\n2381   bool PreviouslyOutlined;\n2382 \n2383   // Sort from beginning to end, so the IRSimilarityCandidates are in order.\n2384   stable_sort(CandidateVec, [](const IRSimilarityCandidate &LHS,\n2385                                const IRSimilarityCandidate &RHS) {\n2386     return LHS.getStartIdx() < RHS.getStartIdx();\n2387   });\n2388 \n2389   IRSimilarityCandidate &FirstCandidate = CandidateVec[0];\n2390   // Since outlining a call and a branch instruction will be the same as only\n2391   // outlinining a call instruction, we ignore it as a space saving.\n2392   if (FirstCandidate.getLength() == 2) {\n2393     if (isa<CallInst>(FirstCandidate.front()->Inst) &&\n2394         isa<BranchInst>(FirstCandidate.back()->Inst))\n2395       return;\n2396   }\n2397 \n2398   unsigned CurrentEndIdx = 0;\n2399   for (IRSimilarityCandidate &IRSC : CandidateVec) {\n2400     PreviouslyOutlined = false;\n2401     unsigned StartIdx = IRSC.getStartIdx();\n2402     unsigned EndIdx = IRSC.getEndIdx();\n2403     const Function &FnForCurrCand = *IRSC.getFunction();\n2404 \n2405     for (unsigned Idx = StartIdx; Idx <= EndIdx; Idx++)\n2406       if (Outlined.contains(Idx)) {\n2407         PreviouslyOutlined = true;\n2408         break;\n2409       }\n2410 \n2411     if (PreviouslyOutlined)\n2412       continue;\n2413 \n2414     // Check over the instructions, and if the basic block has its address\n2415     // taken for use somewhere else, we do not outline that block.\n2416     bool BBHasAddressTaken = any_of(IRSC, [](IRInstructionData &ID){\n2417       return ID.Inst->getParent()->hasAddressTaken();\n2418     });\n2419 \n2420     if (BBHasAddressTaken)\n2421       continue;\n2422 \n2423     if (FnForCurrCand.hasOptNone())\n2424       continue;\n2425 \n2426     if (FnForCurrCand.hasFnAttribute(\"nooutline\")) {\n2427       LLVM_DEBUG({\n2428         dbgs() << \"... Skipping function with nooutline attribute: \"\n2429                << FnForCurrCand.getName() << \"\\n\";\n2430       });\n2431       continue;\n2432     }\n2433 \n2434     if (IRSC.front()->Inst->getFunction()->hasLinkOnceODRLinkage() &&\n2435         !OutlineFromLinkODRs)\n2436       continue;\n2437 \n2438     // Greedily prune out any regions that will overlap with already chosen\n2439     // regions.\n2440     if (CurrentEndIdx != 0 && StartIdx <= CurrentEndIdx)\n2441       continue;\n2442 \n2443     bool BadInst = any_of(IRSC, [this](IRInstructionData &ID) {\n2444       if (!nextIRInstructionDataMatchesNextInst(ID))\n2445         return true;\n2446 \n2447       return !this->InstructionClassifier.visit(ID.Inst);\n2448     });\n2449 \n------------------------------------------------------"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_2RLF676nhkulc50bi9Zo",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'replaceConstants'\",\"k\":2}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_2RLF676nhkulc50bi9Zo",
+    "output": "llvm/lib/Transforms/IPO/IROutliner.cpp:2249:  replaceConstants(*CurrentOS);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_RTZQjsfPDznGWPgcL2Q3",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'getelementptr' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_RTZQjsfPDznGWPgcL2Q3",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_HZipGVaHjxTAHe9quPJD",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'ConstantExpr' llvm/lib/Transforms/IPO/IROutliner.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_HZipGVaHjxTAHe9quPJD",
+    "output": "1931:        // avoid replacing constants that appear in `ConstantExpr`s"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_IDpUGTsq7p5YcPJDMPKS",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'ConstantExpr' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_IDpUGTsq7p5YcPJDMPKS",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_LPKZVIXREKpkIks62HWC",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'Constant' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_LPKZVIXREKpkIks62HWC",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_Nvke9xztJZlXVqnN0Nzf",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'SwitchInst' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_Nvke9xztJZlXVqnN0Nzf",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_Ay2QteOsLBXOoJW9e0lX",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'Constant' llvm/lib/Transforms/IPO/IROutliner.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_Ay2QteOsLBXOoJW9e0lX",
+    "output": "1110:      if (!isa<Constant>(V) &&\n142:  void findSameConstants(DenseSet<unsigned> &NotSame);\n1446:      NewCallArgs.push_back(ConstantInt::get(Type::getInt32Ty(M.getContext()),\n1464:    if (auto It = Region.AggArgToConstant.find(AggArgIdx);\n1465:        It != Region.AggArgToConstant.end()) {\n1466:      Constant *CST = It->second;\n1477:    NewCallArgs.push_back(ConstantPointerNull::get(\n1594:  if (auto It = Region.AggArgToConstant.find(ArgNum);\n1595:      It != Region.AggArgToConstant.end())\n165:static void getSortedConstantKeys(std::vector<Value *> &SortedKeys,\n179:    const ConstantInt *LHSC = cast<ConstantInt>(LHS);\n180:    const ConstantInt *RHSC = cast<ConstantInt>(RHS);\n1914:void replaceConstants(OutlinableRegion &Region) {\n1919:  for (std::pair<unsigned, Constant *> &Const : Region.AggArgToConstant) {\n1922:    Constant *CST = Const.second;\n1931:        // avoid replacing constants that appear in `ConstantExpr`s\n1933:          if (auto *CCandidate = dyn_cast<Constant>(U)) {\n2097:/// Takes in a mapping, \\p OldMap of ConstantValues to BasicBlocks, sorts keys,\n2112:  getSortedConstantKeys(SortedKeys, OldMap);\n2174:            ConstantInt::get(Type::getInt32Ty(M.getContext()), Idx), BB);\n2249:  replaceConstants(*CurrentOS);\n2808:    CurrentGroup.findSameConstants(NotSame);453:/// Find whether \\p V matches the Constants previously found for the \\p GVN.\n457:/// \\param GVNToConstant - The mapping of global value number to Constants.\n458:/// \\returns true if the Value matches the Constant mapped to by V and false if\n459:/// it \\p V is a Constant but does not match.\n460:/// \\returns std::nullopt if \\p V is not a Constant.\n463:                DenseMap<unsigned, Constant *> &GVNToConstant) {\n465:  Constant *CST = dyn_cast<Constant>(V);\n469:  // Holds a mapping from a global value number to a Constant.\n470:  DenseMap<unsigned, Constant *>::iterator GVNToConstantIt;\n474:  // If we have a constant, try to make a new entry in the GVNToConstant.\n475:  std::tie(GVNToConstantIt, Inserted) =\n476:      GVNToConstant.insert(std::make_pair(GVN, CST));\n479:  if (Inserted || (GVNToConstantIt->second == CST))\n538:/// Find whether \\p Region matches the global value numbering to Constant\n542:/// \\param GVNToConstant - The mapping of global value number to Constants.\n545:/// \\returns true if all Constants are the same in every use of a Constant in \\p\n548:collectRegionsConstants(OutlinableRegion &Region,\n549:                        DenseMap<unsigned, Constant *> &GVNToConstant,\n551:  bool ConstantsTheSame = true;\n566:        if (isa<Constant>(V))\n567:          ConstantsTheSame = false;\n572:      // associated Constant value match the previous instances of the same\n573:      // global value number.  If the global value does not map to a Constant,\n575:      std::optional<bool> ConstantMatches =\n576:          constantMatches(V, GVN, GVNToConstant);\n577:      if (ConstantMatches) {\n578:        if (*ConstantMatches)\n581:          ConstantsTheSame = false;\n587:      if (GVNToConstant.contains(GVN))\n588:        ConstantsTheSame = false;\n594:  return ConstantsTheSame;\n597:void OutlinableGroup::findSameConstants(DenseSet<unsigned> &NotSame) {\n598:  DenseMap<unsigned, Constant *> GVNToConstant;\n601:    collectRegionsConstants(*Region, GVNToConstant, NotSame);\n757:/// single Constant across all OutlinableRegions similar to \\p C.\n760:static void findConstants(IRSimilarityCandidate &C, DenseSet<unsigned> &NotSame,\n771:      if (isa<Constant>(V))\n893:  findConstants(C, NotSame, InputGVNs);\n963:    // number to Constant map for the region, and continue to the next input.\n964:    if (Constant *CST = dyn_cast<Constant>(Input)) {\n966:        Region.AggArgToConstant.insert(std::make_pair(AggArgIt->second, CST));\n970:        Region.AggArgToConstant.insert(std::make_pair(TypeIndex, CST));"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_read250_fKjlKMvf7xsP6Dh96AYt",
+    "name": "read250",
+    "arguments": "{\"file\":\"llvm/lib/Transforms/IPO/IROutliner.cpp\",\"position\":1914}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_read250_fKjlKMvf7xsP6Dh96AYt",
+    "output": "file: llvm/lib/Transforms/IPO/IROutliner.cpp:1914-2164\n------------------------------------------------------\n1914 void replaceConstants(OutlinableRegion &Region) {\n1915   OutlinableGroup &Group = *Region.Parent;\n1916   Function *OutlinedFunction = Group.OutlinedFunction;\n1917 \n1918   // Iterate over the constants that need to be elevated into arguments\n1919   for (std::pair<unsigned, Constant *> &Const : Region.AggArgToConstant) {\n1920     unsigned AggArgIdx = Const.first;\n1921     assert(OutlinedFunction && \"Overall Function is not defined?\");\n1922     Constant *CST = Const.second;\n1923     Argument *Arg = Group.OutlinedFunction->getArg(AggArgIdx);\n1924     LLVM_DEBUG(dbgs() << \"Replacing instruction uses of constant \" << *CST\n1925                       << \" in function \" << *OutlinedFunction << \" with \"\n1926                       << *Arg << '\\n');\n1927 \n1928     for (auto &BB : *OutlinedFunction) {\n1929       for (Instruction &I : BB) {\n1930         // We specifically iterate over the direct operands of instructions, to\n1931         // avoid replacing constants that appear in `ConstantExpr`s\n1932         for (auto &U : I.operands()) {\n1933           if (auto *CCandidate = dyn_cast<Constant>(U)) {\n1934             if (CCandidate == CST)\n1935               U = Arg;\n1936           }\n1937         }\n1938       }\n1939     }\n1940   }\n1941 }\n1942 \n1943 /// It is possible that there is a basic block that already performs the same\n1944 /// stores. This returns a duplicate block, if it exists\n1945 ///\n1946 /// \\param OutputBBs [in] the blocks we are looking for a duplicate of.\n1947 /// \\param OutputStoreBBs [in] The existing output blocks.\n1948 /// \\returns an optional value with the number output block if there is a match.\n1949 std::optional<unsigned> findDuplicateOutputBlock(\n1950     DenseMap<Value *, BasicBlock *> &OutputBBs,\n1951     std::vector<DenseMap<Value *, BasicBlock *>> &OutputStoreBBs) {\n1952 \n1953   bool Mismatch = false;\n1954   unsigned MatchingNum = 0;\n1955   // We compare the new set output blocks to the other sets of output blocks.\n1956   // If they are the same number, and have identical instructions, they are\n1957   // considered to be the same.\n1958   for (DenseMap<Value *, BasicBlock *> &CompBBs : OutputStoreBBs) {\n1959     Mismatch = false;\n1960     for (std::pair<Value *, BasicBlock *> &VToB : CompBBs) {\n1961       DenseMap<Value *, BasicBlock *>::iterator OutputBBIt =\n1962           OutputBBs.find(VToB.first);\n1963       if (OutputBBIt == OutputBBs.end()) {\n1964         Mismatch = true;\n1965         break;\n1966       }\n1967 \n1968       BasicBlock *CompBB = VToB.second;\n1969       BasicBlock *OutputBB = OutputBBIt->second;\n1970       if (CompBB->size() - 1 != OutputBB->size()) {\n1971         Mismatch = true;\n1972         break;\n1973       }\n1974 \n1975       BasicBlock::iterator NIt = OutputBB->begin();\n1976       for (Instruction &I : *CompBB) {\n1977         if (isa<BranchInst>(&I))\n1978           continue;\n1979 \n1980         if (!I.isIdenticalTo(&(*NIt))) {\n1981           Mismatch = true;\n1982           break;\n1983         }\n1984 \n1985         NIt++;\n1986       }\n1987     }\n1988 \n1989     if (!Mismatch)\n1990       return MatchingNum;\n1991 \n1992     MatchingNum++;\n1993   }\n1994 \n1995   return std::nullopt;\n1996 }\n1997 \n1998 /// Remove empty output blocks from the outlined region.\n1999 ///\n2000 /// \\param BlocksToPrune - Mapping of return values output blocks for the \\p\n2001 /// Region.\n2002 /// \\param Region - The OutlinableRegion we are analyzing.\n2003 static bool\n2004 analyzeAndPruneOutputBlocks(DenseMap<Value *, BasicBlock *> &BlocksToPrune,\n2005                             OutlinableRegion &Region) {\n2006   bool AllRemoved = true;\n2007   Value *RetValueForBB;\n2008   BasicBlock *NewBB;\n2009   SmallVector<Value *, 4> ToRemove;\n2010   // Iterate over the output blocks created in the outlined section.\n2011   for (std::pair<Value *, BasicBlock *> &VtoBB : BlocksToPrune) {\n2012     RetValueForBB = VtoBB.first;\n2013     NewBB = VtoBB.second;\n2014   \n2015     // If there are no instructions, we remove it from the module, and also\n2016     // mark the value for removal from the return value to output block mapping.\n2017     if (NewBB->size() == 0) {\n2018       NewBB->eraseFromParent();\n2019       ToRemove.push_back(RetValueForBB);\n2020       continue;\n2021     }\n2022     \n2023     // Mark that we could not remove all the blocks since they were not all\n2024     // empty.\n2025     AllRemoved = false;\n2026   }\n2027 \n2028   // Remove the return value from the mapping.\n2029   for (Value *V : ToRemove)\n2030     BlocksToPrune.erase(V);\n2031 \n2032   // Mark the region as having the no output scheme.\n2033   if (AllRemoved)\n2034     Region.OutputBlockNum = -1;\n2035   \n2036   return AllRemoved;\n2037 }\n2038 \n2039 /// For the outlined section, move needed the StoreInsts for the output\n2040 /// registers into their own block. Then, determine if there is a duplicate\n2041 /// output block already created.\n2042 ///\n2043 /// \\param [in] OG - The OutlinableGroup of regions to be outlined.\n2044 /// \\param [in] Region - The OutlinableRegion that is being analyzed.\n2045 /// \\param [in,out] OutputBBs - the blocks that stores for this region will be\n2046 /// placed in.\n2047 /// \\param [in] EndBBs - the final blocks of the extracted function.\n2048 /// \\param [in] OutputMappings - OutputMappings the mapping of values that have\n2049 /// been replaced by a new output value.\n2050 /// \\param [in,out] OutputStoreBBs - The existing output blocks.\n2051 static void alignOutputBlockWithAggFunc(\n2052     OutlinableGroup &OG, OutlinableRegion &Region,\n2053     DenseMap<Value *, BasicBlock *> &OutputBBs,\n2054     DenseMap<Value *, BasicBlock *> &EndBBs,\n2055     const DenseMap<Value *, Value *> &OutputMappings,\n2056     std::vector<DenseMap<Value *, BasicBlock *>> &OutputStoreBBs) {\n2057   // If none of the output blocks have any instructions, this means that we do\n2058   // not have to determine if it matches any of the other output schemes, and we\n2059   // don't have to do anything else.\n2060   if (analyzeAndPruneOutputBlocks(OutputBBs, Region))\n2061     return;\n2062 \n2063   // Determine is there is a duplicate set of blocks.\n2064   std::optional<unsigned> MatchingBB =\n2065       findDuplicateOutputBlock(OutputBBs, OutputStoreBBs);\n2066 \n2067   // If there is, we remove the new output blocks.  If it does not,\n2068   // we add it to our list of sets of output blocks.\n2069   if (MatchingBB) {\n2070     LLVM_DEBUG(dbgs() << \"Set output block for region in function\"\n2071                       << Region.ExtractedFunction << \" to \" << *MatchingBB);\n2072 \n2073     Region.OutputBlockNum = *MatchingBB;\n2074     for (std::pair<Value *, BasicBlock *> &VtoBB : OutputBBs)\n2075       VtoBB.second->eraseFromParent();\n2076     return;\n2077   }\n2078 \n2079   Region.OutputBlockNum = OutputStoreBBs.size();\n2080 \n2081   Value *RetValueForBB;\n2082   BasicBlock *NewBB;\n2083   OutputStoreBBs.push_back(DenseMap<Value *, BasicBlock *>());\n2084   for (std::pair<Value *, BasicBlock *> &VtoBB : OutputBBs) {\n2085     RetValueForBB = VtoBB.first;\n2086     NewBB = VtoBB.second;\n2087     DenseMap<Value *, BasicBlock *>::iterator VBBIt =\n2088         EndBBs.find(RetValueForBB);\n2089     LLVM_DEBUG(dbgs() << \"Create output block for region in\"\n2090                       << Region.ExtractedFunction << \" to \"\n2091                       << *NewBB);\n2092     BranchInst::Create(VBBIt->second, NewBB);\n2093     OutputStoreBBs.back().insert(std::make_pair(RetValueForBB, NewBB));\n2094   }\n2095 }\n2096 \n2097 /// Takes in a mapping, \\p OldMap of ConstantValues to BasicBlocks, sorts keys,\n2098 /// before creating a basic block for each \\p NewMap, and inserting into the new\n2099 /// block. Each BasicBlock is named with the scheme \"<basename>_<key_idx>\".\n2100 ///\n2101 /// \\param OldMap [in] - The mapping to base the new mapping off of.\n2102 /// \\param NewMap [out] - The output mapping using the keys of \\p OldMap.\n2103 /// \\param ParentFunc [in] - The function to put the new basic block in.\n2104 /// \\param BaseName [in] - The start of the BasicBlock names to be appended to\n2105 /// by an index value.\n2106 static void createAndInsertBasicBlocks(DenseMap<Value *, BasicBlock *> &OldMap,\n2107                                        DenseMap<Value *, BasicBlock *> &NewMap,\n2108                                        Function *ParentFunc, Twine BaseName) {\n2109   unsigned Idx = 0;\n2110   std::vector<Value *> SortedKeys;\n2111   \n2112   getSortedConstantKeys(SortedKeys, OldMap);\n2113 \n2114   for (Value *RetVal : SortedKeys) {\n2115     BasicBlock *NewBB = BasicBlock::Create(\n2116         ParentFunc->getContext(), Twine(BaseName) + Twine(\"_\") + Twine(Idx++),\n2117         ParentFunc);\n2118     NewMap.insert(std::make_pair(RetVal, NewBB));\n2119   }\n2120 }\n2121 \n2122 /// Create the switch statement for outlined function to differentiate between\n2123 /// all the output blocks.\n2124 ///\n2125 /// For the outlined section, determine if an outlined block already exists that\n2126 /// matches the needed stores for the extracted section.\n2127 /// \\param [in] M - The module we are outlining from.\n2128 /// \\param [in] OG - The group of regions to be outlined.\n2129 /// \\param [in] EndBBs - The final blocks of the extracted function.\n2130 /// \\param [in,out] OutputStoreBBs - The existing output blocks.\n2131 void createSwitchStatement(\n2132     Module &M, OutlinableGroup &OG, DenseMap<Value *, BasicBlock *> &EndBBs,\n2133     std::vector<DenseMap<Value *, BasicBlock *>> &OutputStoreBBs) {\n2134   // We only need the switch statement if there is more than one store\n2135   // combination, or there is more than one set of output blocks.  The first\n2136   // will occur when we store different sets of values for two different\n2137   // regions.  The second will occur when we have two outputs that are combined\n2138   // in a PHINode outside of the region in one outlined instance, and are used\n2139   // seaparately in another. This will create the same set of OutputGVNs, but\n2140   // will generate two different output schemes.\n2141   if (OG.OutputGVNCombinations.size() > 1) {\n2142     Function *AggFunc = OG.OutlinedFunction;\n2143     // Create a final block for each different return block.\n2144     DenseMap<Value *, BasicBlock *> ReturnBBs;\n2145     createAndInsertBasicBlocks(OG.EndBBs, ReturnBBs, AggFunc, \"final_block\");\n2146 \n2147     for (std::pair<Value *, BasicBlock *> &RetBlockPair : ReturnBBs) {\n2148       std::pair<Value *, BasicBlock *> &OutputBlock =\n2149           *OG.EndBBs.find(RetBlockPair.first);\n2150       BasicBlock *ReturnBlock = RetBlockPair.second;\n2151       BasicBlock *EndBB = OutputBlock.second;\n2152       Instruction *Term = EndBB->getTerminator();\n2153       // Move the return value to the final block instead of the original exit\n2154       // stub.\n2155       Term->moveBefore(*ReturnBlock, ReturnBlock->end());\n2156       // Put the switch statement in the old end basic block for the function\n2157       // with a fall through to the new return block.\n2158       LLVM_DEBUG(dbgs() << \"Create switch statement in \" << *AggFunc << \" for \"\n2159                         << OutputStoreBBs.size() << \"\\n\");\n2160       SwitchInst *SwitchI =\n2161           SwitchInst::Create(AggFunc->getArg(AggFunc->arg_size() - 1),\n2162                              ReturnBlock, OutputStoreBBs.size(), EndBB);\n2163 \n------------------------------------------------------"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_521xve9RgRxZO39SjlcO",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'replaceConstants' llvm/test/\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_521xve9RgRxZO39SjlcO",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_1hj3Yodlw9KTHJvfVEBp",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI -i 'switch' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_1hj3Yodlw9KTHJvfVEBp",
+    "output": "186:  switch (CI->getPredicate()) {\n298:    switch (InstClassifier.visit(*It)) {"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_2eaawlKEUKmkjaRayBHp",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'replaceConstants' llvm/lib/Transforms/IPO/IROutliner.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_2eaawlKEUKmkjaRayBHp",
+    "output": "1914:void replaceConstants(OutlinableRegion &Region) {\n2249:  replaceConstants(*CurrentOS);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_gdUQfhnqyPn4uihUMFYf",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'replaceConstants' llvm/lib/Transforms/IPO/IROutliner.cpp\",\"k\":2}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_gdUQfhnqyPn4uihUMFYf",
+    "output": "2249:  replaceConstants(*CurrentOS);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_Qms2wAFL75JAXFbBmWjn",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'dbg\\\\.value' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_Qms2wAFL75JAXFbBmWjn",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_weSkreFGwNNnk6DPs1Ch",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'SwitchInst' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_weSkreFGwNNnk6DPs1Ch",
+    "output": "Error: You have already executed the tool 'grep250' with these exact arguments. Please change your arguments or thoughts to try a different approach. Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_l8OXgaMfofRq3rAgkzHP",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'replaceConstants' llvm/test/Transforms/IROutliner/\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_l8OXgaMfofRq3rAgkzHP",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_VjS28gQdYNGo7eKQj2EQ",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'visitSwitchInst' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_VjS28gQdYNGo7eKQj2EQ",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_DUTXfSN94vSbv3jkLzVe",
+    "name": "grep250",
+    "arguments": "{\"k\":2,\"args\":\"-nRI 'SwitchInst' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_DUTXfSN94vSbv3jkLzVe",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_dAMfMTbfg5QBG5UPe4mL",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'SwitchInst' llvm/lib/Analysis/\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_dAMfMTbfg5QBG5UPe4mL",
+    "output": "llvm/lib/Analysis/BranchProbabilityInfo.cpp:378:  if (!(isa<BranchInst>(TI) || isa<SwitchInst>(TI) || isa<IndirectBrInst>(TI) ||llvm/lib/Analysis/CFG.cpp:366:  if (auto *SW = dyn_cast<SwitchInst>(Src.getTerminator()))\nllvm/lib/Analysis/FunctionPropertiesAnalysis.cpp:145:    } else if (isa<SwitchInst>(TI)) {\nllvm/lib/Analysis/FunctionPropertiesAnalysis.cpp:146:      SwitchInstructionCount += Direction;\nllvm/lib/Analysis/FunctionPropertiesAnalysis.cpp:64:  } else if (const auto *SI = dyn_cast<SwitchInst>(BB.getTerminator())) {\nllvm/lib/Analysis/InlineCost.cpp:1005:        } else if (SwitchInst *SI = dyn_cast<SwitchInst>(&I)) {\nllvm/lib/Analysis/InlineCost.cpp:2648:bool CallAnalyzer::visitSwitchInst(SwitchInst &SI) {\nllvm/lib/Analysis/InlineCost.cpp:3016:    } else if (SwitchInst *SI = dyn_cast<SwitchInst>(TI)) {\nllvm/lib/Analysis/InlineCost.cpp:519:  bool visitSwitchInst(SwitchInst &SI);\nllvm/lib/Analysis/LazyValueInfo.cpp:1707:  if (SwitchInst *SI = dyn_cast<SwitchInst>(BBFrom->getTerminator())) {\nllvm/lib/Analysis/ScalarEvolution.cpp:9053:  if (SwitchInst *SI = dyn_cast<SwitchInst>(Term)) {\nllvm/lib/Analysis/ScalarEvolution.cpp:9469:                                                      SwitchInst *Switch,\nllvm/lib/Analysis/TargetTransformInfo.cpp:268:    const SwitchInst &SI, unsigned &JTSize, ProfileSummaryInfo *PSI,\nllvm/lib/Analysis/ValueTracking.cpp:7802:      } else if (auto SI = dyn_cast_or_null<SwitchInst>(TI)) {\nllvm/lib/Analysis/ValueTracking.cpp:8133:      if (Handle(cast<SwitchInst>(I)->getCondition()))"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_kL04WJdbzooJLy3H3BlM",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'replaceConstants' llvm/lib/Transforms/IPO/IROutliner.cpp\",\"k\":3}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_kL04WJdbzooJLy3H3BlM",
+    "output": "Error: Index 3 is out of bounds for the results (total results: 2). It must be between 1 and 2."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_KkXAE2WUAY37zqe9gyCx",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'visitSwitchInst' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_KkXAE2WUAY37zqe9gyCx",
+    "output": "Error: You have already executed the tool 'grep250' with these exact arguments. Please change your arguments or thoughts to try a different approach. Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_Mqw4giMjQ395NPJZllAV",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'class SwitchInst' llvm/include/llvm/IR/\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_Mqw4giMjQ395NPJZllAV",
+    "output": "llvm/include/llvm/IR/Instructions.h:3196:class SwitchInst : public Instruction {\nllvm/include/llvm/IR/Instructions.h:3253:    friend class SwitchInst::CaseIteratorImpl<\nllvm/include/llvm/IR/Instructions.h:3304:    friend class SwitchInst::CaseIteratorImpl<CaseHandle>;\nllvm/include/llvm/IR/Instructions.h:3543:class SwitchInstProfUpdateWrapper {"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_7u2qnRwsWFShhBXbceXb",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'InstructionClassifier' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_7u2qnRwsWFShhBXbceXb",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_bSfR314AKG2WlRz5yXrU",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'InstructionClassifier' llvm/lib/Transforms/IPO/IROutliner.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_bSfR314AKG2WlRz5yXrU",
+    "output": "2362:                            InstructionClassifier.visit(*NewEndInst), *IDL);\n2374:    return !this->InstructionClassifier.visit(ID.Inst);\n2447:      return !this->InstructionClassifier.visit(ID.Inst);\n2736:      *BeginRewritten, InstructionClassifier.visit(*BeginRewritten), *IDL);\n2738:      *EndRewritten, InstructionClassifier.visit(*EndRewritten), *IDL);\n2766:  InstructionClassifier.EnableBranches = !DisableBranches;\n2767:  InstructionClassifier.EnableIndirectCalls = !DisableIndirectCalls;\n2768:  InstructionClassifier.EnableIntrinsics = !DisableIntrinsics;"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_WWX6oT8FYB8MMWyiIl1Q",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'SwitchInst' llvm/lib/Transforms/IPO/IROutliner.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_WWX6oT8FYB8MMWyiIl1Q",
+    "output": "2160:      SwitchInst *SwitchI =\n2161:          SwitchInst::Create(AggFunc->getArg(AggFunc->arg_size() - 1),"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_w484jcKNmZ2IZMED31uI",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'SwitchInst' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\",\"k\":3}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_w484jcKNmZ2IZMED31uI",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_U6FmV77Y4JhsuB310Nvo",
+    "name": "grep250",
+    "arguments": "{\"k\":2,\"args\":\"-nRI 'ConstantExpr' llvm/lib/Transforms/IPO/IROutliner.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_U6FmV77Y4JhsuB310Nvo",
+    "output": "Error: Index 2 is out of bounds for the results (total results: 1). It must be between 1 and 1."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_3ZZuJLqPkIAQkXJmm2V6",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'ConstantExpr' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\",\"k\":2}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_3ZZuJLqPkIAQkXJmm2V6",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_zxQSAJCGAYU88oCUBrR0",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'replaceConstants' llvm/lib/Transforms/IPO/IROutliner.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_zxQSAJCGAYU88oCUBrR0",
+    "output": "Error: You have already executed the tool 'grep250' with these exact arguments. Please change your arguments or thoughts to try a different approach. Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_vYN7g3I67U3NWjtktgF2",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'replaceConstants' llvm/lib/Transforms/IPO/IROutliner.cpp\",\"k\":2}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_vYN7g3I67U3NWjtktgF2",
+    "output": "Error: You have already executed the tool 'grep250' with these exact arguments. Please change your arguments or thoughts to try a different approach. Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_BAwRq2Bt18Dw3waWYQnR",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'replaceConstants' llvm/lib/Transforms/IPO/IROutliner.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_BAwRq2Bt18Dw3waWYQnR",
+    "output": "Error: You have already executed the tool 'grep250' with these exact arguments. Please change your arguments or thoughts to try a different approach. Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_e2BTQDzjXxMfdeuC6m2L",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'replaceConstants' llvm/lib/Transforms/IPO/IROutliner.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_e2BTQDzjXxMfdeuC6m2L",
+    "output": "Error: You have already executed the tool 'grep250' with these exact arguments. Please change your arguments or thoughts to try a different approach. Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_p0jBklnBBFvMd2A8wqwP",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'SwitchInst' llvm/lib/Analysis/IRSimilarityIdentifier.cpp\"}"
+  }
+]
