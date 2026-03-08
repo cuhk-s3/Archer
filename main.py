@@ -758,8 +758,13 @@ def run_pr_agent(
   except Exception:
     pass
 
+  existing_tools = set(agent.tools.list(ignore_budget=True))
   for to, th in tools_phase2:
+    tool_name = to.name()
+    if tool_name in existing_tools:
+      continue
     agent.register_tool(to, th)
+    existing_tools.add(tool_name)
 
   return generate_test_for_pr(
     agent=agent,
@@ -1130,12 +1135,24 @@ def main():
     stats.cached_tokens = agent.chat_stats["cached_tokens"]
     stats.total_tokens = agent.chat_stats["total_tokens"]
     stats.chat_cost = agent.chat_stats["total_cost"]
-    usage = []
-    for name in agent.tools.list(ignore_budget=False):
-      total = agent.tools.get_total_budget(name)
-      remaining = agent.tools.get_remaining_budget(name)
-      usage.append({"name": name, "usage": total - remaining})
-    stats.tool_usage = usage
+    # Source of truth: full chat history (covers both phases and removed tools such as `stop`).
+    history_usage = {}
+    for message in agent.get_history():
+      if getattr(message, "type", None) != "function_call":
+        continue
+      tool_name = getattr(message, "name", None)
+      if not tool_name:
+        continue
+      history_usage[tool_name] = history_usage.get(tool_name, 0) + 1
+
+    # Keep currently registered tools in output even if their usage is zero.
+    all_tool_names = set(agent.tools.list(ignore_budget=True)) | set(
+      history_usage.keys()
+    )
+    stats.tool_usage = [
+      {"name": name, "usage": history_usage.get(name, 0)}
+      for name in sorted(all_tool_names)
+    ]
 
     if stats_path:
       with stats_path.open("w") as fout:
