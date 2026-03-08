@@ -84,12 +84,12 @@ pre-commit run --all-files
 Run the agent using `main.py` with the required arguments:
 
 ```bash
-python main.py --issue <ISSUE_ID> --model <MODEL_NAME> [options]
+python main.py --pr <PR_ID> --model <MODEL_NAME> [options]
 ```
 
 ### Arguments
 
-- `--issue`: (Required) The ID of the LLVM issue to review.
+- `--pr`: (Required) The ID of the LLVM Pull Request to review.
 - `--model`: (Required) The LLM model to use (e.g., `gpt-4`).
 - `--driver`: The LLM API driver to use. Choices: `openai` (default), `anthropic`, `openai-generic`.
 - `--stats`: Path to save generation statistics as a JSON file.
@@ -99,7 +99,7 @@ python main.py --issue <ISSUE_ID> --model <MODEL_NAME> [options]
 ### Example
 
 ```bash
-python main.py --issue 12345 --model gpt-4 --stats stats.json --debug
+python main.py --pr 12345 --model gpt-4 --stats stats.json --debug
 ```
 
 ## Structure
