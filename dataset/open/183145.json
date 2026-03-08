@@ -1,0 +1,118 @@
+{
+  "pr_id": 183145,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183145",
+  "state": "open",
+  "title": "[LICM] Relax overflow flag requirements for eq/ne in hoistAdd/hoistSub",
+  "author": "SavchenkoValeriy",
+  "base_commit": "334aa966ec55a6be62f0c924d8c695bbe36e6cd4",
+  "fix_commit": "94c0a8a6dc80ba25ccf3948181d5df0e0caea516",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/LICM.cpp b/llvm/lib/Transforms/Scalar/LICM.cpp\nindex 8ac1cb6a899ba..9e5cd6b9c294f 100644\n--- a/llvm/lib/Transforms/Scalar/LICM.cpp\n+++ b/llvm/lib/Transforms/Scalar/LICM.cpp\n@@ -2582,16 +2582,25 @@ static bool hoistAdd(ICmpInst::Predicate Pred, Value *VariantLHS,\n   assert(!L.isLoopInvariant(VariantLHS) && \"Precondition.\");\n   assert(L.isLoopInvariant(InvariantRHS) && \"Precondition.\");\n \n-  bool IsSigned = ICmpInst::isSigned(Pred);\n+  const bool IsSigned = ICmpInst::isSigned(Pred);\n+  const bool IsEquality = ICmpInst::isEquality(Pred);\n+\n+  // For signed/unsigned predicates we need nsw/nuw respectively.\n+  // For equality predicates everything works.\n+  const bool RequiresNSW = !IsEquality && IsSigned;\n+  const bool RequiresNUW = !IsEquality && !IsSigned;\n \n   // Try to represent VariantLHS as sum of invariant and variant operands.\n   using namespace PatternMatch;\n   Value *VariantOp, *InvariantOp;\n-  if (IsSigned && !match(VariantLHS, m_NSWAddLike(m_Value(VariantOp),\n-                                                  m_Value(InvariantOp))))\n+  if (IsEquality &&\n+      !match(VariantLHS, m_AddLike(m_Value(VariantOp), m_Value(InvariantOp))))\n+    return false;\n+  if (RequiresNSW && !match(VariantLHS, m_NSWAddLike(m_Value(VariantOp),\n+                                                     m_Value(InvariantOp))))\n     return false;\n-  if (!IsSigned && !match(VariantLHS, m_NUWAddLike(m_Value(VariantOp),\n-                                                   m_Value(InvariantOp))))\n+  if (RequiresNUW && !match(VariantLHS, m_NUWAddLike(m_Value(VariantOp),\n+                                                     m_Value(InvariantOp))))\n     return false;\n \n   // LHS itself is a loop-variant, try to represent it in the form:\n@@ -2607,19 +2616,22 @@ static bool hoistAdd(ICmpInst::Predicate Pred, Value *VariantLHS,\n   // we want to avoid this.\n   auto &DL = L.getHeader()->getDataLayout();\n   SimplifyQuery SQ(DL, DT, AC, &ICmp);\n-  if (IsSigned && computeOverflowForSignedSub(InvariantRHS, InvariantOp, SQ) !=\n-                      llvm::OverflowResult::NeverOverflows)\n+\n+  if (RequiresNSW &&\n+      computeOverflowForSignedSub(InvariantRHS, InvariantOp, SQ) !=\n+          llvm::OverflowResult::NeverOverflows)\n     return false;\n-  if (!IsSigned &&\n+  if (RequiresNUW &&\n       computeOverflowForUnsignedSub(InvariantRHS, InvariantOp, SQ) !=\n           llvm::OverflowResult::NeverOverflows)\n     return false;\n+\n   auto *Preheader = L.getLoopPreheader();\n   assert(Preheader && \"Loop is not in simplify form?\");\n   IRBuilder<> Builder(Preheader->getTerminator());\n   Value *NewCmpOp =\n       Builder.CreateSub(InvariantRHS, InvariantOp, \"invariant.op\",\n-                        /*HasNUW*/ !IsSigned, /*HasNSW*/ IsSigned);\n+                        /*HasNUW*/ RequiresNUW, /*HasNSW*/ RequiresNSW);\n   ICmp.setPredicate(Pred);\n   ICmp.setOperand(0, VariantOp);\n   ICmp.setOperand(1, NewCmpOp);\n@@ -2640,15 +2652,24 @@ static bool hoistSub(ICmpInst::Predicate Pred, Value *VariantLHS,\n   assert(!L.isLoopInvariant(VariantLHS) && \"Precondition.\");\n   assert(L.isLoopInvariant(InvariantRHS) && \"Precondition.\");\n \n-  bool IsSigned = ICmpInst::isSigned(Pred);\n+  const bool IsSigned = ICmpInst::isSigned(Pred);\n+  const bool IsEquality = ICmpInst::isEquality(Pred);\n+\n+  // For signed/unsigned predicates we need nsw/nuw respectively.\n+  // For equality predicates everything works.\n+  const bool RequiresNSW = !IsEquality && IsSigned;\n+  const bool RequiresNUW = !IsEquality && !IsSigned;\n \n   // Try to represent VariantLHS as sum of invariant and variant operands.\n   using namespace PatternMatch;\n   Value *VariantOp, *InvariantOp;\n-  if (IsSigned &&\n+  if (IsEquality &&\n+      !match(VariantLHS, m_Sub(m_Value(VariantOp), m_Value(InvariantOp))))\n+    return false;\n+  if (RequiresNSW &&\n       !match(VariantLHS, m_NSWSub(m_Value(VariantOp), m_Value(InvariantOp))))\n     return false;\n-  if (!IsSigned &&\n+  if (RequiresNUW &&\n       !match(VariantLHS, m_NUWSub(m_Value(VariantOp), m_Value(InvariantOp))))\n     return false;\n \n@@ -2671,22 +2692,22 @@ static bool hoistSub(ICmpInst::Predicate Pred, Value *VariantLHS,\n   // \"C1 - C2\" does not overflow.\n   auto &DL = L.getHeader()->getDataLayout();\n   SimplifyQuery SQ(DL, DT, AC, &ICmp);\n-  if (VariantSubtracted && IsSigned) {\n+  if (VariantSubtracted && RequiresNSW) {\n     // C1 - LV < C2 --> LV > C1 - C2\n     if (computeOverflowForSignedSub(InvariantOp, InvariantRHS, SQ) !=\n         llvm::OverflowResult::NeverOverflows)\n       return false;\n-  } else if (VariantSubtracted && !IsSigned) {\n+  } else if (VariantSubtracted && RequiresNUW) {\n     // C1 - LV < C2 --> LV > C1 - C2\n     if (computeOverflowForUnsignedSub(InvariantOp, InvariantRHS, SQ) !=\n         llvm::OverflowResult::NeverOverflows)\n       return false;\n-  } else if (!VariantSubtracted && IsSigned) {\n+  } else if (!VariantSubtracted && RequiresNSW) {\n     // LV - C1 < C2 --> LV < C1 + C2\n     if (computeOverflowForSignedAdd(InvariantOp, InvariantRHS, SQ) !=\n         llvm::OverflowResult::NeverOverflows)\n       return false;\n-  } else { // !VariantSubtracted && !IsSigned\n+  } else if (!VariantSubtracted && RequiresNUW) {\n     // LV - C1 < C2 --> LV < C1 + C2\n     if (computeOverflowForUnsignedAdd(InvariantOp, InvariantRHS, SQ) !=\n         llvm::OverflowResult::NeverOverflows)\n@@ -2698,9 +2719,11 @@ static bool hoistSub(ICmpInst::Predicate Pred, Value *VariantLHS,\n   Value *NewCmpOp =\n       VariantSubtracted\n           ? Builder.CreateSub(InvariantOp, InvariantRHS, \"invariant.op\",\n-                              /*HasNUW*/ !IsSigned, /*HasNSW*/ IsSigned)\n+                              /*HasNUW*/ RequiresNUW,\n+                              /*HasNSW*/ RequiresNSW)\n           : Builder.CreateAdd(InvariantOp, InvariantRHS, \"invariant.op\",\n-                              /*HasNUW*/ !IsSigned, /*HasNSW*/ IsSigned);\n+                              /*HasNUW*/ RequiresNUW,\n+                              /*HasNSW*/ RequiresNSW);\n   ICmp.setPredicate(Pred);\n   ICmp.setOperand(0, VariantOp);\n   ICmp.setOperand(1, NewCmpOp);\n",
+  "components": [
+    "LICM"
+  ],
+  "description": "Equality predicates don't need nsw/nuw because wrapping add/sub are bijections, so `(A op B) == C` iff `A == C op_inv B` unconditionally.\r\n\r\n## Alive2 proofs\r\n\r\n| Transform | `eq` | `ne` |\r\n|---|---|---|\r\n| `LV + C1` pred `C2` => `LV` pred `C2 - C1` | [proof](https://alive2.llvm.org/ce/z/vTNEUY) | [proof](https://alive2.llvm.org/ce/z/DVSKcq) |\r\n| `LV - C1` pred `C2` => `LV` pred `C1 + C2` | [proof](https://alive2.llvm.org/ce/z/Rc3sjm) | [proof](https://alive2.llvm.org/ce/z/Zf6kGN) |\r\n| `C1 - LV` pred `C2` => `LV` pred `C1 - C2` | [proof](https://alive2.llvm.org/ce/z/_tmGcV) | [proof](https://alive2.llvm.org/ce/z/Q3j-sv) |\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LICM/hoist-add-sub.ll",
+      "commands": [
+        "opt -S -passes=licm -verify-memoryssa < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sub_c_lv_eq",
+          "test_body": "define void @sub_c_lv_eq(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = sub i32 %x, %iv\n  %x_check = icmp eq i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "or_disjoint_signed",
+          "test_body": "define void @or_disjoint_signed(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4, !range !0\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = or disjoint i32 %iv, %x\n  %x_check = icmp slt i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n\n!0 = !{i32 0, i32 -2147483648}\n"
+        },
+        {
+          "test_name": "sub_no_flags_ult_neg",
+          "test_body": "define void @sub_no_flags_ult_neg(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = sub i32 %iv, %x\n  %x_check = icmp ult i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "add_no_flags_slt_neg",
+          "test_body": "define void @add_no_flags_slt_neg(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = add i32 %iv, %x\n  %x_check = icmp slt i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "sub_lv_c_ne",
+          "test_body": "define void @sub_lv_c_ne(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = sub i32 %iv, %x\n  %x_check = icmp ne i32 %arith, 100\n  br i1 %x_check, label %backedge, label %exit\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "or_disjoint_unsigned",
+          "test_body": "define void @or_disjoint_unsigned(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4, !range !0\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = or disjoint i32 %iv, %x\n  %x_check = icmp ult i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp ult i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n\n!0 = !{i32 0, i32 2}\n"
+        },
+        {
+          "test_name": "or_disjoint_eq",
+          "test_body": "define void @or_disjoint_eq(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = or disjoint i32 %iv, %x\n  %x_check = icmp eq i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "add_eq",
+          "test_body": "define void @add_eq(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = add i32 %iv, %x\n  %x_check = icmp eq i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "or_no_disjoint_neg",
+          "test_body": "define void @or_no_disjoint_neg(ptr %x_p) {\nentry:\n  %x = load i32, ptr %x_p, align 4, !range !0\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %arith = or i32 %iv, %x\n  %x_check = icmp slt i32 %arith, 100\n  br i1 %x_check, label %exit, label %backedge\n\nbackedge:                                         ; preds = %loop\n  %iv.next = add nuw nsw i32 %iv, 4\n  %loop_cond = icmp slt i32 %iv.next, 1000\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge, %loop\n  ret void\n}\n\n!0 = !{i32 0, i32 -2147483648}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-24T19:41:07Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/LICM.cpp": [
+      [
+        2582,
+        2597
+      ],
+      [
+        2607,
+        2625
+      ],
+      [
+        2640,
+        2654
+      ],
+      [
+        2671,
+        2692
+      ],
+      [
+        2698,
+        2706
+      ]
+    ],
+    "llvm/test/Transforms/LICM/hoist-add-sub.ll": [
+      [
+        1007,
+        1017
+      ],
+      [
+        1045,
+        1055
+      ],
+      [
+        1083,
+        1093
+      ],
+      [
+        1110,
+        1115
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/LICM.cpp": [
+      "hoistAdd",
+      "hoistSub"
+    ]
+  }
+}

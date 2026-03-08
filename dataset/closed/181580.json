@@ -1,0 +1,187 @@
+{
+  "pr_id": 181580,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181580",
+  "state": "closed",
+  "title": "[SLP]Convert compares from zexts, promoted to selects, to inversed op, if improves codegen",
+  "author": "alexey-bataev",
+  "base_commit": "26f944bb50b0f585ba1be805368a987ad5543a07",
+  "fix_commit": "8ab6f71a5ab575838c4688459ff38aea7ea76526",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex afc2ffb71e1c6..7ac5dea2b3d5f 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -3932,6 +3932,12 @@ class slpvectorizer::BoUpSLP {\n   bool matchesShlZExt(const TreeEntry &TE, OrdersType &Order, bool &IsBSwap,\n                       bool &ForLoads) const;\n \n+  /// Checks if the \\p SelectTE matches zext+selects, which can be inversed for\n+  /// better codegen in case like zext (icmp ne), select (icmp eq), ....\n+  bool matchesInversedZExtSelect(\n+      const TreeEntry &SelectTE,\n+      SmallVectorImpl<unsigned> &InversedCmpsIndices) const;\n+\n   class TreeEntry {\n   public:\n     using VecTreeTy = SmallVector<std::unique_ptr<TreeEntry>, 8>;\n@@ -13501,6 +13507,56 @@ bool BoUpSLP::matchesShlZExt(const TreeEntry &TE, OrdersType &Order,\n   return BitcastCost < VecCost;\n }\n \n+bool BoUpSLP::matchesInversedZExtSelect(\n+    const TreeEntry &SelectTE,\n+    SmallVectorImpl<unsigned> &InversedCmpsIndices) const {\n+  assert(SelectTE.hasState() && SelectTE.getOpcode() == Instruction::Select &&\n+         \"Expected select node.\");\n+  SmallVector<std::pair<Instruction *, unsigned>> ZExts;\n+  for (auto [Idx, V] : enumerate(SelectTE.Scalars)) {\n+    auto *Inst = dyn_cast<Instruction>(V);\n+    if (!Inst || Inst->getOpcode() != Instruction::ZExt)\n+      continue;\n+    ZExts.emplace_back(Inst, Idx);\n+  }\n+  if (ZExts.empty())\n+    return false;\n+  const auto *CmpTE = getOperandEntry(&SelectTE, 0);\n+  const auto *Op1TE = getOperandEntry(&SelectTE, 1);\n+  const auto *Op2TE = getOperandEntry(&SelectTE, 2);\n+  // Compares must be alternate vectorized, and other operands must be gathers\n+  // or copyables.\n+  if (CmpTE->State != TreeEntry::Vectorize || !CmpTE->isAltShuffle() ||\n+      (CmpTE->getOpcode() != Instruction::ICmp &&\n+       CmpTE->getOpcode() != Instruction::FCmp) ||\n+      !Op1TE->ReorderIndices.empty() || !Op1TE->ReuseShuffleIndices.empty() ||\n+      !Op2TE->ReorderIndices.empty() || !Op2TE->ReuseShuffleIndices.empty())\n+    return false;\n+  // The operands must be buildvectors/copyables.\n+  if (!Op1TE->isGather() || !Op2TE->isGather())\n+    return false;\n+  // TODO: investigate opportunity for the vector nodes with copyables.\n+  auto *Cmp = CmpTE->getMainOp();\n+  CmpPredicate Pred;\n+  auto MatchCmp = m_Cmp(Pred, m_Value(), m_Value());\n+  if (!match(Cmp, MatchCmp))\n+    return false;\n+  CmpPredicate MainPred = Pred;\n+  CmpPredicate InversedPred(CmpInst::getInversePredicate(Pred),\n+                            Pred.hasSameSign());\n+  for (const auto [Idx, V] : enumerate(CmpTE->Scalars)) {\n+    if (!match(V, MatchCmp))\n+      continue;\n+    if (CmpPredicate::getMatching(MainPred, Pred))\n+      continue;\n+    if (!CmpPredicate::getMatching(InversedPred, Pred))\n+      return false;\n+    InversedCmpsIndices.push_back(Idx);\n+  }\n+\n+  return !InversedCmpsIndices.empty();\n+}\n+\n void BoUpSLP::transformNodes() {\n   constexpr TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n   BaseGraphSize = VectorizableTree.size();\n@@ -13874,15 +13930,53 @@ void BoUpSLP::transformNodes() {\n       if (E.State != TreeEntry::Vectorize)\n         break;\n       auto [MinMaxID, SelectOnly] = canConvertToMinOrMaxIntrinsic(E.Scalars);\n-      if (MinMaxID == Intrinsic::not_intrinsic)\n+      if (MinMaxID != Intrinsic::not_intrinsic) {\n+        // This node is a minmax node.\n+        E.CombinedOp = TreeEntry::MinMax;\n+        TreeEntry *CondEntry = getOperandEntry(&E, 0);\n+        if (SelectOnly && CondEntry->UserTreeIndex &&\n+            CondEntry->State == TreeEntry::Vectorize) {\n+          // The condition node is part of the combined minmax node.\n+          CondEntry->State = TreeEntry::CombinedVectorize;\n+        }\n+        break;\n+      }\n+      // Check for zext + selects, which can be reorered.\n+      SmallVector<unsigned> InversedCmpsIndices;\n+      if (matchesInversedZExtSelect(E, InversedCmpsIndices)) {\n+        auto *CmpTE = getOperandEntry(&E, 0);\n+        auto *Op1TE = getOperandEntry(&E, 1);\n+        auto *Op2TE = getOperandEntry(&E, 2);\n+        // State now is uniform, not alternate opcode.\n+        CmpTE->setOperations(\n+            InstructionsState(CmpTE->getMainOp(), CmpTE->getMainOp()));\n+        // Update mapping between the swapped values and their internal matching\n+        // nodes.\n+        auto UpdateGatherEntry = [&](TreeEntry *OldTE, TreeEntry *NewTE,\n+                                     Value *V) {\n+          if (isConstant(V))\n+            return;\n+          auto It = ValueToGatherNodes.find(V);\n+          assert(It != ValueToGatherNodes.end() &&\n+                 \"Expected to find the value in the map.\");\n+          auto &C = It->getSecond();\n+          if (!is_contained(OldTE->Scalars, V))\n+            C.remove(OldTE);\n+          C.insert(NewTE);\n+        };\n+        ValueList &Op1 = E.getOperand(1);\n+        ValueList &Op2 = E.getOperand(2);\n+        for (const unsigned Idx : InversedCmpsIndices) {\n+          Value *V1 = Op1TE->Scalars[Idx];\n+          Value *V2 = Op2TE->Scalars[Idx];\n+          std::swap(Op1TE->Scalars[Idx], Op2TE->Scalars[Idx]);\n+          std::swap(Op1[Idx], Op2[Idx]);\n+          UpdateGatherEntry(Op1TE, Op2TE, V1);\n+          UpdateGatherEntry(Op2TE, Op1TE, V2);\n+        }\n+        OperandsToTreeEntry.emplace_or_assign(std::make_pair(&E, 1), Op1TE);\n+        OperandsToTreeEntry.emplace_or_assign(std::make_pair(&E, 2), Op2TE);\n         break;\n-      // This node is a minmax node.\n-      E.CombinedOp = TreeEntry::MinMax;\n-      TreeEntry *CondEntry = getOperandEntry(&E, 0);\n-      if (SelectOnly && CondEntry->UserTreeIndex &&\n-          CondEntry->State == TreeEntry::Vectorize) {\n-        // The condition node is part of the combined minmax node.\n-        CondEntry->State = TreeEntry::CombinedVectorize;\n       }\n       break;\n     }\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Some of the zext i1 (cmp) + select sequences can be transformed by\ninverting compare predicates to remove extra shuffles, like\nzext 1 (cmp ne) + select (cmp eq), 0, 2 can be modeled as select <2\nx > (cmp ne), <1, 2>, zeroinitializer\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/bool-mask.ll",
+      "commands": [
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64    -S",
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64-v2 -S",
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64-v3 -S",
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64-v4 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "bitmask_8xi64",
+          "test_body": "define i64 @bitmask_8xi64(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i64, ptr %src, align 8\n  %tobool.not = icmp ne i64 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i64, ptr %src, i64 1\n  %1 = load i64, ptr %arrayidx.1, align 8\n  %tobool.not.1 = icmp eq i64 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i64, ptr %src, i64 2\n  %2 = load i64, ptr %arrayidx.2, align 8\n  %tobool.not.2 = icmp eq i64 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i64, ptr %src, i64 3\n  %3 = load i64, ptr %arrayidx.3, align 8\n  %tobool.not.3 = icmp eq i64 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i64, ptr %src, i64 4\n  %4 = load i64, ptr %arrayidx.4, align 8\n  %tobool.not.4 = icmp eq i64 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i64, ptr %src, i64 5\n  %5 = load i64, ptr %arrayidx.5, align 8\n  %tobool.not.5 = icmp eq i64 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i64, ptr %src, i64 6\n  %6 = load i64, ptr %arrayidx.6, align 8\n  %tobool.not.6 = icmp eq i64 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i64, ptr %src, i64 7\n  %7 = load i64, ptr %arrayidx.7, align 8\n  %tobool.not.7 = icmp eq i64 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  ret i64 %mask.1.7\n}\n"
+        },
+        {
+          "test_name": "bitmask_4xi16",
+          "test_body": "define i64 @bitmask_4xi16(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i16, ptr %src, align 2\n  %tobool.not = icmp ne i16 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i16, ptr %src, i64 1\n  %1 = load i16, ptr %arrayidx.1, align 2\n  %tobool.not.1 = icmp eq i16 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i16, ptr %src, i64 2\n  %2 = load i16, ptr %arrayidx.2, align 2\n  %tobool.not.2 = icmp eq i16 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i16, ptr %src, i64 3\n  %3 = load i16, ptr %arrayidx.3, align 2\n  %tobool.not.3 = icmp eq i16 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i16, ptr %src, i64 4\n  %4 = load i16, ptr %arrayidx.4, align 2\n  %tobool.not.4 = icmp eq i16 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i16, ptr %src, i64 5\n  %5 = load i16, ptr %arrayidx.5, align 2\n  %tobool.not.5 = icmp eq i16 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i16, ptr %src, i64 6\n  %6 = load i16, ptr %arrayidx.6, align 2\n  %tobool.not.6 = icmp eq i16 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i16, ptr %src, i64 7\n  %7 = load i16, ptr %arrayidx.7, align 2\n  %tobool.not.7 = icmp eq i16 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  ret i64 %mask.1.7\n}\n"
+        },
+        {
+          "test_name": "bitmask_16xi8",
+          "test_body": "define i64 @bitmask_16xi8(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i8, ptr %src, align 1\n  %tobool.not = icmp ne i8 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i8, ptr %src, i64 1\n  %1 = load i8, ptr %arrayidx.1, align 1\n  %tobool.not.1 = icmp eq i8 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i8, ptr %src, i64 2\n  %2 = load i8, ptr %arrayidx.2, align 1\n  %tobool.not.2 = icmp eq i8 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i8, ptr %src, i64 3\n  %3 = load i8, ptr %arrayidx.3, align 1\n  %tobool.not.3 = icmp eq i8 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i8, ptr %src, i64 4\n  %4 = load i8, ptr %arrayidx.4, align 1\n  %tobool.not.4 = icmp eq i8 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i8, ptr %src, i64 5\n  %5 = load i8, ptr %arrayidx.5, align 1\n  %tobool.not.5 = icmp eq i8 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i8, ptr %src, i64 6\n  %6 = load i8, ptr %arrayidx.6, align 1\n  %tobool.not.6 = icmp eq i8 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i8, ptr %src, i64 7\n  %7 = load i8, ptr %arrayidx.7, align 1\n  %tobool.not.7 = icmp eq i8 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  %arrayidx.8 = getelementptr inbounds i8, ptr %src, i64 8\n  %8 = load i8, ptr %arrayidx.8, align 1\n  %tobool.not.8 = icmp eq i8 %8, 0\n  %or.8 = select i1 %tobool.not.8, i64 0, i64 256\n  %mask.1.8 = or i64 %or.8, %mask.1.7\n  %arrayidx.9 = getelementptr inbounds i8, ptr %src, i64 9\n  %9 = load i8, ptr %arrayidx.9, align 1\n  %tobool.not.9 = icmp eq i8 %9, 0\n  %or.9 = select i1 %tobool.not.9, i64 0, i64 512\n  %mask.1.9 = or i64 %or.9, %mask.1.8\n  %arrayidx.10 = getelementptr inbounds i8, ptr %src, i64 10\n  %10 = load i8, ptr %arrayidx.10, align 1\n  %tobool.not.10 = icmp eq i8 %10, 0\n  %or.10 = select i1 %tobool.not.10, i64 0, i64 1024\n  %mask.1.10 = or i64 %or.10, %mask.1.9\n  %arrayidx.11 = getelementptr inbounds i8, ptr %src, i64 11\n  %11 = load i8, ptr %arrayidx.11, align 1\n  %tobool.not.11 = icmp eq i8 %11, 0\n  %or.11 = select i1 %tobool.not.11, i64 0, i64 2048\n  %mask.1.11 = or i64 %or.11, %mask.1.10\n  %arrayidx.12 = getelementptr inbounds i8, ptr %src, i64 12\n  %12 = load i8, ptr %arrayidx.12, align 1\n  %tobool.not.12 = icmp eq i8 %12, 0\n  %or.12 = select i1 %tobool.not.12, i64 0, i64 4096\n  %mask.1.12 = or i64 %or.12, %mask.1.11\n  %arrayidx.13 = getelementptr inbounds i8, ptr %src, i64 13\n  %13 = load i8, ptr %arrayidx.13, align 1\n  %tobool.not.13 = icmp eq i8 %13, 0\n  %or.13 = select i1 %tobool.not.13, i64 0, i64 8192\n  %mask.1.13 = or i64 %or.13, %mask.1.12\n  %arrayidx.14 = getelementptr inbounds i8, ptr %src, i64 14\n  %14 = load i8, ptr %arrayidx.14, align 1\n  %tobool.not.14 = icmp eq i8 %14, 0\n  %or.14 = select i1 %tobool.not.14, i64 0, i64 16384\n  %mask.1.14 = or i64 %or.14, %mask.1.13\n  %arrayidx.15 = getelementptr inbounds i8, ptr %src, i64 15\n  %15 = load i8, ptr %arrayidx.15, align 1\n  %tobool.not.15 = icmp eq i8 %15, 0\n  %or.15 = select i1 %tobool.not.15, i64 0, i64 32768\n  %mask.1.15 = or i64 %or.15, %mask.1.14\n  ret i64 %mask.1.15\n}\n"
+        },
+        {
+          "test_name": "bitmask_8xi32",
+          "test_body": "define i64 @bitmask_8xi32(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i32, ptr %src, align 4\n  %tobool.not = icmp ne i32 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i32, ptr %src, i64 1\n  %1 = load i32, ptr %arrayidx.1, align 4\n  %tobool.not.1 = icmp eq i32 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i32, ptr %src, i64 2\n  %2 = load i32, ptr %arrayidx.2, align 4\n  %tobool.not.2 = icmp eq i32 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i32, ptr %src, i64 3\n  %3 = load i32, ptr %arrayidx.3, align 4\n  %tobool.not.3 = icmp eq i32 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i32, ptr %src, i64 4\n  %4 = load i32, ptr %arrayidx.4, align 4\n  %tobool.not.4 = icmp eq i32 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i32, ptr %src, i64 5\n  %5 = load i32, ptr %arrayidx.5, align 4\n  %tobool.not.5 = icmp eq i32 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i32, ptr %src, i64 6\n  %6 = load i32, ptr %arrayidx.6, align 4\n  %tobool.not.6 = icmp eq i32 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i32, ptr %src, i64 7\n  %7 = load i32, ptr %arrayidx.7, align 4\n  %tobool.not.7 = icmp eq i32 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  ret i64 %mask.1.7\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 190182 tests passed\n* 5077 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "Heads-up that we see lots of runtime failures with this patch downstream so I suspect it's causing miscompiles in some way.\r\nUnfortunately I don't have any reproducers I can share at the moment but I'll see if I can manage to extract something."
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> Heads-up that we see lots of runtime failures with this patch downstream so I suspect it's causing miscompiles in some way. Unfortunately I don't have any reproducers I can share at the moment but I'll see if I can manage to extract something.\r\n\r\nPlease, send a reproducer, will try to address issues ASAP"
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "> > Heads-up that we see lots of runtime failures with this patch downstream so I suspect it's causing miscompiles in some way. Unfortunately I don't have any reproducers I can share at the moment but I'll see if I can manage to extract something.\r\n> \r\n> Please, send a reproducer, will try to address issues ASAP\r\n\r\nI've extracted and reduced a C program now and I hope I didn't reduce so much that I broke the input.\r\nWith\r\n```clang -O2 -Wall -fsanitize=undefined bbi-115289.c -o a.out && ./a.out```\r\nyou get\r\n```Fail! faults: 2```\r\nwith this patch.\r\nWithout we get\r\n```Pass!```\r\n[bbi-115289.c](https://github.com/user-attachments/files/25415560/bbi-115289.c)\r\n\r\nAlso https://godbolt.org/z/s7cKGWeWx"
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "> > > Heads-up that we see lots of runtime failures with this patch downstream so I suspect it's causing miscompiles in some way. Unfortunately I don't have any reproducers I can share at the moment but I'll see if I can manage to extract something.\r\n> > \r\n> > \r\n> > Please, send a reproducer, will try to address issues ASAP\r\n> \r\n> I've extracted and reduced a C program now and I hope I didn't reduce so much that I broke the input. With `clang -O2 -Wall -fsanitize=undefined bbi-115289.c -o a.out && ./a.out` you get `Fail! faults: 2` with this patch. Without we get `Pass!` [bbi-115289.c](https://github.com/user-attachments/files/25415560/bbi-115289.c)\r\n> \r\n> Also https://godbolt.org/z/s7cKGWeWx\r\n\r\nNow I've looked at the SLP output from my reproducer enough to see that SLPVectorizer is indeed miscompiling this code.\r\nIn the SLP output we have the following for the \"test\" function:\r\n```\r\n  %2 = load i64, ptr getelementptr inbounds nuw (i8, ptr @arr, i64 8), align 8, !tbaa !10  ; 1 (written earlier in the function)\r\n  [...]\r\n  %5 = phi i64 [ %2, %cont28 ], [ %.pre, %handler.pointer_overflow44 ]                         ; 1\r\n  [...]\r\n  %cmp48.not = icmp eq i64 %5, 1  ; 1\r\n  [...]\r\n  %20 = insertelement <8 x i1> %19, i1 %cmp48.not, i32 7    ; 1\r\n  %21 = select <8 x i1> %20, <8 x i16> <i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 2>, <8 x i16> zeroinitializer ; <0,0,0,0,0,0,0,2>\r\n  %22 = call i16 @llvm.vector.reduce.add.v8i16(<8 x i16> %21) ; 2\r\n  %op.rdx = add i16 %22, %conv38217  ; 2\r\n  ret i16 %op.rdx      ; 2\r\n```\r\nThe function is now erroneously returning 2 instead of 0.\r\n\r\n@alexey-bataev : Revert?"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> > > > Heads-up that we see lots of runtime failures with this patch downstream so I suspect it's causing miscompiles in some way. Unfortunately I don't have any reproducers I can share at the moment but I'll see if I can manage to extract something.\r\n> > > \r\n> > > \r\n> > > Please, send a reproducer, will try to address issues ASAP\r\n> > \r\n> > \r\n> > I've extracted and reduced a C program now and I hope I didn't reduce so much that I broke the input. With `clang -O2 -Wall -fsanitize=undefined bbi-115289.c -o a.out && ./a.out` you get `Fail! faults: 2` with this patch. Without we get `Pass!` [bbi-115289.c](https://github.com/user-attachments/files/25415560/bbi-115289.c)\r\n> > Also https://godbolt.org/z/s7cKGWeWx\r\n> \r\n> Now I've looked at the SLP output from my reproducer enough to see that SLPVectorizer is indeed miscompiling this code. In the SLP output we have the following for the \"test\" function:\r\n> \r\n> ```\r\n>   %2 = load i64, ptr getelementptr inbounds nuw (i8, ptr @arr, i64 8), align 8, !tbaa !10  ; 1 (written earlier in the function)\r\n>   [...]\r\n>   %5 = phi i64 [ %2, %cont28 ], [ %.pre, %handler.pointer_overflow44 ]                         ; 1\r\n>   [...]\r\n>   %cmp48.not = icmp eq i64 %5, 1  ; 1\r\n>   [...]\r\n>   %20 = insertelement <8 x i1> %19, i1 %cmp48.not, i32 7    ; 1\r\n>   %21 = select <8 x i1> %20, <8 x i16> <i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 2>, <8 x i16> zeroinitializer ; <0,0,0,0,0,0,0,2>\r\n>   %22 = call i16 @llvm.vector.reduce.add.v8i16(<8 x i16> %21) ; 2\r\n>   %op.rdx = add i16 %22, %conv38217  ; 2\r\n>   ret i16 %op.rdx      ; 2\r\n> ```\r\n> \r\n> The function is now erroneously returning 2 instead of 0.\r\n> \r\n> @alexey-bataev : Revert?\r\n\r\nGive me a few minutes to investigate the problem"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> > > Heads-up that we see lots of runtime failures with this patch downstream so I suspect it's causing miscompiles in some way. Unfortunately I don't have any reproducers I can share at the moment but I'll see if I can manage to extract something.\r\n> > \r\n> > \r\n> > Please, send a reproducer, will try to address issues ASAP\r\n> \r\n> I've extracted and reduced a C program now and I hope I didn't reduce so much that I broke the input. With `clang -O2 -Wall -fsanitize=undefined bbi-115289.c -o a.out && ./a.out` you get `Fail! faults: 2` with this patch. Without we get `Pass!` [bbi-115289.c](https://github.com/user-attachments/files/25415560/bbi-115289.c)\r\n> \r\n> Also https://godbolt.org/z/s7cKGWeWx\r\n\r\nMust be fixed in 38d804725fb0b353e474e4409fbd3926d4db6384"
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "> > > > Heads-up that we see lots of runtime failures with this patch downstream so I suspect it's causing miscompiles in some way. Unfortunately I don't have any reproducers I can share at the moment but I'll see if I can manage to extract something.\r\n> > > \r\n> > > \r\n> > > Please, send a reproducer, will try to address issues ASAP\r\n> > \r\n> > \r\n> > I've extracted and reduced a C program now and I hope I didn't reduce so much that I broke the input. With `clang -O2 -Wall -fsanitize=undefined bbi-115289.c -o a.out && ./a.out` you get `Fail! faults: 2` with this patch. Without we get `Pass!` [bbi-115289.c](https://github.com/user-attachments/files/25415560/bbi-115289.c)\r\n> > Also https://godbolt.org/z/s7cKGWeWx\r\n> \r\n> Must be fixed in [38d8047](https://github.com/llvm/llvm-project/commit/38d804725fb0b353e474e4409fbd3926d4db6384)\r\n\r\nYes it fixes the exact problem instance I reported.\r\nUnfortunately it does not fix all other runtime failure I see with this patch. :(\r\n\r\n"
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "Second miscompile (at commit 5a4a1f41b1d) seen with:\r\n```opt -passes=slp-vectorizer bbi-115289.ll -S -o -```\r\n\r\nThe input adds 0 to the return value. The slp-vectorizer output adds 8.\r\n[bbi-115289.ll.gz](https://github.com/user-attachments/files/25439905/bbi-115289.ll.gz)\r\n\r\nI can't help but feel that the original patch would have needed better testing to begin with and still does.\r\n\r\nNow revert?"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> Second miscompile (at commit [5a4a1f4](https://github.com/llvm/llvm-project/commit/5a4a1f41b1dd1410feaf78457dec86edccb9ea99)) seen with: `opt -passes=slp-vectorizer bbi-115289.ll -S -o -`\r\n> \r\n> The input adds 0 to the return value. The slp-vectorizer output adds 8. [bbi-115289.ll.gz](https://github.com/user-attachments/files/25439905/bbi-115289.ll.gz)\r\n> \r\n> I can't help but feel that the original patch would have needed better testing to begin with and still does.\r\n> \r\n> Now revert?\r\n\r\nIt was tested, but unfortunately, all these corner cases did not occur neither in SPECs/llvm-test-suite, nor in clang-llvm codebase. I'll fix all the corner cases ASAP"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> Second miscompile (at commit [5a4a1f4](https://github.com/llvm/llvm-project/commit/5a4a1f41b1dd1410feaf78457dec86edccb9ea99)) seen with: `opt -passes=slp-vectorizer bbi-115289.ll -S -o -`\r\n> \r\n> The input adds 0 to the return value. The slp-vectorizer output adds 8. [bbi-115289.ll.gz](https://github.com/user-attachments/files/25439905/bbi-115289.ll.gz)\r\n> \r\n> I can't help but feel that the original patch would have needed better testing to begin with and still does.\r\n> \r\n> Now revert?\r\n\r\nFixed in 95a960daa0ebc4b582dbfebed26981552d94a3cd"
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "> > Second miscompile (at commit [5a4a1f4](https://github.com/llvm/llvm-project/commit/5a4a1f41b1dd1410feaf78457dec86edccb9ea99)) seen with: `opt -passes=slp-vectorizer bbi-115289.ll -S -o -`\r\n> > The input adds 0 to the return value. The slp-vectorizer output adds 8. [bbi-115289.ll.gz](https://github.com/user-attachments/files/25439905/bbi-115289.ll.gz)\r\n> > I can't help but feel that the original patch would have needed better testing to begin with and still does.\r\n> > Now revert?\r\n> \r\n> Fixed in [95a960d](https://github.com/llvm/llvm-project/commit/95a960daa0ebc4b582dbfebed26981552d94a3cd)\r\n\r\nI've verified that fix solved the second problem."
+    },
+    {
+      "author": "alanzhao1",
+      "body": "Heads up - I don't have a reproducer yet, but Google is seeing breakages due to this PR that aren't fixed by [95a960d](https://github.com/llvm/llvm-project/commit/95a960daa0ebc4b582dbfebed26981552d94a3cd) or https://github.com/llvm/llvm-project/commit/5a4a1f41b1dd1410feaf78457dec86edccb9ea99"
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "I've bisected a third miscompile back to this patch.\r\n\r\nThe problem seems to go away with 789bf51f0c\r\n```[SLP]Do not consider condition with multiple uses and negate predicate as a candidate for inversed select```\r\nbut I have no idea if that is just by luck or if the actual problem is solved by that patch."
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> I've bisected a third miscompile back to this patch.\r\n> \r\n> The problem seems to go away with [789bf51](https://github.com/llvm/llvm-project/commit/789bf51f0ce64c541ab0ca81d43c912cf0731628) `[SLP]Do not consider condition with multiple uses and negate predicate as a candidate for inversed select` but I have no idea if that is just by luck or if the actual problem is solved by that patch.\r\n\r\nNo, not by luck. I thought about a possible reason for the potential miscompilation and just came into an idea of the potential issue with multiple uses of compares"
+    },
+    {
+      "author": "alanzhao1",
+      "body": "> Heads up - I don't have a reproducer yet, but Google is seeing breakages due to this PR that aren't fixed by [95a960d](https://github.com/llvm/llvm-project/commit/95a960daa0ebc4b582dbfebed26981552d94a3cd) or [5a4a1f4](https://github.com/llvm/llvm-project/commit/5a4a1f41b1dd1410feaf78457dec86edccb9ea99)\r\n\r\nConfirmed fixed by https://github.com/llvm/llvm-project/commit/789bf51f0ce64c541ab0ca81d43c912cf0731628 - thanks @alexey-bataev!"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-15T22:28:18Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        3932,
+        3937
+      ],
+      [
+        13501,
+        13506
+      ],
+      [
+        13874,
+        13888
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/bool-mask.ll": [
+      [
+        19,
+        27
+      ],
+      [
+        29,
+        37
+      ],
+      [
+        39,
+        47
+      ],
+      [
+        132,
+        140
+      ],
+      [
+        142,
+        150
+      ],
+      [
+        152,
+        160
+      ],
+      [
+        205,
+        213
+      ],
+      [
+        215,
+        223
+      ],
+      [
+        225,
+        233
+      ],
+      [
+        320,
+        328
+      ],
+      [
+        330,
+        338
+      ],
+      [
+        340,
+        348
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::matchesShlZExt",
+      "BoUpSLP::transformNodes",
+      "TreeEntry"
+    ]
+  }
+}

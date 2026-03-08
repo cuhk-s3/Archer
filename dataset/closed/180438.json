@@ -1,0 +1,127 @@
+{
+  "pr_id": 180438,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180438",
+  "state": "closed",
+  "title": "[VPlan] Reject partial reductions with invalid costs in getScaledReds.",
+  "author": "fhahn",
+  "base_commit": "058cad9f82b5eb5d28fb165bb04e1209243972b7",
+  "fix_commit": "292ae399a71f4c1926beab7ee2d06e0a516f2ff5",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex a99641c472b9f..19be84e9db09b 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -5547,15 +5547,12 @@ struct VPPartialReductionChain {\n };\n \n // Helper to transform a partial reduction chain into a partial reduction\n-// recipe. Returns true if transformation succeeded. Checks profitability and\n-// clamps VF range.\n-static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n-                                        VFRange &Range, VPCostContext &CostCtx,\n-                                        VPlan &Plan,\n+// recipe. Assumes profitability has been checked.\n+static void transformToPartialReduction(const VPPartialReductionChain &Chain,\n+                                        VPTypeAnalysis &TypeInfo, VPlan &Plan,\n                                         VPReductionPHIRecipe *RdxPhi,\n                                         RecurKind RK) {\n   VPWidenRecipe *WidenRecipe = Chain.ReductionBinOp;\n-  unsigned ScaleFactor = Chain.ScaleFactor;\n   assert(WidenRecipe->getNumOperands() == 2 && \"Expected binary operation\");\n \n   VPValue *BinOp = WidenRecipe->getOperand(0);\n@@ -5565,67 +5562,6 @@ static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n   if (isa_and_present<VPReductionPHIRecipe, VPReductionRecipe>(BinOp))\n     std::swap(BinOp, Accumulator);\n \n-  // For chained reductions, only transform if accumulator is already a PHI or\n-  // partial reduction. Otherwise, it needs to be transformed first.\n-  auto *AccumRecipe = Accumulator->getDefiningRecipe();\n-  if (!isa_and_present<VPReductionPHIRecipe, VPReductionRecipe>(AccumRecipe))\n-    return false;\n-\n-  // Check if the partial reduction is profitable for the VF range.\n-  Type *PhiType = CostCtx.Types.inferScalarType(Accumulator);\n-\n-  // Derive extend info from the stored extends.\n-  auto GetExtInfo = [&CostCtx](VPWidenCastRecipe *Ext)\n-      -> std::pair<Type *, TargetTransformInfo::PartialReductionExtendKind> {\n-    if (!Ext)\n-      return {nullptr, TargetTransformInfo::PR_None};\n-    Type *ExtOpType = CostCtx.Types.inferScalarType(Ext->getOperand(0));\n-    auto ExtKind = TargetTransformInfo::getPartialReductionExtendKind(\n-        static_cast<Instruction::CastOps>(Ext->getOpcode()));\n-    return {ExtOpType, ExtKind};\n-  };\n-  auto ExtInfoA = GetExtInfo(Chain.ExtendA);\n-  auto ExtInfoB = GetExtInfo(Chain.ExtendB);\n-  Type *ExtOpTypeA = ExtInfoA.first;\n-  Type *ExtOpTypeB = ExtInfoB.first;\n-  auto ExtKindA = ExtInfoA.second;\n-  auto ExtKindB = ExtInfoB.second;\n-  // If ExtendB is nullptr but there's a separate BinOp, the second operand\n-  // was a constant that can use the same extend kind as the first.\n-  if (!Chain.ExtendB && Chain.BinOp && Chain.BinOp != Chain.ReductionBinOp) {\n-    // Validate that the constant can be extended to the narrow type.\n-    const APInt *Const = nullptr;\n-    for (VPValue *Op : Chain.BinOp->operands()) {\n-      if (match(Op, m_APInt(Const)))\n-        break;\n-    }\n-    if (!Const || !canConstantBeExtended(Const, ExtOpTypeA, ExtKindA))\n-      return false;\n-    ExtOpTypeB = ExtOpTypeA;\n-    ExtKindB = ExtKindA;\n-  }\n-\n-  // BinOpc is only set when there's a separate binary op (not when BinOp is\n-  // the reduction itself).\n-  std::optional<unsigned> BinOpc =\n-      (Chain.BinOp && Chain.BinOp != Chain.ReductionBinOp)\n-          ? std::make_optional(Chain.BinOp->getOpcode())\n-          : std::nullopt;\n-\n-  if (!LoopVectorizationPlanner::getDecisionAndClampRange(\n-          [&](ElementCount VF) {\n-            return CostCtx.TTI\n-                .getPartialReductionCost(\n-                    WidenRecipe->getOpcode(), ExtOpTypeA, ExtOpTypeB, PhiType,\n-                    VF, ExtKindA, ExtKindB, BinOpc, CostCtx.CostKind,\n-                    PhiType->isFloatingPointTy()\n-                        ? std::optional{WidenRecipe->getFastMathFlags()}\n-                        : std::nullopt)\n-                .isValid();\n-          },\n-          Range))\n-    return false;\n-\n   // Sub-reductions can be implemented in two ways:\n   // (1) negate the operand in the vector loop (the default way).\n   // (2) subtract the reduced value from the init value in the middle block.\n@@ -5642,7 +5578,7 @@ static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n   // subtract in the middle block.\n   if (WidenRecipe->getOpcode() == Instruction::Sub && RK != RecurKind::Sub) {\n     VPBuilder Builder(WidenRecipe);\n-    Type *ElemTy = CostCtx.Types.inferScalarType(BinOp);\n+    Type *ElemTy = TypeInfo.inferScalarType(BinOp);\n     auto *Zero = Plan.getConstantInt(ElemTy, 0);\n     VPIRFlags Flags = WidenRecipe->getUnderlyingInstr()\n                           ? VPIRFlags(*WidenRecipe->getUnderlyingInstr())\n@@ -5664,6 +5600,7 @@ static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n   assert((!ExitValue || IsLastInChain) &&\n          \"if we found ExitValue, it must match RdxPhi's backedge value\");\n \n+  Type *PhiType = TypeInfo.inferScalarType(RdxPhi);\n   RecurKind RdxKind =\n       PhiType->isFloatingPointTy() ? RecurKind::FAdd : RecurKind::Add;\n   auto *PartialRed = new VPReductionRecipe(\n@@ -5671,7 +5608,7 @@ static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n       RdxKind == RecurKind::FAdd ? WidenRecipe->getFastMathFlags()\n                                  : FastMathFlags(),\n       WidenRecipe->getUnderlyingInstr(), Accumulator, BinOp, Cond,\n-      RdxUnordered{/*VFScaleFactor=*/ScaleFactor});\n+      RdxUnordered{/*VFScaleFactor=*/Chain.ScaleFactor});\n   PartialRed->insertBefore(WidenRecipe);\n \n   if (Cond)\n@@ -5681,22 +5618,22 @@ static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n   // We only need to update the PHI node once, which is when we find the\n   // last reduction in the chain.\n   if (!IsLastInChain)\n-    return true;\n+    return;\n \n   // Scale the PHI and ReductionStartVector by the VFScaleFactor\n   assert(RdxPhi->getVFScaleFactor() == 1 && \"scale factor must not be set\");\n-  RdxPhi->setVFScaleFactor(ScaleFactor);\n+  RdxPhi->setVFScaleFactor(Chain.ScaleFactor);\n \n   auto *StartInst = cast<VPInstruction>(RdxPhi->getStartValue());\n   assert(StartInst->getOpcode() == VPInstruction::ReductionStartVector);\n-  auto *NewScaleFactor = Plan.getConstantInt(32, ScaleFactor);\n+  auto *NewScaleFactor = Plan.getConstantInt(32, Chain.ScaleFactor);\n   StartInst->setOperand(2, NewScaleFactor);\n \n   // If this is the last value in a sub-reduction chain, then update the PHI\n   // node to start at `0` and update the reduction-result to subtract from\n   // the PHI's start value.\n   if (RK != RecurKind::Sub)\n-    return true;\n+    return;\n \n   VPValue *OldStartValue = StartInst->getOperand(0);\n   StartInst->setOperand(0, StartInst->getOperand(1));\n@@ -5713,8 +5650,61 @@ static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n   RdxResult->replaceUsesWithIf(\n       NewResult,\n       [&NewResult](VPUser &U, unsigned Idx) { return &U != NewResult; });\n+}\n \n-  return true;\n+/// Check if a partial reduction chain is is supported by the target (i.e. does\n+/// not have an invalid cost) for the given VF range. Clamps the range and\n+/// returns true if profitable for any VF.\n+static bool isValidPartialReduction(const VPPartialReductionChain &Chain,\n+                                    Type *PhiType, VPCostContext &CostCtx,\n+                                    VFRange &Range) {\n+  auto GetExtInfo = [&CostCtx](VPWidenCastRecipe *Ext)\n+      -> std::pair<Type *, TargetTransformInfo::PartialReductionExtendKind> {\n+    if (!Ext)\n+      return {nullptr, TargetTransformInfo::PR_None};\n+    Type *ExtOpType = CostCtx.Types.inferScalarType(Ext->getOperand(0));\n+    auto ExtKind = TargetTransformInfo::getPartialReductionExtendKind(\n+        static_cast<Instruction::CastOps>(Ext->getOpcode()));\n+    return {ExtOpType, ExtKind};\n+  };\n+  auto ExtInfoA = GetExtInfo(Chain.ExtendA);\n+  auto ExtInfoB = GetExtInfo(Chain.ExtendB);\n+  Type *ExtOpTypeA = ExtInfoA.first;\n+  Type *ExtOpTypeB = ExtInfoB.first;\n+  auto ExtKindA = ExtInfoA.second;\n+  auto ExtKindB = ExtInfoB.second;\n+\n+  // If ExtendB is nullptr but there's a separate BinOp, the second operand\n+  // was a constant that can use the same extend kind as the first.\n+  if (!Chain.ExtendB && Chain.BinOp && Chain.BinOp != Chain.ReductionBinOp) {\n+    const APInt *Const = nullptr;\n+    for (VPValue *Op : Chain.BinOp->operands()) {\n+      if (match(Op, m_APInt(Const)))\n+        break;\n+    }\n+    if (!Const || !canConstantBeExtended(Const, ExtOpTypeA, ExtKindA))\n+      return false;\n+    ExtOpTypeB = ExtOpTypeA;\n+    ExtKindB = ExtKindA;\n+  }\n+\n+  std::optional<unsigned> BinOpc =\n+      (Chain.BinOp && Chain.BinOp != Chain.ReductionBinOp)\n+          ? std::make_optional(Chain.BinOp->getOpcode())\n+          : std::nullopt;\n+  VPWidenRecipe *WidenRecipe = Chain.ReductionBinOp;\n+  return LoopVectorizationPlanner::getDecisionAndClampRange(\n+      [&](ElementCount VF) {\n+        return CostCtx.TTI\n+            .getPartialReductionCost(\n+                WidenRecipe->getOpcode(), ExtOpTypeA, ExtOpTypeB, PhiType, VF,\n+                ExtKindA, ExtKindB, BinOpc, CostCtx.CostKind,\n+                PhiType->isFloatingPointTy()\n+                    ? std::optional{WidenRecipe->getFastMathFlags()}\n+                    : std::nullopt)\n+            .isValid();\n+      },\n+      Range);\n }\n \n /// Examines reduction operations to see if the target can use a cheaper\n@@ -5724,7 +5714,7 @@ static bool transformToPartialReduction(const VPPartialReductionChain &Chain,\n static bool\n getScaledReductions(VPSingleDefRecipe *RedPhiR, VPValue *PrevValue,\n                     SmallVectorImpl<VPPartialReductionChain> &Chains,\n-                    VPTypeAnalysis &TypeInfo) {\n+                    VPCostContext &CostCtx, VFRange &Range) {\n   auto *UpdateR = dyn_cast<VPWidenRecipe>(PrevValue);\n   if (!UpdateR || !Instruction::isBinaryOp(UpdateR->getOpcode()))\n     return false;\n@@ -5753,7 +5743,7 @@ getScaledReductions(VPSingleDefRecipe *RedPhiR, VPValue *PrevValue,\n   // Try and get a scaled reduction from the first non-phi operand.\n   // If one is found, we use the discovered reduction instruction in\n   // place of the accumulator for costing.\n-  if (getScaledReductions(RedPhiR, Op, Chains, TypeInfo)) {\n+  if (getScaledReductions(RedPhiR, Op, Chains, CostCtx, Range)) {\n     RedPhiR = Chains.rbegin()->ReductionBinOp;\n     Op = UpdateR->getOperand(0);\n     PhiOp = UpdateR->getOperand(1);\n@@ -5774,7 +5764,8 @@ getScaledReductions(VPSingleDefRecipe *RedPhiR, VPValue *PrevValue,\n     assert(Operands.size() <= 2 && \"expected at most 2 operands\");\n \n     for (const auto &[I, OpVal] : enumerate(Operands)) {\n-      // Allow constant as second operand - validation happens in transform.\n+      // Allow constant as second operand - validation happens in\n+      // isValidPartialReduction.\n       const APInt *Unused;\n       if (I > 0 && CastRecipes[0] && match(OpVal, m_APInt(Unused)))\n         continue;\n@@ -5824,16 +5815,21 @@ getScaledReductions(VPSingleDefRecipe *RedPhiR, VPValue *PrevValue,\n     return false;\n   }\n \n-  Type *PhiType = TypeInfo.inferScalarType(RedPhiR);\n+  Type *PhiType = CostCtx.Types.inferScalarType(RedPhiR);\n   TypeSize PHISize = PhiType->getPrimitiveSizeInBits();\n-  Type *ExtOpType = TypeInfo.inferScalarType(CastRecipes[0]->getOperand(0));\n+  Type *ExtOpType =\n+      CostCtx.Types.inferScalarType(CastRecipes[0]->getOperand(0));\n   TypeSize ASize = ExtOpType->getPrimitiveSizeInBits();\n   if (!PHISize.hasKnownScalarFactor(ASize))\n     return false;\n \n-  Chains.push_back(\n+  VPPartialReductionChain Chain(\n       {UpdateR, CastRecipes[0], CastRecipes[1], BinOp,\n        static_cast<unsigned>(PHISize.getKnownScalarFactor(ASize))});\n+  if (!isValidPartialReduction(Chain, PhiType, CostCtx, Range))\n+    return false;\n+\n+  Chains.push_back(Chain);\n   return true;\n }\n } // namespace\n@@ -5841,9 +5837,9 @@ getScaledReductions(VPSingleDefRecipe *RedPhiR, VPValue *PrevValue,\n void VPlanTransforms::createPartialReductions(VPlan &Plan,\n                                               VPCostContext &CostCtx,\n                                               VFRange &Range) {\n-  // Find all possible partial reductions, grouping chains by their PHI. This\n-  // grouping allows invalidating the whole chain, if any link is not a valid\n-  // partial reduction.\n+  // Find all possible valid partial reductions, grouping chains by their PHI.\n+  // This grouping allows invalidating the whole chain, if any link is not a\n+  // valid partial reduction.\n   MapVector<VPReductionPHIRecipe *, SmallVector<VPPartialReductionChain>>\n       ChainsByPhi;\n   VPBasicBlock *HeaderVPBB = Plan.getVectorLoopRegion()->getEntryBasicBlock();\n@@ -5859,8 +5855,8 @@ void VPlanTransforms::createPartialReductions(VPlan &Plan,\n       VPValue *ExitValue = RdxResult->getOperand(0);\n       match(ExitValue,\n             m_Select(m_VPValue(), m_VPValue(ExitValue), m_VPValue()));\n-      getScaledReductions(RedPhiR, ExitValue, ChainsByPhi[RedPhiR],\n-                          CostCtx.Types);\n+      getScaledReductions(RedPhiR, ExitValue, ChainsByPhi[RedPhiR], CostCtx,\n+                          Range);\n     }\n   }\n \n@@ -5930,6 +5926,6 @@ void VPlanTransforms::createPartialReductions(VPlan &Plan,\n   for (auto &[Phi, Chains] : ChainsByPhi) {\n     RecurKind RK = cast<VPReductionPHIRecipe>(Phi)->getRecurrenceKind();\n     for (const VPPartialReductionChain &Chain : Chains)\n-      transformToPartialReduction(Chain, Range, CostCtx, Plan, Phi, RK);\n+      transformToPartialReduction(Chain, CostCtx.Types, Plan, Phi, RK);\n   }\n }\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Check if costs for partial reductions are valid up-front in getScaledReductions instead when transforming each link in the chain in transformToPartialReduction. This ensures that we either transform all entries in the chain together, or none via the existing invalidation logic.\r\n\r\nThis fixes a crash when a link in the chain would have invalid cost, as in the added test cases.\r\n\r\nFixes https://github.com/llvm/llvm-project/issues/180340.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-incomplete-chains.ll",
+      "commands": [
+        "opt --mattr=+neon,+dotprod -passes=loop-vectorize -force-vector-interleave=1 -enable-epilogue-vectorization=false -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "no_partial_reduce_for_extend_used_by_and",
+          "test_body": "target triple = \"arm64-apple-macosx\"\n\ndefine i64 @no_partial_reduce_for_extend_used_by_and(ptr %src) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %accum = phi i64 [ 0, %entry ], [ %sub, %loop ]\n  %ld = load i32, ptr %src, align 4\n  %ext = sext i32 %ld to i64\n  %add = add i64 %ext, %accum\n  %and = and i64 %ext, 255\n  %sub = sub i64 %add, %and\n  %iv.next = add i32 %iv, 1\n  %cmp = icmp ult i32 %iv, 79\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret i64 %sub\n}\n"
+        },
+        {
+          "test_name": "no_partial_reduce_for_extend_used_by_shl",
+          "test_body": "target triple = \"arm64-apple-macosx\"\n\ndefine i64 @no_partial_reduce_for_extend_used_by_shl(ptr %src) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %accum = phi i64 [ 0, %entry ], [ %sub, %loop ]\n  %ld = load i32, ptr %src, align 4\n  %ext = sext i32 %ld to i64\n  %add = add i64 %ext, %accum\n  %shl = shl i64 %ext, 2\n  %sub = sub i64 %add, %shl\n  %iv.next = add i32 %iv, 1\n  %cmp = icmp ult i32 %iv, 79\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret i64 %sub\n}\n\nattributes #0 = { \"target-cpu\"=\"grace\" }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "fhahn",
+      "body": "> Accepted with some nits.\r\n> \r\n> On [#178919 (comment)](https://github.com/llvm/llvm-project/pull/178919#discussion_r2769196559) Graham pointed out this exact same issue and I wrote there that I would fix this in a separate PR, which I eventually spent a chunk of my Friday afternoon working on. Unfortunately I didn't have time to post it before I had to catch my train and was subsequently away all weekend. Because you left comments on that PR as well, I figured you would have seen the conversation and made the connection with the Github Issue that was reported. Did you miss that conversation or not realise these were the same issue? There's no point in me posting my changes now as they're largely identical, I just wish I would have spent my time on Friday differently.\r\n> \r\n> As a general comment, the LV is a codebase that sees a lot of churn and a way for others to keep up is to help with fixing the odd issue. As a maintainer/area lead it may help to step back a bit sometimes and leave room for others to get involved. Otherwise, this is not really a collaborative project.\r\n> \r\n\r\nArgh, really sorry I missed the connection to this!\r\n\r\n> With that being said, are you planning any other refactoring or improvements for partial reductions? It would be good to avoid further duplicating work.\r\n\r\nI'm not planning any further refactoring, the PR here also was not planned, but in respones to an issue filed on the weekend. I'll make sure to communicate better if any of that changes.\r\n\r\nOne thing that is still missing w.r.t. partial reductions I think is that we probably should also move creation of expression recipes for them to directly `createPartialReductions`, to only convert the whole chain, if we also actually create combined expressions.\r\n"
+    },
+    {
+      "author": "sdesmalen-arm",
+      "body": "> Argh, really sorry I missed the connection to this!\r\n\r\nThanks, that's okay. Apologies from my end if I sounded like a bit of grump on the Monday morning raising this! :)\r\n\r\n> I'm not planning any further refactoring, [...] One thing that is still missing w.r.t. partial reductions I think is that we probably should also move creation of expression recipes for them to directly `createPartialReductions`, to only convert the whole chain, if we also actually create combined expressions.\r\n\r\nIf you're not planning any further refactoring, then I'm going to clean up partial reductions a bit in the next 1-2 weeks. I was thinking of revisiting the cost interfaces and also see if parts of it can be stream-lined with the in-loop reductions. I've also got a WIP patch that is a step in the direction that you mention above. I'll share it shortly!"
+    },
+    {
+      "author": "fhahn",
+      "body": "> > Argh, really sorry I missed the connection to this!\r\n> \r\n> Thanks, that's okay. Apologies from my end if I sounded like a bit of grump on the Monday morning raising this! :)\r\n> \r\n> > I'm not planning any further refactoring, [...] One thing that is still missing w.r.t. partial reductions I think is that we probably should also move creation of expression recipes for them to directly `createPartialReductions`, to only convert the whole chain, if we also actually create combined expressions.\r\n> \r\n> If you're not planning any further refactoring, then I'm going to clean up partial reductions a bit in the next 1-2 weeks. I was thinking of revisiting the cost interfaces and also see if parts of it can be stream-lined with the in-loop reductions. I've also got a WIP patch that is a step in the direction that you mention above. I'll share it shortly!\r\n\r\nSounds great! I think forming the VPExpressions together with transforming to partial reductions should address one of the open issues where we create partial reductions but then fail to create VPExpressions, which can end up worse.\r\n\r\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-08T20:53:24Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        5547,
+        5561
+      ],
+      [
+        5565,
+        5631
+      ],
+      [
+        5642,
+        5648
+      ],
+      [
+        5664,
+        5669
+      ],
+      [
+        5671,
+        5677
+      ],
+      [
+        5681,
+        5702
+      ],
+      [
+        5713,
+        5720
+      ],
+      [
+        5724,
+        5730
+      ],
+      [
+        5753,
+        5759
+      ],
+      [
+        5774,
+        5780
+      ],
+      [
+        5824,
+        5839
+      ],
+      [
+        5841,
+        5849
+      ],
+      [
+        5859,
+        5866
+      ],
+      [
+        5930,
+        5935
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-incomplete-chains.ll": [
+      [
+        125,
+        128
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::createPartialReductions",
+      "getScaledReductions",
+      "transformToPartialReduction"
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-incomplete-chains.ll": [
+      "test_incomplete_chain_without_mul"
+    ]
+  }
+}

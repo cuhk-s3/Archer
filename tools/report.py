@@ -29,15 +29,17 @@ class ReportTool(FuncToolBase):
           "thoughts",
           "string",
           True,
-          "The detailed thoughts for analyzing the bug including "
+          "If you find any bug, provide the detailed thoughts for analyzing the bug including "
           '1. "Bug Triggering Analysis" for why the provided test can trigger the bug, and '
-          '2. "Fix Weakness Analysis" for why the provided test can reveal the weakness.',
+          '2. "Fix Weakness Analysis" for why the provided test can reveal the weakness.'
+          "If you cannot find any bug, provide the detailed thoughts for summarizing the fix. ",
         ),
         FuncToolSpec.Param(
           "force",
           "boolean",
           False,
-          "Set to true ONLY if you have already found at least one bug AND you are certain that no further testing is required.",
+          "Set to true to force stop immediately without additional checks. "
+          "When false or not provided, the tool will check that all tests have been completed before allowing the report.",
         ),
       ],
     )

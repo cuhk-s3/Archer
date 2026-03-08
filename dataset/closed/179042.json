@@ -1,0 +1,133 @@
+{
+  "pr_id": 179042,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179042",
+  "state": "closed",
+  "title": "InstCombine: Fold bitcast of vector with constant to scalar",
+  "author": "arsenm",
+  "base_commit": "3685f24760470fc873d2ea70dd6f4da6898e5e1b",
+  "fix_commit": "ae7d28c7106b2c93d98be2479baf0440380c9aa8",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\nindex a75c24bb91219..2f3c9c6a083bd 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n@@ -2853,20 +2853,35 @@ static Instruction *foldBitCastSelect(BitCastInst &BitCast,\n   // A vector select must maintain the same number of elements in its operands.\n   Type *CondTy = Cond->getType();\n   Type *DestTy = BitCast.getType();\n+\n+  auto *DestVecTy = dyn_cast<VectorType>(DestTy);\n+\n   if (auto *CondVTy = dyn_cast<VectorType>(CondTy))\n-    if (!DestTy->isVectorTy() ||\n-        CondVTy->getElementCount() !=\n-            cast<VectorType>(DestTy)->getElementCount())\n+    if (!DestVecTy ||\n+        CondVTy->getElementCount() != DestVecTy->getElementCount())\n       return nullptr;\n \n+  auto *Sel = cast<Instruction>(BitCast.getOperand(0));\n+  auto *SrcVecTy = dyn_cast<VectorType>(TVal->getType());\n+\n+  if ((isa<Constant>(TVal) || isa<Constant>(FVal)) &&\n+      (!DestVecTy ||\n+       (SrcVecTy && ElementCount::isKnownLE(DestVecTy->getElementCount(),\n+                                            SrcVecTy->getElementCount())))) {\n+    // Avoid introducing select of vector (or select of vector with more\n+    // elements) until the backend can undo this transformation.\n+    Value *CastedTVal = Builder.CreateBitCast(TVal, DestTy);\n+    Value *CastedFVal = Builder.CreateBitCast(FVal, DestTy);\n+    return SelectInst::Create(Cond, CastedTVal, CastedFVal, \"\", nullptr, Sel);\n+  }\n+\n   // FIXME: This transform is restricted from changing the select between\n   // scalars and vectors to avoid backend problems caused by creating\n   // potentially illegal operations. If a fix-up is added to handle that\n   // situation, we can remove this check.\n-  if (DestTy->isVectorTy() != TVal->getType()->isVectorTy())\n+  if ((DestVecTy != nullptr) != (SrcVecTy != nullptr))\n     return nullptr;\n \n-  auto *Sel = cast<Instruction>(BitCast.getOperand(0));\n   Value *X;\n   if (match(TVal, m_OneUse(m_BitCast(m_Value(X)))) && X->getType() == DestTy &&\n       !isa<Constant>(X)) {\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Fold bitcast (select cond, val, const) ->\r\n  select cond, (bitcast val), (bitcast const)\r\n\r\nRocm device libs has an unfortunate amount of code that does bithacking\r\non the sign bit of double values by casting to <2 x i32> and operating\r\non the high element. This breaks value tracking optimizations on the\r\nfp value.\r\n\r\nThe existing transform would only do this if the input to the select was\r\nalso a bitcast with a single use, and if it didn't convert between vector\r\nand scalar.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/bitcast-select-const-vector.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "bitcast_v2i32_select_to_v2f32_const_lhs",
+          "test_body": "define <2 x float> @bitcast_v2i32_select_to_v2f32_const_lhs(double %arg, <2 x i32> %vec) {\n  %cmp = fcmp one double %arg, 0x7FF0000000000000\n  %s.0.i.i = select i1 %cmp, <2 x i32> <i32 0, i32 2146959360>, <2 x i32> %vec\n  %astype13.i.i = bitcast <2 x i32> %s.0.i.i to <2 x float>\n  ret <2 x float> %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_v4i16_select_to_v2f32_const_rhs",
+          "test_body": "define <2 x float> @bitcast_v4i16_select_to_v2f32_const_rhs(double %arg, <4 x i16> %vec.v4i16) {\n  %cmp = fcmp one double %arg, 0x7FF0000000000000\n  %select = select i1 %cmp, <4 x i16> %vec.v4i16, <4 x i16> <i16 0, i16 23445, i16 9999, i16 -31302>\n  %astype13.i.i = bitcast <4 x i16> %select to <2 x float>\n  ret <2 x float> %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_v2i32_select_to_v2f32_const_rhs",
+          "test_body": "define <2 x float> @bitcast_v2i32_select_to_v2f32_const_rhs(double %arg, <2 x i32> %vec) {\n  %cmp = fcmp one double %arg, 0x7FF0000000000000\n  %s.0.i.i = select i1 %cmp, <2 x i32> %vec, <2 x i32> <i32 0, i32 2146959360>\n  %astype13.i.i = bitcast <2 x i32> %s.0.i.i to <2 x float>\n  ret <2 x float> %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_select_double_to_v2i32_const_lhs",
+          "test_body": "define <2 x i32> @bitcast_select_double_to_v2i32_const_lhs(i64 %i, double %i41) {\n  %i42 = icmp ne i64 %i, 0\n  %s.0.i.i = select nnan i1 %i42, double 1.000000e+00, double %i41\n  %astype13.i.i = bitcast double %s.0.i.i to <2 x i32>\n  ret <2 x i32> %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_v2i32_select_to_double_const_lhs",
+          "test_body": "define double @bitcast_v2i32_select_to_double_const_lhs(double %i, <2 x i32> %i41) {\n  %i42 = fcmp one double %i, 0x7FF0000000000000\n  %s.0.i.i = select i1 %i42, <2 x i32> <i32 0, i32 2146959360>, <2 x i32> %i41\n  %astype13.i.i = bitcast <2 x i32> %s.0.i.i to double\n  ret double %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_v4i16_select_to_v2f32_const_lhs",
+          "test_body": "define <2 x float> @bitcast_v4i16_select_to_v2f32_const_lhs(double %arg, <4 x i16> %vec.v4i16) {\n  %cmp = fcmp one double %arg, 0x7FF0000000000000\n  %select = select i1 %cmp, <4 x i16> <i16 0, i16 23445, i16 9999, i16 -31302>, <4 x i16> %vec.v4i16\n  %astype13.i.i = bitcast <4 x i16> %select to <2 x float>\n  ret <2 x float> %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_select_double_to_v2i32_const_rhs",
+          "test_body": "define <2 x i32> @bitcast_select_double_to_v2i32_const_rhs(i64 %i, double %i41) {\n  %i42 = icmp ne i64 %i, 0\n  %s.0.i.i = select nnan i1 %i42, double %i41, double 1.000000e+00\n  %astype13.i.i = bitcast double %s.0.i.i to <2 x i32>\n  ret <2 x i32> %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_v2i32_select_to_double_const_rhs",
+          "test_body": "define double @bitcast_v2i32_select_to_double_const_rhs(double %i, <2 x i32> %i41) {\n  %i42 = fcmp one double %i, 0x7FF0000000000000\n  %s.0.i.i = select i1 %i42, <2 x i32> %i41, <2 x i32> <i32 0, i32 2146959360>\n  %astype13.i.i = bitcast <2 x i32> %s.0.i.i to double\n  ret double %astype13.i.i\n}\n"
+        },
+        {
+          "test_name": "bitcast_v2i32_vselect_to_double_const_rhs",
+          "test_body": "define double @bitcast_v2i32_vselect_to_double_const_rhs(<2 x double> %cmp.vec, <2 x i32> %val) {\n  %vcmp = fcmp one <2 x double> %cmp.vec, splat (double 0x7FF0000000000000)\n  %select = select <2 x i1> %vcmp, <2 x i32> %val, <2 x i32> <i32 0, i32 2146959360>\n  %cast = bitcast <2 x i32> %select to double\n  ret double %cast\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/copysign.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "issue178245",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine i32 @issue178245(i32 %i.0.i.i) {\nentry:\n  %tobool104.i.i.not = icmp eq i32 %i.0.i.i, -1177359834\n  %conv111.i.i = select i1 %tobool104.i.i.not, i32 0, i32 -5\n  %cast.sign = bitcast i32 %conv111.i.i to float\n  %fcmp = fcmp uno float %cast.sign, 0.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 0.000000e+00, float %cast.sign)\n  %select = select i1 %fcmp, float 0.000000e+00, float %copysign\n  %result = bitcast float %select to i32\n  ret i32 %result\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fold-bin-operand.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "h3",
+          "test_body": "target datalayout = \"E-p:64:64:64-p1:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\ndefine <vscale x 2 x i64> @h3(i1 %A, <vscale x 4 x i32> %B) {\nEntryBlock:\n  %cf = select i1 %A, <vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> %B\n  %bc = bitcast <vscale x 4 x i32> %cf to <vscale x 2 x i64>\n  ret <vscale x 2 x i64> %bc\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#179042** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/179042?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/179042?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "arsenm",
+      "body": "> Your tests convert a vector select into a scalar select, which seems reasonable. But what about the case where this ends up converting a scalar select into a vector select?\r\n\r\nIt's not producing vector select, it's producing select of vector type. I thought the general cast+select preference was to convert to the destination type (e.g, trunc of select with constant is pushed to select of trunc)"
+    },
+    {
+      "author": "nikic",
+      "body": "> > Your tests convert a vector select into a scalar select, which seems reasonable. But what about the case where this ends up converting a scalar select into a vector select?\r\n> \r\n> It's not producing vector select, it's producing select of vector type.\r\n\r\nYes, that's what I meant. Replacing a scalar select with a select of vector type may be a significant pessimization, e.g. on x86 the former will use cmov and the latter will use a branch. See https://llvm.godbolt.org/z/WodKcbrbe for an example.\r\n\r\nIf you want to convert scalar to more expensive vector selects we need to have undo-transforms in the backend in place."
+    },
+    {
+      "author": "arsenm",
+      "body": "Changed to disallow introducing select of vector, but still allow conversion to select of vector with fewer elements "
+    }
+  ],
+  "knowledge_cutoff": "2026-01-31T14:51:35Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+      [
+        2853,
+        2872
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/copysign.ll": [
+      [
+        194,
+        205
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fold-bin-operand.ll": [
+      [
+        292,
+        300
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+      "foldBitCastSelect"
+    ]
+  }
+}

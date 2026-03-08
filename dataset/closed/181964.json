@@ -1,0 +1,116 @@
+{
+  "pr_id": 181964,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181964",
+  "state": "closed",
+  "title": "[ValueTracking] Recognize non-negative subtraction patterns",
+  "author": "user1342234",
+  "base_commit": "febe6052d013634385a8ba3c4d93e8c12ca742dc",
+  "fix_commit": "99ce823e29d8ac69e31bbc9aa296146e18ccd787",
+  "patch": "diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 2d78aa4be3455..34e3d309915f6 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -483,6 +483,21 @@ static void computeKnownBitsFromLerpPattern(const Value *Op0, const Value *Op1,\n   KnownOut.Zero.setHighBits(MinimumNumberOfLeadingZeros);\n }\n \n+static bool isSubtractionKnownNonNegative(const Value *LHS, const Value *RHS) {\n+  // Pattern: LHS - smin(LHS, X) = max(0, LHS - X) >= 0\n+  if (auto *MinCall = dyn_cast<IntrinsicInst>(RHS)) {\n+    if (MinCall->getIntrinsicID() == Intrinsic::smin) {\n+      Value *MinOp0 = MinCall->getOperand(0);\n+      Value *MinOp1 = MinCall->getOperand(1);\n+\n+      // If LHS appears in the smin, then LHS - smin(LHS, X) >= 0\n+      if (MinOp0 == LHS || MinOp1 == LHS)\n+        return true;\n+    }\n+  }\n+  return false;\n+}\n+\n static void computeKnownBitsAddSub(bool Add, const Value *Op0, const Value *Op1,\n                                    bool NSW, bool NUW,\n                                    const APInt &DemandedElts,\n@@ -503,6 +518,10 @@ static void computeKnownBitsAddSub(bool Add, const Value *Op0, const Value *Op1,\n           .value_or(false))\n     KnownOut.makeNonNegative();\n \n+  if (!Add && !KnownOut.isNonNegative() &&\n+        isSubtractionKnownNonNegative(Op0, Op1))\n+    KnownOut.makeNonNegative();\n+\n   if (Add)\n     // Try to match lerp pattern and combine results\n     computeKnownBitsFromLerpPattern(Op0, Op1, DemandedElts, KnownOut, Q, Depth);\n@@ -1401,6 +1420,46 @@ static void unionWithMinMaxIntrinsicClamp(const IntrinsicInst *II,\n         ConstantRange::getNonEmpty(*CLow, *CHigh + 1).toKnownBits());\n }\n \n+static bool isSelectKnownNonNegative(const SelectInst *SI) {\n+\n+  if (auto *Cmp = dyn_cast<ICmpInst>(SI->getCondition())) {\n+    const Value *TrueVal = SI->getTrueValue();\n+    const Value *FalseVal = SI->getFalseValue();\n+    const Value *CmpLHS = Cmp->getOperand(0);\n+    const Value *CmpRHS = Cmp->getOperand(1);\n+    ICmpInst::Predicate Pred = Cmp->getPredicate();\n+\n+    // Determine which value is zero and which is sub based on predicate\n+    const Value *ZeroVal, *SubVal;\n+    if (Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SLE) {\n+      // condition is (b < a) or (b <= a)\n+      // zero is on true side, sub is on false side\n+      ZeroVal = TrueVal;\n+      SubVal = FalseVal;\n+    } else if (Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE) {\n+      // condition is (b > a) or (b >= a)\n+      // zero is on false side, sub is on true side\n+      ZeroVal = FalseVal;\n+      SubVal = TrueVal;\n+    } else {\n+      return false; // predicate we don't handle\n+    }\n+\n+    // Now just check once\n+    if (auto *ConstInt = dyn_cast<ConstantInt>(ZeroVal)) {\n+      if (ConstInt->isZero()) {\n+        if (auto *Sub = dyn_cast<BinaryOperator>(SubVal)) {\n+          if (Sub->getOpcode() == Instruction::Sub &&\n+              Sub->getOperand(0) == CmpLHS && Sub->getOperand(1) == CmpRHS)\n+            return true;\n+        }\n+      }\n+    }\n+  }\n+\n+  return false;\n+}\n+\n static void computeKnownBitsFromOperator(const Operator *I,\n                                          const APInt &DemandedElts,\n                                          KnownBits &Known,\n@@ -1466,6 +1525,10 @@ static void computeKnownBitsFromOperator(const Operator *I,\n     Known =\n         ComputeForArm(I->getOperand(1), /*Invert=*/false)\n             .intersectWith(ComputeForArm(I->getOperand(2), /*Invert=*/true));\n+            \n+    if (isSelectKnownNonNegative(cast<SelectInst>(I)))\n+    Known.makeNonNegative();\n+    \n     break;\n   }\n   case Instruction::FPTrunc:\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "Fix missed optimization for nonnegative `b - a` (issue #146131)\r\n\r\nThe optimizer currently fails to recognize that `b - a` (signed subtraction) is provably nonnegative in patterns like:\r\n\r\n- `if (b < a) a = b; return (int32_t)(b - a);`\r\n- Equivalently, `return (b < a ? 0 : (int32_t)(b - a));`\r\n\r\nOn x86-64, this should generate shorter/better code in affected cases\r\n\r\nFixes #146131",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/sext-nonneg-sub.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "neg_unrelated_smin",
+          "test_body": "define i64 @neg_unrelated_smin(i32 %a, i32 %b, i32 %c) {\n  %min = call i32 @llvm.smin.i32(i32 %a, i32 %c)\n  %sub = sub nsw i32 %b, %min\n  %ext = sext i32 %sub to i64\n  ret i64 %ext\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "smin_commutative",
+          "test_body": "define i64 @smin_commutative(i32 %a, i32 %b) {\n  %min = call i32 @llvm.smin.i32(i32 %a, i32 %b)\n  %sub = sub nsw i32 %a, %min\n  %ext = sext i32 %sub to i64\n  ret i64 %ext\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_reversed",
+          "test_body": "define i64 @select_reversed(i32 %a, i32 %b) {\n  %cmp = icmp sgt i32 %b, %a\n  %sub = sub nsw i32 %b, %a\n  %cond = select i1 %cmp, i32 %sub, i32 0\n  %ext = sext i32 %cond to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "func3",
+          "test_body": "define i64 @func3(i32 %a, i32 %b) {\nentry:\n  %cmp = icmp slt i32 %b, %a\n  %sub = sub nsw i32 %b, %a\n  %cond = select i1 %cmp, i32 0, i32 %sub\n  %conv = sext i32 %cond to i64\n  ret i64 %conv\n}\n"
+        },
+        {
+          "test_name": "neg_unguarded_sub",
+          "test_body": "define i64 @neg_unguarded_sub(i32 %a, i32 %b) {\n  %sub = sub nsw i32 %b, %a\n  %ext = sext i32 %sub to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "neg_select_nonzero",
+          "test_body": "define i64 @neg_select_nonzero(i32 %a, i32 %b) {\n  %cmp = icmp slt i32 %b, %a\n  %sub = sub nsw i32 %b, %a\n  %cond = select i1 %cmp, i32 1, i32 %sub\n  %ext = sext i32 %cond to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "neg_wrong_cmp_select",
+          "test_body": "define i64 @neg_wrong_cmp_select(i32 %a, i32 %b) {\n  %cmp = icmp slt i32 %a, %b\n  %sub = sub nsw i32 %b, %a\n  %cond = select i1 %cmp, i32 0, i32 %sub\n  %ext = sext i32 %cond to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "func1",
+          "test_body": "define i64 @func1(i32 %a, i32 %b) {\nentry:\n  %spec.select = tail call i32 @llvm.smin.i32(i32 %b, i32 %a)\n  %sub = sub nsw i32 %b, %spec.select\n  %conv = sext i32 %sub to i64\n  ret i64 %conv\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "user1342234",
+      "body": "@nikic \r\nSorry!\r\n\r\nUpdated with pre-commit baseline + functional diff commits by InstCombine guide.\r\n\r\n\r\nAdded Alive2 proofs:\r\n\r\n- Select pattern: https://alive2.llvm.org/ce/z/YjBg-S\r\n- smin pattern: https://alive2.llvm.org/ce/z/VZiU4F\r\n\r\nFull-width versions timed out, so I reduced to i8\r\n\r\n\r\nI'm not entirely sure this is the correct approach to solve this. Instead, should I have written patterns in ```InstCombineCasts.cpp``` at ```visitSExt```?\r\n\r\n\r\n\r\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions cpp -- llvm/lib/Analysis/ValueTracking.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 34e3d3099..b5ec29ecf 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -519,7 +519,7 @@ static void computeKnownBitsAddSub(bool Add, const Value *Op0, const Value *Op1,\n     KnownOut.makeNonNegative();\n \n   if (!Add && !KnownOut.isNonNegative() &&\n-        isSubtractionKnownNonNegative(Op0, Op1))\n+      isSubtractionKnownNonNegative(Op0, Op1))\n     KnownOut.makeNonNegative();\n \n   if (Add)\n@@ -1525,10 +1525,10 @@ static void computeKnownBitsFromOperator(const Operator *I,\n     Known =\n         ComputeForArm(I->getOperand(1), /*Invert=*/false)\n             .intersectWith(ComputeForArm(I->getOperand(2), /*Invert=*/true));\n-            \n+\n     if (isSelectKnownNonNegative(cast<SelectInst>(I)))\n-    Known.makeNonNegative();\n-    \n+      Known.makeNonNegative();\n+\n     break;\n   }\n   case Instruction::FPTrunc:\n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 131018 tests passed\n* 2949 tests skipped\n* 1 test failed\n\n## Failed Tests\n(click on a test name to see its output)\n\n### LLVM\n<details>\n<summary>LLVM.Transforms/PhaseOrdering/min-max-abs-cse.ll</summary>\n\n```\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 2\nc:\\_work\\llvm-project\\llvm-project\\build\\bin\\opt.exe < C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\PhaseOrdering\\min-max-abs-cse.ll -S -O1 | c:\\_work\\llvm-project\\llvm-project\\build\\bin\\filecheck.exe C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\PhaseOrdering\\min-max-abs-cse.ll\n# executed command: 'c:\\_work\\llvm-project\\llvm-project\\build\\bin\\opt.exe' -S -O1\n# note: command had no output on stdout or stderr\n# executed command: 'c:\\_work\\llvm-project\\llvm-project\\build\\bin\\filecheck.exe' 'C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\PhaseOrdering\\min-max-abs-cse.ll'\n# .---command stderr------------\n# | C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\PhaseOrdering\\min-max-abs-cse.ll:18:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[R:%.*]] = sub i8 [[TMP1]], [[M1]]\n# |               ^\n# | <stdin>:9:49: note: scanning from here\n# |  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0)\n# |                                                 ^\n# | <stdin>:9:49: note: with \"TMP1\" equal to \"%m2\"\n# |  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0)\n# |                                                 ^\n# | <stdin>:9:49: note: with \"M1\" equal to \"%m1\"\n# |  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0)\n# |                                                 ^\n# | <stdin>:10:2: note: possible intended match here\n# |  %r = sub nsw i8 %m2, %m1\n# |  ^\n# | \n# | Input file: <stdin>\n# | Check file: C:\\_work\\llvm-project\\llvm-project\\llvm\\test\\Transforms\\PhaseOrdering\\min-max-abs-cse.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n# |            1: ; ModuleID = '<stdin>' \n# |            2: source_filename = \"<stdin>\" \n# |            3:  \n# |            4: ; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none) \n# |            5: define range(i8 -127, -128) i8 @smax_nsw(i8 %a, i8 %b) local_unnamed_addr #0 { \n# |            6:  %sub = sub nsw i8 %a, %b \n# |            7:  %cmp1 = icmp slt i8 %a, %b \n# |            8:  %m1 = select i1 %cmp1, i8 0, i8 %sub \n# |            9:  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0) \n# | next:18'0                                                     X error: no match found\n# | next:18'1                                                       with \"TMP1\" equal to \"%m2\"\n# | next:18'2                                                       with \"M1\" equal to \"%m1\"\n# |           10:  %r = sub nsw i8 %m2, %m1 \n# | next:18'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:18'3      ?                         possible intended match\n# |           11:  ret i8 %r \n# | next:18'0     ~~~~~~~~~~~\n# |           12: } \n# | next:18'0     ~~\n# |           13:  \n# | next:18'0     ~\n# |           14: ; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none) \n# | next:18'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |           15: define range(i8 0, -127) i8 @abs_swapped(i8 %a) local_unnamed_addr #0 { \n# | next:18'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            .\n# |            .\n# |            .\n# | >>>>>>\n# `-----------------------------\n# error: command failed with exit status: 1\n\n--\n\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 169794 tests passed\n* 3071 tests skipped\n* 1 test failed\n\n## Failed Tests\n(click on a test name to see its output)\n\n### LLVM\n<details>\n<summary>LLVM.Transforms/PhaseOrdering/min-max-abs-cse.ll</summary>\n\n```\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 2\n/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/opt < /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/PhaseOrdering/min-max-abs-cse.ll -S -O1 | /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/FileCheck /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/PhaseOrdering/min-max-abs-cse.ll\n# executed command: /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/opt -S -O1\n# note: command had no output on stdout or stderr\n# executed command: /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/FileCheck /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/PhaseOrdering/min-max-abs-cse.ll\n# .---command stderr------------\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/PhaseOrdering/min-max-abs-cse.ll:18:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[R:%.*]] = sub i8 [[TMP1]], [[M1]]\n# |               ^\n# | <stdin>:9:49: note: scanning from here\n# |  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0)\n# |                                                 ^\n# | <stdin>:9:49: note: with \"TMP1\" equal to \"%m2\"\n# |  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0)\n# |                                                 ^\n# | <stdin>:9:49: note: with \"M1\" equal to \"%m1\"\n# |  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0)\n# |                                                 ^\n# | <stdin>:10:2: note: possible intended match here\n# |  %r = sub nsw i8 %m2, %m1\n# |  ^\n# | \n# | Input file: <stdin>\n# | Check file: /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/PhaseOrdering/min-max-abs-cse.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n# |            1: ; ModuleID = '<stdin>' \n# |            2: source_filename = \"<stdin>\" \n# |            3:  \n# |            4: ; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none) \n# |            5: define range(i8 -127, -128) i8 @smax_nsw(i8 %a, i8 %b) local_unnamed_addr #0 { \n# |            6:  %sub = sub nsw i8 %a, %b \n# |            7:  %cmp1 = icmp slt i8 %a, %b \n# |            8:  %m1 = select i1 %cmp1, i8 0, i8 %sub \n# |            9:  %m2 = tail call i8 @llvm.smax.i8(i8 %sub, i8 0) \n# | next:18'0                                                     X error: no match found\n# | next:18'1                                                       with \"TMP1\" equal to \"%m2\"\n# | next:18'2                                                       with \"M1\" equal to \"%m1\"\n# |           10:  %r = sub nsw i8 %m2, %m1 \n# | next:18'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:18'3      ?                         possible intended match\n# |           11:  ret i8 %r \n# | next:18'0     ~~~~~~~~~~~\n# |           12: } \n# | next:18'0     ~~\n# |           13:  \n# | next:18'0     ~\n# |           14: ; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none) \n# | next:18'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |           15: define range(i8 0, -127) i8 @abs_swapped(i8 %a) local_unnamed_addr #0 { \n# | next:18'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            .\n# |            .\n# |            .\n# | >>>>>>\n# `-----------------------------\n# error: command failed with exit status: 1\n\n--\n\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    },
+    {
+      "author": "user1342234",
+      "body": "Redoing entire PR"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-18T06:19:28Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        483,
+        488
+      ],
+      [
+        503,
+        508
+      ],
+      [
+        1401,
+        1406
+      ],
+      [
+        1466,
+        1471
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownBitsAddSub",
+      "computeKnownBitsFromLerpPattern",
+      "computeKnownBitsFromOperator",
+      "unionWithMinMaxIntrinsicClamp"
+    ]
+  }
+}

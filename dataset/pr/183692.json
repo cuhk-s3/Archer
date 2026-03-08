@@ -1,0 +1,143 @@
+{
+  "pr_id": 183692,
+  "title": "[InstCombine] fold commutative binop with const into select",
+  "author": "imkiva",
+  "base_commit": "192acd6d536cbbb57f778bd996401716ec51d439",
+  "fix_commit": "c5ba26fd5ecd54e8204d1403ce90e7d6fa0aff9d",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 0ca5da1bbf251..88b1d333d98fc 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2314,16 +2314,19 @@ Instruction *InstCombinerImpl::foldBinopWithPhiOperands(BinaryOperator &BO) {\n }\n \n Instruction *InstCombinerImpl::foldBinOpIntoSelectOrPhi(BinaryOperator &I) {\n-  bool IsOtherParamConst = isa<Constant>(I.getOperand(1));\n+  auto TryFoldOperand = [&](unsigned OpIdx, bool IsOtherParamConst) {\n+    if (auto *Sel = dyn_cast<SelectInst>(I.getOperand(OpIdx)))\n+      return FoldOpIntoSelect(I, Sel, false, !IsOtherParamConst);\n+    if (auto *PN = dyn_cast<PHINode>(I.getOperand(OpIdx)))\n+      return foldOpIntoPhi(I, PN);\n+    return static_cast<Instruction *>(nullptr);\n+  };\n \n-  if (auto *Sel = dyn_cast<SelectInst>(I.getOperand(0))) {\n-    if (Instruction *NewSel =\n-            FoldOpIntoSelect(I, Sel, false, !IsOtherParamConst))\n-      return NewSel;\n-  } else if (auto *PN = dyn_cast<PHINode>(I.getOperand(0))) {\n-    if (Instruction *NewPhi = foldOpIntoPhi(I, PN))\n-      return NewPhi;\n-  }\n+  if (Instruction *NewI =\n+          TryFoldOperand(/*OpIdx=*/0, isa<Constant>(I.getOperand(1))))\n+    return NewI;\n+  if (I.isCommutative())\n+    return TryFoldOperand(/*OpIdx=*/1, isa<Constant>(I.getOperand(0)));\n   return nullptr;\n }\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This PR adds `foldBinOpIntoSelectOrPhi` another check: \r\n- if the binary operator is commutative, try `FoldOpIntoSelect` for swapped operands.\r\n\r\nalive2: https://alive2.llvm.org/ce/z/T56TMM\r\nalso fixes #183498",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/binop-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "OrSelectIcmpNonZero",
+          "test_body": "define i32 @OrSelectIcmpNonZero(i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %a, 0\n  %sel = select i1 %cmp, i32 %b, i32 42\n  %or = or i32 %sel, %a\n  ret i32 %or\n}\n"
+        },
+        {
+          "test_name": "OrSelectIcmpZero",
+          "test_body": "define i32 @OrSelectIcmpZero(i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %a, 0\n  %sel = select i1 %cmp, i32 %b, i32 0\n  %or = or i32 %sel, %a\n  ret i32 %or\n}\n"
+        },
+        {
+          "test_name": "OrSelectIcmpZeroCommuted",
+          "test_body": "define i32 @OrSelectIcmpZeroCommuted(i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %a, 0\n  %sel = select i1 %cmp, i32 %b, i32 0\n  %or = or i32 %a, %sel\n  ret i32 %or\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fmul.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s",
+        "opt -S -passes=instcombine -use-constant-fp-for-fixed-length-splat < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fmul_select_strict",
+          "test_body": "define float @fmul_select_strict(float %x, i1 %c) {\n  %sel = select i1 %c, float 1.000000e+00, float 0.000000e+00\n  %mul = fmul float %sel, %x\n  ret float %mul\n}\n"
+        },
+        {
+          "test_name": "fmul_sqrt_select",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.sqrt.f64(double) #0\n\ndefine double @fmul_sqrt_select(double %x, i1 %c) {\n  %sqr = call double @llvm.sqrt.f64(double %x)\n  %sel = select i1 %c, double %sqr, double 1.000000e+00\n  %mul = fmul fast double %sqr, %sel\n  ret double %mul\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-binop.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_eq_or_of_selects_with_constant_vectorized_nonsplat",
+          "test_body": "define <2 x i1> @icmp_eq_or_of_selects_with_constant_vectorized_nonsplat(<2 x i1> %a, <2 x i1> %b) {\n  %s1 = select <2 x i1> %a, <2 x i64> splat (i64 65536), <2 x i64> zeroinitializer\n  %s2 = select <2 x i1> %b, <2 x i64> <i64 256, i64 128>, <2 x i64> zeroinitializer\n  %or = or <2 x i64> %s1, %s2\n  %cmp = icmp eq <2 x i64> %or, <i64 65792, i64 65664>\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "pr173177",
+          "test_body": "define <2 x i1> @pr173177(<2 x i1> %a, i1 %b) {\nentry:\n  %s1 = select <2 x i1> %a, <2 x i16> splat (i16 179), <2 x i16> splat (i16 1)\n  %s2 = select i1 %b, <2 x i16> zeroinitializer, <2 x i16> splat (i16 255)\n  %and = and <2 x i16> %s1, %s2\n  %cmp = icmp eq <2 x i16> %and, zeroinitializer\n  ret <2 x i1> %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/or-select-zero-icmp.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "cmp_swapped",
+          "test_body": "define i32 @cmp_swapped(i32 %x, i32 %y) {\n  %cmp = icmp eq i32 0, %x\n  %sel = select i1 %cmp, i32 %y, i32 0\n  %or = or i32 %x, %sel\n  ret i32 %or\n}\n"
+        },
+        {
+          "test_name": "basic",
+          "test_body": "define i32 @basic(i32 %a, i32 %b) {\n  %cmp = icmp eq i32 %a, 0\n  %sel = select i1 %cmp, i32 %b, i32 0\n  %or = or i32 %sel, %a\n  ret i32 %or\n}\n"
+        },
+        {
+          "test_name": "negative_wrong_predicate",
+          "test_body": "define i32 @negative_wrong_predicate(i32 %a, i32 %b) {\n  %cmp = icmp ne i32 %a, 0\n  %sel = select i1 %cmp, i32 %b, i32 0\n  %or = or i32 %sel, %a\n  ret i32 %or\n}\n"
+        },
+        {
+          "test_name": "swap_operand_order",
+          "test_body": "define i32 @swap_operand_order(i32 %x, i32 %y) {\n  %cmp = icmp eq i32 %x, 0\n  %sel = select i1 %cmp, i32 %y, i32 0\n  %or = or i32 %x, %sel\n  ret i32 %or\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/recurrence.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_and3",
+          "test_body": "define i64 @test_and3(i64 %a, i64 %b) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %a, %entry ], [ %iv.next, %loop ]\n  %iv.next = and i64 %b, %iv\n  tail call void @use(i64 %iv.next)\n  br label %loop\n}\n\ndeclare void @use(i64)\n"
+        },
+        {
+          "test_name": "test_or3",
+          "test_body": "define i64 @test_or3(i64 %a, i64 %b) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %a, %entry ], [ %iv.next, %loop ]\n  %iv.next = or i64 %b, %iv\n  tail call void @use(i64 %iv.next)\n  br label %loop\n}\n\ndeclare void @use(i64)\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "pr62088",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @pr62088() {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %not2 = phi i32 [ 0, %entry ], [ -2, %loop ]\n  %i.0 = phi i32 [ 0, %entry ], [ %shr, %loop ]\n  %h.0 = phi i32 [ 0, %entry ], [ 1, %loop ]\n  %i.0.fr = freeze i32 %i.0\n  %sext = shl i32 %i.0.fr, 16\n  %conv = ashr exact i32 %sext, 16\n  %not = xor i32 %conv, -1\n  %and = and i32 %h.0, 1\n  %rem.urem = sub nsw i32 %and, %conv\n  %rem.cmp = icmp ult i32 %and, %conv\n  %rem = select i1 %rem.cmp, i32 %not, i32 %rem.urem\n  %xor = xor i32 %rem, %not2\n  %sub = sub nsw i32 0, %xor\n  %sub5 = sub i32 -1824888657, %xor\n  %xor6 = xor i32 %sub5, -1260914025\n  %cmp = icmp slt i32 %xor6, 824855120\n  %shr = ashr i32 %xor6, 40\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret i32 %rem\n}\n"
+        },
+        {
+          "test_name": "pr61361",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @pr61361(i32 %arg) {\n  %cmp1 = icmp eq i32 %arg, 1\n  %sel1 = select i1 %cmp1, i32 0, i32 33554431\n  %cmp2 = icmp eq i32 %arg, 0\n  %sel2 = select i1 %cmp2, i32 %sel1, i32 0\n  %ashr = ashr i32 %sel2, 1\n  ret i32 %ashr\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/induction.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=2 -force-widen-divrem-via-safe-divisor=0 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=1 -force-vector-width=2 -force-widen-divrem-via-safe-divisor=0 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=2 -force-vector-width=2 -force-widen-divrem-via-safe-divisor=0 -S",
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=2 -force-vector-width=2 -force-widen-divrem-via-safe-divisor=0 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=2 -force-vector-width=4 -force-widen-divrem-via-safe-divisor=0 -enable-interleaved-mem-accesses -S"
+      ],
+      "tests": [
+        {
+          "test_name": "PR32419",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine i32 @PR32419(i32 %a, i16 %b) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %i = phi i32 [ -20, %entry ], [ %i.next, %for.inc ]\n  %var0 = phi i32 [ %a, %entry ], [ %var6, %for.inc ]\n  %var1 = trunc i32 %i to i16\n  %var2 = icmp eq i16 %var1, 0\n  br i1 %var2, label %for.inc, label %for.cond\n\nfor.cond:                                         ; preds = %for.body\n  %var3 = urem i16 %b, %var1\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.cond, %for.body\n  %var4 = phi i16 [ %var3, %for.cond ], [ 0, %for.body ]\n  %var5 = sext i16 %var4 to i32\n  %var6 = or i32 %var0, %var5\n  %i.next = add nsw i32 %i, 1\n  %cond = icmp eq i32 %i.next, 0\n  br i1 %cond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.inc\n  %var7 = phi i32 [ %var6, %for.inc ]\n  ret i32 %var7\n}\n"
+        },
+        {
+          "test_name": "testoverflowcheck",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\n@e = external global i8, align 1\n@d = external global i32, align 4\n@c = external global i32, align 4\n\ndefine i32 @testoverflowcheck() {\nentry:\n  %.pr.i = load i8, ptr @e, align 1\n  %0 = load i32, ptr @d, align 4\n  %c.promoted.i = load i32, ptr @c, align 4\n  br label %cond.end.i\n\ncond.end.i:                                       ; preds = %cond.end.i, %entry\n  %inc4.i = phi i8 [ %.pr.i, %entry ], [ %inc.i, %cond.end.i ]\n  %and3.i = phi i32 [ %c.promoted.i, %entry ], [ %and.i, %cond.end.i ]\n  %and.i = and i32 %0, %and3.i\n  %inc.i = add i8 %inc4.i, 1\n  %tobool.i = icmp eq i8 %inc.i, 0\n  br i1 %tobool.i, label %loopexit, label %cond.end.i\n\nloopexit:                                         ; preds = %cond.end.i\n  ret i32 %and.i\n}\n"
+        }
+      ]
+    }
+  ]
+}

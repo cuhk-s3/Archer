@@ -1,0 +1,197 @@
+{
+  "pr_id": 176414,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176414",
+  "state": "open",
+  "title": "[InstCombine] Preserve multi-dimensional array structure in GEP optimization",
+  "author": "akadutta",
+  "base_commit": "5b4ed872890f38b07a160878d1816ae7087fe20f",
+  "fix_commit": "fe8abc6c745ab61d14d08ff22df1d16d9aa1fbfc",
+  "patch": "diff --git a/clang/test/CodeGen/union-tbaa1.c b/clang/test/CodeGen/union-tbaa1.c\nindex 3f6ada5023f27..c512c011e588f 100644\n--- a/clang/test/CodeGen/union-tbaa1.c\n+++ b/clang/test/CodeGen/union-tbaa1.c\n@@ -11,13 +11,13 @@ void bar(vect32 p[][2]);\n // CHECK-LABEL: define dso_local void @fred(\n // CHECK-SAME: i32 noundef [[NUM:%.*]], ptr noundef writeonly captures(none) initializes((0, 8)) [[VEC:%.*]], ptr noundef readonly captures(none) [[INDEX:%.*]], ptr noundef readonly captures(none) [[ARR:%.*]]) local_unnamed_addr #[[ATTR0:[0-9]+]] {\n // CHECK-NEXT:  [[ENTRY:.*:]]\n-// CHECK-NEXT:    [[TMP:%.*]] = alloca [4 x [2 x %union.vect32]], align 8\n+// CHECK-NEXT:    [[TMP:%.*]] = alloca [4 x [2 x [[UNION_VECT32:%.*]]]], align 8\n // CHECK-NEXT:    call void @llvm.lifetime.start.p0(ptr nonnull [[TMP]]) #[[ATTR3:[0-9]+]]\n // CHECK-NEXT:    [[TMP0:%.*]] = load i32, ptr [[INDEX]], align 4, !tbaa [[TBAA2:![0-9]+]]\n // CHECK-NEXT:    [[ARRAYIDX:%.*]] = getelementptr inbounds [2 x i32], ptr [[ARR]], i32 [[TMP0]]\n // CHECK-NEXT:    [[TMP1:%.*]] = load i32, ptr [[ARRAYIDX]], align 4, !tbaa [[TBAA2]]\n // CHECK-NEXT:    [[MUL:%.*]] = mul i32 [[TMP1]], [[NUM]]\n-// CHECK-NEXT:    [[ARRAYIDX2:%.*]] = getelementptr inbounds [2 x %union.vect32], ptr [[TMP]], i32 [[TMP0]]\n+// CHECK-NEXT:    [[ARRAYIDX2:%.*]] = getelementptr inbounds [4 x [2 x [[UNION_VECT32]]]], ptr [[TMP]], i32 0, i32 [[TMP0]]\n // CHECK-NEXT:    store i32 [[MUL]], ptr [[ARRAYIDX2]], align 8, !tbaa [[TBAA6:![0-9]+]]\n // CHECK-NEXT:    [[ARRAYIDX5:%.*]] = getelementptr inbounds nuw i8, ptr [[ARRAYIDX]], i32 4\n // CHECK-NEXT:    [[TMP2:%.*]] = load i32, ptr [[ARRAYIDX5]], align 4, !tbaa [[TBAA2]]\n@@ -27,7 +27,7 @@ void bar(vect32 p[][2]);\n // CHECK-NEXT:    [[TMP3:%.*]] = lshr i32 [[MUL]], 16\n // CHECK-NEXT:    store i32 [[TMP3]], ptr [[VEC]], align 4, !tbaa [[TBAA2]]\n // CHECK-NEXT:    [[TMP4:%.*]] = load i32, ptr [[INDEX]], align 4, !tbaa [[TBAA2]]\n-// CHECK-NEXT:    [[ARRAYIDX13:%.*]] = getelementptr inbounds [2 x %union.vect32], ptr [[TMP]], i32 [[TMP4]]\n+// CHECK-NEXT:    [[ARRAYIDX13:%.*]] = getelementptr inbounds [4 x [2 x [[UNION_VECT32]]]], ptr [[TMP]], i32 0, i32 [[TMP4]]\n // CHECK-NEXT:    [[ARRAYIDX15:%.*]] = getelementptr inbounds nuw i8, ptr [[ARRAYIDX13]], i32 6\n // CHECK-NEXT:    [[TMP5:%.*]] = load i16, ptr [[ARRAYIDX15]], align 2, !tbaa [[TBAA6]]\n // CHECK-NEXT:    [[CONV16:%.*]] = zext i16 [[TMP5]] to i32\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex d24db3de8f7b3..0daf76227418b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2921,12 +2921,21 @@ Instruction *InstCombinerImpl::visitGEPOfGEP(GetElementPtrInst &GEP,\n   Indices.append(GEP.op_begin() + 2, GEP.op_end());\n \n   // Don't create GEPs with more than one non-zero index.\n-  unsigned NumNonZeroIndices = count_if(Indices, [](Value *Idx) {\n-    auto *C = dyn_cast<Constant>(Idx);\n-    return !C || !C->isNullValue();\n-  });\n-  if (NumNonZeroIndices > 1)\n-    return nullptr;\n+  // Exception: For AMDGPU, preserve multi-dimensional array structure for\n+  // better backend optimization (memory coalescing, vectorization). Check if\n+  // the source element type is a multi-dimensional array.\n+  Type *GEPSrcElemTy = GEP.getSourceElementType();\n+  bool IsMultiDimArray_Strip = GEPSrcElemTy->isArrayTy() &&\n+                               GEPSrcElemTy->getArrayElementType()->isArrayTy();\n+\n+  if (!IsMultiDimArray_Strip) {\n+    unsigned NumNonZeroIndices = count_if(Indices, [](Value *Idx) {\n+      auto *C = dyn_cast<Constant>(Idx);\n+      return !C || !C->isNullValue();\n+    });\n+    if (NumNonZeroIndices > 1)\n+      return nullptr;\n+  }\n \n   return replaceInstUsesWith(\n       GEP, Builder.CreateGEP(\n@@ -3364,17 +3373,24 @@ Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {\n                                drop_end(Indices), \"\", GEP.getNoWrapFlags()));\n   }\n \n-  // Strip leading zero indices.\n-  auto *FirstIdx = dyn_cast<Constant>(Indices.front());\n-  if (FirstIdx && FirstIdx->isNullValue() &&\n-      !FirstIdx->getType()->isVectorTy()) {\n-    gep_type_iterator GTI = gep_type_begin(GEP);\n-    ++GTI;\n-    if (!GTI.isStruct())\n-      return replaceInstUsesWith(GEP, Builder.CreateGEP(GTI.getIndexedType(),\n-                                                        GEP.getPointerOperand(),\n-                                                        drop_begin(Indices), \"\",\n-                                                        GEP.getNoWrapFlags()));\n+  // Strip leading zero indices (except for multi-dimensional arrays).\n+  // Preserve structure for better backend optimization.\n+  Type *GEPSrcElemTy = GEP.getSourceElementType();\n+  bool IsMultiDimArray_Strip = GEPSrcElemTy->isArrayTy() &&\n+                               GEPSrcElemTy->getArrayElementType()->isArrayTy();\n+\n+  if (!IsMultiDimArray_Strip) {\n+    auto *FirstIdx = dyn_cast<Constant>(Indices.front());\n+    if (FirstIdx && FirstIdx->isNullValue() &&\n+        !FirstIdx->getType()->isVectorTy()) {\n+      gep_type_iterator GTI = gep_type_begin(GEP);\n+      ++GTI;\n+      if (!GTI.isStruct())\n+        return replaceInstUsesWith(GEP, Builder.CreateGEP(GTI.getIndexedType(),\n+                                                          GEP.getPointerOperand(),\n+                                                          drop_begin(Indices), \"\",\n+                                                          GEP.getNoWrapFlags()));\n+    }\n   }\n \n   // Scalarize vector operands; prefer splat-of-gep.as canonical form.\n@@ -3403,29 +3419,33 @@ Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {\n     return replaceInstUsesWith(GEP, Res);\n   }\n \n-  bool SeenNonZeroIndex = false;\n-  for (auto [IdxNum, Idx] : enumerate(Indices)) {\n-    auto *C = dyn_cast<Constant>(Idx);\n-    if (C && C->isNullValue())\n-      continue;\n+  // GEP has multiple non-zero indices: Split it (except for multi-dim arrays).\n+  // Preserve structure for better backend optimization.\n+  if (!IsMultiDimArray_Strip) {\n+    bool SeenNonZeroIndex = false;\n+    for (auto [IdxNum, Idx] : enumerate(Indices)) {\n+      auto *C = dyn_cast<Constant>(Idx);\n+      if (C && C->isNullValue())\n+        continue;\n \n-    if (!SeenNonZeroIndex) {\n-      SeenNonZeroIndex = true;\n-      continue;\n-    }\n+      if (!SeenNonZeroIndex) {\n+        SeenNonZeroIndex = true;\n+        continue;\n+      }\n \n-    // GEP has multiple non-zero indices: Split it.\n-    ArrayRef<Value *> FrontIndices = ArrayRef(Indices).take_front(IdxNum);\n-    Value *FrontGEP =\n-        Builder.CreateGEP(GEPEltType, PtrOp, FrontIndices,\n-                          GEP.getName() + \".split\", GEP.getNoWrapFlags());\n-\n-    SmallVector<Value *> BackIndices;\n-    BackIndices.push_back(Constant::getNullValue(NewScalarIndexTy));\n-    append_range(BackIndices, drop_begin(Indices, IdxNum));\n-    return GetElementPtrInst::Create(\n-        GetElementPtrInst::getIndexedType(GEPEltType, FrontIndices), FrontGEP,\n-        BackIndices, GEP.getNoWrapFlags());\n+      // GEP has multiple non-zero indices: Split it.\n+      ArrayRef<Value *> FrontIndices = ArrayRef(Indices).take_front(IdxNum);\n+      Value *FrontGEP =\n+          Builder.CreateGEP(GEPEltType, PtrOp, FrontIndices,\n+                            GEP.getName() + \".split\", GEP.getNoWrapFlags());\n+\n+      SmallVector<Value *> BackIndices;\n+      BackIndices.push_back(Constant::getNullValue(NewScalarIndexTy));\n+      append_range(BackIndices, drop_begin(Indices, IdxNum));\n+      return GetElementPtrInst::Create(\n+          GetElementPtrInst::getIndexedType(GEPEltType, FrontIndices), FrontGEP,\n+          BackIndices, GEP.getNoWrapFlags());\n+    }\n   }\n \n   // Check to see if the inputs to the PHI node are getelementptr instructions.\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "These changes are needed to improve register pressure on AMDGPU backends.  Commits 055bfc0 and 8a09adc simplified multi-dimensional array GEP operations into chains of single-index GEPs and stripped leading zeros. It causes significant performance drop on AMDGPUs by removing semantic information that the backend relies on. For example, multi-dimensional GEPs allow coalesced LDS reads that reduces register pressure. \r\n\r\nIf we use the example in https://github.com/llvm/llvm-project/issues/170477, flattened GEPs lead to a pattern of ds_read->spill to scratch. If we guard the GEP flattening for multi-dimensional arrays, it allows the backend to generate code such that ds_reads are immediately used.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "xzy",
+          "test_body": "@glob = external hidden global [10 x [10 x [10 x i32]]]\n\ndefine ptr @xzy(i64 %x, i64 %y, i64 %z) {\nentry:\n  %gep = getelementptr inbounds [10 x [10 x [10 x i32]]], ptr getelementptr (i8, ptr @glob, i64 40), i64 0, i64 %x, i64 %z, i64 %y\n  ret ptr %gep\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/strcmp-3.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "call_strcmp_a5iI_a5i0",
+          "test_body": "@a5 = external constant [5 x [4 x i8]]\n\ndeclare i32 @strcmp(ptr, ptr)\n\ndefine i32 @call_strcmp_a5iI_a5i0(i64 %I) {\n  %p = getelementptr [5 x [4 x i8]], ptr @a5, i64 0, i64 %I, i64 0\n  %cmp = call i32 @strcmp(ptr %p, ptr @a5)\n  ret i32 %cmp\n}\n"
+        },
+        {
+          "test_name": "call_strcmp_a5i0_a5i1_pI",
+          "test_body": "@a5 = external constant [5 x [4 x i8]]\n\ndeclare i32 @strcmp(ptr, ptr)\n\ndefine i32 @call_strcmp_a5i0_a5i1_pI(i64 %I) {\n  %q = getelementptr [5 x [4 x i8]], ptr @a5, i64 0, i64 1, i64 %I\n  %cmp = call i32 @strcmp(ptr @a5, ptr %q)\n  ret i32 %cmp\n}\n"
+        },
+        {
+          "test_name": "call_strcmp_a5i0_a5iI",
+          "test_body": "@a5 = external constant [5 x [4 x i8]]\n\ndeclare i32 @strcmp(ptr, ptr)\n\ndefine i32 @call_strcmp_a5i0_a5iI(i64 %I) {\n  %q = getelementptr [5 x [4 x i8]], ptr @a5, i64 0, i64 %I, i64 0\n  %cmp = call i32 @strcmp(ptr @a5, ptr %q)\n  ret i32 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_strcmp_a5i0_a5i1_to_0",
+          "test_body": "@a5 = external constant [5 x [4 x i8]]\n\ndeclare i32 @strcmp(ptr, ptr)\n\ndefine i32 @fold_strcmp_a5i0_a5i1_to_0() {\n  %q = getelementptr [5 x [4 x i8]], ptr @a5, i64 0, i64 1, i64 0\n  %cmp = call i32 @strcmp(ptr @a5, ptr %q)\n  ret i32 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_strcmp_a5i0_a5i1_p1_to_0",
+          "test_body": "@a5 = external constant [5 x [4 x i8]]\n\ndeclare i32 @strcmp(ptr, ptr)\n\ndefine i32 @fold_strcmp_a5i0_a5i1_p1_to_0() {\n  %q = getelementptr [5 x [4 x i8]], ptr @a5, i64 0, i64 1, i64 1\n  %cmp = call i32 @strcmp(ptr @a5, ptr %q)\n  ret i32 %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/strlen-8.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fold_a5_4_i2_pI",
+          "test_body": "@a5_4 = external constant [5 x [4 x i8]]\n\ndeclare i64 @strlen(ptr)\n\ndefine i64 @fold_a5_4_i2_pI(i64 %I) {\n  %ptr = getelementptr [5 x [4 x i8]], ptr @a5_4, i64 0, i64 2, i64 %I\n  %len = call i64 @strlen(ptr %ptr)\n  ret i64 %len\n}\n"
+        },
+        {
+          "test_name": "fold_a5_4_i4_pI_to_0",
+          "test_body": "@a5_4 = external constant [5 x [4 x i8]]\n\ndeclare i64 @strlen(ptr)\n\ndefine i64 @fold_a5_4_i4_pI_to_0(i64 %I) {\n  %ptr = getelementptr [5 x [4 x i8]], ptr @a5_4, i64 0, i64 4, i64 %I\n  %len = call i64 @strlen(ptr %ptr)\n  ret i64 %len\n}\n"
+        },
+        {
+          "test_name": "fold_a5_4_i1_pI",
+          "test_body": "@a5_4 = external constant [5 x [4 x i8]]\n\ndeclare i64 @strlen(ptr)\n\ndefine i64 @fold_a5_4_i1_pI(i64 %I) {\n  %ptr = getelementptr [5 x [4 x i8]], ptr @a5_4, i64 0, i64 1, i64 %I\n  %len = call i64 @strlen(ptr %ptr)\n  ret i64 %len\n}\n"
+        },
+        {
+          "test_name": "fold_a5_4_i0_pI",
+          "test_body": "@a5_4 = external constant [5 x [4 x i8]]\n\ndeclare i64 @strlen(ptr)\n\ndefine i64 @fold_a5_4_i0_pI(i64 %I) {\n  %ptr = getelementptr [5 x [4 x i8]], ptr @a5_4, i64 0, i64 0, i64 %I\n  %len = call i64 @strlen(ptr %ptr)\n  ret i64 %len\n}\n"
+        },
+        {
+          "test_name": "fold_a5_4_i3_pI_to_0",
+          "test_body": "@a5_4 = external constant [5 x [4 x i8]]\n\ndeclare i64 @strlen(ptr)\n\ndefine i64 @fold_a5_4_i3_pI_to_0(i64 %I) {\n  %ptr = getelementptr [5 x [4 x i8]], ptr @a5_4, i64 0, i64 3, i64 %I\n  %len = call i64 @strlen(ptr %ptr)\n  ret i64 %len\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions cpp,c -- clang/test/CodeGen/union-tbaa1.c llvm/lib/Transforms/InstCombine/InstructionCombining.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 548cf2be6..1ec37492a 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -3388,10 +3388,10 @@ Instruction *InstCombinerImpl::visitGetElementPtrInst(GetElementPtrInst &GEP) {\n       gep_type_iterator GTI = gep_type_begin(GEP);\n       ++GTI;\n       if (!GTI.isStruct())\n-        return replaceInstUsesWith(GEP, Builder.CreateGEP(GTI.getIndexedType(),\n-                                                          GEP.getPointerOperand(),\n-                                                          drop_begin(Indices), \"\",\n-                                                          GEP.getNoWrapFlags()));\n+        return replaceInstUsesWith(\n+            GEP,\n+            Builder.CreateGEP(GTI.getIndexedType(), GEP.getPointerOperand(),\n+                              drop_begin(Indices), \"\", GEP.getNoWrapFlags()));\n     }\n   }\n \n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 195374 tests passed\n* 6398 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 131164 tests passed\n* 4190 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "akadutta",
+      "body": "I am working off a slightly smaller version of the example in https://github.com/llvm/llvm-project/issues/170477. \r\nKnowing the full layout enables the backend to recognize consecutive elements in shared memory. The full layout allows the backend to do more efficient loads. Without this patch, stride calculations are lost, without which, the backend cannot optimize/coalesce vector loads. It has to generate conservative code. Consider these two ASM snippets below:\r\n\r\nWithout patch:\r\n\r\n```\r\nds_read_b128 v[0:3], v1 offset:12400\r\ns_waitcnt lgkmcnt(0)\r\nbuffer_store_dword v0, off, s[0:3], 0 offset:252 ; 4-byte Folded Spill\r\ns_nop 0\r\nbuffer_store_dword v1, off, s[0:3], 0 offset:256 ; 4-byte Folded Spill\r\nbuffer_store_dword v2, off, s[0:3], 0 offset:260 ; 4-byte Folded Spill\r\nbuffer_store_dword v3, off, s[0:3], 0 offset:264 ; 4-byte Folded Spill\r\n.............................................\r\n............................................\r\nbuffer_load_dword v44, off, s[0:3], 0 offset:252 ; 4-byte Folded Reload\r\nbuffer_load_dword v45, off, s[0:3], 0 offset:256 ; 4-byte Folded Reload\r\nbuffer_load_dword v46, off, s[0:3], 0 offset:260 ; 4-byte Folded Reload\r\nbuffer_load_dword v47, off, s[0:3], 0 offset:264 ; 4-byte Folded Reload\r\ns_waitcnt vmcnt(2)\r\nv_fmac_f64_e32 v[40:41], v[44:45], v[0:1]\r\ns_waitcnt vmcnt(0)\r\nv_fmac_f64_e32 v[40:41], v[46:47], v[2:3]\r\n```\r\n\r\nWith patch:\r\n\r\n```\r\nds_read_b128 v[24:27], v58 offset:12400\r\ns_waitcnt lgkmcnt(0)\r\nv_fmac_f64_e32 v[50:51], v[24:25], v[8:9]\r\nv_fmac_f64_e32 v[50:51], v[26:27], v[10:11]\r\n```\r\n\r\nWith flattened accesses, LDS reads are immediately spilled to scratch, and then re-read just before their use. With structured accesses, the scheduler can batch multiple LDS reads together and schedule uses immediately after reads. \r\n\r\nSteps to repro:\r\nopt -O3 -march=amdgcn -mcpu=gfx90a -S minimal_vgpr_spill_reproducer.ll -o opted_repro.ll\r\nllc -march=amdgcn -mcpu=gfx90a opted_repro.ll -o opted_repro.s\r\n\r\n[minimal_vgpr_spill_reproducer.ll.txt](https://github.com/user-attachments/files/24676329/minimal_vgpr_spill_reproducer.ll.txt)\r\n"
+    },
+    {
+      "author": "nikic",
+      "body": "I've checked the test case, and I think the root cause here is actually additional unrolling. I haven't tried figuring out what exactly changes in the cost model. I see one invariant GEP index being hoisted out now, possibly that's enough to push it over the edge?"
+    },
+    {
+      "author": "akadutta",
+      "body": "Thank you for taking the time to look at the test case. It is indeed the case that disabling unrolling improves register pressure and removes any spills. \r\nHowever, I think the performance loss is still related to the loss of GEP structure. Simply disabling unrolling did not recover performance. Here's why I think so:\r\nThe flattened GEPs do not preserve semantic information about multi dimensional arrays. The unroller sees simpler flattened structure and unrolls more aggressively. The unroller incorrectly computes the \"simplicity\" of the flattened GEPs. However, when structure is preserved the unroller is more conservative. Additionally, when we do not preserve the GEP structures, it makes it difficult for the backend to recognize patterns. In the flattened case, the backend sees arbitrary offsets, falls back to simple loads, and the unrolled code leads to huge register pressure. However, when structure is preserved, the backend can recognize strided access patterns easier, can issue specialized LDS instructions, and performs better scheduling. I think that, although the unroller aggravates the problem, the cause still traces back to the GEP changes. \r\nPlease let me know what you think."
+    },
+    {
+      "author": "akadutta",
+      "body": "ping"
+    },
+    {
+      "author": "arsenm",
+      "body": "> The flattened GEPs do not preserve semantic information about multi dimensional arrays.\r\n\r\nThe GEP type doesn't really contain semantic information about the array. It's just a size factor in the address computation\r\n\r\n> the backend can recognize strided access patterns easier,\r\n\r\nCan you be more specific about what code this is?\r\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-16T16:02:21Z",
+  "patch_location_lineno": {
+    "clang/test/CodeGen/union-tbaa1.c": [
+      [
+        11,
+        23
+      ],
+      [
+        27,
+        33
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        2921,
+        2932
+      ],
+      [
+        3364,
+        3380
+      ],
+      [
+        3403,
+        3431
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/canonicalize-gep-constglob.ll": [
+      [
+        35,
+        43
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/strcmp-3.ll": [
+      [
+        25,
+        31
+      ],
+      [
+        40,
+        46
+      ],
+      [
+        68,
+        74
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/strlen-8.ll": [
+      [
+        16,
+        22
+      ],
+      [
+        30,
+        36
+      ],
+      [
+        44,
+        50
+      ],
+      [
+        58,
+        64
+      ],
+      [
+        72,
+        78
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "InstCombinerImpl::visitGEPOfGEP",
+      "InstCombinerImpl::visitGetElementPtrInst"
+    ]
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "pr_id": 179968,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179968",
+  "state": "closed",
+  "title": "[InstCombine] Fold min/max(fpext x, C) to fpext(min/max(x, fptrunc C))",
+  "author": "nikic",
+  "base_commit": "531430b614cf8a5122335168abbc54096b5225a2",
+  "fix_commit": "4de25b6b8c42f63f3bd866bc6552184abd67b51c",
+  "patch": "diff --git a/llvm/lib/Analysis/ConstantFolding.cpp b/llvm/lib/Analysis/ConstantFolding.cpp\nindex c0754d3a41264..ab060b1b9320a 100644\n--- a/llvm/lib/Analysis/ConstantFolding.cpp\n+++ b/llvm/lib/Analysis/ConstantFolding.cpp\n@@ -4748,6 +4748,17 @@ Constant *llvm::getLosslessInvCast(Constant *C, Type *InvCastTo,\n     }\n     return InvC;\n   }\n+  case Instruction::FPExt: {\n+    Constant *InvC =\n+        ConstantFoldCastOperand(Instruction::FPTrunc, C, InvCastTo, DL);\n+    if (InvC) {\n+      Constant *CastInvC =\n+          ConstantFoldCastOperand(CastOp, InvC, C->getType(), DL);\n+      if (CastInvC == C)\n+        return InvC;\n+    }\n+    return nullptr;\n+  }\n   default:\n     return nullptr;\n   }\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 1b42ed5e4a349..7be083c2ebbd7 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -2878,6 +2878,18 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n       return new FPExtInst(NewCall, II->getType());\n     }\n \n+    // m(fpext X, C) -> fpext m(X, TruncC) if C can be losslessly truncated.\n+    Constant *C;\n+    if (match(Arg0, m_OneUse(m_FPExt(m_Value(X)))) &&\n+        match(Arg1, m_ImmConstant(C))) {\n+      if (Constant *TruncC =\n+              getLosslessInvCast(C, X->getType(), Instruction::FPExt, DL)) {\n+        Value *NewCall =\n+            Builder.CreateBinaryIntrinsic(IID, X, TruncC, II, II->getName());\n+        return new FPExtInst(NewCall, II->getType());\n+      }\n+    }\n+\n     // max X, -X --> fabs X\n     // min X, -X --> -(fabs X)\n     // TODO: Remove one-use limitation? That is obviously better for max,\n",
+  "components": [
+    "ConstantFold",
+    "InstCombine"
+  ],
+  "description": "Fold `min/max(fpext x, C)` to `fpext(min/max(x, fptrunc C))` in cases where the truncation of the constant is lossless.\r\n\r\nThis helps eliminate fpext/fptrunc pairs around min/max and addresses the regression from https://github.com/llvm/llvm-project/pull/177988.\r\n\r\nProof: https://alive2.llvm.org/ce/z/y_Bcdd",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/minnum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "reduce_precision_multi_use_2",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.minnum.f64(double, double) #0\n\ndefine float @reduce_precision_multi_use_2(float %x, float %y, ptr %p, ptr %p2) {\n  %x.ext = fpext float %x to double\n  %y.ext = fpext float %y to double\n  store double %x.ext, ptr %p, align 8\n  store double %y.ext, ptr %p2, align 8\n  %minnum = call double @llvm.minnum.f64(double %x.ext, double %y.ext)\n  %trunc = fptrunc double %minnum to float\n  ret float %trunc\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "reduce_precision_const",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.minnum.f64(double, double) #0\n\ndefine float @reduce_precision_const(float %x) {\n  %x.ext = fpext float %x to double\n  %minnum = call double @llvm.minnum.f64(double %x.ext, double 1.000000e+00)\n  %trunc = fptrunc double %minnum to float\n  ret float %trunc\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negated_op",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndefine float @negated_op(float %x) {\n  %negx = fneg float %x\n  %r = call float @llvm.minnum.f32(float %x, float %negx)\n  ret float %r\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "reduce_precision_const_multi_use",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.minnum.f64(double, double) #0\n\ndeclare void @use(double)\n\ndefine float @reduce_precision_const_multi_use(float %x) {\n  %x.ext = fpext float %x to double\n  call void @use(double %x.ext)\n  %minnum = call double @llvm.minnum.f64(double %x.ext, double 1.000000e+00)\n  %trunc = fptrunc double %minnum to float\n  ret float %trunc\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "reduce_precision_const_not_lossless",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.minnum.f64(double, double) #0\n\ndefine float @reduce_precision_const_not_lossless(float %x) {\n  %x.ext = fpext float %x to double\n  %minnum = call double @llvm.minnum.f64(double %x.ext, double 1.000000e-01)\n  %trunc = fptrunc double %minnum to float\n  ret float %trunc\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-05T16:03:35Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      [
+        4748,
+        4753
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        2878,
+        2883
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minnum.ll": [
+      [
+        486,
+        491
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      "llvm::getLosslessInvCast"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst"
+    ],
+    "llvm/test/Transforms/InstCombine/minnum.ll": [
+      "negated_op",
+      "reduce_precision_multi_use_2"
+    ]
+  }
+}

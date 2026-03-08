@@ -1,0 +1,214 @@
+{
+  "pr_id": 182444,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182444",
+  "state": "closed",
+  "title": "FunctionAttrs: Basic propagation of nofpclass",
+  "author": "arsenm",
+  "base_commit": "4a4912294e4088791b56818f0651a5637cc74c19",
+  "fix_commit": "aa13cd677e0c52a5a7f52c09db47ccf759eb8230",
+  "patch": "diff --git a/llvm/lib/Transforms/IPO/FunctionAttrs.cpp b/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\nindex 626d28d4c50d8..4c1695a68587d 100644\n--- a/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\n+++ b/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\n@@ -47,6 +47,7 @@\n #include \"llvm/IR/Metadata.h\"\n #include \"llvm/IR/ModuleSummaryIndex.h\"\n #include \"llvm/IR/PassManager.h\"\n+#include \"llvm/IR/PatternMatch.h\"\n #include \"llvm/IR/Type.h\"\n #include \"llvm/IR/Use.h\"\n #include \"llvm/IR/User.h\"\n@@ -66,6 +67,7 @@\n #include <vector>\n \n using namespace llvm;\n+using namespace llvm::PatternMatch;\n \n #define DEBUG_TYPE \"function-attrs\"\n \n@@ -2376,12 +2378,13 @@ static bool runImpl(CallGraphSCC &SCC, AARGetterT AARGetter) {\n }\n \n static bool addNoRecurseAttrsTopDown(Function &F) {\n+  if (F.doesNotRecurse())\n+    return false;\n+\n   // We check the preconditions for the function prior to calling this to avoid\n   // the cost of building up a reversible post-order list. We assert them here\n   // to make sure none of the invariants this relies on were violated.\n   assert(!F.isDeclaration() && \"Cannot deduce norecurse without a definition!\");\n-  assert(!F.doesNotRecurse() &&\n-         \"This function has already been deduced as norecurs!\");\n   assert(F.hasInternalLinkage() &&\n          \"Can only do top-down deduction for internal linkage functions!\");\n \n@@ -2404,6 +2407,55 @@ static bool addNoRecurseAttrsTopDown(Function &F) {\n   return true;\n }\n \n+static bool addNoFPClassAttrsTopDown(Function &F) {\n+  assert(!F.isDeclaration() && \"Cannot deduce nofpclass without a definition!\");\n+  unsigned NumArgs = F.arg_size();\n+  SmallVector<FPClassTest, 8> ArgsNoFPClass(NumArgs, fcAllFlags);\n+  FPClassTest RetNoFPClass = fcAllFlags;\n+\n+  bool Changed = false;\n+  for (User *U : F.users()) {\n+    auto *CB = dyn_cast<CallBase>(U);\n+    if (!CB || CB->getCalledFunction() != &F)\n+      return false;\n+\n+    RetNoFPClass &= CB->getRetNoFPClass();\n+    for (unsigned I = 0; I != NumArgs; ++I) {\n+      // TODO: Consider computeKnownFPClass, at least with a small search\n+      // depth. This will currently not catch non-splat vectors.\n+      const APFloat *Cst;\n+      if (match(CB->getArgOperand(I), m_APFloat(Cst)))\n+        ArgsNoFPClass[I] &= ~Cst->classify();\n+      else\n+        ArgsNoFPClass[I] &= CB->getParamNoFPClass(I);\n+    }\n+  }\n+\n+  LLVMContext &Ctx = F.getContext();\n+\n+  if (RetNoFPClass != fcNone) {\n+    FPClassTest OldAttr = F.getAttributes().getRetNoFPClass();\n+    if (OldAttr != RetNoFPClass) {\n+      F.addRetAttr(Attribute::getWithNoFPClass(Ctx, RetNoFPClass));\n+      Changed = true;\n+    }\n+  }\n+\n+  for (unsigned I = 0; I != NumArgs; ++I) {\n+    FPClassTest ArgNoFPClass = ArgsNoFPClass[I];\n+    if (ArgNoFPClass == fcNone)\n+      continue;\n+    FPClassTest OldAttr = F.getParamNoFPClass(I);\n+    if (OldAttr == ArgNoFPClass)\n+      continue;\n+\n+    F.addParamAttr(I, Attribute::getWithNoFPClass(Ctx, ArgNoFPClass));\n+    Changed = true;\n+  }\n+\n+  return Changed;\n+}\n+\n static bool deduceFunctionAttributeInRPO(Module &M, LazyCallGraph &CG) {\n   // We only have a post-order SCC traversal (because SCCs are inherently\n   // discovered in post-order), so we accumulate them in a vector and then walk\n@@ -2420,13 +2472,15 @@ static bool deduceFunctionAttributeInRPO(Module &M, LazyCallGraph &CG) {\n       if (SCC.size() != 1)\n         continue;\n       Function &F = SCC.begin()->getFunction();\n-      if (!F.isDeclaration() && !F.doesNotRecurse() && F.hasInternalLinkage())\n+      if (!F.isDeclaration() && F.hasInternalLinkage())\n         Worklist.push_back(&F);\n     }\n   }\n   bool Changed = false;\n-  for (auto *F : llvm::reverse(Worklist))\n+  for (auto *F : llvm::reverse(Worklist)) {\n     Changed |= addNoRecurseAttrsTopDown(*F);\n+    Changed |= addNoFPClassAttrsTopDown(*F);\n+  }\n \n   return Changed;\n }\n",
+  "components": [
+    "FunctionAttrs"
+  ],
+  "description": "Perform caller->callee propagation of nofpclass on callsites. As\nfar as I can tell the only prior callsite to callee propagation here\nwas for norecurse. This doesn't handle transitive callers.\n\nI was hoping to avoid doing this, and instead get attributor/attributor-light\nenabled in the default pass pipeline. nofpclass propagation enabled by\ndefault is the main blocker for eliminating the finite_only_opt global\ncheck in device-libs, but this single level of propagation is most likely\nsufficient for that use. Implemnting this here is probably the most expedient\npath to removing the control library.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/FunctionAttrs/nofpclass.ll",
+      "commands": [
+        "opt -S -passes='cgscc(function-attrs),rpo-function-attrs' < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "nofpclass_non_call_user",
+          "test_body": "define hidden float @nofpclass_non_call_user(float %arg, ptr %ptr) {\n  %load = load volatile float, ptr %ptr, align 4\n  %add = fadd float %arg, %load\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "call_nofpclass_non_call_user",
+          "test_body": "declare hidden float @nofpclass_non_call_user(float, ptr)\n\ndefine float @call_nofpclass_non_call_user(float %arg, ptr %ptr, ptr %fptr.ptr) {\n  %ret = call nofpclass(nan) float @nofpclass_non_call_user(float nofpclass(nan) %arg, ptr %ptr)\n  store ptr @nofpclass_non_call_user, ptr %fptr.ptr, align 8\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "return_f32_extern",
+          "test_body": "define float @return_f32_extern(ptr %ptr) {\n  %val = load volatile float, ptr %ptr, align 4\n  ret float %val\n}\n"
+        },
+        {
+          "test_name": "caller_transitive_nonan",
+          "test_body": "declare hidden float @transitive_nonan_callee1(float, ptr)\n\ndefine float @caller_transitive_nonan(float %arg, ptr %ptr) {\n  %ret = call nofpclass(nan) float @transitive_nonan_callee1(float nofpclass(nan) %arg, ptr %ptr)\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "transitive_nonan_callee0",
+          "test_body": "define hidden float @transitive_nonan_callee0(float %arg, ptr %ptr) {\n  %load = load volatile float, ptr %ptr, align 4\n  %add = fadd float %arg, %load\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "refine_existing_nofpclass",
+          "test_body": "define hidden nofpclass(nan) float @refine_existing_nofpclass(float nofpclass(inf) %arg, ptr %ptr) {\n  %load = load float, ptr %ptr, align 4\n  ret float %load\n}\n"
+        },
+        {
+          "test_name": "mutually_recursive0",
+          "test_body": "define hidden float @mutually_recursive0(float %arg) {\n  %call = call nofpclass(nan) float @mutually_recursive1(float %arg)\n  ret float %call\n}\n\ndeclare hidden float @mutually_recursive1(float)\n"
+        },
+        {
+          "test_name": "calls_merged_arg_uses",
+          "test_body": "declare hidden float @merged_arg_uses(float, half, half)\n\ndefine float @calls_merged_arg_uses(float %arg0, half %arg1, half %arg2) {\n  %call0 = call float @merged_arg_uses(float nofpclass(nan inf) %arg0, half nofpclass(zero) %arg1, half nofpclass(zero) %arg2)\n  %call1 = call float @merged_arg_uses(float nofpclass(nan) %arg0, half nofpclass(sub) %arg1, half %arg2)\n  %ret = fadd float %call0, %call1\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "non_callee_use_ret",
+          "test_body": "define hidden float @non_callee_use_ret(ptr %ptr) {\n  %val = load volatile float, ptr %ptr, align 4\n  ret float %val\n}\n"
+        },
+        {
+          "test_name": "call_infer_arg_from_constants",
+          "test_body": "declare hidden void @infer_arg_from_constants(float, <2 x half>, float, float)\n\ndefine void @call_infer_arg_from_constants() {\n  call void @infer_arg_from_constants(float 0.000000e+00, <2 x half> <half 0xH3C00, half 0xHBC00>, float poison, float 0x7FF8000000000000)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "caller_non_callee_use",
+          "test_body": "declare hidden float @non_callee_use_ret(ptr)\n\ndeclare float @uses_func_ptr(ptr)\n\ndefine float @caller_non_callee_use(ptr %ptr) {\n  %ret = call nofpclass(nan) float @uses_func_ptr(ptr @non_callee_use_ret)\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "infer_arg_from_load",
+          "test_body": "define hidden void @infer_arg_from_load(float %arg) {\n  ret void\n}\n"
+        },
+        {
+          "test_name": "mutually_recursive1",
+          "test_body": "declare hidden float @mutually_recursive0(float)\n\ndefine hidden float @mutually_recursive1(float %arg) {\n  %call = call float @mutually_recursive0(float %arg)\n  ret float %call\n}\n"
+        },
+        {
+          "test_name": "merged_ret_uses",
+          "test_body": "define hidden float @merged_ret_uses(ptr %ptr) {\n  %val = load volatile float, ptr %ptr, align 4\n  ret float %val\n}\n"
+        },
+        {
+          "test_name": "caller_refine_existing_nofpclass",
+          "test_body": "declare hidden nofpclass(nan) float @refine_existing_nofpclass(float nofpclass(inf), ptr)\n\ndefine float @caller_refine_existing_nofpclass(float %arg, ptr %ptr) {\n  %call = call nofpclass(inf) float @refine_existing_nofpclass(float nofpclass(zero) %arg, ptr %ptr)\n  ret float %call\n}\n"
+        },
+        {
+          "test_name": "merged_arg_uses",
+          "test_body": "define hidden float @merged_arg_uses(float %arg0, half %arg1, half %arg2) {\n  %fpext0 = fpext half %arg1 to float\n  %fpext1 = fpext half %arg1 to float\n  %add0 = fadd float %arg0, %fpext0\n  %add1 = fadd float %add0, %fpext1\n  ret float %add1\n}\n"
+        },
+        {
+          "test_name": "transitive_nonan_callee1",
+          "test_body": "declare hidden float @transitive_nonan_callee0(float, ptr)\n\ndefine hidden float @transitive_nonan_callee1(float %arg, ptr %ptr) {\n  %ret = call float @transitive_nonan_callee0(float %arg, ptr %ptr)\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "self_recursive_callsite_attrs",
+          "test_body": "define hidden float @self_recursive_callsite_attrs(float %x) {\n  %ret = call nofpclass(inf) float @self_recursive_callsite_attrs(float nofpclass(nan) %x)\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "call_mixed_ret_and_args_0",
+          "test_body": "declare hidden { double, double } @mixed_ret_and_args(float, i32, <2 x double>, { double, double })\n\ndefine void @call_mixed_ret_and_args_0(float %a, i32 %b, <2 x double> %c, { double, double } %d) {\n  %result = call nofpclass(sub) { double, double } @mixed_ret_and_args(float nofpclass(nan) %a, i32 %b, <2 x double> nofpclass(inf) %c, { double, double } nofpclass(zero) %d)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "calls_merge_rets",
+          "test_body": "declare hidden float @merged_ret_uses(ptr)\n\ndefine float @calls_merge_rets(ptr %ptr) {\n  %call0 = call nofpclass(nan inf) float @merged_ret_uses(ptr %ptr)\n  %call1 = call nofpclass(nan zero) float @merged_ret_uses(ptr %ptr)\n  %add = fadd float %call0, %call1\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "call_infer_arg_from_load",
+          "test_body": "declare hidden void @infer_arg_from_load(float)\n\ndefine void @call_infer_arg_from_load(ptr %ptr) {\n  %not.nan = load float, ptr %ptr, align 4, !nofpclass !0\n  call void @infer_arg_from_load(float %not.nan)\n  ret void\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "calls_no_inf_return",
+          "test_body": "declare float @return_f32_extern(ptr)\n\ndeclare hidden float @only_noinf_ret_uses(ptr)\n\ndefine float @calls_no_inf_return(ptr %ptr) {\n  %call0 = call float @return_f32_extern(ptr %ptr)\n  %call1 = call nofpclass(inf) float @only_noinf_ret_uses(ptr %ptr)\n  %add = fadd float %call0, %call1\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "infer_arg_from_constants",
+          "test_body": "define hidden void @infer_arg_from_constants(float %a, <2 x half> %b, float %c, float %d) {\n  ret void\n}\n"
+        },
+        {
+          "test_name": "called_with_wrong_ret_type",
+          "test_body": "define hidden float @called_with_wrong_ret_type(ptr %ptr) {\n  %val = load volatile float, ptr %ptr, align 4\n  ret float %val\n}\n"
+        },
+        {
+          "test_name": "wrong_callee_ret_type",
+          "test_body": "declare hidden float @called_with_wrong_ret_type(ptr)\n\ndefine <2 x half> @wrong_callee_ret_type(ptr %ptr) {\n  %ret = call nofpclass(nan) <2 x half> @called_with_wrong_ret_type(ptr %ptr)\n  ret <2 x half> %ret\n}\n"
+        },
+        {
+          "test_name": "mixed_ret_and_args",
+          "test_body": "define hidden { double, double } @mixed_ret_and_args(float %scalar.arg, i32 %not.fp, <2 x double> %vec, { double, double } %struct) {\n  %fpext = fpext float %scalar.arg to double\n  %vec.0 = extractelement <2 x double> %vec, i32 0\n  %insert.0 = insertvalue { double, double } poison, double %fpext, 0\n  %insert.1 = insertvalue { double, double } poison, double %vec.0, 0\n  ret { double, double } %insert.1\n}\n"
+        },
+        {
+          "test_name": "only_noinf_ret_uses",
+          "test_body": "define hidden float @only_noinf_ret_uses(ptr %ptr) {\n  %val = load volatile float, ptr %ptr, align 4\n  ret float %val\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "ipo",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#182444** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/182444?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/182444?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 169895 tests passed\n* 3067 tests skipped\n* 1 test failed\n\n## Failed Tests\n(click on a test name to see its output)\n\n### lldb-api\n<details>\n<summary>lldb-api.functionalities/data-formatter/data-formatter-stl/generic/list/TestDataFormatterGenericList.py</summary>\n\n```\nScript:\n--\n/usr/bin/python3 /home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/test/API/dotest.py -u CXXFLAGS -u CFLAGS --env LLVM_LIBS_DIR=/home/gha/actions-runner/_work/llvm-project/llvm-project/build/./lib --env LLVM_INCLUDE_DIR=/home/gha/actions-runner/_work/llvm-project/llvm-project/build/include --env LLVM_TOOLS_DIR=/home/gha/actions-runner/_work/llvm-project/llvm-project/build/./bin --libcxx-include-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/include/c++/v1 --libcxx-include-target-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/include/x86_64-unknown-linux-gnu/c++/v1 --libcxx-library-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/./lib/x86_64-unknown-linux-gnu --arch x86_64 --build-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/lldb-test-build.noindex --lldb-module-cache-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/lldb-test-build.noindex/module-cache-lldb/lldb-api --clang-module-cache-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/lldb-test-build.noindex/module-cache-clang/lldb-api --executable /home/gha/actions-runner/_work/llvm-project/llvm-project/build/./bin/lldb --compiler /home/gha/actions-runner/_work/llvm-project/llvm-project/build/./bin/clang --dsymutil /home/gha/actions-runner/_work/llvm-project/llvm-project/build/./bin/dsymutil --make /usr/bin/gmake --llvm-tools-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/./bin --lldb-obj-root /home/gha/actions-runner/_work/llvm-project/llvm-project/build/tools/lldb --lldb-libs-dir /home/gha/actions-runner/_work/llvm-project/llvm-project/build/./lib --cmake-build-type Release /home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/test/API/functionalities/data-formatter/data-formatter-stl/generic/list -p TestDataFormatterGenericList.py\n--\nExit Code: 1\n\nCommand Output (stdout):\n--\nlldb version 23.0.0git (https://github.com/llvm/llvm-project revision cfa3d24a77dd8becc2f6f1e011004653c20f7e85)\n  clang revision cfa3d24a77dd8becc2f6f1e011004653c20f7e85\n  llvm revision cfa3d24a77dd8becc2f6f1e011004653c20f7e85\nSkipping the following test categories: msvcstl, dsym, pdb, gmodules, debugserver, objc\n\n--\nCommand Output (stderr):\n--\nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libcpp_dsym (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libcpp_dsym) (test case does not fall in any category of interest for this run) \nPASS: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libcpp_dwarf (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libcpp_dwarf)\nPASS: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libcpp_dwo (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libcpp_dwo)\nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libcpp_pdb (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libcpp_pdb) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libstdcpp_dsym (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libstdcpp_dsym) (test case does not fall in any category of interest for this run) \nPASS: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libstdcpp_dwarf (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libstdcpp_dwarf)\nPASS: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libstdcpp_dwo (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libstdcpp_dwo)\nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_libstdcpp_pdb (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_libstdcpp_pdb) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_msvcstl_dsym (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_msvcstl_dsym) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_msvcstl_dwarf (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_msvcstl_dwarf) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_msvcstl_dwo (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_msvcstl_dwo) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_ptr_and_ref_msvcstl_pdb (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_ptr_and_ref_msvcstl_pdb) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libcpp_dsym (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libcpp_dsym) (test case does not fall in any category of interest for this run) \nPASS: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libcpp_dwarf (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libcpp_dwarf)\nPASS: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libcpp_dwo (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libcpp_dwo)\nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libcpp_pdb (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libcpp_pdb) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libstdcpp_dsym (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libstdcpp_dsym) (test case does not fall in any category of interest for this run) \nFAIL: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libstdcpp_dwarf (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libstdcpp_dwarf)\nFAIL: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libstdcpp_dwo (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libstdcpp_dwo)\nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_libstdcpp_pdb (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libstdcpp_pdb) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_msvcstl_dsym (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_msvcstl_dsym) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_msvcstl_dwarf (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_msvcstl_dwarf) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_msvcstl_dwo (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_msvcstl_dwo) (test case does not fall in any category of interest for this run) \nUNSUPPORTED: LLDB (/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang-x86_64) :: test_with_run_command_msvcstl_pdb (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_msvcstl_pdb) (test case does not fall in any category of interest for this run) \n======================================================================\nFAIL: test_with_run_command_libstdcpp_dwarf (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libstdcpp_dwarf)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/packages/Python/lldbsuite/test/lldbtest.py\", line 1858, in test_method\n    return attrvalue(self)\n           ^^^^^^^^^^^^^^^\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/test/API/functionalities/data-formatter/data-formatter-stl/generic/list/TestDataFormatterGenericList.py\", line 302, in test_with_run_command_libstdcpp\n    self.do_test_with_run_command(is_libstdcpp=True)\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/test/API/functionalities/data-formatter/data-formatter-stl/generic/list/TestDataFormatterGenericList.py\", line 64, in do_test_with_run_command\n    self.expect(\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/packages/Python/lldbsuite/test/lldbtest.py\", line 2477, in expect\n    self.runCmd(\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/packages/Python/lldbsuite/test/lldbtest.py\", line 1049, in runCmd\n    self.assertTrue(self.res.Succeeded(), msg + output)\nAssertionError: False is not true : Command 'frame variable &numbers_list._M_impl._M_node --raw' did not return successfully\nError output:\nerror: <user expression 0>:1:15: \"_M_impl\" is not a member of \"(int_list) numbers_list\"\n   1 | &numbers_list._M_impl._M_node\n     | ^\n\nConfig=x86_64-/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang\n======================================================================\nFAIL: test_with_run_command_libstdcpp_dwo (TestDataFormatterGenericList.GenericListDataFormatterTestCase.test_with_run_command_libstdcpp_dwo)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/packages/Python/lldbsuite/test/lldbtest.py\", line 1858, in test_method\n    return attrvalue(self)\n           ^^^^^^^^^^^^^^^\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/test/API/functionalities/data-formatter/data-formatter-stl/generic/list/TestDataFormatterGenericList.py\", line 302, in test_with_run_command_libstdcpp\n    self.do_test_with_run_command(is_libstdcpp=True)\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/test/API/functionalities/data-formatter/data-formatter-stl/generic/list/TestDataFormatterGenericList.py\", line 64, in do_test_with_run_command\n    self.expect(\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/packages/Python/lldbsuite/test/lldbtest.py\", line 2477, in expect\n    self.runCmd(\n  File \"/home/gha/actions-runner/_work/llvm-project/llvm-project/lldb/packages/Python/lldbsuite/test/lldbtest.py\", line 1049, in runCmd\n    self.assertTrue(self.res.Succeeded(), msg + output)\nAssertionError: False is not true : Command 'frame variable &numbers_list._M_impl._M_node --raw' did not return successfully\nError output:\nerror: <user expression 0>:1:15: \"_M_impl\" is not a member of \"(int_list) numbers_list\"\n   1 | &numbers_list._M_impl._M_node\n     | ^\n\nConfig=x86_64-/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/clang\n----------------------------------------------------------------------\nRan 24 tests in 3.645s\n\nFAILED (failures=2, skipped=16)\n\n--\n\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "Hello @arsenm \r\n\r\nThe following starts failing with this patch:\r\n```opt -verify-each -passes=\"cgscc(inline),rpo-function-attrs\" bbi-115351.ll -S -o /dev/null```\r\nResult:\r\n```\r\nAttribute 'nofpclass(all)' applied to incompatible type!\r\nptr @safe_add_func_int64_t_s_s\r\nLLVM ERROR: Broken module found after pass \"ReversePostOrderFunctionAttrsPass\", compilation aborted!\r\n```\r\n[bbi-115351.ll.gz](https://github.com/user-attachments/files/25468694/bbi-115351.ll.gz)\r\n"
+    },
+    {
+      "author": "arsenm",
+      "body": "> Hello @arsenm\r\n> \r\n> The following starts failing with this patch: `opt -verify-each -passes=\"cgscc(inline),rpo-function-attrs\" bbi-115351.ll -S -o /dev/null` Result:\r\n> \r\n> ```\r\n> Attribute 'nofpclass(all)' applied to incompatible type!\r\n> ptr @safe_add_func_int64_t_s_s\r\n> LLVM ERROR: Broken module found after pass \"ReversePostOrderFunctionAttrsPass\", compilation aborted!\r\n> ```\r\n> \r\n> [bbi-115351.ll.gz](https://github.com/user-attachments/files/25468694/bbi-115351.ll.gz)\r\n\r\nI think this is an inline or pass manager bug when there is a call in unreachable code. If you first run cgscc(inline), then separately run rpo-function-attrs, it doesn't happen. This code shouldn't need to worry about seeing a function with no uses."
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "> > Hello @arsenm\r\n> > The following starts failing with this patch: `opt -verify-each -passes=\"cgscc(inline),rpo-function-attrs\" bbi-115351.ll -S -o /dev/null` Result:\r\n> > ```\r\n> > Attribute 'nofpclass(all)' applied to incompatible type!\r\n> > ptr @safe_add_func_int64_t_s_s\r\n> > LLVM ERROR: Broken module found after pass \"ReversePostOrderFunctionAttrsPass\", compilation aborted!\r\n> > ```\r\n> > \r\n> > \r\n> >     \r\n> >       \r\n> >     \r\n> > \r\n> >       \r\n> >     \r\n> > \r\n> >     \r\n> >   \r\n> > [bbi-115351.ll.gz](https://github.com/user-attachments/files/25468694/bbi-115351.ll.gz)\r\n> \r\n> I think this is an inline or pass manager bug when there is a call in unreachable code. If you first run cgscc(inline), then separately run rpo-function-attrs, it doesn't happen. This code shouldn't need to worry about seeing a function with no uses.\r\n\r\nI wrote an issue about it:\r\nhttps://github.com/llvm/llvm-project/issues/182834"
+    },
+    {
+      "author": "nikic",
+      "body": "@arsenm The call graph is allowed to have spurious ref edges."
+    },
+    {
+      "author": "mikaelholmen",
+      "body": "Fixed in [8b36a41](https://github.com/llvm/llvm-project/commit/8b36a41d89aea26ffdb75456854022b767c5bf4b). Thanks!"
+    },
+    {
+      "author": "alexfh",
+      "body": "@arsenm we're seeing a miscompilation with `-Os` after this PR: https://gcc.godbolt.org/z/E9qbsnojK\r\n\r\nCould you take a look? Thanks!"
+    },
+    {
+      "author": "arsenm",
+      "body": "> Could you take a look? Thanks!\r\n\r\nI do see a suspicious change, which wasn't actually triggered by this PR. In `@_ZNK3Foo3barEv`,   `%sub = fsub double %call2, %call4` is replaced by `%sub = fsub nnan double 0.000000e+00, %call4`.  Not sure why, nofpclass didn't even propagate to the return value \r\n\r\n"
+    },
+    {
+      "author": "arsenm",
+      "body": "Does reverting a80d4329ce96856a02bd279c800c3d08619da4c9 help?"
+    },
+    {
+      "author": "arsenm",
+      "body": "> Does reverting [a80d432](https://github.com/llvm/llvm-project/commit/a80d4329ce96856a02bd279c800c3d08619da4c9) help?\r\n\r\nOpened https://github.com/llvm/llvm-project/pull/183835 for this "
+    }
+  ],
+  "knowledge_cutoff": "2026-02-20T06:52:37Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/IPO/FunctionAttrs.cpp": [
+      [
+        47,
+        52
+      ],
+      [
+        66,
+        71
+      ],
+      [
+        2376,
+        2387
+      ],
+      [
+        2404,
+        2409
+      ],
+      [
+        2420,
+        2432
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/IPO/FunctionAttrs.cpp": [
+      "addNoRecurseAttrsTopDown",
+      "deduceFunctionAttributeInRPO"
+    ]
+  }
+}

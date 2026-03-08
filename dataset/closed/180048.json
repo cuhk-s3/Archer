@@ -1,0 +1,90 @@
+{
+  "pr_id": 180048,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180048",
+  "state": "closed",
+  "title": "[VPlan] Introduce m_c_Logical(And|Or)",
+  "author": "artagnon",
+  "base_commit": "47331ae73555b68535546170a76de2829b00d8a2",
+  "fix_commit": "93be0327c50fbe71b04459c0322b2ff577fd51be",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\nindex c0b736de1bc51..34cb5a8b48f78 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n@@ -364,12 +364,23 @@ template <unsigned Opcode, typename... OpTys>\n using VPInstruction_match = Recipe_match<std::tuple<OpTys...>, Opcode,\n                                          /*Commutative*/ false, VPInstruction>;\n \n+template <unsigned Opcode, typename... OpTys>\n+using VPInstruction_commutative_match =\n+    Recipe_match<std::tuple<OpTys...>, Opcode,\n+                 /*Commutative*/ true, VPInstruction>;\n+\n template <unsigned Opcode, typename... OpTys>\n inline VPInstruction_match<Opcode, OpTys...>\n m_VPInstruction(const OpTys &...Ops) {\n   return VPInstruction_match<Opcode, OpTys...>(Ops...);\n }\n \n+template <unsigned Opcode, typename Op0_t, typename Op1_t>\n+inline VPInstruction_commutative_match<Opcode, Op0_t, Op1_t>\n+m_c_VPInstruction(const Op0_t &Op0, const Op1_t &Op1) {\n+  return VPInstruction_commutative_match<Opcode, Op0_t, Op1_t>(Op0, Op1);\n+}\n+\n /// BuildVector is matches only its opcode, w/o matching its operands as the\n /// number of operands is not fixed.\n inline VPInstruction_match<VPInstruction::BuildVector> m_BuildVector() {\n@@ -799,6 +810,11 @@ m_Not(const Op0_t &Op0) {\n                      m_c_Binary<Instruction::Xor>(m_AllOnes(), Op0));\n }\n \n+template <typename Op0_t, typename Op1_t, typename Op2_t>\n+inline auto m_c_Select(const Op0_t &Op0, const Op1_t &Op1, const Op2_t &Op2) {\n+  return m_CombineOr(m_Select(Op0, Op1, Op2), m_Select(m_Not(Op0), Op2, Op1));\n+}\n+\n template <typename Op0_t, typename Op1_t>\n inline match_combine_or<\n     VPInstruction_match<VPInstruction::LogicalAnd, Op0_t, Op1_t>,\n@@ -809,12 +825,24 @@ m_LogicalAnd(const Op0_t &Op0, const Op1_t &Op1) {\n       m_Select(Op0, Op1, m_False()));\n }\n \n+template <typename Op0_t, typename Op1_t>\n+inline auto m_c_LogicalAnd(const Op0_t &Op0, const Op1_t &Op1) {\n+  return m_CombineOr(\n+      m_c_VPInstruction<VPInstruction::LogicalAnd, Op0_t, Op1_t>(Op0, Op1),\n+      m_c_Select(Op0, Op1, m_False()));\n+}\n+\n template <typename Op0_t, typename Op1_t>\n inline AllRecipe_match<Instruction::Select, Op0_t, specific_intval<1>, Op1_t>\n m_LogicalOr(const Op0_t &Op0, const Op1_t &Op1) {\n   return m_Select(Op0, m_True(), Op1);\n }\n \n+template <typename Op0_t, typename Op1_t>\n+inline auto m_c_LogicalOr(const Op0_t &Op0, const Op1_t &Op1) {\n+  return m_c_Select(Op0, m_True(), Op1);\n+}\n+\n template <typename Op0_t, typename Op1_t, typename Op2_t>\n using VPScalarIVSteps_match = Recipe_match<std::tuple<Op0_t, Op1_t, Op2_t>, 0,\n                                            false, VPScalarIVStepsRecipe>;\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 5708abfaf6f5b..89a270d1219e7 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -1064,8 +1064,9 @@ InstructionCost VPRecipeWithIRFlags::getCostForRecipeWithOpcode(\n \n     VPValue *Op0, *Op1;\n     bool IsLogicalAnd =\n-        match(this, m_LogicalAnd(m_VPValue(Op0), m_VPValue(Op1)));\n-    bool IsLogicalOr = match(this, m_LogicalOr(m_VPValue(Op0), m_VPValue(Op1)));\n+        match(this, m_c_LogicalAnd(m_VPValue(Op0), m_VPValue(Op1)));\n+    bool IsLogicalOr =\n+        match(this, m_c_LogicalOr(m_VPValue(Op0), m_VPValue(Op1)));\n     // Also match the inverted forms:\n     // select x, false, y --> !x & y (still AND)\n     // select x, y, true --> !x | y (still OR)\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 2245a7e0f004f..d49cbfadcf079 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -1295,11 +1295,11 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n     return Def->replaceAllUsesWith(X);\n \n   // x && false -> false\n-  if (match(Def, m_LogicalAnd(m_VPValue(X), m_False())))\n-    return Def->replaceAllUsesWith(Def->getOperand(1));\n+  if (match(Def, m_c_LogicalAnd(m_VPValue(X), m_False())))\n+    return Def->replaceAllUsesWith(Plan->getFalse());\n \n-  // true && x -> x\n-  if (match(Def, m_LogicalAnd(m_True(), m_VPValue(X))))\n+  // x && true -> x\n+  if (match(Def, m_c_LogicalAnd(m_VPValue(X), m_True())))\n     return Def->replaceAllUsesWith(X);\n \n   // (x && y) | (x && z) -> x && (y | z)\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/constant-fold-commutative-and.ll",
+      "commands": [
+        ""
+      ],
+      "tests": [
+        {
+          "test_name": "constant_fold_commutative_and",
+          "test_body": "define void @constant_fold_commutative_and(ptr %ptr.n, ptr noalias %p, i1 %cond) {\nentry:\n  br label %ph\n\nph:                                               ; preds = %latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %latch ]\n  %n = load i64, ptr %ptr.n, align 4\n  br i1 %cond, label %latch, label %pred.1\n\npred.1:                                           ; preds = %ph\n  %cmp = icmp ult i64 %n, 4\n  br i1 %cmp, label %latch, label %pred.2\n\npred.2:                                           ; preds = %pred.1\n  %cmp.2 = icmp ult i64 %n, 7\n  br label %latch\n\nlatch:                                            ; preds = %pred.2, %pred.1, %ph\n  %merge.val = phi i1 [ false, %ph ], [ true, %pred.1 ], [ %cmp.2, %pred.2 ]\n  %gep = getelementptr i8, ptr %p, i64 %iv\n  store i1 %merge.val, ptr %gep, align 1\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 16\n  br i1 %ec, label %exit, label %ph\n\nexit:                                             ; preds = %latch\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "fhahn",
+      "body": "This now needs an update to main I think after https://github.com/llvm/llvm-project/pull/179426 landed"
+    },
+    {
+      "author": "artagnon",
+      "body": "> This now needs an update to main I think after #179426 landed\r\n\r\nI'm actually thinking of closing this one; it's impossible to cover the patch with any additional tests, as:\r\n1. VPInstruction::LogicalAnd is created by VPlan with a definite operand order. I tried to test with swapped operands, but failed.\r\n2. simplifyRecipe already simplifies select !c, x, y -> select c, y, x.\r\n\r\nWhy should we add extra code that cannot be covered? The benefit would be purely NFC, and would allow us to write m_c_Logical(And|Or) with swapped operand orders: what do you think?"
+    },
+    {
+      "author": "artagnon",
+      "body": "> it should perform an additional fold for the test case below I think\r\n\r\nThanks for the test case!"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-05T22:28:21Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      [
+        364,
+        375
+      ],
+      [
+        799,
+        804
+      ],
+      [
+        809,
+        820
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        1064,
+        1071
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        1295,
+        1305
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      "m_BuildVector",
+      "m_LogicalAnd",
+      "m_LogicalOr",
+      "m_Not",
+      "m_VPInstruction"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPRecipeWithIRFlags::getCostForRecipeWithOpcode"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "simplifyRecipe"
+    ]
+  }
+}

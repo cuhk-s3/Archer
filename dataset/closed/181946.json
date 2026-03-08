@@ -1,0 +1,176 @@
+{
+  "pr_id": 181946,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181946",
+  "state": "closed",
+  "title": "[ThinLTO] Distinguish symbols that are promoted",
+  "author": "mtrofin",
+  "base_commit": "c7c95c29f3cad869dd7da397aeef016ad4a750ed",
+  "fix_commit": "1f2d97d90e029ec827d6df3a0a36bd3f776e875b",
+  "patch": "diff --git a/llvm/include/llvm/IR/ModuleSummaryIndex.h b/llvm/include/llvm/IR/ModuleSummaryIndex.h\nindex 31c2f13a63e5f..5ede26cc7923c 100644\n--- a/llvm/include/llvm/IR/ModuleSummaryIndex.h\n+++ b/llvm/include/llvm/IR/ModuleSummaryIndex.h\n@@ -509,6 +509,10 @@ class GlobalValueSummary {\n     /// summary. The value is interpreted as 'ImportKind' enum defined above.\n     unsigned ImportType : 1;\n \n+    /// This symbol was promoted. Thinlink stages need to be aware of this\n+    /// transition\n+    unsigned Promoted : 1;\n+\n     /// Convenience Constructors\n     explicit GVFlags(GlobalValue::LinkageTypes Linkage,\n                      GlobalValue::VisibilityTypes Visibility,\n@@ -517,7 +521,7 @@ class GlobalValueSummary {\n         : Linkage(Linkage), Visibility(Visibility),\n           NotEligibleToImport(NotEligibleToImport), Live(Live),\n           DSOLocal(IsLocal), CanAutoHide(CanAutoHide),\n-          ImportType(static_cast<unsigned>(ImportType)) {}\n+          ImportType(static_cast<unsigned>(ImportType)), Promoted(false) {}\n   };\n \n private:\n@@ -584,12 +588,28 @@ class GlobalValueSummary {\n     return static_cast<GlobalValue::LinkageTypes>(Flags.Linkage);\n   }\n \n+  bool wasPromoted() const { return Flags.Promoted; }\n+\n+  void promote() {\n+    assert(GlobalValue::isLocalLinkage(linkage()) &&\n+           \"unexpected (re-)promotion of non-local symbol\");\n+    assert(!Flags.Promoted);\n+    Flags.Promoted = true;\n+    Flags.Linkage = GlobalValue::LinkageTypes::ExternalLinkage;\n+  }\n+\n   /// Sets the linkage to the value determined by global summary-based\n   /// optimization. Will be applied in the ThinLTO backends.\n   void setLinkage(GlobalValue::LinkageTypes Linkage) {\n+    assert(!wasPromoted());\n+    assert(!GlobalValue::isExternalLinkage(Linkage) && \"use `promote` instead\");\n     Flags.Linkage = Linkage;\n   }\n \n+  void setExternalLinkageForTest() {\n+    Flags.Linkage = GlobalValue::LinkageTypes::ExternalLinkage;\n+  }\n+\n   /// Return true if this global value can't be imported.\n   bool notEligibleToImport() const { return Flags.NotEligibleToImport; }\n \ndiff --git a/llvm/lib/LTO/LTO.cpp b/llvm/lib/LTO/LTO.cpp\nindex 749af6eda3fdb..c88ec5e09396a 100644\n--- a/llvm/lib/LTO/LTO.cpp\n+++ b/llvm/lib/LTO/LTO.cpp\n@@ -393,6 +393,9 @@ static void thinLTOResolvePrevailingGUID(\n     // FIXME: We may want to split the compile time and correctness\n     // aspects into separate routines.\n     if (isPrevailing(VI.getGUID(), S.get())) {\n+      assert(!S->wasPromoted() &&\n+             \"promoted symbols used to be internal linkage and shouldn't have \"\n+             \"a prevailing variant\");\n       if (GlobalValue::isLinkOnceLinkage(OriginalLinkage)) {\n         S->setLinkage(GlobalValue::getWeakLinkage(\n             GlobalValue::isLinkOnceODRLinkage(OriginalLinkage)));\n@@ -415,8 +418,11 @@ static void thinLTOResolvePrevailingGUID(\n     // When force-import-all is used, it indicates that object linking is not\n     // supported by the target. In this case, we can't change the linkage as\n     // well in case the global is converted to declaration.\n+    // Also, if the symbol was promoted, it wouldn't have a prevailing variant,\n+    // but also its linkage is set correctly (to External) already.\n     else if (!isa<AliasSummary>(S.get()) &&\n-             !GlobalInvolvedWithAlias.count(S.get()) && !ForceImportAll)\n+             !GlobalInvolvedWithAlias.count(S.get()) && !ForceImportAll &&\n+             !S->wasPromoted())\n       S->setLinkage(GlobalValue::AvailableExternallyLinkage);\n \n     // For ELF, set visibility to the computed visibility from summaries. We\n@@ -485,7 +491,7 @@ static void thinLTOInternalizeAndPromoteGUID(\n     // exported.\n     if (isExported(S->modulePath(), VI)) {\n       if (GlobalValue::isLocalLinkage(S->linkage()))\n-        S->setLinkage(GlobalValue::ExternalLinkage);\n+        S->promote();\n       continue;\n     }\n \ndiff --git a/llvm/lib/Transforms/IPO/FunctionAttrs.cpp b/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\nindex 855692db006f9..626d28d4c50d8 100644\n--- a/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\n+++ b/llvm/lib/Transforms/IPO/FunctionAttrs.cpp\n@@ -387,7 +387,7 @@ static FunctionSummary *calculatePrevailingSummary(\n       }\n       Local = FS;\n     } else if (GlobalValue::isExternalLinkage(Linkage)) {\n-      assert(IsPrevailing(VI.getGUID(), GVS.get()));\n+      assert(IsPrevailing(VI.getGUID(), GVS.get()) || GVS->wasPromoted());\n       Prevailing = FS;\n       break;\n     } else if (GlobalValue::isWeakODRLinkage(Linkage) ||\ndiff --git a/llvm/lib/Transforms/IPO/FunctionImport.cpp b/llvm/lib/Transforms/IPO/FunctionImport.cpp\nindex 077ab72c15e10..4d4b32749a045 100644\n--- a/llvm/lib/Transforms/IPO/FunctionImport.cpp\n+++ b/llvm/lib/Transforms/IPO/FunctionImport.cpp\n@@ -2106,7 +2106,7 @@ static bool doImportingForModuleForTest(\n   for (auto &I : *Index) {\n     for (auto &S : I.second.getSummaryList()) {\n       if (GlobalValue::isLocalLinkage(S->linkage()))\n-        S->setLinkage(GlobalValue::ExternalLinkage);\n+        S->setExternalLinkageForTest();\n     }\n   }\n \ndiff --git a/llvm/tools/llvm-link/llvm-link.cpp b/llvm/tools/llvm-link/llvm-link.cpp\nindex 33c3e6fc350fb..f6fc41d750b50 100644\n--- a/llvm/tools/llvm-link/llvm-link.cpp\n+++ b/llvm/tools/llvm-link/llvm-link.cpp\n@@ -422,7 +422,7 @@ static bool linkFiles(const char *argv0, LLVMContext &Context, Linker &L,\n       for (auto &I : *Index) {\n         for (auto &S : I.second.getSummaryList()) {\n           if (GlobalValue::isLocalLinkage(S->linkage()))\n-            S->setLinkage(GlobalValue::ExternalLinkage);\n+            S->setExternalLinkageForTest();\n         }\n       }\n \n",
+  "components": [
+    "FunctionAttrs",
+    "FunctionImport"
+  ],
+  "description": "Thinlink may decide some symbols with internal linkage should get promoted to external. Such a symbol, when being imported, would have its name changed by appending a suffix (`.llvm.<a hash>`) to avoid collisions - since internal linkage symbols have non-unique names.\n\nLater, still during Thinlink, in `thinLTOResolvePrevailingGUID`, the fact that this symbol was promoted is not considered and we set its linkage to `AvailableExternally`(when reading `thinLTOResolvePrevailingGUID`, note that \"prevailing-ness\" is not a concept that the original symbol would have participated in)\n\n\n\nThis should result in a final (native) link error, because the symbol's definition may be elided. But we get lucky: in the post-thinlink backend, during import, in `llvm::thinLTOFinalizeInModule`, after this symbol's name was changed and its linkage also changed to `External` (see `FunctionImportGlobalProcessing::processGlobalForThinLTO`), we try to find it in the `DefinedGlobals`, fail (because its guid is computed from its changed name)) and leave its linkage as-is. Which happens to be correct.\n\nThis patch makes this outcome intentional rather than accidental. It becomes critical once we land [this RFC](https://discourse.llvm.org/t/rfc-keep-globalvalue-guids-stable/84801).\n\nAs a side-benefit, the extra attribute propagations that weren't happening in `llvm::thinLTOFinalizeInModule` now do.",
+  "tests": [
+    {
+      "file": "llvm/test/ThinLTO/X86/Inputs/export2.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "main",
+          "test_body": "target triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @main() {\nentry:\n  call void @callstaticfunc()\n  ret i32 0\n}\n\ndeclare void @callstaticfunc()\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/ThinLTO/X86/export2.ll",
+      "commands": [
+        "llvm-dis %t1.bc.thinlto.bc -o -"
+      ],
+      "tests": [
+        {
+          "test_name": "staticfunc",
+          "test_body": "target triple = \"x86_64-unknown-linux-gnu\"\n\ndefine hidden void @staticfunc() {\nentry:\n  ret void\n}\n"
+        },
+        {
+          "test_name": "callstaticfunc",
+          "test_body": "target triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @callstaticfunc() {\nentry:\n  call void @staticfunc()\n  ret void\n}\n\ndeclare hidden void @staticfunc()\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/ThinLTO/X86/funcattrs-prop-exported-internal.ll",
+      "commands": [
+        "llvm-dis -o - %t.o.1.3.import.bc"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "; Function import can promote an internal function to external but not mark it as prevailing.\n; Given that the internal function's attributes would have already propagated to its callers \n; that are part of the import chain there's no need to actually propagate off this copy as \n; propagating the caller performs the same thing.\n\n;--- main.ll\ntarget datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare void @caller()\ndeclare void @caller_noattr()\n\ndefine void @importer() {\n  call void @caller()\n  ret void\n}\n\n; If somehow the caller doesn't get the attributes, we\n; shouldn't propagate from the internal callee.\ndefine void @importer_noattr() {\n  call void @caller_noattr()\n  ret void\n}\n\n\n\n;--- callees.ll\ntarget datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\nattributes #0 = { nounwind norecurse }\n\ndefine void @caller() #0 {\n  call void @callee()\n  ret void\n}\n\ndefine void @caller_noattr() {\n  call void @callee()\n  ret void\n}\n\ndefine internal void @callee() #0 {\n  ret void\n}"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/ThinLTO/X86/module_asm2.ll",
+      "commands": [
+        "llvm-nm %t1.bc.thinlto.o",
+        "llvm-nm %t2.bc.thinlto.o",
+        "llvm-nm %t.o.1",
+        "llvm-nm %t.o.2"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "; Test to ensure that uses and defs in module level asm are handled\n; appropriately. Specifically, we should conservatively block importing\n; of any references to these values, as they can't be renamed.\n\n\n\n; Check that local values b and x, which are referenced on\n; llvm.used and llvm.compiler.used, respectively, are not promoted.\n; Similarly, foo which is defined in module level asm should not be\n; promoted.\n; NM0-DAG: d b\n; NM0-DAG: d x\n; NM0-DAG: t foo\n; NM0-DAG: T func1\n; NM0-DAG: T func2\n; NM0-DAG: T func3\n; NM0-DAG: T callglobalfunc\n; NM0-DAG: T callweakfunc\n; NM0-DAG: T globalfunc\n; NM0-DAG: W weakfunc\n\n; Ensure that foo, b and x are likewise not exported (imported as refs\n; into the other module), since they can't be promoted. Additionally,\n; referencing functions func2 and func3 should not have been\n; imported. However, we should have been able to import callglobalfunc\n; and callweakfunc (leaving undefined symbols globalfunc and weakfunc)\n; since globalfunc and weakfunc were defined but not local in module asm.\n; NM1-NOT: foo\n; NM1-NOT: b\n; NM1-NOT: x\n; NM1-DAG: U func1\n; NM1-DAG: U func2\n; NM1-DAG: U func3\n; NM1-DAG: U globalfunc\n; NM1-DAG: U weakfunc\n; NM1-DAG: T main\n; NM1-NOT: foo\n; NM1-NOT: b\n; NM1-NOT: x\n\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n@b = internal global i32 1, align 4\n@x = internal global i32 1, align 4\n\n@llvm.compiler.used = appending global [1 x ptr] [ptr @b], section \"llvm.metadata\"\n@llvm.used = appending global [1 x ptr] [ptr @x], section \"llvm.metadata\"\n\nmodule asm \"\\09.text\"\nmodule asm \"\\09.type\\09foo,@function\"\nmodule asm \"foo:\"\nmodule asm \"\\09movl    b, %eax\"\nmodule asm \"\\09movl    x, %edx\"\nmodule asm \"\\09ret \"\nmodule asm \"\\09.size\\09foo, .-foo\"\nmodule asm \"\"\nmodule asm \"\\09.globl\\09globalfunc\"\nmodule asm \"\\09.type\\09globalfunc,@function\"\nmodule asm \"globalfunc:\"\nmodule asm \"\\09movl    b, %eax\"\nmodule asm \"\\09movl    x, %edx\"\nmodule asm \"\\09ret \"\nmodule asm \"\\09.size\\09globalfunc, .-globalfunc\"\nmodule asm \"\"\nmodule asm \"\\09.weak\\09weakfunc\"\nmodule asm \"\\09.type\\09weakfunc,@function\"\nmodule asm \"weakfunc:\"\nmodule asm \"\\09movl    b, %eax\"\nmodule asm \"\\09movl    x, %edx\"\nmodule asm \"\\09ret \"\nmodule asm \"\\09.size\\09weakfunc, .-weakfunc\"\nmodule asm \"\"\n\ndeclare i16 @foo() #0\ndeclare i16 @globalfunc() #0\ndeclare i16 @weakfunc() #0\n\ndefine i32 @func1() #1 {\n  call i16 @foo()\n  ret i32 1\n}\n\ndefine i32 @func2() #1 {\n  %1 = load i32, ptr @b, align 4\n  ret i32 %1\n}\n\ndefine i32 @func3() #1 {\n  %1 = load i32, ptr @x, align 4\n  ret i32 %1\n}\n\ndefine i32 @callglobalfunc() #1 {\n  call i16 @globalfunc()\n  ret i32 1\n}\n\ndefine i32 @callweakfunc() #1 {\n  call i16 @weakfunc()\n  ret i32 1\n}"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "LTO",
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "mtrofin",
+      "body": "* **#181946** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/181946?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/181946?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 190218 tests passed\n* 5081 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 131019 tests passed\n* 2949 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "mtrofin",
+      "body": "### Merge activity\n\n* **Feb 19, 6:24 PM UTC**: A user started a stack merge that includes this pull request via [Graphite](https://app.graphite.com/github/pr/llvm/llvm-project/181946).\n* **Feb 19, 6:26 PM UTC**: @mtrofin merged this pull request with [Graphite](https://app.graphite.com/github/pr/llvm/llvm-project/181946).\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-18T00:42:28Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/IR/ModuleSummaryIndex.h": [
+      [
+        509,
+        514
+      ],
+      [
+        517,
+        523
+      ],
+      [
+        584,
+        595
+      ]
+    ],
+    "llvm/lib/LTO/LTO.cpp": [
+      [
+        393,
+        398
+      ],
+      [
+        415,
+        422
+      ],
+      [
+        485,
+        491
+      ]
+    ],
+    "llvm/lib/Transforms/IPO/FunctionAttrs.cpp": [
+      [
+        387,
+        393
+      ]
+    ],
+    "llvm/lib/Transforms/IPO/FunctionImport.cpp": [
+      [
+        2106,
+        2112
+      ]
+    ],
+    "llvm/test/ThinLTO/X86/funcattrs-prop-exported-internal.ll": [
+      [
+        27,
+        33
+      ]
+    ],
+    "llvm/test/ThinLTO/X86/module_asm2.ll": [
+      [
+        9,
+        15
+      ]
+    ],
+    "llvm/tools/llvm-link/llvm-link.cpp": [
+      [
+        422,
+        428
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/IR/ModuleSummaryIndex.h": [
+      "GVFlags",
+      "isLive",
+      "linkage",
+      "notEligibleToImport",
+      "setLinkage"
+    ],
+    "llvm/lib/LTO/LTO.cpp": [
+      "thinLTOInternalizeAndPromoteGUID",
+      "thinLTOResolvePrevailingGUID"
+    ],
+    "llvm/lib/Transforms/IPO/FunctionAttrs.cpp": [
+      "calculatePrevailingSummary"
+    ],
+    "llvm/lib/Transforms/IPO/FunctionImport.cpp": [
+      "doImportingForModuleForTest"
+    ],
+    "llvm/tools/llvm-link/llvm-link.cpp": [
+      "linkFiles"
+    ]
+  }
+}

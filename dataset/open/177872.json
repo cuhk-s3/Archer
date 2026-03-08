@@ -1,0 +1,218 @@
+{
+  "pr_id": 177872,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177872",
+  "state": "open",
+  "title": "[InstCombine] Fix miscompilation for `select` + `FCmp`",
+  "author": "wermos",
+  "base_commit": "a33db04a63f4aa03178905529e01c4dcd5412cf8",
+  "fix_commit": "d18ff296610e34428a9fae22ab378b1acb65a265",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex e57be1dce7b46..9705c5a59453d 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -4545,13 +4545,34 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n         CmpInst::Predicate MinMaxPred = getMinMaxPred(SPF, SPR.Ordered);\n \n         Value *Cmp;\n-        if (CmpInst::isIntPredicate(MinMaxPred))\n+        Value *NewSI;\n+        if (CmpInst::isIntPredicate(MinMaxPred)) {\n           Cmp = Builder.CreateICmp(MinMaxPred, LHS, RHS);\n-        else\n-          Cmp = Builder.CreateFCmpFMF(MinMaxPred, LHS, RHS,\n-                                      cast<Instruction>(SI.getCondition()));\n+          NewSI = Builder.CreateSelect(Cmp, LHS, RHS, SI.getName(), &SI);\n+        } else {\n+          // Intersect fast-math flags between the original select and its\n+          // condition before forming a min/max fcmp+select pattern.\n+          //\n+          // Therefore, only retain fast-math flags that were already required\n+          // by both the original select and its condition.\n+          FastMathFlags CmpFMF =\n+              cast<Instruction>(SI.getCondition())->getFastMathFlags();\n+\n+          // We can't unconditionally query fast-math flags from the select\n+          // because only selects that produce floating-point values implement\n+          // FPMathOperator. Treat non-FP selects as having no fast-math\n+          // guarantees.\n+          FastMathFlags SelFMF;\n+          if (SIFPOp)\n+            SelFMF = SI.getFastMathFlags();\n+\n+          FastMathFlags NewFMF = SelFMF & CmpFMF;\n+\n+          Cmp = Builder.CreateFCmpFMF(MinMaxPred, LHS, RHS, NewFMF);\n+\n+          NewSI = Builder.CreateSelectFMF(Cmp, LHS, RHS, NewFMF);\n+        }\n \n-        Value *NewSI = Builder.CreateSelect(Cmp, LHS, RHS, SI.getName(), &SI);\n         if (!IsCastNeeded)\n           return replaceInstUsesWith(SI, NewSI);\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Fixes #177541\r\n\r\nThis PR fixes the miscompilation reported in #177541 by correcting the handling of fast-math flags (FMF) when there is an `FCmp` and a `select` that depends on the result of the `FCmp`.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/clamp-to-minmax.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat -S"
+      ],
+      "tests": [
+        {
+          "test_name": "clamp_float_fast_ordered_strict_maxmin",
+          "test_body": "define float @clamp_float_fast_ordered_strict_maxmin(float %x) {\n  %cmp2 = fcmp fast olt float %x, 2.550000e+02\n  %min = select i1 %cmp2, float %x, float 2.550000e+02\n  %cmp1 = fcmp fast olt float %x, 1.000000e+00\n  %r = select i1 %cmp1, float 1.000000e+00, float %min\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_float_fast_unordered_strict_minmax",
+          "test_body": "define float @clamp_float_fast_unordered_strict_minmax(float %x) {\n  %cmp2 = fcmp fast ugt float %x, 1.000000e+00\n  %max = select i1 %cmp2, float %x, float 1.000000e+00\n  %cmp1 = fcmp fast ugt float %x, 2.550000e+02\n  %r = select i1 %cmp1, float 2.550000e+02, float %max\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_test_1",
+          "test_body": "define float @clamp_test_1(float %x) {\n  %inner_cmp = fcmp fast ult float %x, 2.550000e+02\n  %inner_sel = select i1 %inner_cmp, float %x, float 2.550000e+02\n  %outer_cmp = fcmp fast ugt float %x, 1.000000e+00\n  %r = select i1 %outer_cmp, float %inner_sel, float 1.000000e+00\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_float_fast_unordered_strict_maxmin",
+          "test_body": "define float @clamp_float_fast_unordered_strict_maxmin(float %x) {\n  %cmp2 = fcmp fast ult float %x, 2.550000e+02\n  %min = select i1 %cmp2, float %x, float 2.550000e+02\n  %cmp1 = fcmp fast ult float %x, 1.000000e+00\n  %r = select i1 %cmp1, float 1.000000e+00, float %min\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_float_fast_unordered_nonstrict_maxmin",
+          "test_body": "define float @clamp_float_fast_unordered_nonstrict_maxmin(float %x) {\n  %cmp2 = fcmp fast ult float %x, 2.550000e+02\n  %min = select i1 %cmp2, float %x, float 2.550000e+02\n  %cmp1 = fcmp fast ule float %x, 1.000000e+00\n  %r = select i1 %cmp1, float 1.000000e+00, float %min\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_float_fast_ordered_strict_minmax",
+          "test_body": "define float @clamp_float_fast_ordered_strict_minmax(float %x) {\n  %cmp2 = fcmp fast ogt float %x, 1.000000e+00\n  %max = select i1 %cmp2, float %x, float 1.000000e+00\n  %cmp1 = fcmp fast ogt float %x, 2.550000e+02\n  %r = select i1 %cmp1, float 2.550000e+02, float %max\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_select_no_fmf_strengthening",
+          "test_body": "define float @clamp_select_no_fmf_strengthening(float %x) {\nentry:\n  %a = fcmp nnan ninf ult float %x, 2.550000e+02\n  %b = select i1 %a, float 2.550000e+02, float %x\n  %c = fcmp nnan ugt float %x, 5.120000e+02\n  %r = select i1 %c, float 5.120000e+02, float %b\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_float_fast_ordered_nonstrict_maxmin",
+          "test_body": "define float @clamp_float_fast_ordered_nonstrict_maxmin(float %x) {\n  %cmp2 = fcmp fast olt float %x, 2.550000e+02\n  %min = select i1 %cmp2, float %x, float 2.550000e+02\n  %cmp1 = fcmp fast ole float %x, 1.000000e+00\n  %r = select i1 %cmp1, float 1.000000e+00, float %min\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "clamp_float_fast_unordered_nonstrict_minmax",
+          "test_body": "define float @clamp_float_fast_unordered_nonstrict_minmax(float %x) {\n  %cmp2 = fcmp fast ugt float %x, 1.000000e+00\n  %max = select i1 %cmp2, float %x, float 1.000000e+00\n  %cmp1 = fcmp fast uge float %x, 2.550000e+02\n  %r = select i1 %cmp1, float 2.550000e+02, float %max\n  ret float %r\n}\n"
+        },
+        {
+          "test_name": "mixed_clamp_to_i32_2",
+          "test_body": "define i32 @mixed_clamp_to_i32_2(float %x) {\n  %float_min_cmp = fcmp ogt float %x, 2.550000e+02\n  %float_min = select i1 %float_min_cmp, float 2.550000e+02, float %x\n  %i32_min = fptosi float %float_min to i32\n  %lo_cmp = fcmp olt float %x, 1.000000e+00\n  %r = select i1 %lo_cmp, i32 1, i32 %i32_min\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "mixed_clamp_to_float_vec",
+          "test_body": "define <2 x float> @mixed_clamp_to_float_vec(<2 x i32> %x) {\n  %si_min_cmp = icmp sgt <2 x i32> %x, splat (i32 255)\n  %si_min = select <2 x i1> %si_min_cmp, <2 x i32> splat (i32 255), <2 x i32> %x\n  %f_min = sitofp <2 x i32> %si_min to <2 x float>\n  %f_x = sitofp <2 x i32> %x to <2 x float>\n  %lo_cmp = fcmp ult <2 x float> %f_x, splat (float 1.000000e+00)\n  %r = select <2 x i1> %lo_cmp, <2 x float> splat (float 1.000000e+00), <2 x float> %f_min\n  ret <2 x float> %r\n}\n"
+        },
+        {
+          "test_name": "clamp_float_fast_ordered_nonstrict_minmax",
+          "test_body": "define float @clamp_float_fast_ordered_nonstrict_minmax(float %x) {\n  %cmp2 = fcmp fast ogt float %x, 1.000000e+00\n  %max = select i1 %cmp2, float %x, float 1.000000e+00\n  %cmp1 = fcmp fast oge float %x, 2.550000e+02\n  %r = select i1 %cmp1, float 2.550000e+02, float %max\n  ret float %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-fp.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "t14_commute",
+          "test_body": "define i8 @t14_commute(float %a) {\n  %1 = fcmp ule float %a, 0.000000e+00\n  %2 = fptosi float %a to i8\n  %3 = select i1 %1, i8 0, i8 %2\n  ret i8 %3\n}\n"
+        },
+        {
+          "test_name": "t15",
+          "test_body": "define i8 @t15(float %a) {\n  %1 = fcmp nsz ule float %a, 0.000000e+00\n  %2 = fptosi float %a to i8\n  %3 = select i1 %1, i8 %2, i8 0\n  ret i8 %3\n}\n"
+        },
+        {
+          "test_name": "t11",
+          "test_body": "define i8 @t11(float %a, float %b) {\n  %1 = fcmp fast ult float %b, %a\n  %2 = fptosi float %a to i8\n  %3 = fptosi float %b to i8\n  %4 = select i1 %1, i8 %3, i8 %2\n  ret i8 %4\n}\n"
+        },
+        {
+          "test_name": "t9",
+          "test_body": "define i8 @t9(float %a) {\n  %1 = fcmp ult float %a, 0.000000e+00\n  %2 = fptosi float %a to i8\n  %3 = select i1 %1, i8 %2, i8 0\n  ret i8 %3\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "wermos",
+      "body": "~I am aware that I committed some commented code.~\r\n\r\nThe way I addressed the miscompilation caused some test changes in 5 other test files. I'm not sure if my fix was too heavy-handed.\r\n\r\n~I'll remove the commented code once I am more confident of my fix.~"
+    },
+    {
+      "author": "valadaptive",
+      "body": "I think https://github.com/llvm/llvm-project/pull/177821 touched some of the same tests, which may need to be regenerated."
+    },
+    {
+      "author": "wermos",
+      "body": "> I think #177821 touched some of the same tests, which may need to be regenerated.\r\n\r\nGot it. I'll rebase my branch on top of the current `main`."
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "Can you have a look at whether this patch also fixes https://github.com/llvm/llvm-project/issues/157254? The original reproducer is a bit different from this one. But they share the common code path.\r\n"
+    },
+    {
+      "author": "wermos",
+      "body": "> Can you have a look at whether this patch also fixes #157254?\r\n\r\nI tried it out and the issue is still present even after this PR."
+    },
+    {
+      "author": "wermos",
+      "body": "@arsenm could you please take a look at the reworked fix?"
+    },
+    {
+      "author": "wermos",
+      "body": "@arsenm I've addressed all the review comments you made."
+    },
+    {
+      "author": "wermos",
+      "body": "Ping @arsenm "
+    },
+    {
+      "author": "wermos",
+      "body": "@dtcxzyw could you please review this? This PR underwent some initial review rounds and I think it is good enough to be merged but it is stuck in a perpetual loop of pinging and asking for code review.\r\n\r\nPing @nikic also."
+    },
+    {
+      "author": "wermos",
+      "body": "Ping @arsenm for final review"
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "Intersecting flags still doesn't work for a slightly modified reproducer: https://alive2.llvm.org/ce/z/gT485h\r\n```\r\n\r\n----------------------------------------\r\ndefine float @src(float noundef %x) {\r\nentry:\r\n  %a = fcmp nnan ninf ult float noundef %x, 255.000000\r\n  %b = select i1 %a, float 255.000000, float noundef %x\r\n  %c = fcmp nnan ugt float noundef %x, 512.000000\r\n  %r = select ninf i1 %c, float 512.000000, float %b\r\n  ret float %r\r\n}\r\n=>\r\ndefine float @tgt(float noundef %x) {\r\nentry:\r\n  %a.inv = fcmp nnan ninf oge float noundef %x, 255.000000\r\n  %b = select nnan ninf i1 %a.inv, float noundef %x, float 255.000000\r\n  %.inv = fcmp ole float %b, 512.000000\r\n  %r = select i1 %.inv, float %b, float 512.000000\r\n  ret float %r\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nNOTE: The counterexample is unique.\r\n\r\nExample:\r\nfloat noundef %x = #x7f800000 (+oo)\r\n\r\nSource:\r\ni1 %a = poison\r\nfloat %b = poison\r\ni1 %c = #x1 (1)\r\nfloat %r = #x44000000 (512)\r\n\r\nTarget:\r\ni1 %a.inv = poison\r\nfloat %b = poison\r\ni1 %.inv = poison\r\nfloat %r = poison\r\nSource value: #x44000000 (512)\r\nTarget value: poison\r\n```\r\n\r\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-25T19:25:42Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        4545,
+        4557
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/clamp-to-minmax.ll": [
+      [
+        7,
+        14
+      ],
+      [
+        23,
+        30
+      ],
+      [
+        39,
+        46
+      ],
+      [
+        55,
+        62
+      ],
+      [
+        74,
+        81
+      ],
+      [
+        90,
+        97
+      ],
+      [
+        106,
+        113
+      ],
+      [
+        122,
+        129
+      ],
+      [
+        140,
+        147
+      ],
+      [
+        574,
+        580
+      ],
+      [
+        590,
+        592
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minmax-fp.ll": [
+      [
+        157,
+        163
+      ],
+      [
+        228,
+        234
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::visitSelectInst"
+    ]
+  }
+}

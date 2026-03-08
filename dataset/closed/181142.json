@@ -1,0 +1,106 @@
+{
+  "pr_id": 181142,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181142",
+  "state": "closed",
+  "title": "[LoopIdiomVectorize] Bail when vectorization is disabled",
+  "author": "hazzlim",
+  "base_commit": "49ef440525f3902bb62ca5c198f1a1309fede033",
+  "fix_commit": "61a73b4ebfe8ae98e22cdd2bd77e2dfd88dfc3cb",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp\nindex 53129e2e5fbba..d3a91fc5b1326 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp\n@@ -67,6 +67,7 @@\n #include \"llvm/Transforms/Vectorize/LoopIdiomVectorize.h\"\n #include \"llvm/Analysis/DomTreeUpdater.h\"\n #include \"llvm/Analysis/LoopPass.h\"\n+#include \"llvm/Analysis/OptimizationRemarkEmitter.h\"\n #include \"llvm/Analysis/TargetTransformInfo.h\"\n #include \"llvm/IR/Dominators.h\"\n #include \"llvm/IR/IRBuilder.h\"\n@@ -74,6 +75,7 @@\n #include \"llvm/IR/MDBuilder.h\"\n #include \"llvm/IR/PatternMatch.h\"\n #include \"llvm/Transforms/Utils/BasicBlockUtils.h\"\n+#include \"llvm/Transforms/Vectorize/LoopVectorizationLegality.h\"\n \n using namespace llvm;\n using namespace PatternMatch;\n@@ -123,6 +125,9 @@ class LoopIdiomVectorize {\n   const TargetTransformInfo *TTI;\n   const DataLayout *DL;\n \n+  /// Interface to emit optimization remarks.\n+  OptimizationRemarkEmitter &ORE;\n+\n   // Blocks that will be used for inserting vectorized code.\n   BasicBlock *EndBlock = nullptr;\n   BasicBlock *VectorLoopPreheaderBlock = nullptr;\n@@ -133,9 +138,9 @@ class LoopIdiomVectorize {\n public:\n   LoopIdiomVectorize(LoopIdiomVectorizeStyle S, unsigned VF, DominatorTree *DT,\n                      LoopInfo *LI, const TargetTransformInfo *TTI,\n-                     const DataLayout *DL)\n-      : VectorizeStyle(S), ByteCompareVF(VF), DT(DT), LI(LI), TTI(TTI), DL(DL) {\n-  }\n+                     const DataLayout *DL, OptimizationRemarkEmitter &ORE)\n+      : VectorizeStyle(S), ByteCompareVF(VF), DT(DT), LI(LI), TTI(TTI), DL(DL),\n+        ORE(ORE) {}\n \n   bool run(Loop *L);\n \n@@ -199,7 +204,17 @@ PreservedAnalyses LoopIdiomVectorizePass::run(Loop &L, LoopAnalysisManager &AM,\n   if (ByteCmpVF.getNumOccurrences())\n     BCVF = ByteCmpVF;\n \n-  LoopIdiomVectorize LIV(VecStyle, BCVF, &AR.DT, &AR.LI, &AR.TTI, DL);\n+  Function &F = *L.getHeader()->getParent();\n+  auto &FAMP = AM.getResult<FunctionAnalysisManagerLoopProxy>(L, AR);\n+  auto *ORE = FAMP.getCachedResult<OptimizationRemarkEmitterAnalysis>(F);\n+\n+  std::optional<OptimizationRemarkEmitter> ORELocal;\n+  if (!ORE) {\n+    ORELocal.emplace(&F);\n+    ORE = &*ORELocal;\n+  }\n+\n+  LoopIdiomVectorize LIV(VecStyle, BCVF, &AR.DT, &AR.LI, &AR.TTI, DL, *ORE);\n   if (!LIV.run(&L))\n     return PreservedAnalyses::all();\n \n@@ -219,6 +234,14 @@ bool LoopIdiomVectorize::run(Loop *L) {\n   if (DisableAll || F.hasOptSize())\n     return false;\n \n+  // Bail if vectorization is disabled on loop.\n+  LoopVectorizeHints Hints(L, /*InterleaveOnlyWhenForced=*/true, ORE);\n+  if (!Hints.allowVectorization(&F, L, /*VectorizeOnlyWhenForced=*/false)) {\n+    LLVM_DEBUG(dbgs() << DEBUG_TYPE << \" is disabled on \" << L->getName()\n+                      << \" due to vectorization hints\\n\");\n+    return false;\n+  }\n+\n   if (F.hasFnAttribute(Attribute::NoImplicitFloat)) {\n     LLVM_DEBUG(dbgs() << DEBUG_TYPE << \" is disabled on \" << F.getName()\n                       << \" due to its NoImplicitFloat attribute\");\n@@ -1004,6 +1027,18 @@ bool LoopIdiomVectorize::recognizeFindFirstByte() {\n     return false;\n \n   auto *InnerLoop = CurLoop->getSubLoops().front();\n+  Function &F = *InnerLoop->getHeader()->getParent();\n+\n+  // Bail if vectorization is disabled on inner loop.\n+  LoopVectorizeHints Hints(InnerLoop, /*InterleaveOnlyWhenForced=*/true, ORE);\n+  if (!Hints.allowVectorization(&F, InnerLoop,\n+                                /*VectorizeOnlyWhenForced=*/false)) {\n+    LLVM_DEBUG(dbgs() << DEBUG_TYPE << \" is disabled on inner loop \"\n+                      << InnerLoop->getName()\n+                      << \" due to vectorization hints\\n\");\n+    return false;\n+  }\n+\n   PHINode *IndPhi = dyn_cast<PHINode>(&Header->front());\n   if (!IndPhi || IndPhi->getNumIncomingValues() != 2)\n     return false;\n",
+  "components": [
+    "LoopIdiomVectorize"
+  ],
+  "description": "Bail on vectorizing a loop in LoopIdiomVectorize when the loop carries\r\nhints that indicate vectorization is disabled.\r\n\r\nThis means that LoopIdiomVectorize will now respect vectorize(disable)\r\nloop hints.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopIdiom/AArch64/disable-vectorize.ll",
+      "commands": [
+        "opt -mtriple=aarch64 -mattr=+sve -passes='loop(loop-idiom-vectorize)' -pass-remarks-analysis=loop-vectorize -S 2>&1 %s"
+      ],
+      "tests": [
+        {
+          "test_name": "compare_bytes_simple_hint_width_1",
+          "test_body": "define i32 @compare_bytes_simple_hint_width_1(ptr %a, ptr %b, i32 %len, i32 %extra, i32 %n) {\nentry:\n  br label %while.cond\n\nwhile.cond:                                       ; preds = %while.body, %entry\n  %len.addr = phi i32 [ %len, %entry ], [ %inc, %while.body ]\n  %inc = add i32 %len.addr, 1\n  %cmp.not = icmp eq i32 %inc, %n\n  br i1 %cmp.not, label %while.end, label %while.body\n\nwhile.body:                                       ; preds = %while.cond\n  %idxprom = zext i32 %inc to i64\n  %arrayidx = getelementptr inbounds i8, ptr %a, i64 %idxprom\n  %0 = load i8, ptr %arrayidx, align 1\n  %arrayidx2 = getelementptr inbounds i8, ptr %b, i64 %idxprom\n  %1 = load i8, ptr %arrayidx2, align 1\n  %cmp.not2 = icmp eq i8 %0, %1\n  br i1 %cmp.not2, label %while.cond, label %while.end, !llvm.loop !0\n\nwhile.end:                                        ; preds = %while.body, %while.cond\n  %inc.lcssa = phi i32 [ %inc, %while.body ], [ %inc, %while.cond ]\n  %extra.phi = phi i32 [ %extra, %while.body ], [ %extra, %while.cond ]\n  %res = add i32 %inc.lcssa, %extra.phi\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 1}\n"
+        },
+        {
+          "test_name": "find_first_of_i8_outer_loop_hint_width_1",
+          "test_body": "define ptr @find_first_of_i8_outer_loop_hint_width_1(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %search_test = icmp eq ptr %search_start, %search_end\n  %needle_test = icmp eq ptr %needle_start, %needle_end\n  %combined_test = or i1 %search_test, %needle_test\n  br i1 %combined_test, label %exit, label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr inbounds i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %exit, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr inbounds i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %exit, label %header, !llvm.loop !0\n\nexit:                                             ; preds = %search_check, %match_check, %entry\n  %res = phi ptr [ %search_end, %entry ], [ %search_ptr, %match_check ], [ %search_end, %search_check ]\n  ret ptr %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 1}\n"
+        },
+        {
+          "test_name": "find_first_of_i8_inner_loop_hint_disable",
+          "test_body": "define ptr @find_first_of_i8_inner_loop_hint_disable(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %search_test = icmp eq ptr %search_start, %search_end\n  %needle_test = icmp eq ptr %needle_start, %needle_end\n  %combined_test = or i1 %search_test, %needle_test\n  br i1 %combined_test, label %exit, label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr inbounds i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check, !llvm.loop !0\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %exit, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr inbounds i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %exit, label %header\n\nexit:                                             ; preds = %search_check, %match_check, %entry\n  %res = phi ptr [ %search_end, %entry ], [ %search_ptr, %match_check ], [ %search_end, %search_check ]\n  ret ptr %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.enable\", i1 false}\n"
+        },
+        {
+          "test_name": "find_first_of_i8_inner_loop_hint_width_1",
+          "test_body": "define ptr @find_first_of_i8_inner_loop_hint_width_1(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %search_test = icmp eq ptr %search_start, %search_end\n  %needle_test = icmp eq ptr %needle_start, %needle_end\n  %combined_test = or i1 %search_test, %needle_test\n  br i1 %combined_test, label %exit, label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr inbounds i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check, !llvm.loop !0\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %exit, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr inbounds i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %exit, label %header\n\nexit:                                             ; preds = %search_check, %match_check, %entry\n  %res = phi ptr [ %search_end, %entry ], [ %search_ptr, %match_check ], [ %search_end, %search_check ]\n  ret ptr %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 1}\n"
+        },
+        {
+          "test_name": "compare_bytes_simple_hint_disable",
+          "test_body": "define i32 @compare_bytes_simple_hint_disable(ptr %a, ptr %b, i32 %len, i32 %extra, i32 %n) {\nentry:\n  br label %while.cond\n\nwhile.cond:                                       ; preds = %while.body, %entry\n  %len.addr = phi i32 [ %len, %entry ], [ %inc, %while.body ]\n  %inc = add i32 %len.addr, 1\n  %cmp.not = icmp eq i32 %inc, %n\n  br i1 %cmp.not, label %while.end, label %while.body\n\nwhile.body:                                       ; preds = %while.cond\n  %idxprom = zext i32 %inc to i64\n  %arrayidx = getelementptr inbounds i8, ptr %a, i64 %idxprom\n  %0 = load i8, ptr %arrayidx, align 1\n  %arrayidx2 = getelementptr inbounds i8, ptr %b, i64 %idxprom\n  %1 = load i8, ptr %arrayidx2, align 1\n  %cmp.not2 = icmp eq i8 %0, %1\n  br i1 %cmp.not2, label %while.cond, label %while.end, !llvm.loop !0\n\nwhile.end:                                        ; preds = %while.body, %while.cond\n  %inc.lcssa = phi i32 [ %inc, %while.body ], [ %inc, %while.cond ]\n  %extra.phi = phi i32 [ %extra, %while.body ], [ %extra, %while.cond ]\n  %res = add i32 %inc.lcssa, %extra.phi\n  ret i32 %res\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.enable\", i1 false}\n"
+        },
+        {
+          "test_name": "find_first_of_i8_outer_loop_hint_disable",
+          "test_body": "define ptr @find_first_of_i8_outer_loop_hint_disable(ptr %search_start, ptr %search_end, ptr %needle_start, ptr %needle_end) #0 {\nentry:\n  %search_test = icmp eq ptr %search_start, %search_end\n  %needle_test = icmp eq ptr %needle_start, %needle_end\n  %combined_test = or i1 %search_test, %needle_test\n  br i1 %combined_test, label %exit, label %header\n\nheader:                                           ; preds = %search_check, %entry\n  %search_ptr = phi ptr [ %search_next, %search_check ], [ %search_start, %entry ]\n  %search_load = load i8, ptr %search_ptr, align 1\n  br label %match_check\n\nneedle_check:                                     ; preds = %match_check\n  %needle_next = getelementptr inbounds i8, ptr %needle_ptr, i64 1\n  %needle_cmp = icmp eq ptr %needle_next, %needle_end\n  br i1 %needle_cmp, label %search_check, label %match_check\n\nmatch_check:                                      ; preds = %needle_check, %header\n  %needle_ptr = phi ptr [ %needle_start, %header ], [ %needle_next, %needle_check ]\n  %needle_load = load i8, ptr %needle_ptr, align 1\n  %match_cmp = icmp eq i8 %search_load, %needle_load\n  br i1 %match_cmp, label %exit, label %needle_check\n\nsearch_check:                                     ; preds = %needle_check\n  %search_next = getelementptr inbounds i8, ptr %search_ptr, i64 1\n  %search_cmp = icmp eq ptr %search_next, %search_end\n  br i1 %search_cmp, label %exit, label %header, !llvm.loop !0\n\nexit:                                             ; preds = %search_check, %match_check, %entry\n  %res = phi ptr [ %search_end, %entry ], [ %search_ptr, %match_check ], [ %search_end, %search_check ]\n  ret ptr %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve2\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.enable\", i1 false}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 190270 tests passed\n* 5081 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 131066 tests passed\n* 2949 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "hazzlim",
+      "body": "Thanks all for reviewing! :) "
+    }
+  ],
+  "knowledge_cutoff": "2026-02-12T13:55:21Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp": [
+      [
+        67,
+        72
+      ],
+      [
+        74,
+        79
+      ],
+      [
+        123,
+        128
+      ],
+      [
+        133,
+        141
+      ],
+      [
+        199,
+        205
+      ],
+      [
+        219,
+        224
+      ],
+      [
+        1004,
+        1009
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopIdiomVectorize.cpp": [
+      "LoopIdiomVectorize::recognizeFindFirstByte",
+      "LoopIdiomVectorize::run",
+      "LoopIdiomVectorizePass::run"
+    ]
+  }
+}

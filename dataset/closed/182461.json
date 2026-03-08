@@ -1,0 +1,116 @@
+{
+  "pr_id": 182461,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182461",
+  "state": "closed",
+  "title": "[InstCombine] Decompose icmp over min/max intrinsics when compared with a constant",
+  "author": "Nathiyaa-Sengodan",
+  "base_commit": "d0979b77ae530f469c93c2914604f93fe090a07a",
+  "fix_commit": "06b124fcdc8960c5c1c5a01c5c2b2f59f1b69201",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex bce609275ffa9..4c0052973ede2 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -5717,8 +5717,26 @@ Instruction *InstCombinerImpl::foldICmpWithMinMax(Instruction &I,\n   Pred = Pred.dropSameSign();\n   auto CmpXZ = IsCondKnownTrue(simplifyICmpInst(Pred, X, Z, Q));\n   auto CmpYZ = IsCondKnownTrue(simplifyICmpInst(Pred, Y, Z, Q));\n-  if (!CmpXZ.has_value() && !CmpYZ.has_value())\n+\n+  if (!CmpXZ.has_value() && !CmpYZ.has_value()) {\n+    // General decomposition of icmp over min/max intrinsic:\n+    // min(X, Y) pred Z --> (X pred Z) and (Y pred Z) when pred is >, >=\n+    // min(X, Y) pred Z --> (X pred Z)  or (Y pred Z) when pred is <, <=\n+    // max(X, Y) pred Z --> (X pred Z)  or (Y pred Z) when pred is >, >=\n+    // max(X, Y) pred Z --> (X pred Z) and (Y pred Z) when pred is <, <=\n+    if (MinMax->hasOneUse() && !ICmpInst::isEquality(Pred) &&\n+        isa<Constant>(Z)) {\n+      bool IsSame =\n+          MinMax->getPredicate() == ICmpInst::getStrictPredicate(Pred);\n+      Value *CmpX = Builder.CreateICmp(Pred, X, Z);\n+      Value *CmpY = Builder.CreateICmp(Pred, Y, Z);\n+      if (IsSame)\n+        return BinaryOperator::CreateOr(CmpX, CmpY);\n+      return BinaryOperator::CreateAnd(CmpX, CmpY);\n+    }\n     return nullptr;\n+  }\n+\n   if (!CmpXZ.has_value()) {\n     std::swap(X, Y);\n     std::swap(CmpXZ, CmpYZ);\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": " Fold icmp pred min/max(X, Y), C (constant) into individual comparisons combined with and/or:\r\n\r\n  min(X, Y) pred C --> (X pred C) and (Y pred C) when pred is >, >=\r\n  min(X, Y) pred C --> (X pred C) or  (Y pred C) when pred is <, <=\r\n  max(X, Y) pred C --> (X pred C) or  (Y pred C) when pred is >, >=\r\n  max(X, Y) pred C --> (X pred C) and (Y pred C) when pred is <, <=\r\n\r\n This eliminates the min/max intrinsic and exposes simple constant comparisons that enable further optimization by downstream passes.\r\n \r\n The decomposition is restricted to cases where:\r\n- The comparison operand C is a constant\r\n- The min/max has one use\r\n- The predicate is non-equality\r\n\r\nExample:\r\n\r\nBefore :\r\n%v = call i8 @llvm.smin.i8(i8 %x, i8 %y)\r\n%cmp = icmp sgt i8 %v, 5\r\n\r\nAfter this fold:\r\n%cmp1 = icmp sgt i8 %x, 5\r\n%cmp2 = icmp sgt i8 %y, 5\r\n%res = and i1 %cmp1, %cmp2\r\n\r\nFixes [#167059](https://github.com/llvm/llvm-project/issues/167059)",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/min-positive.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "smin_commute_vec_poison_elts",
+          "test_body": "define <2 x i1> @smin_commute_vec_poison_elts(<2 x i32> %x, <2 x i32> %other) {\n  %notneg = and <2 x i32> %x, splat (i32 7)\n  %positive = or <2 x i32> %notneg, splat (i32 1)\n  %cmp = icmp slt <2 x i32> %other, %positive\n  %sel = select <2 x i1> %cmp, <2 x i32> %other, <2 x i32> %positive\n  %test = icmp sgt <2 x i32> %sel, <i32 0, i32 poison>\n  ret <2 x i1> %test\n}\n"
+        },
+        {
+          "test_name": "maybe_not_positive_vec",
+          "test_body": "define <2 x i1> @maybe_not_positive_vec(<2 x i32> %x, <2 x i32> %other) {\n  %notneg = and <2 x i32> %x, splat (i32 7)\n  %cmp = icmp slt <2 x i32> %notneg, %other\n  %sel = select <2 x i1> %cmp, <2 x i32> %notneg, <2 x i32> %other\n  %test = icmp sgt <2 x i32> %sel, zeroinitializer\n  ret <2 x i1> %test\n}\n"
+        },
+        {
+          "test_name": "maybe_not_positive",
+          "test_body": "@g = external global i32\n\ndefine i1 @maybe_not_positive(i32 %other) {\n  %positive = load i32, ptr @g, align 4, !range !0\n  %cmp = icmp slt i32 %positive, %other\n  %sel = select i1 %cmp, i32 %positive, i32 %other\n  %test = icmp sgt i32 %sel, 0\n  ret i1 %test\n}\n\n!0 = !{i32 0, i32 2048}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-intrinsics.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "smax_sgt_decompose",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\ndefine i1 @smax_sgt_decompose(i8 %x, i8 %y) {\n  %v = call i8 @llvm.smax.i8(i8 %x, i8 %y)\n  %cmp = icmp sgt i8 %v, 5\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "smin_sgt_decompose_multiuse",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndeclare void @use(i8)\n\ndefine i1 @smin_sgt_decompose_multiuse(i8 %x, i8 %y) {\n  %v = call i8 @llvm.smin.i8(i8 %x, i8 %y)\n  call void @use(i8 %v)\n  %cmp = icmp sgt i8 %v, 5\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_ult_decompose",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i1 @umin_ult_decompose(i8 %x, i8 %y) {\n  %v = call i8 @llvm.umin.i8(i8 %x, i8 %y)\n  %cmp = icmp ult i8 %v, 5\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_smin_and_multiuse",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndeclare void @use(i8)\n\ndefine i8 @test_smin_and_multiuse(i8 %x, i8 %y) {\n  %x1 = and i8 %x, 31\n  %y1 = and i8 %y, 31\n  call void @use(i8 %y1)\n  %res = call i8 @llvm.smin.i8(i8 %x1, i8 %y1)\n  ret i8 %res\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "smin_of_sub_nsw_sgt_zero_decompose",
+          "test_body": "define i1 @smin_of_sub_nsw_sgt_zero_decompose(i16 %arg0, i16 %arg1) {\n  %v0 = sub nsw i16 %arg1, %arg0\n  %v1 = sub nsw i16 32, %arg0\n  %v2 = call i16 @llvm.smin.i16(i16 %v1, i16 %v0)\n  %v3 = icmp sgt i16 %v2, 0\n  ret i1 %v3\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smin.i16(i16, i16) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "smax_sgt_variable",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smax.i8(i8, i8) #0\n\ndefine i1 @smax_sgt_variable(i8 %x, i8 %y, i8 %z) {\n  %v = call i8 @llvm.smax.i8(i8 %x, i8 %y)\n  %cmp = icmp sgt i8 %v, %z\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "smin_sgt_decompose",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.smin.i8(i8, i8) #0\n\ndefine i1 @smin_sgt_decompose(i8 %x, i8 %y) {\n  %v = call i8 @llvm.smin.i8(i8 %x, i8 %y)\n  %cmp = icmp sgt i8 %v, 5\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "dtcxzyw",
+      "body": "According to the IR diff in llvm-opt-benchmark I don't think this canonicalization enables more optimizations in the middle-end. BTW the decomposed form doesn't win across multiple targets: https://godbolt.org/z/sz1v3GTze\r\n\r\nAs for the motivating case, it makes more sense to convert `smin((sub nsw A, C), (sub nsw B, C))` into `sub nsw smin(A, B), C` in the middle-end: https://alive2.llvm.org/ce/z/NJzMpH We already have similar transformations for add/shl in `foldIntrinsicUsingDistributiveLaws`.\r\n"
+    },
+    {
+      "author": "Nathiyaa-Sengodan",
+      "body": "Makes sense. Thanks.\r\n\r\nLet me try to implement the fold smin((sub nsw A, C), (sub nsw B, C)) into sub nsw smin(A, B), C. "
+    }
+  ],
+  "knowledge_cutoff": "2026-02-20T09:45:41Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      [
+        5717,
+        5724
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/min-positive.ll": [
+      [
+        84,
+        91
+      ],
+      [
+        98,
+        105
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minmax-intrinsics.ll": [
+      [
+        2718,
+        2720
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      "InstCombinerImpl::foldICmpWithMinMax"
+    ]
+  }
+}

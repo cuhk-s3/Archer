@@ -54,6 +54,12 @@ if [[ $LAB_LLVM_ALIVE_TV == "alive-tv not found" ]]; then
   return 1
 fi
 
+export LAB_LLVM_LLUBI=${DEP_LLUBI_BUILD_DIR}/llubi
+if [[ ! -f $LAB_LLVM_LLUBI ]]; then
+  echo "Error: llubi does not exist at $LAB_LLVM_LLUBI"
+  return 1
+fi
+
 export LAB_DATASET_DIR=$LLVM_AUTOREVIEW_HOME_DIR/dataset
 if [[ ! -d $LAB_DATASET_DIR ]]; then
   echo "Error: dataset directory does not exist at $LAB_DATASET_DIR"

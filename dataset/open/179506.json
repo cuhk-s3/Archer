@@ -1,0 +1,111 @@
+{
+  "pr_id": 179506,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179506",
+  "state": "open",
+  "title": "[VPlan] Factor collectGroupedReplicateMemOps",
+  "author": "artagnon",
+  "base_commit": "bbde3e3b59c8f7d8eee940a5aeb4eb5a849c05f4",
+  "fix_commit": "80ab493e0313de91484c83bed6ffb6a0a9fceb9b",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 36c8c0560c9eb..c548f3b07f22f 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8131,6 +8131,7 @@ void LoopVectorizationPlanner::buildVPlansWithVPRecipes(ElementCount MinVF,\n     if (auto Plan = tryToBuildVPlanWithVPRecipes(\n             std::unique_ptr<VPlan>(VPlan0->duplicate()), SubRange, &LVer)) {\n       // Now optimize the initial VPlan.\n+      VPlanTransforms::hoistInvariantLoads(*Plan, PSE, OrigLoop);\n       VPlanTransforms::hoistPredicatedLoads(*Plan, PSE, OrigLoop);\n       VPlanTransforms::sinkPredicatedStores(*Plan, PSE, OrigLoop);\n       RUN_VPLAN_PASS(VPlanTransforms::truncateToMinimalBitwidths, *Plan,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 877a8d77c810d..3a22c6035695f 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -230,6 +230,47 @@ canHoistOrSinkWithNoAliasCheck(const MemoryLocation &MemLoc,\n   return true;\n }\n \n+// Collect either Loads or Stores grouped by their address SCEV.\n+template <unsigned Opcode>\n+static SmallVector<SmallVector<VPReplicateRecipe *, 4>>\n+collectGroupedReplicateMemOps(\n+    VPlan &Plan, PredicatedScalarEvolution &PSE, const Loop *L,\n+    function_ref<bool(VPReplicateRecipe *)> FilterFn) {\n+  static_assert(Opcode == Instruction::Load || Opcode == Instruction::Store,\n+                \"Only Load and Store opcodes supported\");\n+  constexpr bool IsLoad = (Opcode == Instruction::Load);\n+  SmallDenseMap<const SCEV *, SmallVector<VPReplicateRecipe *, 4>>\n+      RecipesByAddress;\n+  for (VPBlockBase *Block :\n+       vp_depth_first_shallow(Plan.getVectorLoopRegion()->getEntry())) {\n+    auto *VPBB = cast<VPBasicBlock>(Block);\n+    for (VPRecipeBase &R : *VPBB) {\n+      auto *RepR = dyn_cast<VPReplicateRecipe>(&R);\n+      if (!RepR || RepR->getOpcode() != Opcode || !FilterFn(RepR))\n+        continue;\n+\n+      // For loads, operand 0 is address; for stores, operand 1 is address.\n+      VPValue *Addr = RepR->getOperand(IsLoad ? 0 : 1);\n+      const SCEV *AddrSCEV = vputils::getSCEVExprForVPValue(Addr, PSE, L);\n+      if (!isa<SCEVCouldNotCompute>(AddrSCEV))\n+        RecipesByAddress[AddrSCEV].push_back(RepR);\n+    }\n+  }\n+  auto Groups = to_vector(RecipesByAddress.values());\n+  VPDominatorTree VPDT(Plan);\n+  for (auto &Group : Groups) {\n+    // Sort mem ops by dominance order, with earliest (most dominating) first.\n+    stable_sort(Group, [&VPDT](VPReplicateRecipe *A, VPReplicateRecipe *B) {\n+      return VPDT.properlyDominates(A, B);\n+    });\n+  }\n+  // Sort groups by leader dominance order.\n+  stable_sort(Groups, [&VPDT](auto A, auto B) {\n+    return VPDT.properlyDominates(A[0], B[0]);\n+  });\n+  return Groups;\n+}\n+\n /// Return true if we do not know how to (mechanically) hoist or sink \\p R out\n /// of a loop region.\n static bool cannotHoistOrSinkRecipe(const VPRecipeBase &R) {\n@@ -2813,7 +2854,6 @@ void VPlanTransforms::optimize(VPlan &Plan) {\n   RUN_VPLAN_PASS(removeDeadRecipes, Plan);\n \n   RUN_VPLAN_PASS(createAndOptimizeReplicateRegions, Plan);\n-  RUN_VPLAN_PASS(hoistInvariantLoads, Plan);\n   RUN_VPLAN_PASS(mergeBlocksIntoPredecessors, Plan);\n   RUN_VPLAN_PASS(licm, Plan);\n }\n@@ -4596,51 +4636,33 @@ void VPlanTransforms::materializeBroadcasts(VPlan &Plan) {\n   }\n }\n \n-void VPlanTransforms::hoistInvariantLoads(VPlan &Plan) {\n-  VPRegionBlock *LoopRegion = Plan.getVectorLoopRegion();\n-\n-  // Collect candidate loads with invariant addresses and noalias scopes\n-  // metadata and memory-writing recipes with noalias metadata.\n-  SmallVector<std::pair<VPRecipeBase *, MemoryLocation>> CandidateLoads;\n-  SmallVector<MemoryLocation> Stores;\n-  for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(\n-           vp_depth_first_shallow(LoopRegion->getEntry()))) {\n-    for (VPRecipeBase &R : *VPBB) {\n-      // Only handle single-scalar replicated loads with invariant addresses.\n-      if (auto *RepR = dyn_cast<VPReplicateRecipe>(&R)) {\n-        if (RepR->isPredicated() || !RepR->isSingleScalar() ||\n-            RepR->getOpcode() != Instruction::Load)\n-          continue;\n+void VPlanTransforms::hoistInvariantLoads(VPlan &Plan,\n+                                          PredicatedScalarEvolution &PSE,\n+                                          const Loop *L) {\n+  VPBasicBlock *Preheader = Plan.getVectorPreheader();\n+  auto IsInvariantLoad = [](VPReplicateRecipe *RepR) {\n+    if (RepR->isPredicated() || !RepR->isSingleScalar() ||\n+        RepR->getOpcode() != Instruction::Load)\n+      return false;\n+    VPValue *Addr = RepR->getOperand(0);\n+    return Addr->isDefinedOutsideLoopRegions();\n+  };\n+  auto Groups = collectGroupedReplicateMemOps<Instruction::Load>(\n+      Plan, PSE, L, IsInvariantLoad);\n+  for (auto Group : Groups) {\n+    VPReplicateRecipe *EarliestLoad = Group[0];\n+    VPBasicBlock *EntryBB = Plan.getVectorLoopRegion()->getEntryBasicBlock();\n+    VPBasicBlock *ExitBB = Plan.getVectorLoopRegion()->getExitingBasicBlock();\n \n-        VPValue *Addr = RepR->getOperand(0);\n-        if (Addr->isDefinedOutsideLoopRegions()) {\n-          MemoryLocation Loc = *vputils::getMemoryLocation(*RepR);\n-          if (!Loc.AATags.Scope)\n-            continue;\n-          CandidateLoads.push_back({RepR, Loc});\n-        }\n-      }\n-      if (R.mayWriteToMemory()) {\n-        auto Loc = vputils::getMemoryLocation(R);\n-        if (!Loc || !Loc->AATags.Scope || !Loc->AATags.NoAlias)\n-          return;\n-        Stores.push_back(*Loc);\n-      }\n-    }\n-  }\n+    // Check that the load doesn't alias with stores in the vector loop: if the\n+    // load is before a store in the loop, we would need to re-load the value on\n+    // each iteration.\n+    auto LoadLoc = vputils::getMemoryLocation(*EarliestLoad);\n+    if (!LoadLoc || !canHoistOrSinkWithNoAliasCheck(*LoadLoc, EntryBB, ExitBB))\n+      continue;\n \n-  VPBasicBlock *Preheader = Plan.getVectorPreheader();\n-  for (auto &[LoadRecipe, LoadLoc] : CandidateLoads) {\n-    // Hoist the load to the preheader if it doesn't alias with any stores\n-    // according to the noalias metadata. Other loads should have been hoisted\n-    // by other passes\n-    const AAMDNodes &LoadAA = LoadLoc.AATags;\n-    if (all_of(Stores, [&](const MemoryLocation &StoreLoc) {\n-          return !ScopedNoAliasAAResult::mayAliasInScopes(\n-              LoadAA.Scope, StoreLoc.AATags.NoAlias);\n-        })) {\n-      LoadRecipe->moveBefore(*Preheader, Preheader->getFirstNonPhi());\n-    }\n+    for (VPReplicateRecipe *Load : Group)\n+      Load->moveBefore(*Preheader, Preheader->getFirstNonPhi());\n   }\n }\n \n@@ -4661,33 +4683,17 @@ collectComplementaryPredicatedMemOps(VPlan &Plan,\n   static_assert(Opcode == Instruction::Load || Opcode == Instruction::Store,\n                 \"Only Load and Store opcodes supported\");\n   constexpr bool IsLoad = (Opcode == Instruction::Load);\n-  VPRegionBlock *LoopRegion = Plan.getVectorLoopRegion();\n-  VPDominatorTree VPDT(Plan);\n   VPTypeAnalysis TypeInfo(Plan);\n \n-  // Group predicated operations by their address SCEV.\n-  DenseMap<const SCEV *, SmallVector<VPReplicateRecipe *>> RecipesByAddress;\n-  for (VPBlockBase *Block : vp_depth_first_shallow(LoopRegion->getEntry())) {\n-    auto *VPBB = cast<VPBasicBlock>(Block);\n-    for (VPRecipeBase &R : *VPBB) {\n-      auto *RepR = dyn_cast<VPReplicateRecipe>(&R);\n-      if (!RepR || RepR->getOpcode() != Opcode || !RepR->isPredicated())\n-        continue;\n-\n-      // For loads, operand 0 is address; for stores, operand 1 is address.\n-      VPValue *Addr = RepR->getOperand(IsLoad ? 0 : 1);\n-      const SCEV *AddrSCEV = vputils::getSCEVExprForVPValue(Addr, PSE, L);\n-      if (!isa<SCEVCouldNotCompute>(AddrSCEV))\n-        RecipesByAddress[AddrSCEV].push_back(RepR);\n-    }\n-  }\n-\n   // For each address, collect operations with the same or complementary masks.\n   SmallVector<SmallVector<VPReplicateRecipe *, 4>> AllGroups;\n   auto GetLoadStoreValueType = [&](VPReplicateRecipe *Recipe) {\n     return TypeInfo.inferScalarType(IsLoad ? Recipe : Recipe->getOperand(0));\n   };\n-  for (auto &[Addr, Recipes] : RecipesByAddress) {\n+  auto Groups = collectGroupedReplicateMemOps<Opcode>(\n+      Plan, PSE, L,\n+      [](VPReplicateRecipe *RepR) { return RepR->isPredicated(); });\n+  for (auto Recipes : Groups) {\n     if (Recipes.size() < 2)\n       continue;\n \n@@ -4722,11 +4728,6 @@ collectComplementaryPredicatedMemOps(VPlan &Plan,\n \n       if (HasComplementaryMask) {\n         assert(Group.size() >= 2 && \"must have at least 2 entries\");\n-        // Sort replicates by dominance order, with earliest (most dominating)\n-        // first.\n-        sort(Group, [&VPDT](VPReplicateRecipe *A, VPReplicateRecipe *B) {\n-          return VPDT.properlyDominates(A, B);\n-        });\n         AllGroups.push_back(std::move(Group));\n       }\n     }\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\nindex 16f7ae2daeb5e..23d42250598da 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n@@ -379,7 +379,8 @@ struct VPlanTransforms {\n   /// Hoist single-scalar loads with invariant addresses out of the vector loop\n   /// to the preheader, if they are proven not to alias with any stores in the\n   /// plan using noalias metadata.\n-  static void hoistInvariantLoads(VPlan &Plan);\n+  static void hoistInvariantLoads(VPlan &Plan, PredicatedScalarEvolution &PSE,\n+                                  const Loop *L);\n \n   /// Hoist predicated loads from the same address to the loop entry block, if\n   /// they are guaranteed to execute on both paths (i.e., in replicate regions\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Factor collectGroupedReplicateMemOps, enabling the reuse of canHoistOrSinkWithNoAliasCheck in hoistInvariantLoads.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/VPlan/vplan-print-after-all.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -disable-output -vplan-print-after-all -force-vector-width=4 -vplan-verify-each < %s 2>&1",
+        "opt -passes=loop-vectorize -disable-output -vplan-print-after-all -force-vector-width=4 -vplan-verify-each < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\n; Verify that `-vplan-print-after-all` option works.\n\n\n; Also verify that VPlans are actually printed (we aren't interested in the\n; exact dump content, just that it's performed):\n\n;\n;\n\ndefine void @foo(ptr %ptr, i64 %n) {\nentry:\n  br label %header\n\nheader:\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %header ]\n  %gep = getelementptr i64, ptr %ptr, i64 %iv\n  store i64 %iv, ptr %gep\n  %iv.next = add nsw i64 %iv, 1\n  %exitcond = icmp slt i64 %iv.next, %n\n  br i1 %exitcond, label %header, label %exit\n\nexit:\n  ret void\n}"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 191482 tests passed\n* 4975 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 131714 tests passed\n* 2967 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "artagnon",
+      "body": "> I don't know how ScopedAA works. Would the following be ok?\r\n> \r\n> ```llvm\r\n>   %store i16 42, %p + 2\r\n>   %ld i16, %p       ; No alias with store, earliest load\r\n>   %ld i32, %p       ; Another load in the group, this one is partial alias\r\n> ```\r\n\r\nGood question! We really should be using the full AliasAnalysis in VPlan -- ScopedNoAliasAA is just one small component of AA that we're currently using for simplicity, which relies on the noalias-metadata; this is very limited indeed. See https://github.com/artagnon/llvm-project/blob/main/llvm/test/Transforms/LoopVectorize/hoist-predicated-loads-with-predicated-stores.ll -- there are plenty of missed optimizations, fixing them requires us to use the full AA; I plan to investigate this problem later. At the moment, I just want to us to use the current ScopedNoAliasAA code to the maximum extent possible -- I've hence factored out collectGroupedReplicateMemOps, so we can reuse it. The current logic surrounding the final alias call has a lot of firepower, and is unfortunately being limited by the final alias call.\r\n\r\nFor your example, it's impossible to tell if it will be analyzed by ScopedNoAliasAA without creating a full example, and running it through the AA metadata-annotater."
+    },
+    {
+      "author": "artagnon",
+      "body": "Gentle ping."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-03T17:16:48Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        8131,
+        8136
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        230,
+        235
+      ],
+      [
+        2813,
+        2819
+      ],
+      [
+        4596,
+        4646
+      ],
+      [
+        4661,
+        4693
+      ],
+      [
+        4722,
+        4732
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.h": [
+      [
+        379,
+        385
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/VPlan/vplan-print-after-all.ll": [
+      [
+        31,
+        37
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationPlanner::buildVPlansWithVPRecipes"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::hoistInvariantLoads",
+      "VPlanTransforms::materializeBroadcasts",
+      "VPlanTransforms::optimize",
+      "canHoistOrSinkWithNoAliasCheck",
+      "cannotHoistOrSinkRecipe",
+      "collectComplementaryPredicatedMemOps"
+    ]
+  }
+}

@@ -1,0 +1,119 @@
+{
+  "pr_id": 174981,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174981",
+  "state": "open",
+  "title": "[InstCombinePHI] Enable gep arg fold transform with constant indices",
+  "author": "OutOfCache",
+  "base_commit": "cc1bb845da525a02ad6b48e02e59dbe870f6bc13",
+  "fix_commit": "4806cd736b58af3d27eeb3253babeba903fcb195",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp b/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp\nindex ba1865a2b5469..de85236efd9fb 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp\n@@ -16,6 +16,7 @@\n #include \"llvm/ADT/Statistic.h\"\n #include \"llvm/Analysis/InstructionSimplify.h\"\n #include \"llvm/Analysis/ValueTracking.h\"\n+#include \"llvm/IR/GetElementPtrTypeIterator.h\"\n #include \"llvm/IR/PatternMatch.h\"\n #include \"llvm/Support/CommandLine.h\"\n #include \"llvm/Transforms/InstCombine/InstCombiner.h\"\n@@ -566,16 +567,24 @@ Instruction *InstCombinerImpl::foldPHIArgGEPIntoPHI(PHINode &PN) {\n       AllBasePointersAreAllocas = false;\n \n     // Compare the operand lists.\n+    gep_type_iterator TypeIter = gep_type_begin(GEP);\n     for (unsigned Op = 0, E = FirstInst->getNumOperands(); Op != E; ++Op) {\n       if (FirstInst->getOperand(Op) == GEP->getOperand(Op))\n         continue;\n \n-      // Don't merge two GEPs when two operands differ (introducing phi nodes)\n-      // if one of the PHIs has a constant for the index.  The index may be\n-      // substantially cheaper to compute for the constants, so making it a\n-      // variable index could pessimize the path.  This also handles the case\n-      // for struct indices, which must always be constant.\n-      if (isa<Constant>(FirstInst->getOperand(Op)) ||\n+      // Don't merge two GEPs if the GEP indices a struct, because struct\n+      // indices must be constant.\n+      if (Op > 0) { // skip pointer operand\n+        if (TypeIter.isStruct())\n+          return nullptr;\n+        ++TypeIter;\n+      }\n+\n+      // Don't merge if there is a mixture of constant and variable indices for\n+      // the same operand. If all the indices are constant, the chance is higher\n+      // that we can create a lookup table. Otherwise, we could pessimize the\n+      // path.\n+      if (isa<Constant>(FirstInst->getOperand(Op)) !=\n           isa<Constant>(GEP->getOperand(Op)))\n         return nullptr;\n \n@@ -587,7 +596,7 @@ Instruction *InstCombinerImpl::foldPHIArgGEPIntoPHI(PHINode &PN) {\n       // also requires a PHI, we'd be introducing more PHIs than we're\n       // eliminating, which increases register pressure on entry to the PHI's\n       // block.\n-      if (NeededPhi)\n+      if (NeededPhi && FixedOperands[Op] != nullptr)\n         return nullptr;\n \n       FixedOperands[Op] = nullptr; // Needs a PHI.\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 49504b20fa1ec..d381c9984366b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -3104,7 +3104,7 @@ static bool shouldCanonicalizeGEPToPtrAdd(GetElementPtrInst &GEP) {\n \n   // gep (gep %p, C1), %x, C2 is expanded so the two constants can\n   // possibly be merged together.\n-  auto PtrOpGep = dyn_cast<GEPOperator>(PtrOp);\n+  auto *PtrOpGep = dyn_cast<GEPOperator>(PtrOp);\n   return PtrOpGep && PtrOpGep->hasAllConstantIndices() &&\n          any_of(GEP.indices(), [](Value *V) {\n            const APInt *C;\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "https://alive2.llvm.org/ce/z/DzO5Ow\r\n\r\nThe fold changes a phi node with getelementptrs as incoming values to a phi node with offsets, while creating a new getelementptr after the phi and the phi value as offset:\r\n\r\n```llvm\r\n; before\r\n%old.phi = phi ptr [ %gep0, %bb0], [ %gep1, %bb1]\r\n\r\n; after\r\n%new.phi = phi i64 [ %off0, %bb0], [ %off1, %bb1 ]\r\n%new.gep = getelementptr i8, ptr %p, i64 %new.phi\r\n```\r\nThis transform should not happen if we index into a struct, since it creates a new gep with variable index and structs need constant indices.\r\n\r\nPreviously, this was prevented by disabling the transform for any constant indices. Now, the change should apply to getelementptrs with constant indices, if the indexed type is not a struct.\r\n\r\nDo not transform if the offset is constant for some of the geps and variable for others, as suggested here https://github.com/llvm/llvm-project/issues/169919",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/fold-phi-arg-gep-to-phi.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "gep_mixed_offset_1",
+          "test_body": "define ptr @gep_mixed_offset_1(i1 %cond, ptr %ptr, i64 %off1) {\nentry:\n  %gep0 = getelementptr inbounds i8, ptr %ptr, i64 16\n  %gep1 = getelementptr inbounds i8, ptr %ptr, i64 %off1\n  br i1 %cond, label %f1, label %f0\n\nf0:                                               ; preds = %entry\n  br label %merge\n\nf1:                                               ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %f1, %f0\n  %phi = phi ptr [ %gep0, %f0 ], [ %gep1, %f1 ]\n  ret ptr %phi\n}\n"
+        },
+        {
+          "test_name": "gep_constant_offset",
+          "test_body": "define ptr @gep_constant_offset(i1 %cond, ptr %ptr) {\nentry:\n  %gep0 = getelementptr inbounds i8, ptr %ptr, i64 16\n  %gep1 = getelementptr inbounds i8, ptr %ptr, i64 32\n  br i1 %cond, label %f1, label %f0\n\nf0:                                               ; preds = %entry\n  br label %merge\n\nf1:                                               ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %f1, %f0\n  %phi = phi ptr [ %gep0, %f0 ], [ %gep1, %f1 ]\n  ret ptr %phi\n}\n"
+        },
+        {
+          "test_name": "struct_constant_offset",
+          "test_body": "%foo = type { i16, i16, i16 }\n\ndefine ptr @struct_constant_offset(i1 %cond, %foo %ptr) {\nentry:\n  %lane.0 = alloca %foo, align 16\n  %gep0 = getelementptr inbounds %foo, ptr %lane.0, i64 1\n  %gep1 = getelementptr inbounds %foo, ptr %lane.0, i64 2\n  br i1 %cond, label %f1, label %f0\n\nf0:                                               ; preds = %entry\n  br label %merge\n\nf1:                                               ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %f1, %f0\n  %phi = phi ptr [ %gep0, %f0 ], [ %gep1, %f1 ]\n  ret ptr %phi\n}\n"
+        },
+        {
+          "test_name": "test",
+          "test_body": "%foo = type { i16, i16, i16 }\n\ndefine <16 x ptr> @test(i1 %tobool, i1 %end, <16 x i64> %varidx) {\nentry:\n  %lane.0 = alloca %foo, align 16\n  %lane.15 = insertelement <16 x ptr> poison, ptr %lane.0, i64 0\n  br label %loop\n\nloop:                                             ; preds = %f1, %f0, %entry\n  %vec.phi = phi <16 x ptr> [ %mm_vectorGEP1, %f0 ], [ %mm_vectorGEP2, %f1 ], [ zeroinitializer, %entry ]\n  %mm_vectorGEP1 = getelementptr inbounds %foo, <16 x ptr> %lane.15, <16 x i64> %varidx, <16 x i32> splat (i32 1)\n  %mm_vectorGEP2 = getelementptr inbounds %foo, <16 x ptr> %lane.15, <16 x i64> %varidx, <16 x i32> splat (i32 2)\n  br i1 %tobool, label %f1, label %f0\n\nf0:                                               ; preds = %loop\n  br i1 %end, label %loop, label %merge\n\nf1:                                               ; preds = %loop\n  br i1 %end, label %loop, label %merge\n\nmerge:                                            ; preds = %f1, %f0\n  ret <16 x ptr> %vec.phi\n}\n"
+        },
+        {
+          "test_name": "gep_different_offset_types_canonicalized",
+          "test_body": "define ptr @gep_different_offset_types_canonicalized(i1 %cond, i1 %end, ptr %ptr, i64 %off0, i32 %off1) {\nentry:\n  %gep0 = getelementptr inbounds <3 x i8>, ptr %ptr, i64 0, i64 %off0\n  %gep1 = getelementptr inbounds <3 x i8>, ptr %ptr, i64 0, i32 %off1\n  br label %loop\n\nloop:                                             ; preds = %f1, %f0, %entry\n  %phi = phi ptr [ %gep0, %f0 ], [ %gep1, %f1 ], [ %gep0, %entry ]\n  br i1 %cond, label %f1, label %f0\n\nf0:                                               ; preds = %loop\n  br i1 %end, label %merge, label %loop\n\nf1:                                               ; preds = %loop\n  br i1 %end, label %merge, label %loop\n\nmerge:                                            ; preds = %f1, %f0\n  ret ptr %phi\n}\n"
+        },
+        {
+          "test_name": "gep_mixed_offset_2",
+          "test_body": "define ptr @gep_mixed_offset_2(i1 %cond, ptr %ptr, i64 %off0) {\nentry:\n  %gep0 = getelementptr inbounds i8, ptr %ptr, i64 %off0\n  %gep1 = getelementptr inbounds i8, ptr %ptr, i64 32\n  br i1 %cond, label %f1, label %f0\n\nf0:                                               ; preds = %entry\n  br label %merge\n\nf1:                                               ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %f1, %f0\n  %phi = phi ptr [ %gep0, %f0 ], [ %gep1, %f1 ]\n  ret ptr %phi\n}\n"
+        },
+        {
+          "test_name": "gep_different_offset_types_negative",
+          "test_body": "define ptr @gep_different_offset_types_negative(i1 %cond, i1 %end, ptr %ptr, i64 %off0, i32 %off1) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %f1, %f0, %entry\n  %phi = phi ptr [ %gep0, %f0 ], [ %gep1, %f1 ], [ null, %entry ]\n  %gep0 = getelementptr inbounds <3 x i8>, ptr %ptr, i64 0, i64 %off0\n  %gep1 = getelementptr inbounds <3 x i8>, ptr %ptr, i64 0, i32 %off1\n  br i1 %cond, label %f1, label %f0\n\nf0:                                               ; preds = %loop\n  br i1 %end, label %merge, label %loop\n\nf1:                                               ; preds = %loop\n  br i1 %end, label %merge, label %loop\n\nmerge:                                            ; preds = %f1, %f0\n  ret ptr %phi\n}\n"
+        },
+        {
+          "test_name": "gep_variable_offset",
+          "test_body": "define ptr @gep_variable_offset(i1 %cond, ptr %ptr, i64 %off0, i64 %off1) {\nentry:\n  %gep0 = getelementptr inbounds i8, ptr %ptr, i64 %off0\n  %gep1 = getelementptr inbounds i8, ptr %ptr, i64 %off1\n  br i1 %cond, label %f1, label %f0\n\nf0:                                               ; preds = %entry\n  br label %merge\n\nf1:                                               ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %f1, %f0\n  %phi = phi ptr [ %gep0, %f0 ], [ %gep1, %f1 ]\n  ret ptr %phi\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/opaque-ptr.ll",
+      "commands": [
+        "opt -S -passes='instcombine<no-verify-fixpoint>' < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "phi_of_gep_different_type",
+          "test_body": "define ptr @phi_of_gep_different_type(i1 %c, ptr %p) {\n  br i1 %c, label %if, label %else\n\nif:                                               ; preds = %0\n  %gep1 = getelementptr i32, ptr %p, i64 1\n  br label %join\n\nelse:                                             ; preds = %0\n  %gep2 = getelementptr i64, ptr %p, i64 1\n  br label %join\n\njoin:                                             ; preds = %else, %if\n  %phi = phi ptr [ %gep1, %if ], [ %gep2, %else ]\n  ret ptr %phi\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 129381 tests passed\n* 2862 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 188400 tests passed\n* 5000 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-08T14:07:03Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp": [
+      [
+        16,
+        21
+      ],
+      [
+        566,
+        581
+      ],
+      [
+        587,
+        593
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        3104,
+        3110
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fold-phi-arg-gep-to-phi-negative.ll": [
+      [
+        1,
+        39
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp": [
+      "InstCombinerImpl::foldPHIArgGEPIntoPHI"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "shouldCanonicalizeGEPToPtrAdd"
+    ]
+  }
+}

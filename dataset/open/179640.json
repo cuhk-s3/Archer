@@ -1,0 +1,124 @@
+{
+  "pr_id": 179640,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179640",
+  "state": "open",
+  "title": "[ConstantFolding] Fix bitcasting vectors with non-integer ratios",
+  "author": "varev-dev",
+  "base_commit": "bbde3e3b59c8f7d8eee940a5aeb4eb5a849c05f4",
+  "fix_commit": "a7fe5f7067ccf6f72faa1a789770ab154eed8505",
+  "patch": "diff --git a/llvm/lib/Analysis/ConstantFolding.cpp b/llvm/lib/Analysis/ConstantFolding.cpp\nindex 7573afe423ec9..3c858167849be 100644\n--- a/llvm/lib/Analysis/ConstantFolding.cpp\n+++ b/llvm/lib/Analysis/ConstantFolding.cpp\n@@ -217,81 +217,121 @@ Constant *FoldBitCast(Constant *C, Type *DestTy, const DataLayout &DL) {\n   // conversion here, which depends on whether the input or output has\n   // more elements.\n   bool isLittleEndian = DL.isLittleEndian();\n-\n+  unsigned SrcBitSize = SrcEltTy->getPrimitiveSizeInBits();\n+  unsigned DstBitSize = DL.getTypeSizeInBits(DstEltTy);\n   SmallVector<Constant*, 32> Result;\n   if (NumDstElt < NumSrcElt) {\n     // Handle: bitcast (<4 x i32> <i32 0, i32 1, i32 2, i32 3> to <2 x i64>)\n-    Constant *Zero = Constant::getNullValue(DstEltTy);\n-    unsigned Ratio = NumSrcElt/NumDstElt;\n-    unsigned SrcBitSize = SrcEltTy->getPrimitiveSizeInBits();\n+    //         bitcast (<4 x i24> <i24 0, i24 1, i24 2, i24 3> to <3 x i32>)\n+    APInt Rest(DstBitSize, 0);\n+    unsigned RestBitSize = 0;\n+    bool RestConsistsUndef = false;\n     unsigned SrcElt = 0;\n-    for (unsigned i = 0; i != NumDstElt; ++i) {\n-      // Build each element of the result.\n-      Constant *Elt = Zero;\n-      unsigned ShiftAmt = isLittleEndian ? 0 : SrcBitSize*(Ratio-1);\n-      for (unsigned j = 0; j != Ratio; ++j) {\n-        Constant *Src = C->getAggregateElement(SrcElt++);\n-        if (isa_and_nonnull<UndefValue>(Src))\n-          Src = Constant::getNullValue(\n-              cast<VectorType>(C->getType())->getElementType());\n-        else\n-          Src = dyn_cast_or_null<ConstantInt>(Src);\n-        if (!Src)  // Reject constantexpr elements.\n+    while (Result.size() != NumDstElt) {\n+      APInt Elt = Rest;\n+      APInt NextVecElem;\n+      while (RestBitSize < DstBitSize) {\n+        assert (SrcElt < NumSrcElt && \"Source vector overflow.\");\n+        auto *Element = C->getAggregateElement(SrcElt++);\n+        if (!Element) // Reject constantexpr elements.\n           return ConstantExpr::getBitCast(C, DestTy);\n \n-        // Zero extend the element to the right size.\n-        Src = ConstantFoldCastOperand(Instruction::ZExt, Src, Elt->getType(),\n-                                      DL);\n-        assert(Src && \"Constant folding cannot fail on plain integers\");\n-\n-        // Shift it to the right place, depending on endianness.\n-        Src = ConstantFoldBinaryOpOperands(\n-            Instruction::Shl, Src, ConstantInt::get(Src->getType(), ShiftAmt),\n-            DL);\n-        assert(Src && \"Constant folding cannot fail on plain integers\");\n-\n-        ShiftAmt += isLittleEndian ? SrcBitSize : -SrcBitSize;\n-\n-        // Mix it in.\n-        Elt = ConstantFoldBinaryOpOperands(Instruction::Or, Elt, Src, DL);\n-        assert(Elt && \"Constant folding cannot fail on plain integers\");\n+        if (isa_and_nonnull<UndefValue>(Element)) {\n+          RestBitSize += SrcBitSize;\n+          if (RestBitSize == SrcBitSize || RestConsistsUndef) {\n+            RestConsistsUndef = true;\n+            continue;\n+          }\n+          NextVecElem = APInt::getZero(DstBitSize);\n+        } else {\n+          auto *Src = dyn_cast<ConstantInt>(Element);\n+          if (!Src)\n+            return ConstantExpr::getBitCast(C, DestTy);\n+          NextVecElem = Src->getValue();\n+          NextVecElem = NextVecElem.zext(DstBitSize);\n+        }\n+        \n+        if (isLittleEndian) {\n+          Elt |= NextVecElem << RestBitSize;\n+        } else {\n+          Elt <<= SrcBitSize;\n+          Elt |= NextVecElem.lshr(RestBitSize);\n+        }\n+        RestBitSize += SrcBitSize;\n+        RestConsistsUndef = false;\n       }\n-      Result.push_back(Elt);\n+      if (RestConsistsUndef)\n+        Result.push_back(UndefValue::get(DstEltTy));\n+      else\n+        Result.push_back(ConstantInt::get(DstEltTy, Elt));\n+      \n+      if (isLittleEndian)\n+        Rest = NextVecElem.lshr(DstBitSize - RestBitSize);\n+      else\n+        Rest = NextVecElem << (DstBitSize - RestBitSize);\n+      RestBitSize -= DstBitSize;\n     }\n     return ConstantVector::get(Result);\n   }\n \n   // Handle: bitcast (<2 x i64> <i64 0, i64 1> to <4 x i32>)\n+  //         bitcast (<3 x i64> <i64 0, i64 1, i64 2> to <8 x i24>)\n   unsigned Ratio = NumDstElt/NumSrcElt;\n-  unsigned DstBitSize = DL.getTypeSizeInBits(DstEltTy);\n-\n-  // Loop over each source value, expanding into multiple results.\n-  for (unsigned i = 0; i != NumSrcElt; ++i) {\n-    auto *Element = C->getAggregateElement(i);\n-\n+  APInt Rest(SrcBitSize, 0);\n+  unsigned RestSize = 0;\n+  for (unsigned i = 0; Result.size() != NumDstElt;) {\n+    unsigned UnusedBits = SrcBitSize - RestSize;\n+    if (RestSize >= DstBitSize) {\n+      APInt Elt = isLittleEndian ? Rest.lshr(UnusedBits)\n+                                 : Rest << (RestSize - DstBitSize);\n+      Result.push_back(ConstantInt::get(DstEltTy, Elt.trunc(DstBitSize)));\n+      RestSize -= DstBitSize;\n+      continue;\n+    }\n+    auto *Element = C->getAggregateElement(i++);\n     if (!Element) // Reject constantexpr elements.\n       return ConstantExpr::getBitCast(C, DestTy);\n \n+    APInt NextVecElem;\n     if (isa<UndefValue>(Element)) {\n       // Correctly Propagate undef values.\n-      Result.append(Ratio, UndefValue::get(DstEltTy));\n-      continue;\n+      if (SrcBitSize % DstBitSize == 0) {\n+        Result.append(Ratio, UndefValue::get(DstEltTy));\n+        continue;\n+      }\n+      // Replace Undef with zeros to prevent partial corruption.\n+      NextVecElem = APInt::getZero(SrcBitSize);\n+    } else {\n+      auto *Src = dyn_cast<ConstantInt>(Element);\n+      if (!Src)\n+        return ConstantExpr::getBitCast(C, DestTy);\n+      NextVecElem = Src->getValue();\n     }\n-\n-    auto *Src = dyn_cast<ConstantInt>(Element);\n-    if (!Src)\n-      return ConstantExpr::getBitCast(C, DestTy);\n-\n-    unsigned ShiftAmt = isLittleEndian ? 0 : DstBitSize*(Ratio-1);\n+    APInt Value = Rest;\n+    if (SrcBitSize % DstBitSize)\n+      Rest = NextVecElem;\n+    if (RestSize != 0) {\n+      // Shift the Rest into the right place, shift NextVecElem to fit Rest.\n+      if (isLittleEndian) {\n+        Value.lshrInPlace(UnusedBits == SrcBitSize ? 0 : UnusedBits);\n+        NextVecElem <<= RestSize;\n+      } else {\n+        Value <<= UnusedBits;\n+        NextVecElem.lshrInPlace(RestSize);\n+      }\n+    }\n+    Value |= NextVecElem;\n+    unsigned ShiftAmt = isLittleEndian ? 0 : SrcBitSize - DstBitSize;\n     for (unsigned j = 0; j != Ratio; ++j) {\n       // Shift the piece of the value into the right place, depending on\n       // endianness.\n-      APInt Elt = Src->getValue().lshr(ShiftAmt);\n+      APInt Elt = Value.lshr(ShiftAmt);\n       ShiftAmt += isLittleEndian ? DstBitSize : -DstBitSize;\n \n       // Truncate and remember this piece.\n       Result.push_back(ConstantInt::get(DstEltTy, Elt.trunc(DstBitSize)));\n     }\n+    RestSize = SrcBitSize + RestSize - Ratio * DstBitSize;\n   }\n \n   return ConstantVector::get(Result);\n",
+  "components": [
+    "ConstantFold"
+  ],
+  "description": "This patch fixes a crash when constant folding bitcast from a vector with larger elements to a vector with smaller ones, where the element count ratio is not an integer (e.g., <3 x i32> to <4 x i24>). \r\n\r\nAlso this patch fixes existing miscompilation when bitcasting a vector with smaller elements into vector with larger ones, where the element count ratio is not an integer (e.g., <4 x i24> to <3 x i32>). \r\n\r\nPreviously the logic assumed a uniform ratio, leading to \r\n- an incorrect number of result elements and subsequent crashes in RAUW, or\r\n- miscompilation, bytes lost in process.\r\n\r\nFixes #179626 \r\nFixes #181195 ",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstSimplify/bitcast-vector-fold.ll",
+      "commands": [
+        "opt < %s -passes=instsimplify -S",
+        "opt < %s -passes=instsimplify -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test13",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <3 x i32> @test13() {\n  %c = bitcast <4 x i24> <i24 1, i24 256, i24 65536, i24 0> to <3 x i32>\n  ret <3 x i32> %c\n}\n"
+        },
+        {
+          "test_name": "test11",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <4 x i24> @test11() {\n  %c = bitcast <3 x i32> splat (i32 1) to <4 x i24>\n  ret <4 x i24> %c\n}\n"
+        },
+        {
+          "test_name": "test10",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <1 x i1> @test10() {\n  %ret = icmp eq <1 x i64> splat (i64 -1), zeroinitializer\n  ret <1 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "test14",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <3 x i64> @test14() {\n  %c = bitcast <8 x i24> splat (i24 1) to <3 x i64>\n  ret <3 x i64> %c\n}\n"
+        },
+        {
+          "test_name": "bitcast_constexpr_scalar_fp_to_vector_int",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <1 x i32> @bitcast_constexpr_scalar_fp_to_vector_int() {\n  %res = bitcast float 1.000000e+00 to <1 x i32>\n  ret <1 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "bitcast_constexpr_4i24_3i32_u1u",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <4 x i24> @bitcast_constexpr_4i24_3i32_u1u() {\n  %cast = bitcast <3 x i32> <i32 undef, i32 1, i32 undef> to <4 x i24>\n  ret <4 x i24> %cast\n}\n"
+        },
+        {
+          "test_name": "test12",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <8 x i24> @test12() {\n  %c = bitcast <3 x i64> <i64 281474993487873, i64 72057598332895488, i64 1099511693312> to <8 x i24>\n  ret <8 x i24> %c\n}\n"
+        },
+        {
+          "test_name": "bitcast_constexpr_16i8_8i16_u256uuu256uu",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <16 x i8> @bitcast_constexpr_16i8_8i16_u256uuu256uu() {\n  %cast = bitcast <8 x i16> <i16 undef, i16 256, i16 undef, i16 undef, i16 undef, i16 256, i16 undef, i16 undef> to <16 x i8>\n  ret <16 x i8> %cast\n}\n"
+        },
+        {
+          "test_name": "foo",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <2 x float> @foo() {\n  %cast = bitcast i64 -1 to <2 x float>\n  ret <2 x float> %cast\n}\n"
+        },
+        {
+          "test_name": "bitcast_constexpr_3i32_4i24_uu11",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <3 x i32> @bitcast_constexpr_3i32_4i24_uu11() {\n  %cast = bitcast <4 x i24> <i24 undef, i24 undef, i24 1, i24 1> to <3 x i32>\n  ret <3 x i32> %cast\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "varev-dev",
+      "body": "Update regarding the fix approach: Following the feedback and further debugging I confirmed that the root cause lies in `lib/Analysis/ConstantFolding.cpp`, The function FoldBitCast incorrectly calculates the element ratio for vector types that don't divide evenly (e.g., casting 3 x i32 to 4 x i24), leading to a result with the wrong number of elements.\r\n\r\nI am rewriting this patch to fix `ConstantFolding.cpp` directly. I will implement a check to handle these non-uniform vector bitcasts correctly."
+    },
+    {
+      "author": "varev-dev",
+      "body": "Ready for review. \r\n\r\nI have implemented the bit-stream handling logic for the unpacking scenario (SrcBitSize > DstBitSize) and verified it with the regression test in InstSimplify.\r\n\r\n@nikic "
+    },
+    {
+      "author": "varev-dev",
+      "body": "Gentle ping. \r\n\r\nI have implemented the previous review suggestions: recuded the test and replaced the workaround with proper fix in `ConstantFolding::FoldBitCast` for cases where `SrcBitSize % DstBitSize != 0`.\r\n\r\nI would appreciate another review of the current implementation. Thank you"
+    },
+    {
+      "author": "varev-dev",
+      "body": "@nikic I have addressed all requested changes in the latest commits. Since the PR is still marked as 'Changes Required', it might be filtered out of the review queue. Could you please take a look and dismiss the block if the current state looks good?"
+    },
+    {
+      "author": "cardigan1008",
+      "body": "Hi, there is a related miscompilation test case:\r\n\r\n```llvm\r\ndefine <2 x i60> @rev_nonint_ratio() {\r\n  %c = bitcast <5 x i24> <i24 1, i24 2, i24 3, i24 4, i24 5> to <2 x i60>\r\n  ret <2 x i60> %c\r\n}\r\n```\r\n\r\nAlive2 proof: https://alive2.llvm.org/ce/z/RTtbvU\r\n\r\n> Note: This is a review assisted with a self-built AI agent. The reproducer was validated manually. Please let me know if anything is wrong.\r\n\r\nThe patch fixed non-integer-ratio handling only for `NumDstElt > NumSrcElt` (widening to smaller elements) by adding bit-stream logic. It did not symmetrically fix the reverse compression path (`NumDstElt < NumSrcElt`), leaving old floor-ratio packing logic.\r\n\r\nThe `NumDstElt < NumSrcElt` path still uses `Ratio = NumSrcElt / NumDstElt` integer truncation and assumes integral grouping, which is invalid for non-integer element-count ratios (here 5/2)."
+    },
+    {
+      "author": "varev-dev",
+      "body": "@cardigan1008 Good catch, the case you described was also reported in #181195. I am working on this path right now and will update this PR shortly to cover the complete non-byte-sized vector cast logic."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-04T10:58:24Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      [
+        217,
+        297
+      ]
+    ],
+    "llvm/test/Transforms/InstSimplify/bitcast-vector-fold.ll": [
+      [
+        83,
+        88
+      ],
+      [
+        277,
+        282
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      "FoldBitCast"
+    ]
+  }
+}

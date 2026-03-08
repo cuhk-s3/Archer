@@ -1,0 +1,85 @@
+{
+  "pr_id": 179432,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179432",
+  "state": "closed",
+  "title": "[InstCombine] Bubble splices of binop operands to their result",
+  "author": "lukel97",
+  "base_commit": "a3a15f3252dee76e394cb4c20bc287194ac55667",
+  "fix_commit": "c9bd141794c776ceeec6a0061db19063b899fd5a",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex a9904f7867e94..e2bda2450c66f 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2392,6 +2392,48 @@ static Constant *constantFoldBinOpWithSplat(unsigned Opcode, Constant *Vector,\n   return ConstantFoldBinaryOpOperands(Opcode, LHS, RHS, DL);\n }\n \n+template <Intrinsic::ID SpliceID>\n+static Instruction *foldSpliceBinOp(BinaryOperator &Inst,\n+                                    InstCombiner::BuilderTy &Builder) {\n+  Value *LHS = Inst.getOperand(0), *RHS = Inst.getOperand(1);\n+  auto CreateBinOpSplice = [&](Value *X, Value *Y, Value *Offset) {\n+    Value *V = Builder.CreateBinOp(Inst.getOpcode(), X, Y, Inst.getName());\n+    if (auto *BO = dyn_cast<BinaryOperator>(V))\n+      BO->copyIRFlags(&Inst);\n+    Module *M = Inst.getModule();\n+    Function *F = Intrinsic::getOrInsertDeclaration(M, SpliceID, V->getType());\n+    return CallInst::Create(F, {V, PoisonValue::get(V->getType()), Offset});\n+  };\n+  Value *V1, *V2, *Offset;\n+  if (match(LHS,\n+            m_Intrinsic<SpliceID>(m_Value(V1), m_Poison(), m_Value(Offset)))) {\n+    // Op(splice(V1, poison, offset), splice(V2, poison, offset))\n+    // -> splice(Op(V1, V2), poison, offset)\n+    if (match(RHS, m_Intrinsic<SpliceID>(m_Value(V2), m_Poison(),\n+                                         m_Specific(Offset))) &&\n+        (LHS->hasOneUse() || RHS->hasOneUse() ||\n+         (LHS == RHS && LHS->hasNUses(2))))\n+      return CreateBinOpSplice(V1, V2, Offset);\n+\n+    // Op(splice(V1, poison, offset), RHSSplat)\n+    // -> splice(Op(V1, RHSSplat), poison, offset)\n+    if (LHS->hasOneUse() && isSplatValue(RHS))\n+      return CreateBinOpSplice(V1, RHS, Offset);\n+  }\n+  // Op(LHSSplat, splice(V2, poison, offset))\n+  // -> splice(Op(LHSSplat, V2), poison, offset)\n+  else if (isSplatValue(LHS) &&\n+           match(RHS, m_OneUse(m_Intrinsic<SpliceID>(m_Value(V2), m_Poison(),\n+                                                     m_Value(Offset)))))\n+    return CreateBinOpSplice(LHS, V2, Offset);\n+\n+  // TODO: Fold binops of the form\n+  // Op(splice(poison, V1, offset), splice(poison, V2, offset))\n+  // -> splice(poison, Op(V1, V2), offset)\n+\n+  return nullptr;\n+}\n+\n Instruction *InstCombinerImpl::foldVectorBinop(BinaryOperator &Inst) {\n   if (!isa<VectorType>(Inst.getType()))\n     return nullptr;\n@@ -2520,6 +2562,13 @@ Instruction *InstCombinerImpl::foldVectorBinop(BinaryOperator &Inst) {\n                           m_Value(V2), m_AllOnes(), m_Value(EVL))))\n     return createBinOpVPReverse(LHS, V2, EVL);\n \n+  if (Instruction *Folded =\n+          foldSpliceBinOp<Intrinsic::vector_splice_left>(Inst, Builder))\n+    return Folded;\n+  if (Instruction *Folded =\n+          foldSpliceBinOp<Intrinsic::vector_splice_right>(Inst, Builder))\n+    return Folded;\n+\n   // It may not be safe to reorder shuffles and things like div, urem, etc.\n   // because we may trap when executing those ops on unknown vector elements.\n   // See PR20059.\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "In #172961 we are trying to remove llvm.experimental.vp.reverse now that llvm.vector.splice.right supports variable offsets.\r\n\r\nA VP reverse reverses the first EVL elements of the vector, e.g. 01234567 -> 210xxxxx when EVL=3, where x=poison.\r\n\r\nThis can now be represented by splice.right(reverse(V), poison, EVL):\r\n\r\n       01234567\r\n    -> 76543210 (reverse)\r\n    -> 210xxxxx (splice.right)\r\n\r\nThis PR implements the vp.reverse combines that pull through binops, but generalized to vector.splice. Specifically, this implements the following combines:\r\n\r\n    Op(splice(V1, poison, offset), splice(V2, poison, offset)) -> splice(Op(V1, V2), poison, offset)\r\n    Op(splice(V1, poison, offset), RHSSplat) -> splice(Op(V1, RHSSplat), poison, offset)\r\n    Op(LHSSplat, splice(V2, poison, offset)) -> splice(Op(LHSSplat, V2), poison, offset)\r\n\r\nWe can then remove the vp.reverse intrinsic and its related combines soon after, once we migrate the loop vectorizer over.\r\n\r\n\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/vector-splice.ll",
+      "commands": [
+        "opt < %s -p instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "binop_splice_right_rhs_splat",
+          "test_body": "define <4 x i32> @binop_splice_right_rhs_splat(<4 x i32> %v1, i32 %x, i32 %offset) {\n  %splice = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> poison, i32 %offset)\n  %head = insertelement <4 x i32> poison, i32 %x, i32 0\n  %splat = shufflevector <4 x i32> %head, <4 x i32> poison, <4 x i32> zeroinitializer\n  %res = add <4 x i32> %splice, %splat\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "binop_splice_right_lhs_splat",
+          "test_body": "define <4 x i32> @binop_splice_right_lhs_splat(<4 x i32> %v1, i32 %x, i32 %offset) {\n  %splice = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> poison, i32 %offset)\n  %head = insertelement <4 x i32> poison, i32 %x, i32 0\n  %splat = shufflevector <4 x i32> %head, <4 x i32> poison, <4 x i32> zeroinitializer\n  %res = add <4 x i32> %splat, %splice\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "binop_splice_mismatched_offset",
+          "test_body": "define <4 x i32> @binop_splice_mismatched_offset(<4 x i32> %v1, <4 x i32> %v2, i32 %offset1, i32 %offset2) {\n  %splice1 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> poison, i32 %offset1)\n  %splice2 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v2, <4 x i32> poison, i32 %offset2)\n  %res = add <4 x i32> %splice1, %splice2\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "binop_splice_left_rhs_splat",
+          "test_body": "define <4 x i32> @binop_splice_left_rhs_splat(<4 x i32> %v1, i32 %x, i32 %offset) {\n  %splice = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> poison, i32 %offset)\n  %head = insertelement <4 x i32> poison, i32 %x, i32 0\n  %splat = shufflevector <4 x i32> %head, <4 x i32> poison, <4 x i32> zeroinitializer\n  %res = add <4 x i32> %splice, %splat\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "binop_splice_left_lhs_splat",
+          "test_body": "define <4 x i32> @binop_splice_left_lhs_splat(<4 x i32> %v1, i32 %x, i32 %offset) {\n  %splice = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> poison, i32 %offset)\n  %head = insertelement <4 x i32> poison, i32 %x, i32 0\n  %splat = shufflevector <4 x i32> %head, <4 x i32> poison, <4 x i32> zeroinitializer\n  %res = add <4 x i32> %splat, %splice\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "binop_splice_left",
+          "test_body": "define <4 x i32> @binop_splice_left(<4 x i32> %v1, <4 x i32> %v2, i32 %offset) {\n  %splice1 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> poison, i32 %offset)\n  %splice2 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v2, <4 x i32> poison, i32 %offset)\n  %res = add <4 x i32> %splice1, %splice2\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "binop_splice_right",
+          "test_body": "define <4 x i32> @binop_splice_right(<4 x i32> %v1, <4 x i32> %v2, i32 %offset) {\n  %splice1 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> poison, i32 %offset)\n  %splice2 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v2, <4 x i32> poison, i32 %offset)\n  %res = add <4 x i32> %splice1, %splice2\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "binop_splice_mismatched_vector",
+          "test_body": "define <4 x i32> @binop_splice_mismatched_vector(<4 x i32> %v1, <4 x i32> %v2, <4 x i32> %v3, i32 %offset) {\n  %splice1 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v1, <4 x i32> %v3, i32 %offset)\n  %splice2 = call <4 x i32> @llvm.vector.splice.v4i32(<4 x i32> %v2, <4 x i32> %v3, i32 %offset)\n  %res = add <4 x i32> %splice1, %splice2\n  ret <4 x i32> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <4 x i32> @llvm.vector.splice.v4i32(<4 x i32>, <4 x i32>, i32 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-03T11:01:14Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        2392,
+        2397
+      ],
+      [
+        2520,
+        2525
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "InstCombinerImpl::foldVectorBinop",
+      "constantFoldBinOpWithSplat"
+    ]
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "pr_id": 183792,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183792",
+  "state": "open",
+  "title": "[StructurizeCFG] Fix incorrect zero-cost hoisting in nested control flow",
+  "author": "yxsamliu",
+  "base_commit": "c49460bae76c873725ae77d5f9b4d6239b7c40a7",
+  "fix_commit": "8f4b16f55a6c3d633b89a8a2e3b848042df730f3",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp b/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp\nindex 0a8f5ea2fdae1..77d8c5bf8cc4e 100644\n--- a/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp\n+++ b/llvm/lib/Transforms/Scalar/StructurizeCFG.cpp\n@@ -479,6 +479,16 @@ void StructurizeCFG::hoistZeroCostElseBlockPhiValues(BasicBlock *ElseBB,\n \n   if (!ElseSucc || !CommonDominator)\n     return;\n+  // Only hoist when the merge phi has exactly 2 incoming values (a simple\n+  // if-else). With 3+ incoming values, multiple control-flow paths merge at\n+  // ElseSucc. After structurization the hoisted instruction ends up in a\n+  // dominator block that feeds a Flow phi on every edge, including edges\n+  // where the else block was never taken, causing the hoisted value to\n+  // leak into unrelated paths.\n+  for (PHINode &Phi : ElseSucc->phis()) {\n+    if (Phi.getNumIncomingValues() != 2)\n+      return;\n+  }\n   Instruction *Term = CommonDominator->getTerminator();\n   for (PHINode &Phi : ElseSucc->phis()) {\n     Value *ElseVal = Phi.getIncomingValueForBlock(ElseBB);\n",
+  "components": [
+    "StructurizeCFG"
+  ],
+  "description": "hoistZeroCostElseBlockPhiValues() hoists zero-cost instructions from else blocks to their common dominator with the then block. When the merge point phi has 3+ incoming values (i.e. multiple control-flow paths converge), the hoisted instruction ends up in a dominator that feeds a Flow phi on every edge, including edges where the else block was never taken. simplifyHoistedPhis() then replaces poison entries in those Flow phis with the hoisted value, causing it to leak into unrelated paths.\r\n\r\nThis manifests as miscompilation in sorting kernels compiled with code coverage: the PGO counter blocks create deeply nested CFGs where the hoisted shufflevector (used for swapping sort keys) reaches the no-swap path, corrupting sort results.\r\n\r\nFix by skipping hoisting when any merge phi has more than 2 incoming values, restricting it to simple if-else structures where the control flow is unambiguous.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/StructurizeCFG/hoist-zerocost-nested.ll",
+      "commands": [
+        "opt -passes=fix-irreducible,unify-loop-exits,structurizecfg -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sort_two_iters",
+          "test_body": "@counter_less = external addrspace(1) global [4 x i64]\n@counter_eq = external addrspace(1) global [2 x i64]\n@counter_swap = external addrspace(1) global [2 x i64]\n\ndefine amdgpu_kernel void @sort_two_iters(i1 %do_iter1, i1 %do_iter2, <2 x float> %key_a, <2 x float> %key_b, <2 x float> %key_c, <4 x i32> %values_vec, ptr addrspace(1) %out_values, ptr addrspace(1) %out_key) {\nentry:\n  %cnt_less0 = load i64, ptr addrspace(1) @counter_less, align 8\n  %cnt_eq0 = load i64, ptr addrspace(1) @counter_eq, align 8\n  %cnt_swap0 = load i64, ptr addrspace(1) @counter_swap, align 8\n  br i1 %do_iter1, label %iter1.cmp_x, label %iter1.done\n\niter1.cmp_x:                                      ; preds = %entry\n  %cnt_less1 = add i64 %cnt_less0, 1\n  store i64 %cnt_less1, ptr addrspace(1) @counter_less, align 8\n  %ax = extractelement <2 x float> %key_a, i64 0\n  %bx = extractelement <2 x float> %key_b, i64 0\n  %x_less = fcmp olt float %ax, %bx\n  br i1 %x_less, label %iter1.do_swap, label %iter1.check_eq\n\niter1.check_eq:                                   ; preds = %iter1.cmp_x\n  %cnt_eq1 = add i64 %cnt_eq0, 1\n  store i64 %cnt_eq1, ptr addrspace(1) @counter_eq, align 8\n  %x_eq = fcmp oeq float %ax, %bx\n  br i1 %x_eq, label %iter1.cmp_y, label %iter1.done\n\niter1.cmp_y:                                      ; preds = %iter1.check_eq\n  %cnt_less2 = add i64 %cnt_less0, 2\n  store i64 %cnt_less2, ptr addrspace(1) @counter_less, align 8\n  %ay = extractelement <2 x float> %key_a, i64 1\n  %by = extractelement <2 x float> %key_b, i64 1\n  %y_less = fcmp olt float %ay, %by\n  br i1 %y_less, label %iter1.do_swap, label %iter1.done\n\niter1.do_swap:                                    ; preds = %iter1.cmp_y, %iter1.cmp_x\n  %cnt_swap1 = add i64 %cnt_swap0, 1\n  store i64 %cnt_swap1, ptr addrspace(1) @counter_swap, align 8\n  %swapped1 = shufflevector <4 x i32> %values_vec, <4 x i32> poison, <4 x i32> <i32 0, i32 2, i32 1, i32 3>\n  br label %iter1.done\n\niter1.done:                                       ; preds = %iter1.do_swap, %iter1.cmp_y, %iter1.check_eq, %entry\n  %vals1 = phi <4 x i32> [ %swapped1, %iter1.do_swap ], [ %values_vec, %iter1.check_eq ], [ %values_vec, %iter1.cmp_y ], [ %values_vec, %entry ]\n  %cnt_eq_out1 = phi i64 [ %cnt_eq0, %iter1.do_swap ], [ %cnt_eq1, %iter1.check_eq ], [ %cnt_eq1, %iter1.cmp_y ], [ %cnt_eq0, %entry ]\n  %cnt_less_out1 = phi i64 [ %cnt_less1, %iter1.do_swap ], [ %cnt_less1, %iter1.check_eq ], [ %cnt_less2, %iter1.cmp_y ], [ %cnt_less0, %entry ]\n  %key_lo1 = phi <2 x float> [ %key_b, %iter1.do_swap ], [ %key_a, %iter1.check_eq ], [ %key_a, %iter1.cmp_y ], [ %key_a, %entry ]\n  %key_hi1 = phi <2 x float> [ %key_a, %iter1.do_swap ], [ %key_b, %iter1.check_eq ], [ %key_b, %iter1.cmp_y ], [ %key_b, %entry ]\n  br i1 %do_iter2, label %iter2.cmp_x, label %iter2.done\n\niter2.cmp_x:                                      ; preds = %iter1.done\n  %cnt_less3 = add i64 %cnt_less_out1, 1\n  store i64 %cnt_less3, ptr addrspace(1) @counter_less, align 8\n  %cx = extractelement <2 x float> %key_c, i64 0\n  %hi1x = extractelement <2 x float> %key_hi1, i64 0\n  %x_less2 = fcmp olt float %hi1x, %cx\n  br i1 %x_less2, label %iter2.do_swap, label %iter2.check_eq\n\niter2.check_eq:                                   ; preds = %iter2.cmp_x\n  %cnt_eq2 = add i64 %cnt_eq_out1, 1\n  store i64 %cnt_eq2, ptr addrspace(1) @counter_eq, align 8\n  %x_eq2 = fcmp oeq float %hi1x, %cx\n  br i1 %x_eq2, label %iter2.cmp_y, label %iter2.done\n\niter2.cmp_y:                                      ; preds = %iter2.check_eq\n  %cnt_less4 = add i64 %cnt_less_out1, 2\n  store i64 %cnt_less4, ptr addrspace(1) @counter_less, align 8\n  %hi1y = extractelement <2 x float> %key_hi1, i64 1\n  %cy = extractelement <2 x float> %key_c, i64 1\n  %y_less2 = fcmp olt float %hi1y, %cy\n  br i1 %y_less2, label %iter2.do_swap, label %iter2.done\n\niter2.do_swap:                                    ; preds = %iter2.cmp_y, %iter2.cmp_x\n  %cnt_swap2 = add i64 %cnt_swap0, 2\n  store i64 %cnt_swap2, ptr addrspace(1) @counter_swap, align 8\n  %swapped2 = shufflevector <4 x i32> %vals1, <4 x i32> poison, <4 x i32> <i32 1, i32 0, i32 2, i32 3>\n  br label %iter2.done\n\niter2.done:                                       ; preds = %iter2.do_swap, %iter2.cmp_y, %iter2.check_eq, %iter1.done\n  %vals2 = phi <4 x i32> [ %swapped2, %iter2.do_swap ], [ %vals1, %iter2.check_eq ], [ %vals1, %iter2.cmp_y ], [ %vals1, %iter1.done ]\n  store <4 x i32> %vals2, ptr addrspace(1) %out_values, align 16\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-02-27T18:32:55Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/StructurizeCFG.cpp": [
+      [
+        479,
+        484
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/StructurizeCFG.cpp": [
+      "StructurizeCFG::hoistZeroCostElseBlockPhiValues"
+    ]
+  }
+}

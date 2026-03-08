@@ -1,0 +1,172 @@
+{
+  "pr_id": 182492,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182492",
+  "state": "closed",
+  "title": "[LV] Fix miscompile with conditional scalar assignment + tail folding",
+  "author": "MacDue",
+  "base_commit": "a14b72ba63daf3d908f81c846049458692c8d269",
+  "fix_commit": "9ed37b49d2bc75a30c2dccb55319e01944e9bf4a",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 2342c8bfa502e..6b878036f7959 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -1431,11 +1431,18 @@ class LoopVectorizationCostModel {\n \n   /// Returns true if the predicated reduction select should be used to set the\n   /// incoming value for the reduction phi.\n-  bool usePredicatedReductionSelect() const {\n+  bool usePredicatedReductionSelect(RecurKind RecurrenceKind) const {\n     // Force to use predicated reduction select since the EVL of the\n     // second-to-last iteration might not be VF*UF.\n     if (foldTailWithEVL())\n       return true;\n+\n+    // Note: For FindLast recurrences we prefer a predicated select to simplify\n+    // matching in handleFindLastReductions(), rather than handle multiple\n+    // cases.\n+    if (RecurrenceDescriptor::isFindLastRecurrenceKind(RecurrenceKind))\n+      return true;\n+\n     return PreferPredicatedReductionSelect ||\n            TTI.preferPredicatedReductionSelect();\n   }\n@@ -8481,6 +8488,7 @@ void LoopVectorizationPlanner::addReductionResultComputation(\n     if (!PhiR || isa<VPIRValue>(PhiR->getOperand(1)))\n       continue;\n \n+    RecurKind RecurrenceKind = PhiR->getRecurrenceKind();\n     const RecurrenceDescriptor &RdxDesc = Legal->getRecurrenceDescriptor(\n         cast<PHINode>(PhiR->getUnderlyingInstr()));\n     Type *PhiTy = TypeInfo.inferScalarType(PhiR);\n@@ -8505,7 +8513,8 @@ void LoopVectorizationPlanner::addReductionResultComputation(\n                     m_VPInstruction<VPInstruction::ComputeAnyOfResult>(),\n                     m_VPInstruction<VPInstruction::ComputeReductionResult>()));\n       });\n-      if (CM.usePredicatedReductionSelect())\n+\n+      if (CM.usePredicatedReductionSelect(RecurrenceKind))\n         PhiR->setOperand(1, NewExitingVPV);\n     }\n \n@@ -8525,7 +8534,6 @@ void LoopVectorizationPlanner::addReductionResultComputation(\n     VPInstruction *FinalReductionResult;\n     VPBuilder::InsertPointGuard Guard(Builder);\n     Builder.setInsertPoint(MiddleVPBB, IP);\n-    RecurKind RecurrenceKind = PhiR->getRecurrenceKind();\n     // For AnyOf reductions, find the select among PhiR's users. This is used\n     // both to find NewVal for ComputeAnyOfResult and to adjust the reduction.\n     VPRecipeBase *AnyOfSelect = nullptr;\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex 3101b42625c53..6eaf52ba49482 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -1350,6 +1350,7 @@ bool VPlanTransforms::handleFindLastReductions(VPlan &Plan) {\n   //   ...extract-last-active replaces compute-reduction-result.\n   //   result = extract-last-active vp<new.data>, vp<new.mask>, ir<default.val>\n \n+  VPValue *HeaderMask = vputils::findHeaderMask(Plan);\n   for (auto &Phi : Plan.getVectorLoopRegion()->getEntryBasicBlock()->phis()) {\n     auto *PhiR = dyn_cast<VPReductionPHIRecipe>(&Phi);\n     if (!PhiR || !RecurrenceDescriptor::isFindLastRecurrenceKind(\n@@ -1357,7 +1358,16 @@ bool VPlanTransforms::handleFindLastReductions(VPlan &Plan) {\n       continue;\n \n     // Find the condition for the select/blend.\n-    auto *SelectR = cast<VPSingleDefRecipe>(&PhiR->getBackedgeRecipe());\n+    VPValue *BackedgeSelect = PhiR->getBackedgeValue();\n+    VPValue *CondSelect = BackedgeSelect;\n+\n+    // If there's a header mask, the backedge select will not be the find-last\n+    // select.\n+    if (HeaderMask && !match(BackedgeSelect,\n+                             m_Select(m_Specific(HeaderMask),\n+                                      m_VPValue(CondSelect), m_Specific(PhiR))))\n+      llvm_unreachable(\"expected header mask select\");\n+\n     VPValue *Cond = nullptr, *Op1 = nullptr, *Op2 = nullptr;\n \n     // If we're matching a blend rather than a select, there should be one\n@@ -1381,11 +1391,22 @@ bool VPlanTransforms::handleFindLastReductions(VPlan &Plan) {\n       return NumIncomingDataValues == 1;\n     };\n \n+    VPSingleDefRecipe *SelectR =\n+        cast<VPSingleDefRecipe>(CondSelect->getDefiningRecipe());\n     if (!match(SelectR,\n                m_Select(m_VPValue(Cond), m_VPValue(Op1), m_VPValue(Op2))) &&\n         !MatchBlend(SelectR))\n       return false;\n \n+    assert(Cond != HeaderMask && \"Cond must not be HeaderMask\");\n+\n+    // Find final reduction computation and replace it with an\n+    // extract.last.active intrinsic.\n+    auto *RdxResult =\n+        vputils::findUserOf<VPInstruction::ComputeReductionResult>(\n+            BackedgeSelect);\n+    assert(RdxResult && \"Could not find reduction result\");\n+\n     // Add mask phi.\n     VPBuilder Builder = VPBuilder::getToInsertAfter(PhiR);\n     auto *MaskPHI = new VPWidenPHIRecipe(nullptr, /*Start=*/Plan.getFalse());\n@@ -1402,6 +1423,9 @@ bool VPlanTransforms::handleFindLastReductions(VPlan &Plan) {\n     }\n     assert(Op2 == PhiR && \"data value must be selected if Cond is true\");\n \n+    if (HeaderMask)\n+      Cond = Builder.createLogicalAnd(HeaderMask, Cond);\n+\n     VPValue *AnyOf = Builder.createNaryOp(VPInstruction::AnyOf, {Cond});\n     VPValue *MaskSelect = Builder.createSelect(AnyOf, Cond, MaskPHI);\n     MaskPHI->addOperand(MaskSelect);\n@@ -1410,15 +1434,9 @@ bool VPlanTransforms::handleFindLastReductions(VPlan &Plan) {\n     VPValue *DataSelect =\n         Builder.createSelect(AnyOf, Op1, Op2, SelectR->getDebugLoc());\n     SelectR->replaceAllUsesWith(DataSelect);\n+    PhiR->setBackedgeValue(DataSelect);\n     SelectR->eraseFromParent();\n \n-    // Find final reduction computation and replace it with an\n-    // extract.last.active intrinsic.\n-    auto *RdxResult =\n-        vputils::findUserOf<VPInstruction::ComputeReductionResult>(DataSelect);\n-    // TODO: Handle tail-folding.\n-    if (!RdxResult)\n-      return false;\n     Builder.setInsertPoint(RdxResult);\n     auto *ExtractLastActive =\n         Builder.createNaryOp(VPInstruction::ExtractLastActive,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 875bad9bfe17b..1c8971d0beec7 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -5668,6 +5668,7 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n     return std::nullopt;\n   };\n \n+  VPValue *HeaderMask = vputils::findHeaderMask(Plan);\n   for (VPRecipeBase &Phi :\n        make_early_inc_range(VectorLoopRegion->getEntryBasicBlock()->phis())) {\n     auto *PhiR = dyn_cast<VPReductionPHIRecipe>(&Phi);\n@@ -5675,16 +5676,24 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n                      PhiR->getRecurrenceKind()))\n       continue;\n \n-    // Get the IV and condition from the backedge value of the reduction phi.\n-    // The backedge value should be a select between the phi and the IV.\n+    // If there's a header mask, the backedge select will not be the find-last\n+    // select.\n     VPValue *BackedgeVal = PhiR->getBackedgeValue();\n+    VPValue *CondSelect = BackedgeVal;\n+    if (HeaderMask &&\n+        !match(BackedgeVal, m_Select(m_Specific(HeaderMask),\n+                                     m_VPValue(CondSelect), m_Specific(PhiR))))\n+      llvm_unreachable(\"expected header mask select\");\n+\n+    // Get the IV from the conditional select of the reduction phi.\n+    // The conditional select should be a select between the phi and the IV.\n     VPValue *Cond, *TrueVal, *FalseVal;\n-    if (!match(BackedgeVal, m_Select(m_VPValue(Cond), m_VPValue(TrueVal),\n-                                     m_VPValue(FalseVal))))\n+    if (!match(CondSelect, m_Select(m_VPValue(Cond), m_VPValue(TrueVal),\n+                                    m_VPValue(FalseVal))))\n       continue;\n \n     // The non-phi operand of the select is the IV.\n-    assert(is_contained(BackedgeVal->getDefiningRecipe()->operands(), PhiR));\n+    assert(is_contained(CondSelect->getDefiningRecipe()->operands(), PhiR));\n     VPValue *IV = TrueVal == PhiR ? FalseVal : TrueVal;\n \n     const SCEV *IVSCEV = vputils::getSCEVExprForVPValue(IV, PSE, &L);\n@@ -5776,8 +5785,7 @@ void VPlanTransforms::optimizeFindIVReductions(VPlan &Plan,\n \n     auto *NewPhiR = new VPReductionPHIRecipe(\n         cast<PHINode>(PhiR->getUnderlyingInstr()), RecurKind::FindIV, *StartVPV,\n-        *BackedgeVal, RdxUnordered{1}, {},\n-        PhiR->hasUsesOutsideReductionChain());\n+        *CondSelect, RdxUnordered{1}, {}, PhiR->hasUsesOutsideReductionChain());\n     NewPhiR->insertBefore(PhiR);\n     PhiR->replaceAllUsesWith(NewPhiR);\n     PhiR->eraseFromParent();\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Previously, we could miscompile when vectorizing conditional scalar assignments with forced tail folding, as the backedge select could be based on the header mask, not the assignment conditional.\r\n\r\nThis resulted in a number of failures in the LLVM test suite when building with `-O3 -march=armv8-a+sve -mllvm -prefer-predicate-over-epilogue=predicate-dont-vectorize`.\r\n\r\nThe patch reworks `handleFindLastReductions()` to correctly handle tail folding.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/conditional-scalar-assignment-fold-tail.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -prefer-predicate-over-epilogue=predicate-dont-vectorize -mattr=+sve -S < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "simple_find_last_reduction",
+          "test_body": "target triple = \"aarch64-linux-gnu\"\n\ndefine i32 @simple_find_last_reduction(i64 %N, ptr %data, i32 %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %data.phi = phi i32 [ -1, %entry ], [ %select.data, %loop ]\n  %ld.addr = getelementptr inbounds i32, ptr %data, i64 %iv\n  %ld = load i32, ptr %ld.addr, align 4\n  %select.cmp = icmp slt i32 %a, %ld\n  %select.data = select i1 %select.cmp, i32 %ld, i32 %data.phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %select.data\n}\n"
+        },
+        {
+          "test_name": "non_speculatable_find_last_reduction",
+          "test_body": "target triple = \"aarch64-linux-gnu\"\n\ndefine i32 @non_speculatable_find_last_reduction(ptr noalias %a, ptr noalias %b, i32 %default_val, i64 %N, i32 %threshold) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %latch ]\n  %data.phi = phi i32 [ %default_val, %entry ], [ %select.data, %latch ]\n  %a.addr = getelementptr inbounds nuw i32, ptr %a, i64 %iv\n  %ld.a = load i32, ptr %a.addr, align 4\n  %if.cond = icmp sgt i32 %ld.a, %threshold\n  br i1 %if.cond, label %if.then, label %latch\n\nif.then:                                          ; preds = %loop\n  %b.addr = getelementptr inbounds nuw i32, ptr %b, i64 %iv\n  %ld.b = load i32, ptr %b.addr, align 4\n  br label %latch\n\nlatch:                                            ; preds = %if.then, %loop\n  %select.data = phi i32 [ %ld.b, %if.then ], [ %data.phi, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %latch\n  ret i32 %select.data\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/VPlan/conditional-scalar-assignment-vplan.ll",
+      "commands": [
+        "-force-vector-width=4 -disable-output 2>&1 < %s",
+        "-disable-output 2>&1 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "simple_csa_int_select",
+          "test_body": "define i32 @simple_csa_int_select(i64 %N, ptr %data, i32 %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %data.phi = phi i32 [ -1, %entry ], [ %select.data, %loop ]\n  %ld.addr = getelementptr inbounds i32, ptr %data, i64 %iv\n  %ld = load i32, ptr %ld.addr, align 4\n  %select.cmp = icmp slt i32 %a, %ld\n  %select.data = select i1 %select.cmp, i32 %ld, i32 %data.phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %select.data\n}\n"
+        },
+        {
+          "test_name": "simple_csa_int_load",
+          "test_body": "define i32 @simple_csa_int_load(ptr noalias %a, ptr noalias %b, i32 %default_val, i64 %N, i32 %threshold) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %latch ]\n  %data.phi = phi i32 [ %default_val, %entry ], [ %select.data, %latch ]\n  %a.addr = getelementptr inbounds nuw i32, ptr %a, i64 %iv\n  %ld.a = load i32, ptr %a.addr, align 4\n  %if.cond = icmp sgt i32 %ld.a, %threshold\n  br i1 %if.cond, label %if.then, label %latch\n\nif.then:                                          ; preds = %loop\n  %b.addr = getelementptr inbounds nuw i32, ptr %b, i64 %iv\n  %ld.b = load i32, ptr %b.addr, align 4\n  br label %latch\n\nlatch:                                            ; preds = %if.then, %loop\n  %select.data = phi i32 [ %ld.b, %if.then ], [ %data.phi, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %latch\n  ret i32 %select.data\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/iv-select-cmp-fold-tail.ll",
+      "commands": [
+        "opt -p loop-vectorize -prefer-predicate-over-epilogue=predicate-dont-vectorize -force-vector-width=4 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "find_last_trunc_iv",
+          "test_body": "define i32 @find_last_trunc_iv(ptr %src, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i32 [ 0, %entry ], [ %rdx.next, %loop ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %l = load i32, ptr %gep.src, align 4\n  %cmp103 = icmp eq i32 %l, 0\n  %0 = trunc i64 %iv to i32\n  %rdx.next = select i1 %cmp103, i32 %0, i32 %rdx\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, %n\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %rdx.next\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "MacDue",
+      "body": "> > -O3 -march=armv8-a+sve -mllvm -prefer-predicate-over-epilogue=predicate-dont-vectorize.\r\n> \r\n> Would probably be good if one of the SVE bots could also run test-suite with that config\r\n\r\nA short-term fix may be to force tail-folding for some CSA tests in the test-suite. Can the something like the `vectorize_predicate(enable)`  pragma do that?"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-20T13:25:53Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        1431,
+        1441
+      ],
+      [
+        8481,
+        8486
+      ],
+      [
+        8505,
+        8511
+      ],
+      [
+        8525,
+        8531
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        1350,
+        1355
+      ],
+      [
+        1357,
+        1363
+      ],
+      [
+        1381,
+        1391
+      ],
+      [
+        1402,
+        1407
+      ],
+      [
+        1410,
+        1424
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        5668,
+        5673
+      ],
+      [
+        5675,
+        5690
+      ],
+      [
+        5776,
+        5783
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/VPlan/conditional-scalar-assignment-vplan.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        12,
+        18
+      ],
+      [
+        71,
+        76
+      ],
+      [
+        98,
+        104
+      ],
+      [
+        174,
+        179
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/iv-select-cmp-fold-tail.ll": [
+      [
+        1,
+        24
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationPlanner::addReductionResultComputation",
+      "usePredicatedReductionSelect"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "VPlanTransforms::handleFindLastReductions"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::optimizeFindIVReductions"
+    ],
+    "llvm/test/Transforms/LoopVectorize/VPlan/conditional-scalar-assignment-vplan.ll": [
+      "simple_csa_int_load",
+      "simple_csa_int_select"
+    ]
+  }
+}

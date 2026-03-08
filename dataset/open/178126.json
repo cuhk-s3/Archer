@@ -1,0 +1,90 @@
+{
+  "pr_id": 178126,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/178126",
+  "state": "open",
+  "title": "[SROA] Allow unfolding gep(phi(gep,gep))",
+  "author": "thetheodor",
+  "base_commit": "f4ceddd307cae62fd6d3fc5a5d4c7867f63065da",
+  "fix_commit": "6ef8a6389d72aabe3dc80e0f31a74ed330347155",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/SROA.cpp b/llvm/lib/Transforms/Scalar/SROA.cpp\nindex 83eabdae3db7f..57a30c5bf6340 100644\n--- a/llvm/lib/Transforms/Scalar/SROA.cpp\n+++ b/llvm/lib/Transforms/Scalar/SROA.cpp\n@@ -4448,16 +4448,23 @@ class AggLoadStoreRewriter : public InstVisitor<AggLoadStoreRewriter, bool> {\n   //   => phi ((gep ptr1, idx), (gep ptr2, idx))\n   // and  gep ptr, (phi idx1, idx2)\n   //   => phi ((gep ptr, idx1), (gep ptr, idx2))\n+  //\n+  // Also handles GEPs as PHI incoming values when non-cyclic:\n+  //   gep (phi (gep ptr1, idx1), (gep ptr2, idx2)), idx\n+  //   => phi ((gep (gep ptr1, idx1), idx), (gep (gep ptr2, idx2), idx))\n   bool unfoldGEPPhi(GetElementPtrInst &GEPI) {\n-    // To prevent infinitely expanding recursive phis, bail if the GEP pointer\n-    // operand (looking through the phi if it is the phi we want to unfold) is\n-    // an instruction besides a static alloca.\n+    // To prevent infinitely expanding recursive phis, only allow GEP pointer\n+    // operands (looking through the phi if it is the phi we want to unfold)\n+    // that are static allocas or GEPs that do not point back\n+    // to the PHI node itself (i.e. they don't form a cycle).\n     PHINode *Phi = dyn_cast<PHINode>(GEPI.getPointerOperand());\n-    auto IsInvalidPointerOperand = [](Value *V) {\n+    auto IsInvalidPointerOperand = [Phi](Value *V) {\n       if (!isa<Instruction>(V))\n         return false;\n       if (auto *AI = dyn_cast<AllocaInst>(V))\n         return !AI->isStaticAlloca();\n+      if (isa<GetElementPtrInst>(V) && Phi && getUnderlyingObject(V, 0) != Phi)\n+        return false;\n       return true;\n     };\n     if (Phi) {\n@@ -4507,9 +4514,6 @@ class AggLoadStoreRewriter : public InstVisitor<AggLoadStoreRewriter, bool> {\n                                     Phi->getName() + \".sroa.phi\");\n \n     Type *SourceTy = GEPI.getSourceElementType();\n-    // We only handle arguments, constants, and static allocas here, so we can\n-    // insert GEPs at the end of the entry block.\n-    IRB.SetInsertPoint(GEPI.getFunction()->getEntryBlock().getTerminator());\n     for (unsigned I = 0, E = Phi->getNumIncomingValues(); I != E; ++I) {\n       Value *Op = Phi->getIncomingValue(I);\n       BasicBlock *BB = Phi->getIncomingBlock(I);\n@@ -4518,6 +4522,16 @@ class AggLoadStoreRewriter : public InstVisitor<AggLoadStoreRewriter, bool> {\n         NewGEP = NewPhi->getIncomingValue(NI);\n       } else {\n         SmallVector<Value *> NewOps = GetNewOps(Op);\n+\n+        // For arguments, constants, and static allocas, we insert GEPs at the\n+        // end of the entry block. For GEP incoming values, we insert right\n+        // after the GEP to ensure proper dominance.\n+        if (auto *OpGEP = dyn_cast<GetElementPtrInst>(NewOps[0])) {\n+          IRB.SetInsertPoint(OpGEP->getNextNode());\n+        } else {\n+          IRB.SetInsertPoint(\n+              GEPI.getFunction()->getEntryBlock().getTerminator());\n+        }\n         NewGEP =\n             IRB.CreateGEP(SourceTy, NewOps[0], ArrayRef(NewOps).drop_front(),\n                           Phi->getName() + \".sroa.gep\", GEPI.getNoWrapFlags());\n",
+  "components": [
+    "SROA"
+  ],
+  "description": "Unfolding a Phi node with a GEP argument through an outer GEP is currently not allowed. The reason is that the inner GEP might point back to the PHI node itself (e.g., in case of a loop) and form a cycle, which would be infinitely unfolded. This limitation prevents SROA from folding multiple GEPs even in simple if-else cases. To lift this limination we check if the underlying pointer of the inner GEP does not point back to the PHI node, if so we allow the unfolding:\r\n\r\ngep (phi (gep ptr1, idx1), (gep ptr2, idx2)), idx\r\n=> phi ((gep (gep ptr1, idx1), idx), (gep (gep ptr2, idx2), idx))",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SROA/phi-gep.ll",
+      "commands": [
+        "opt -S -passes='sroa<preserve-cfg>' < %s",
+        "opt -S -passes='sroa<modify-cfg>' < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_gep_phi_gep_self",
+          "test_body": "define i32 @test_gep_phi_gep_self(i1 %cond) {\nentry:\n  %a = alloca [4 x i32], align 4\n  call void @use(ptr %a)\n  %gep_a = getelementptr inbounds [4 x i32], ptr %a, i64 0, i64 0\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %phi = phi ptr [ %gep_a, %entry ], [ %phi, %loop ]\n  %gep = getelementptr inbounds i32, ptr %phi, i64 1\n  %val = load i32, ptr %gep, align 4\n  %done = icmp eq i32 %val, 0\n  br i1 %done, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %val\n}\n\ndeclare void @use(ptr)\n"
+        },
+        {
+          "test_name": "test_gep_phi_alloca_and_non_alloca_operands",
+          "test_body": "define i32 @test_gep_phi_alloca_and_non_alloca_operands(i1 %cond, ptr %arg) {\nentry:\n  %a = alloca [2 x i32], align 4\n  store i32 42, ptr %a, align 4\n  call void @use(ptr %a)\n  br i1 %cond, label %then, label %else\n\nthen:                                             ; preds = %entry\n  br label %merge\n\nelse:                                             ; preds = %entry\n  %gep_arg = getelementptr inbounds i32, ptr %arg, i64 0\n  br label %merge\n\nmerge:                                            ; preds = %else, %then\n  %phi = phi ptr [ %a, %then ], [ %gep_arg, %else ]\n  %elem1 = getelementptr inbounds i32, ptr %phi, i64 1\n  %val = load i32, ptr %elem1, align 4\n  ret i32 %val\n}\n\ndeclare void @use(ptr)\n"
+        },
+        {
+          "test_name": "test_gep_phi_gep_non_alloca_operands",
+          "test_body": "define i32 @test_gep_phi_gep_non_alloca_operands(i1 %cond) {\nentry:\n  %a = alloca [4 x i32], align 4\n  %b = alloca [4 x i32], align 4\n  call void @use(ptr %a)\n  call void @use(ptr %b)\n  br i1 %cond, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %gep_a = getelementptr inbounds [4 x i32], ptr %a, i64 0, i64 1\n  br label %merge\n\nelse:                                             ; preds = %entry\n  %gep_b = getelementptr inbounds [4 x i32], ptr %b, i64 0, i64 1\n  br label %merge\n\nmerge:                                            ; preds = %else, %then\n  %phi = phi ptr [ %gep_a, %then ], [ %gep_b, %else ]\n  %elem1 = getelementptr inbounds i32, ptr %phi, i64 1\n  %val = load i32, ptr %elem1, align 4\n  ret i32 %val\n}\n\ndeclare void @use(ptr)\n"
+        },
+        {
+          "test_name": "test_unfold_phi_duplicate_phi_entry",
+          "test_body": "define i64 @test_unfold_phi_duplicate_phi_entry(ptr %arg, i8 %arg1, i1 %arg2) {\nbb:\n  %alloca = alloca [2 x i64], align 8\n  br i1 %arg2, label %bb5, label %bb3\n\nbb3:                                              ; preds = %bb\n  switch i8 %arg1, label %bb4 [\n    i8 0, label %bb5\n    i8 1, label %bb5\n  ]\n\nbb4:                                              ; preds = %bb3\n  ret i64 0\n\nbb5:                                              ; preds = %bb3, %bb3, %bb\n  %phi = phi ptr [ %arg, %bb3 ], [ %arg, %bb3 ], [ %alloca, %bb ]\n  %getelementptr = getelementptr i64, ptr %phi, i64 1\n  %load = load i64, ptr %getelementptr, align 4\n  ret i64 %load\n}\n"
+        },
+        {
+          "test_name": "test_gep_phi_gep",
+          "test_body": "define i32 @test_gep_phi_gep(i1 %cond) {\nentry:\n  %a = alloca [2 x i32], align 4\n  %b = alloca [2 x i32], align 4\n  %a1 = getelementptr inbounds [2 x i32], ptr %a, i64 0, i64 1\n  %b1 = getelementptr inbounds [2 x i32], ptr %b, i64 0, i64 1\n  store i32 1000, ptr %a1, align 4\n  store i32 5000, ptr %b1, align 4\n  %gep_a = getelementptr inbounds [2 x i32], ptr %a, i64 0, i64 0\n  %gep_b = getelementptr inbounds [2 x i32], ptr %b, i64 0, i64 0\n  br i1 %cond, label %then, label %else\n\nthen:                                             ; preds = %entry\n  br label %merge\n\nelse:                                             ; preds = %entry\n  br label %merge\n\nmerge:                                            ; preds = %else, %then\n  %phi = phi ptr [ %gep_a, %then ], [ %gep_b, %else ]\n  %elem1 = getelementptr inbounds i32, ptr %phi, i64 1\n  %val = load i32, ptr %elem1, align 4\n  ret i32 %val\n}\n"
+        },
+        {
+          "test_name": "test_gep_phi_gep_cycle",
+          "test_body": "define i32 @test_gep_phi_gep_cycle(i1 %cond) {\nentry:\n  %a = alloca [4 x i32], align 4\n  %a0 = getelementptr inbounds [4 x i32], ptr %a, i64 0, i64 0\n  store i32 42, ptr %a0, align 4\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %phi = phi ptr [ %a0, %entry ], [ %gep, %loop ]\n  %gep = getelementptr inbounds i32, ptr %phi, i64 1\n  %val = load i32, ptr %phi, align 4\n  %done = icmp eq i32 %val, 0\n  br i1 %done, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %val\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "thetheodor",
+      "body": "(I can't request reviewers via the GitHub interface because I don't have commit access, so I'm tagging a few recent SROA reviewers instead.)\r\n\r\n@nikic @mtrofin @arsenm @dtcxzyw \r\nCould you please help with reviewing this PR? Thanks!"
+    },
+    {
+      "author": "nikic",
+      "body": "It looks like the llvm-opt-benchmark results are mostly regressions?"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-27T07:11:42Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/SROA.cpp": [
+      [
+        4448,
+        4463
+      ],
+      [
+        4507,
+        4515
+      ],
+      [
+        4518,
+        4523
+      ]
+    ],
+    "llvm/test/Transforms/SROA/phi-gep.ll": [
+      [
+        705,
+        710
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/SROA.cpp": [
+      "unfoldGEPPhi"
+    ]
+  }
+}

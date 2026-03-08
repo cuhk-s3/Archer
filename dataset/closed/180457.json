@@ -1,0 +1,119 @@
+{
+  "pr_id": 180457,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180457",
+  "state": "closed",
+  "title": "[SLP] Use the correct identity when combining binary opcodes with AND/MUL",
+  "author": "bababuck",
+  "base_commit": "e4674b85e94a2f158b30417313bfbfb643b3eab2",
+  "fix_commit": "e3e94ae0348f861a3686ce02b0719e84cb7fa1db",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex f89c22fafcf04..a05be31a69ebe 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -1080,55 +1080,56 @@ class BinOpSameOpcodeHelper {\n       auto [CI, Pos] = isBinOpWithConstantInt(I);\n       const APInt &FromCIValue = CI->getValue();\n       unsigned FromCIValueBitWidth = FromCIValue.getBitWidth();\n-      APInt ToCIValue;\n+      Type *RHSType = I->getOperand(Pos)->getType();\n+      Constant *RHS;\n       switch (FromOpcode) {\n       case Instruction::Shl:\n         if (ToOpcode == Instruction::Mul) {\n-          ToCIValue = APInt::getOneBitSet(FromCIValueBitWidth,\n-                                          FromCIValue.getZExtValue());\n+          RHS = ConstantInt::get(\n+              RHSType, APInt::getOneBitSet(FromCIValueBitWidth,\n+                                           FromCIValue.getZExtValue()));\n         } else {\n           assert(FromCIValue.isZero() && \"Cannot convert the instruction.\");\n-          ToCIValue = ToOpcode == Instruction::And\n-                          ? APInt::getAllOnes(FromCIValueBitWidth)\n-                          : APInt::getZero(FromCIValueBitWidth);\n+          RHS = ConstantExpr::getBinOpIdentity(ToOpcode, RHSType,\n+                                               /*AllowRHSConstant=*/true);\n         }\n         break;\n       case Instruction::Mul:\n         assert(FromCIValue.isPowerOf2() && \"Cannot convert the instruction.\");\n         if (ToOpcode == Instruction::Shl) {\n-          ToCIValue = APInt(FromCIValueBitWidth, FromCIValue.logBase2());\n+          RHS = ConstantInt::get(\n+              RHSType, APInt(FromCIValueBitWidth, FromCIValue.logBase2()));\n         } else {\n           assert(FromCIValue.isOne() && \"Cannot convert the instruction.\");\n-          ToCIValue = ToOpcode == Instruction::And\n-                          ? APInt::getAllOnes(FromCIValueBitWidth)\n-                          : APInt::getZero(FromCIValueBitWidth);\n+          RHS = ConstantExpr::getBinOpIdentity(ToOpcode, RHSType,\n+                                               /*AllowRHSConstant=*/true);\n         }\n         break;\n       case Instruction::Add:\n       case Instruction::Sub:\n         if (FromCIValue.isZero()) {\n-          ToCIValue = APInt::getZero(FromCIValueBitWidth);\n+          RHS = ConstantExpr::getBinOpIdentity(ToOpcode, RHSType,\n+                                               /*AllowRHSConstant=*/true);\n         } else {\n           assert(is_contained({Instruction::Add, Instruction::Sub}, ToOpcode) &&\n                  \"Cannot convert the instruction.\");\n-          ToCIValue = FromCIValue;\n-          ToCIValue.negate();\n+          APInt NegatedVal = APInt(FromCIValue);\n+          NegatedVal.negate();\n+          RHS = ConstantInt::get(RHSType, NegatedVal);\n         }\n         break;\n       case Instruction::And:\n         assert(FromCIValue.isAllOnes() && \"Cannot convert the instruction.\");\n-        ToCIValue = ToOpcode == Instruction::Mul\n-                        ? APInt::getOneBitSet(FromCIValueBitWidth, 0)\n-                        : APInt::getZero(FromCIValueBitWidth);\n+        RHS = ConstantExpr::getBinOpIdentity(ToOpcode, RHSType,\n+                                             /*AllowRHSConstant=*/true);\n         break;\n       default:\n         assert(FromCIValue.isZero() && \"Cannot convert the instruction.\");\n-        ToCIValue = APInt::getZero(FromCIValueBitWidth);\n+        RHS = ConstantExpr::getBinOpIdentity(ToOpcode, RHSType,\n+                                             /*AllowRHSConstant=*/true);\n         break;\n       }\n       Value *LHS = I->getOperand(1 - Pos);\n-      Constant *RHS =\n-          ConstantInt::get(I->getOperand(Pos)->getType(), ToCIValue);\n       // constant + x cannot be -constant - x\n       // instead, it should be x - -constant\n       if (Pos == 1 ||\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Fixes #180456\r\n\r\nFix the following SLP lowering:\r\n```\r\ndefine void @sub_mul(ptr %p, ptr %s) {\r\nentry:\r\n  %p1 = getelementptr i16, ptr %p, i64 1\r\n  %p2 = getelementptr i16, ptr %p, i64 2\r\n  %p3 = getelementptr i16, ptr %p, i64 3\r\n\r\n  %l0 = load i16, ptr %p\r\n  %l1 = load i16, ptr %p1\r\n  %l2 = load i16, ptr %p2\r\n  %l3 = load i16, ptr %p3\r\n\r\n  %mul0 = sub i16 %l0, 0\r\n  %mul1 = mul i16 %l1, 5\r\n  %mul2 = mul i16 %l2, 2\r\n  %mul3 = mul i16 %l3, 3\r\n\r\n  %s1 = getelementptr i16, ptr %s, i64 1\r\n  %s2 = getelementptr i16, ptr %s, i64 2\r\n  %s3 = getelementptr i16, ptr %s, i64 3\r\n\r\n  store i16 %mul0, ptr %s\r\n  store i16 %mul1, ptr %s1\r\n  store i16 %mul2, ptr %s2\r\n  store i16 %mul3, ptr %s3\r\n  ret void\r\n}\r\n```\r\nto\r\n```\r\ndefine void @sub_mul(ptr %p, ptr %s) {\r\nentry:\r\n%tmp0 = load <4 x i16>, ptr %p, align 2\r\n%tmp1 = mul <4 x i16> %tmp0, <i16 0, i16 5, i16 2, i16 3> -> updates to <i16 1, i16 5, i16 2, i16 3>\r\nstore <4 x i16> %tmp1, ptr %s, align 2\r\nret void\r\n}\r\n```",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/buildvector-postpone-for-dependency.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -slp-threshold=-99999 -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test() {\nbb:\n  br label %bb6\n\nbb1:                                              ; No predecessors!\n  %ashr = ashr i32 0, 0\n  br label %bb2\n\nbb2:                                              ; preds = %bb6, %bb1\n  %phi = phi i32 [ %ashr, %bb1 ], [ %ashr9, %bb6 ]\n  %phi3 = phi i32 [ 0, %bb1 ], [ %mul10, %bb6 ]\n  %phi4 = phi i32 [ 0, %bb1 ], [ %mul11, %bb6 ]\n  %phi5 = phi i32 [ 0, %bb1 ], [ %mul, %bb6 ]\n  ret void\n\nbb6:                                              ; preds = %bb6, %bb\n  %phi7 = phi i32 [ 0, %bb ], [ %mul11, %bb6 ]\n  %phi8 = phi i32 [ 0, %bb ], [ %mul10, %bb6 ]\n  %mul = mul i32 0, %phi8\n  %ashr9 = ashr i32 0, 0\n  %mul10 = mul i32 0, 0\n  %mul11 = mul i32 %phi7, 0\n  br i1 false, label %bb2, label %bb6\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/bv-shuffle-mask.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i16 @test(i16 %v1, i16 %v2) {\nentry:\n  %0 = and i16 %v2, %v1\n  %1 = and i16 %0, 0\n  %2 = and i16 %1, 0\n  %3 = icmp ne i16 %2, 0\n  %.not5.not = or i1 %3, false\n  %inc.1.1.i82.i.i = or i16 %v2, 0\n  %inc.143.1.i98.i.i = or i16 0, 0\n  %4 = or i16 %inc.1.1.i82.i.i, 0\n  %5 = or i16 %4, 0\n  %6 = or i16 %5, 0\n  %7 = icmp ne i16 %6, 0\n  %.not7.not = or i1 false, %7\n  %8 = or i1 %.not5.not, %.not7.not\n  %9 = and i16 0, %inc.143.1.i98.i.i\n  %10 = and i16 %9, 0\n  %11 = icmp ne i16 %10, 0\n  %.not5.not.1 = or i1 %11, false\n  %inc.143.i76.i.i.1 = or i16 %v1, 0\n  %inc.143.1.i98.i.i.1 = or i16 0, 0\n  %12 = or i16 0, %inc.143.i76.i.i.1\n  %13 = or i16 %12, 0\n  %14 = or i16 %13, 0\n  %15 = icmp ne i16 %14, 0\n  %.not7.not.1 = or i1 false, %15\n  %16 = or i1 %.not5.not.1, %.not7.not.1\n  %17 = or i1 %8, %16\n  %18 = and i16 0, %inc.143.1.i98.i.i.1\n  %19 = and i16 %18, 0\n  %20 = icmp ne i16 %19, 0\n  %.not5.not.2 = or i1 %20, false\n  %inc.143.i76.i.i.2 = or i16 %v1, 0\n  %inc.143.1.i98.i.i.2 = or i16 0, 0\n  %21 = or i16 0, %inc.143.i76.i.i.2\n  %22 = or i16 %21, 0\n  %23 = or i16 %22, 0\n  %24 = icmp ne i16 %23, 0\n  %.not7.not.2 = or i1 false, %24\n  %25 = or i1 %.not5.not.2, %.not7.not.2\n  %26 = or i1 false, %25\n  %27 = and i16 0, %inc.143.1.i98.i.i.2\n  %28 = and i16 %27, 0\n  %29 = icmp ne i16 %28, 0\n  %.not5.not.3 = or i1 %29, false\n  %inc.143.i76.i.i.3 = or i16 %v1, 0\n  %30 = or i16 0, %inc.143.i76.i.i.3\n  %31 = or i16 %30, 0\n  %32 = or i16 %31, 0\n  %33 = icmp ne i16 %32, 0\n  %.not7.not.3 = or i1 false, %33\n  %34 = or i1 %.not5.not.3, %.not7.not.3\n  %35 = select i1 %34, i1 true, i1 %25\n  %36 = select i1 %35, i1 true, i1 %16\n  %37 = select i1 %36, i1 true, i1 %8\n  %spec.select31 = select i1 %37, i32 0, i32 0\n  %38 = or i1 false, %34\n  store i32 %spec.select31, ptr null, align 4\n  ret i16 0\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/copyable-child-node-used-outside.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -S -slp-threshold=-99999 -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define <4 x i32> @test() {\nbb:\n  %trunc = trunc i64 0 to i32\n  br label %bb1\n\nbb1:                                              ; preds = %bb\n  %or = or i32 %trunc, 0\n  %zext = zext i32 %or to i64\n  %and = and i32 0, 0\n  %or2 = or i32 %trunc, 0\n  br label %bb3\n\nbb3:                                              ; preds = %bb1\n  %0 = insertelement <4 x i32> zeroinitializer, i32 %trunc, i32 0\n  %1 = insertelement <4 x i32> %0, i32 %and, i32 1\n  %2 = insertelement <4 x i32> %1, i32 %or2, i32 2\n  %3 = insertelement <4 x i32> %2, i32 %or, i32 3\n  ret <4 x i32> %3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/semanticly-same.ll",
+      "commands": [
+        "%if x86-registered-target %{ opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -slp-threshold=-50 < %s",
+        "%if aarch64-registered-target %{ opt -S --passes=slp-vectorizer -mtriple=aarch64-unknown-linux-gnu -slp-threshold=-50 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sub_and",
+          "test_body": "define void @sub_and(ptr %p, ptr %s) {\nentry:\n  %p1 = getelementptr i16, ptr %p, i64 1\n  %p2 = getelementptr i16, ptr %p, i64 2\n  %p3 = getelementptr i16, ptr %p, i64 3\n  %l0 = load i16, ptr %p, align 2\n  %l1 = load i16, ptr %p1, align 2\n  %l2 = load i16, ptr %p2, align 2\n  %l3 = load i16, ptr %p3, align 2\n  %mul0 = add i16 %l0, 0\n  %mul1 = and i16 %l1, 5\n  %mul2 = and i16 %l2, 2\n  %mul3 = and i16 %l3, 3\n  %s1 = getelementptr i16, ptr %s, i64 1\n  %s2 = getelementptr i16, ptr %s, i64 2\n  %s3 = getelementptr i16, ptr %s, i64 3\n  store i16 %mul0, ptr %s, align 2\n  store i16 %mul1, ptr %s1, align 2\n  store i16 %mul2, ptr %s2, align 2\n  store i16 %mul3, ptr %s3, align 2\n  ret void\n}\n"
+        },
+        {
+          "test_name": "add_mul",
+          "test_body": "define void @add_mul(ptr %p, ptr %s) {\nentry:\n  %p1 = getelementptr i16, ptr %p, i64 1\n  %p2 = getelementptr i16, ptr %p, i64 2\n  %p3 = getelementptr i16, ptr %p, i64 3\n  %l0 = load i16, ptr %p, align 2\n  %l1 = load i16, ptr %p1, align 2\n  %l2 = load i16, ptr %p2, align 2\n  %l3 = load i16, ptr %p3, align 2\n  %mul0 = add i16 %l0, 0\n  %mul1 = mul i16 %l1, 5\n  %mul2 = mul i16 %l2, 2\n  %mul3 = mul i16 %l3, 3\n  %s1 = getelementptr i16, ptr %s, i64 1\n  %s2 = getelementptr i16, ptr %s, i64 2\n  %s3 = getelementptr i16, ptr %s, i64 3\n  store i16 %mul0, ptr %s, align 2\n  store i16 %mul1, ptr %s1, align 2\n  store i16 %mul2, ptr %s2, align 2\n  store i16 %mul3, ptr %s3, align 2\n  ret void\n}\n"
+        },
+        {
+          "test_name": "sub_mul",
+          "test_body": "define void @sub_mul(ptr %p, ptr %s) {\nentry:\n  %p1 = getelementptr i16, ptr %p, i64 1\n  %p2 = getelementptr i16, ptr %p, i64 2\n  %p3 = getelementptr i16, ptr %p, i64 3\n  %l0 = load i16, ptr %p, align 2\n  %l1 = load i16, ptr %p1, align 2\n  %l2 = load i16, ptr %p2, align 2\n  %l3 = load i16, ptr %p3, align 2\n  %mul0 = sub i16 %l0, 0\n  %mul1 = mul i16 %l1, 5\n  %mul2 = mul i16 %l2, 2\n  %mul3 = mul i16 %l3, 3\n  %s1 = getelementptr i16, ptr %s, i64 1\n  %s2 = getelementptr i16, ptr %s, i64 2\n  %s3 = getelementptr i16, ptr %s, i64 3\n  store i16 %mul0, ptr %s, align 2\n  store i16 %mul1, ptr %s1, align 2\n  store i16 %mul2, ptr %s2, align 2\n  store i16 %mul3, ptr %s3, align 2\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189967 tests passed\n* 5068 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130799 tests passed\n* 2929 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-09T03:34:31Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        1080,
+        1134
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/buildvector-postpone-for-dependency.ll": [
+      [
+        13,
+        19
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/bv-shuffle-mask.ll": [
+      [
+        5,
+        11
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/copyable-child-node-used-outside.ll": [
+      [
+        10,
+        16
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "getOperand"
+    ]
+  }
+}

@@ -2,7 +2,7 @@ PROMPT_SYSTEM = """\
 You are an LLVM compiler expert specializing in test case generation and bug detection. You are conducting LLVM code review now.
 
 ## Context
-Users reported an optimization bug in LLVM. Maintainers provided a fix, but fixes often have edge cases or introduce new issues.
+Maintainers provided a patch, but patches often have edge cases or introduce new issues.
 
 ## Your Task
 You will work in two phases:
@@ -10,8 +10,8 @@ You will work in two phases:
 - Phase 2: Generate targeted test cases by modifying existing tests to target identified issues
 
 ## You Will Receive
-- Original bug description and failing test case(s)
-- The code region that was modified (the fix)
+- Original patch description and related test case(s)
+- The code region that was modified (the patch)
 - Information about the optimization pass and component involved
 
 ## Tools You Can Use
@@ -24,7 +24,7 @@ You have multiple tools for each phase, but you should try to avoid using them w
 PROMPT_ANALYZE = """\
 # Phase 1: Analyze the Fix
 
-This is a patch for fixing {bug_type} bugs in {component}:
+This is a patch for {component}:
 
 {patch}
 
@@ -179,7 +179,8 @@ if you think the provided test cases have limited coverage of potential issues. 
 
 ### Important Rule
 You can always keep mutating the test case and verifying it until you find an issue or are confident that no issues can be found. \
-However, make sure it is aligned with the potential issues you identified in Phase 1.
+However, make sure it is aligned with the potential issues you identified in Phase 1. \
+Meanwhile, avoid stucking on a test case for too long. If you have tried multiple mutations and still cannot find any issues, move on to other test cases or strategies.
 
 ### Handling Verification Results
 - **Failed-to-prove**:

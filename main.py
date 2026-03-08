@@ -1,9 +1,21 @@
+#!/usr/bin/env python3
+"""
+PR Review Script for Pull Requests
+
+This script handles code review for PRs in LLVM, similar to main.py but with the following differences:
+1. Input is a PR ID instead of an issue ID
+2. Extracts patch from PR information
+3. Applies the patch and builds LLVM (in build_dir/pr/)
+"""
+
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 from argparse import ArgumentParser
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -12,9 +24,13 @@ import json_repair
 import prompts
 from base.console import get_boxed_console
 from llvm.debugger import DebuggerBase
-from llvm.lab_env import Environment
 from llvm.llvm import LLVM
 from llvm.llvm_helper import (
+  apply as apply_patch,
+)
+from llvm.llvm_helper import (
+  dataset_dir,
+  get_langref_desc,
   get_llvm_build_dir,
   git_execute,
   llvm_dir,
@@ -38,8 +54,6 @@ from tools.verify import VerifyTool
 # - Agent configurations
 # - ===============================================
 
-# We restrict the agent to chat at most 500 rounds for each run
-# and consume at most 10 million tokens among all runs.
 MAX_CHAT_ROUNDS = 500
 MAX_CONSUMED_TOKENS = 10_000_000
 MAX_TCS_GET_CONTEXT = 250
@@ -54,12 +68,7 @@ ADDITIONAL_CMAKE_FLAGS = [
   f"-DCMAKE_CXX_FLAGS_RELWITHDEBINFO={COMPILATION_FLAGS}",
 ]
 ALIVE_TV_PATH = os.environ.get("LAB_LLVM_ALIVE_TV", None)
-# TODO: integrate llubi to env scripts
 LLUBI_PATH = os.environ.get("LAB_LLVM_LLUBI", None)
-
-# - ================================================
-# - Statistis and output
-# - ================================================
 
 console = get_boxed_console(debug_mode=True)
 
@@ -86,13 +95,10 @@ class Bug:
 
 @dataclass
 class RunStats:
-  # Command to run autoreview
   command: dict
-  # The error message for failed runs
   error: Optional[str] = None
   errmsg: Optional[str] = None
   traceback: Optional[str] = None
-  # Agent interaction stats
   input_tokens: int = 0
   output_tokens: int = 0
   cached_tokens: int = 0
@@ -102,9 +108,7 @@ class RunStats:
   phase1_round: int = 0
   phase2_round: int = 0
   total_time_sec: float = 0.0
-  # The tool usage
   tool_usage: List[dict] = field(default_factory=list)
-  # Review stats
   strategies: List[dict] = field(
     default_factory=lambda *_, **__: [
       {
@@ -116,20 +120,12 @@ class RunStats:
     ]
   )
   reason_thou: str = "<not-provided>"
-  # The generated bugs for successful runs
   bugs: List[Bug] = field(default_factory=list)
-  test_traj: List[str] = field(
-    default_factory=list
-  )  # Trajectories of patches ever tried during testing
+  test_traj: List[str] = field(default_factory=list)
   report: Optional[str] = None
 
   def as_dict(self) -> dict:
     return asdict(self)
-
-
-# - ===============================================
-# - Agent's main code
-# - ==============================================
 
 
 class NoAvailableBugFound(Exception):
@@ -169,48 +165,6 @@ def ensure_tools_available(agent: AgentBase, tools: List[str]):
     raise ReachToolBudget(f"Tools [{', '.join(unavailable_tools)}] are out of budget.")
 
 
-def get_tool_list(
-  fixenv: Environment,
-  llvm: LLVM,
-  build_dir: str,
-  debugger: DebuggerBase = None,
-  phase: int = 0,
-):
-  common_tools = [
-    # General tools
-    (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (GrepNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (ListNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (ReadNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    # LLVM-specific tools
-    (LangRefTool(fixenv), MAX_TCS_GET_CONTEXT),
-  ]
-
-  if phase == 1:
-    return common_tools + [
-      # Stop the analysis (Phase 1)
-      (StopTool(), MAX_TCS_GET_CONTEXT),
-    ]
-  elif phase == 2:
-    return common_tools + [
-      # LLVM-specific tools for Phase 2
-      (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
-      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
-      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
-      # Report the bug (Phase 2)
-      (ReportTool(), MAX_TCS_GET_CONTEXT),
-    ]
-  else:
-    # Default behavior: return all tools (maybe for retro-compatibility or fallback)
-    return common_tools + [
-      (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
-      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
-      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
-      (StopTool(), MAX_TCS_GET_CONTEXT),
-      (ReportTool(), MAX_TCS_GET_CONTEXT),
-    ]
-
-
 def get_component_knowledge(component: List[str]) -> str:
   console.print(f"Retrieving knowledge for component: {component} ...")
 
@@ -226,7 +180,6 @@ def get_component_knowledge(component: List[str]) -> str:
     return "No specific knowledge provided for this component."
 
   knowledge = [f.read_text(encoding="utf-8") for f in knowledge_file]
-
   return "\n".join(knowledge)
 
 
@@ -235,19 +188,13 @@ def check_duplicate_tool_call(
 ) -> Optional[str]:
   try:
     if isinstance(args, str):
-      # Use json_repair to handle partially malformed JSON string
       obj = json_repair.loads(args)
     else:
-      # If args is already a dict (or list), use it directly
       obj = args
-    # Ensure consistent string representation
     normalized_args = json.dumps(obj, sort_keys=True)
   except Exception:
-    # Fallback to simple string normalization if JSON parsing fails entirely
-    # Remove whitespace to be safer against formatting changes
     normalized_args = "".join(str(args).split())
 
-  # Only check for duplicates for specific tools
   if not any(name.startswith(prefix) for prefix in ["find", "grep", "read", "list"]):
     return None
 
@@ -261,18 +208,203 @@ def check_duplicate_tool_call(
       "Please change your arguments or thoughts to try a different approach. "
       "Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
     )
+
   executed_tool_calls.add(call_signature)
   consecutive_duplicates[0] = 0
   return None
 
 
-def generate_test(
+@dataclass
+class PRInfo:
+  """Information extracted from a GitHub PR"""
+
+  pr_id: int
+  pr_url: str = ""
+  title: str = ""
+  author: str = ""
+  base_commit: str = ""
+  fix_commit: str = ""  # Latest commit in the PR
+  patch: str = ""
+  components: List[str] = field(default_factory=list)
+  state: str = ""
+  knowledge_cutoff: str = ""
+  description: str = ""
+  tests: List[dict] = field(default_factory=list)
+  labels: List[str] = field(default_factory=list)
+  comments: List[dict] = field(default_factory=list)
+  patch_location_lineno: dict = field(default_factory=dict)
+  patch_location_funcname: dict = field(default_factory=dict)
+
+
+class PREnvironment:
+  """Simplified environment class for PR review"""
+
+  def __init__(self, pr_info: PRInfo):
+    self.pr_info = pr_info
+    self.base_commit = pr_info.base_commit
+
+  def get_langref_desc(self, keywords):
+    """Get language reference descriptions for given keywords"""
+    return get_langref_desc(keywords, self.base_commit)
+
+  def get_tests(self):
+    """Get the tests extracted from PR patch"""
+    return self.pr_info.tests
+
+
+def extract_pr_info(pr_id: int) -> bool:
+  """Extract PR info using pr_extract.py script"""
+  pr_extract_script = Path(__file__).parent / "dataset" / "scripts" / "pr_extract.py"
+
+  try:
+    console.print(f"Extracting PR #{pr_id} information...")
+    result = subprocess.run(
+      ["python3", str(pr_extract_script), str(pr_id), "--skip-closed-check"],
+      capture_output=True,
+      text=True,
+      timeout=300,
+    )
+
+    if result.returncode != 0:
+      console.print(f"Failed to extract PR info: {result.stderr}", color="red")
+      return False
+
+    console.print(result.stdout)
+    return True
+  except subprocess.TimeoutExpired:
+    console.print("PR extraction timed out", color="red")
+    return False
+  except Exception as e:
+    console.print(f"Error extracting PR info: {e}", color="red")
+    return False
+
+
+def setup_llvm_environment(pr_info: PRInfo) -> bool:
+  """Setup LLVM environment by checking out base commit and applying patch"""
+  # Checkout base commit
+  console.print("Checking out the base commit ...")
+  try:
+    reset(pr_info.base_commit)
+  except Exception as e:
+    console.print(
+      f"Warning: Failed to reset HEAD to {pr_info.base_commit}: {e}",
+      color="yellow",
+    )
+    console.print("Sync the repository and try again.", color="yellow")
+    reset("main")
+    git_execute(["pull", "origin", "main"])
+    try:
+      reset(pr_info.base_commit)
+    except Exception as e:
+      panic(f"Failed to reset HEAD to {pr_info.base_commit}: {e}")
+
+  # Apply the patch
+  success, log = apply_patch(pr_info.patch)
+  if not success:
+    console.print(f"Failed to apply patch: {log}", color="red")
+    return False
+
+  return True
+
+
+def get_pr_info_path(pr_id: int) -> Optional[Path]:
+  """Get the path to PR info, checking both open/ and closed/ directories"""
+  # Check closed directory first (most PRs should be closed)
+  closed_path = Path(dataset_dir) / "closed" / f"{pr_id}.json"
+  if closed_path.exists():
+    return closed_path
+
+  # Check open directory
+  open_path = Path(dataset_dir) / "open" / f"{pr_id}.json"
+  if open_path.exists():
+    return open_path
+
+  return None
+
+
+def load_saved_pr_info(pr_id: int) -> Optional[PRInfo]:
+  """Load previously saved PR info"""
+  info_path = get_pr_info_path(pr_id)
+  if info_path is None:
+    return None
+  try:
+    with open(info_path, "r") as f:
+      data = json.load(f)
+    allowed_keys = {f.name for f in fields(PRInfo)}
+    filtered = {k: v for k, v in data.items() if k in allowed_keys}
+    return PRInfo(**filtered)
+  except Exception as e:
+    console.print(f"Warning: Failed to load saved PR info: {e}", color="yellow")
+    return None
+
+
+def pr_info_changed(old_pr_info: Optional[PRInfo], new_pr_info: PRInfo) -> bool:
+  """Check if PR info has changed by comparing fix_commit
+
+  If the latest commit in the PR has changed, we need to rebuild.
+  """
+  if old_pr_info is None:
+    return True  # No saved info, always need to rebuild
+
+  # Compare fix_commit (latest commit in PR)
+  if old_pr_info.fix_commit != new_pr_info.fix_commit:
+    console.print(
+      f"PR commit has changed: {old_pr_info.fix_commit[:7]} -> {new_pr_info.fix_commit[:7]}",
+      color="yellow",
+    )
+    return True
+
+  return False
+
+
+def get_tool_list(
+  pr_env: PREnvironment,
+  llvm: LLVM,
+  build_dir: str,
+  debugger: DebuggerBase = None,
+  phase: int = 0,
+):
+  """Get tool list for different phases"""
+  common_tools = [
+    (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (GrepNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (ListNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (ReadNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (LangRefTool(pr_env), MAX_TCS_GET_CONTEXT),
+  ]
+
+  if phase == 1:
+    return common_tools + [
+      (StopTool(), MAX_TCS_GET_CONTEXT),
+    ]
+  elif phase == 2:
+    return common_tools + [
+      (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
+      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
+      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
+      (ReportTool(), MAX_TCS_GET_CONTEXT),
+    ]
+  else:
+    return common_tools + [
+      (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
+      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
+      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
+      (StopTool(), MAX_TCS_GET_CONTEXT),
+      (ReportTool(), MAX_TCS_GET_CONTEXT),
+    ]
+
+
+def generate_test_for_pr(
   agent: AgentBase,
-  fixenv: Environment,
+  pr_env: PREnvironment,
   llvm: LLVM,
   stats: RunStats,
 ) -> Optional[str]:
-  initial_tests = fixenv.get_tests()
+  """Generate tests for PR (Phase 2) - following main.py's generate_test logic"""
+  console.print("Phase 2: Generating and verifying test cases for PR...")
+
+  # Extract test objects from PR environment (like main.py does from fixenv)
+  initial_tests = pr_env.get_tests()
   test_objects = []
   for _, test_file in enumerate(initial_tests):
     commands = test_file.get("commands", [])
@@ -300,7 +432,6 @@ def generate_test(
     for action_str in relevant_actions:
       try:
         action = json_repair.loads(action_str)
-        # Check if the action is verify or difftest and is associated with the current test index
         if action.get("test_index") == index and action.get("tool") in [
           "verify",
           "difftest",
@@ -318,10 +449,10 @@ def generate_test(
 
     return True, ""
 
+  # Register TestsTool (like main.py does)
   tests_tool = TestsTool(test_objects, strategies=stats.strategies, validator=validator)
   agent.register_tool(tests_tool, MAX_TCS_GET_CONTEXT * 2)
 
-  console.print("Phase 2: Generating and verifying test cases ...")
   agent.append_user_message(
     prompts.PROMPT_GENERATE.format(
       strategies=str(stats.strategies),
@@ -331,10 +462,7 @@ def generate_test(
   executed_tool_calls = set()
   consecutive_duplicates = [0]
 
-  # Set up pre-check handler to prevent duplicate tool calls
   def tool_pre_check(name: str, args: dict) -> Optional[str]:
-    # Check for duplicate tool calls BEFORE execution
-    nonlocal executed_tool_calls, consecutive_duplicates
     return check_duplicate_tool_call(
       name, args, executed_tool_calls, consecutive_duplicates
     )
@@ -353,8 +481,6 @@ def generate_test(
     )
 
   def tool_call_handler(name: str, args: str, res: str) -> Tuple[bool, str]:
-    # Note: Duplicate checking is now handled by tool_pre_check_handler in AgentBase
-
     ensure_tools_available(agent, ["report", "verify", "difftest", "tests_manager"])
 
     if name == "tests_manager":
@@ -397,7 +523,26 @@ def generate_test(
           if match and int(match.group(1)) > 0:
             res += "\n\nHint: There are failed-to-prove transformations. You should consider using the `difftest` tool to verify the correctness of this case."
       except Exception:
-        return (True, res)  # Continue the process with an error message
+        return (True, res)
+
+    if name == "trans":
+      try:
+        trans_result = json.loads(res)
+        # Check if trans returned a crash (bug found)
+        if trans_result.get("is_crash") and trans_result.get("found"):
+          stats.test_traj.append(res)
+          stats.bugs.append(
+            Bug(
+              original_ir=trans_result["original_ir"],
+              transformed_ir=trans_result.get("transformed_ir", "<crash>"),
+              log=trans_result["log"],
+              thoughts=trans_result.get("thoughts"),
+            )
+          )
+          return (True, res)
+      except Exception:
+        pass
+
     if name == "difftest":
       try:
         diff_result = json.loads(res)
@@ -419,7 +564,6 @@ def generate_test(
           transformed_ir = "<missing>"
           original_out = "<missing>"
           transformed_out = "<missing>"
-          # Find the last unconfirmed test in test_traj
           for i in range(len(stats.test_traj) - 1, -1, -1):
             try:
               prev_res = json.loads(stats.test_traj[i])
@@ -441,7 +585,6 @@ def generate_test(
               pass
 
           if diff_result.get("found", False) and original_out != transformed_out:
-            # We only add to bugs if the agent confirms it's a real bug
             log_msg = f"Confirmed as bug by agent.\nOriginal Output: {original_out}\nTransformed Output: {transformed_out}"
             stats.bugs.append(
               Bug(
@@ -454,52 +597,51 @@ def generate_test(
         elif diff_result.get("action") == "test":
           return (True, res)
       except Exception:
-        return (True, res)  # Continue the process with an error message
-    if name != "report":
-      return True, res  # Continue the process
+        return (True, res)
 
-    try:
-      # The report tool returns a parseable JSON string
+    if name == "report":
       report_data = json.loads(res)
-    except Exception:
-      return (True, res)  # Continue the process with an error message
 
-    force_stop = report_data.get("force", False)
-    all_tested = all(t.tested for t in test_objects)
+      force_stop = report_data.get("force", False)
+      all_tested = all(t.tested for t in test_objects)
 
-    if not all_tested and not force_stop:
+      console.print(
+        f"Report called. force={force_stop}, all_tested={all_tested}, bugs_found={len(stats.bugs)}"
+      )
+
+      # If force=True, allow immediate stop without any checks
+      if force_stop:
+        console.print("Force stopping the process as requested.")
+        stats.report = report_data.get("thoughts", None)
+        return False, res
+
+      # If all tests have been completed, allow the report regardless of bugs found
+      if all_tested:
+        stats.report = report_data.get("thoughts", None)
+        return False, res
+
+      # If not all tests are done and no force stop, require continuing
       return True, (
         "Error: You cannot call `report` yet "
         "because not all tests have been marked as tested (which requires covering all strategies per test). "
         "Please use `tests_manager` to check untested tests, "
         "test them, and mark them as tested. "
-        "If you have already found at least one bug and want to stop immediately, set `force=True` in `report`."
+        "If you want to stop immediately without further testing, set `force=True` in `report`."
       )
 
-    if force_stop and not stats.bugs:
-      return True, (
-        "Error: You cannot use `force=True` in `report` because no bugs have been found yet. "
-        "Please verify the bug using `verify` or `difftest` tools first."
-      )
-
-    stats.report = report_data.get("thoughts", None)
-    return False, res  # Stop the process with the result
+    return True, res  # Continue the process for other tools
 
   ret = agent.run(
     [
-      # Explore codebase tools
       f"list{MAX_ROLS_PER_TC}",
       f"read{MAX_ROLS_PER_TC}",
       f"find{MAX_ROLS_PER_TC}",
       f"grep{MAX_ROLS_PER_TC}",
-      # Documentation tools
       "langref",
-      # Verification and transformation tools
       "trans",
       "verify",
       "difftest",
       "tests_manager",
-      # Stop tool to finish the analysis
       "report",
     ],
     response_handler=response_handler,
@@ -510,40 +652,37 @@ def generate_test(
   return ret
 
 
-def run_mini_agent(
+def run_pr_agent(
   agent: AgentBase,
-  fixenv: Environment,
+  pr_info: PRInfo,
+  pr_env: PREnvironment,
   llvm: LLVM,
   stats: RunStats,
   build_dir: str,
   debugger: DebuggerBase = None,
 ) -> Optional[str]:
+  """Main PR review agent"""
   agent.clear_history()
   agent.append_system_message(prompts.PROMPT_SYSTEM)
 
   #####################################################
-  # The agent runs by:
-  # 1. Analyze the fix first to reason about the possible issues and propose potential bug-trigger strategies.
-  # 2. Generate test cases and verify the proposed strategies to confirm the real bug.
+  # Phase 1: Analyze the PR
   #####################################################
-
-  console.print("Phase 1: Analyzing the fix ...")
+  console.print("Phase 1: Analyzing the PR...")
+  # Combine title, description, and patch for the prompt
+  full_patch = f"{pr_info.title}\n{pr_info.description}\n{pr_info.patch}"
   agent.append_user_message(
     prompts.PROMPT_ANALYZE.format(
-      bug_type=fixenv.get_bug_type(),
-      component=", ".join(fixenv.get_hint_components()),
-      patch=fixenv.get_reference_patch(),
-      knowledge=get_component_knowledge(fixenv.get_hint_components()),
+      component=", ".join(pr_info.components),
+      patch=full_patch,
+      knowledge=get_component_knowledge(pr_info.components),
     )
   )
 
   executed_tool_calls = set()
   consecutive_duplicates = [0]
 
-  # Set up pre-check handler to prevent duplicate tool calls
   def tool_pre_check(name: str, args: dict) -> Optional[str]:
-    # Check for duplicate tool calls BEFORE execution
-    nonlocal executed_tool_calls, consecutive_duplicates
     return check_duplicate_tool_call(
       name, args, executed_tool_calls, consecutive_duplicates
     )
@@ -575,16 +714,12 @@ def run_mini_agent(
     return False, res  # Stop the process with the result
 
   response = agent.run(
-    # TODO: Remove the hardcoded tool names
     [
-      # Explore codebase tools
       f"list{MAX_ROLS_PER_TC}",
       f"read{MAX_ROLS_PER_TC}",
       f"find{MAX_ROLS_PER_TC}",
       f"grep{MAX_ROLS_PER_TC}",
-      # Documentation tools
       "langref",
-      # Stop tool to finish the analysis
       "stop",
     ],
     response_handler=response_handler,
@@ -616,42 +751,50 @@ def run_mini_agent(
   stats.reason_thou = reasoning_thoughts
   stats.strategies = [s.as_dict() for s in test_strategies]
 
-  tools_phase2 = get_tool_list(fixenv, llvm, build_dir, debugger, phase=2)
+  tools_phase2 = get_tool_list(pr_env, llvm, build_dir, debugger, phase=2)
   try:
     if hasattr(agent.tools, "remove_tool"):
       agent.tools.remove_tool("stop")
   except Exception:
     pass
 
+  existing_tools = set(agent.tools.list(ignore_budget=True))
   for to, th in tools_phase2:
+    tool_name = to.name()
+    if tool_name in existing_tools:
+      continue
     agent.register_tool(to, th)
+    existing_tools.add(tool_name)
 
-  return generate_test(
+  return generate_test_for_pr(
     agent=agent,
-    fixenv=fixenv,
+    pr_env=pr_env,
     llvm=llvm,
     stats=stats,
   )
 
 
-def autoreview(
+def pr_review(
   agent: AgentBase,
-  fixenv: Environment,
+  pr_info: PRInfo,
+  pr_env: PREnvironment,
   llvm: LLVM,
   stats: RunStats,
   build_dir: str,
 ):
+  """Main PR review function"""
   debugger = None
 
   # Register Phase 1 tools
-  tools_phase1 = get_tool_list(fixenv, llvm, build_dir, debugger, phase=1)
+  tools_phase1 = get_tool_list(pr_env, llvm, build_dir, debugger, phase=1)
   for to, th in tools_phase1:
     agent.register_tool(to, th)
 
-  return run_mini_agent(
+  return run_pr_agent(
     debugger=debugger,
     agent=agent,
-    fixenv=fixenv,
+    pr_info=pr_info,
+    pr_env=pr_env,
     llvm=llvm,
     stats=stats,
     build_dir=build_dir,
@@ -659,12 +802,12 @@ def autoreview(
 
 
 def parse_args():
-  parser = ArgumentParser(description="llvm-autoreview (mini)")
+  parser = ArgumentParser(description="PR Review Tool for LLVM Pull Requests")
   parser.add_argument(
-    "--issue",
-    type=str,
+    "--pr",
+    type=int,
     required=True,
-    help="The issue ID to review.",
+    help="The PR ID to review.",
   )
   parser.add_argument(
     "--model",
@@ -676,7 +819,7 @@ def parse_args():
     "--driver",
     type=str,
     default="openai",
-    help="The LLM api to use (default: openai).",
+    help="The LLM API to use (default: openai).",
     choices=["openai", "anthropic", "openai-generic"],
   )
   parser.add_argument(
@@ -692,26 +835,231 @@ def parse_args():
     help="Path to a JSON file containing the chat history of the agent (default: None).",
   )
   parser.add_argument(
+    "--review",
+    type=str,
+    default=None,
+    help="Path to save the generated review as a Markdown file (default: None).",
+  )
+  parser.add_argument(
     "--debug",
     action="store_true",
     default=False,
     help="Enable debug mode for more verbose output (default: False).",
   )
+  parser.add_argument(
+    "--force",
+    action="store_true",
+    default=False,
+    help="Force overwrite existing stats/history/review files (default: False).",
+  )
   return parser.parse_args()
+
+
+def generate_review(pr_info: PRInfo, stats: RunStats) -> str:
+  """Generate a markdown review from the PR review results"""
+  report_lines = []
+
+  # Title
+  report_lines.append(f"# PR Review Report: #{pr_info.pr_id}\n")
+
+  # PR Information
+  report_lines.append("## PR Information\n")
+  report_lines.append(f"- **Title**: {pr_info.title}")
+  report_lines.append(f"- **Author**: {pr_info.author}")
+  report_lines.append(f"- **State**: {pr_info.state}")
+  report_lines.append(f"- **URL**: {pr_info.pr_url}")
+  report_lines.append(f"- **Base Commit**: `{pr_info.base_commit[:10]}`")
+  report_lines.append(f"- **Fix Commit**: `{pr_info.fix_commit[:10]}`")
+  report_lines.append(f"- **Components**: {', '.join(pr_info.components)}\n")
+
+  # Executive Summary
+  report_lines.append("## Executive Summary\n")
+  report_lines.append(f"- **Bugs Found**: {len(stats.bugs)}")
+  report_lines.append(f"- **Total Time**: {stats.total_time_sec:.2f} seconds")
+  report_lines.append(
+    f"- **Chat Rounds**: {stats.chat_rounds} (Phase 1: {stats.phase1_round}, Phase 2: {stats.phase2_round})"
+  )
+  report_lines.append(
+    f"- **Tokens Used**: {stats.total_tokens:,} (Input: {stats.input_tokens:,}, Output: {stats.output_tokens:,}, Cached: {stats.cached_tokens:,})"
+  )
+  report_lines.append(f"- **Estimated Cost**: ${stats.chat_cost:.4f}\n")
+
+  # Test Strategies
+  if stats.strategies:
+    report_lines.append("## Test Strategies\n")
+    for idx, strategy in enumerate(stats.strategies, 1):
+      report_lines.append(f"### Strategy {idx}: {strategy['name']}\n")
+      report_lines.append(f"- **Target**: {strategy['target']}")
+      report_lines.append(f"- **Rationale**: {strategy['rationale']}")
+      report_lines.append(f"- **Expected Issue**: {strategy['expected_issue']}\n")
+
+  # Bugs Found
+  if stats.bugs:
+    report_lines.append("## Bugs Found\n")
+    for idx, bug in enumerate(stats.bugs, 1):
+      report_lines.append(f"### Bug #{idx}\n")
+
+      if bug.thoughts:
+        report_lines.append(f"**Analysis:**\n{bug.thoughts}\n")
+
+      report_lines.append("**Original LLVM IR:**")
+      report_lines.append("```llvm")
+      report_lines.append(bug.original_ir)
+      report_lines.append("```\n")
+
+      report_lines.append("**Transformed LLVM IR:**")
+      report_lines.append("```llvm")
+      report_lines.append(bug.transformed_ir)
+      report_lines.append("```\n")
+
+      report_lines.append("**Verification Log:**")
+      report_lines.append("```")
+      report_lines.append(bug.log)
+      report_lines.append("```\n")
+  else:
+    report_lines.append("## Bugs Found\n")
+    report_lines.append("No bugs were found during the review.\n")
+
+  # Agent Report
+  if stats.report:
+    report_lines.append("## Agent Review\n")
+    parsed_report = None
+    if isinstance(stats.report, str):
+      try:
+        parsed_report = json_repair.loads(stats.report)
+      except Exception:
+        parsed_report = None
+
+    if isinstance(parsed_report, dict):
+      test_payload = parsed_report.get("test")
+      if isinstance(test_payload, list) and len(test_payload) >= 2:
+        report_lines.append("### Reproducer\n")
+        report_lines.append("**LLVM IR:**")
+        ir_text = test_payload[0]
+        if isinstance(ir_text, str):
+          if ir_text.strip().startswith("```"):
+            report_lines.append(ir_text.strip())
+          else:
+            report_lines.append("```llvm")
+            report_lines.append(ir_text.strip())
+            report_lines.append("```")
+        report_lines.append("")
+        report_lines.append("**Command:**")
+        report_lines.append("```bash")
+        report_lines.append(str(test_payload[1]).strip())
+        report_lines.append("```\n")
+
+      args_text = parsed_report.get("args")
+      if args_text is not None:
+        report_lines.append(f"- **Args**: `{args_text}`")
+
+      force_flag = parsed_report.get("force")
+      if force_flag is not None:
+        report_lines.append(f"- **Force Stop**: {force_flag}")
+
+      thoughts_text = parsed_report.get("thoughts")
+      if thoughts_text:
+        report_lines.append("\n### Analysis\n")
+        report_lines.append(thoughts_text.strip())
+        report_lines.append("\n")
+    else:
+      report_lines.append(str(stats.report))
+      report_lines.append("\n")
+
+  # Tool Usage Statistics
+  if stats.tool_usage:
+    report_lines.append("## Tool Usage\n")
+    report_lines.append("| Tool | Usage Count |")
+    report_lines.append("|------|-------------|")
+    for tool in stats.tool_usage:
+      report_lines.append(f"| {tool['name']} | {tool['usage']} |")
+    report_lines.append("\n")
+
+  # Errors (if any)
+  if stats.error:
+    report_lines.append("## Errors\n")
+    report_lines.append(f"**Error Type**: {stats.error}\n")
+    report_lines.append(f"**Error Message**: {stats.errmsg}\n")
+    if stats.traceback:
+      report_lines.append("**Traceback:**")
+      report_lines.append("```")
+      report_lines.append(stats.traceback)
+      report_lines.append("```\n")
+
+  return "\n".join(report_lines)
 
 
 def main():
   if os.environ.get("LLVM_AUTOREVIEW_HOME_DIR") is None:
-    panic("The llvm-autoreview environment has not been brought up.")
+    panic("Error: The llvm-autoreview environment has not been brought up.")
 
   args = parse_args()
 
-  # Set up the console for output
+  # Set up console
   if args.debug:
-    global console
-    console = get_boxed_console(debug_mode=True)
+    console.debug = True
 
-  # Set up used LLMs and agents
+  # Load or extract PR information
+  pr_info = load_saved_pr_info(args.pr)
+
+  if pr_info is None:
+    # PR info not found, extract it using pr_extract.py
+    console.print(f"PR #{args.pr} data not found, extracting...")
+    if not extract_pr_info(args.pr):
+      panic("Failed to extract PR information")
+
+    # Try loading again
+    pr_info = load_saved_pr_info(args.pr)
+    if pr_info is None:
+      panic("Failed to load PR information after extraction")
+
+  # Setup build directory under pr/
+  base_build_dir = get_llvm_build_dir()
+  build_dir = os.path.join(base_build_dir, "pr", str(args.pr))
+
+  # Check if PR info has changed
+  saved_pr_info = load_saved_pr_info(args.pr)
+  pr_changed = pr_info_changed(saved_pr_info, pr_info)
+
+  if pr_changed and Path(build_dir).exists():
+    console.print(
+      "PR has changed. Removing old build directory...",
+      color="yellow",
+    )
+    console.print(f"Removing old build directory: {build_dir}", color="yellow")
+    shutil.rmtree(build_dir)
+
+  # Ensure build directory exists
+  os.makedirs(build_dir, exist_ok=True)
+  set_llvm_build_dir(build_dir)
+
+  # Setup LLVM environment
+  if not setup_llvm_environment(pr_info):
+    panic("Failed to setup LLVM environment")
+
+  # Build LLVM if not already built
+  opt_path = Path(build_dir) / "bin" / "opt"
+  if not opt_path.exists():
+    console.print("Building LLVM with the PR patch...")
+    from llvm import llvm_helper
+
+    success, log = llvm_helper.build(
+      max_build_jobs=int(
+        os.environ.get("LLVM_AUTOREVIEW_MAX_BUILD_JOBS", os.cpu_count())
+      ),
+      additional_cmake_args=ADDITIONAL_CMAKE_FLAGS,
+    )
+
+    if not success:
+      console.print("Build failed:", color="red")
+      console.print(log)
+      panic("Failed to build LLVM")
+
+    console.print("LLVM built successfully!", color="green")
+  else:
+    console.print(f"LLVM already built at {build_dir}", color="green")
+
+  # Set up LLM and agent
   if args.driver == "openai":
     from lms.openai import OpenAIAgent
 
@@ -731,100 +1079,97 @@ def main():
       args.model, token_limit=MAX_CONSUMED_TOKENS, debug_mode=args.debug
     )
   else:
-    panic(f"Unsupported LLM driver: {args.driver}")
+    panic(f"Unknown driver: {args.driver}")
 
   # Set up saved statistics and output
   stats_path = None
   if args.stats:
     stats_path = Path(args.stats)
-    if stats_path.exists():
+    if stats_path.exists() and not args.force:
       panic(f"Stats file {stats_path} already exists.")
 
   history_path = None
   if args.history:
     history_path = Path(args.history)
-    if history_path.exists():
+    if history_path.exists() and not args.force:
       panic(f"History file {history_path} already exists.")
 
-  # Set up the LLVM environment
-  build_dir = os.path.join(get_llvm_build_dir(), args.issue)
-  set_llvm_build_dir(build_dir)
-  env = Environment(
-    args.issue,
-    base_model_knowledge_cutoff="2000-12-31Z",  # FIXME: workaround for evaluation
-    additional_cmake_args=ADDITIONAL_CMAKE_FLAGS,
-    max_build_jobs=os.environ.get("LLVM_AUTOREVIEW_MAX_BUILD_JOBS"),
-  )
-
-  bug_type = env.get_bug_type()
-  if bug_type not in [
-    "miscompilation",
-  ]:  # We only support miscompilation for now
-    panic(f"Unsupported bug type: {bug_type}")
-
-  console.print(f"Issue ID: {args.issue}")
-  console.print(f"Issue Type: {bug_type}")
-  console.print(f"Issue Commit: {env.get_base_commit()}")
-  console.print(f"Issue Fix Commit: {env.get_hint_fix_commit()}")
-  console.print(f"Issue Title: {env.get_hint_issue()['title']}")
-  console.print(f"Issue Labels: {env.get_hint_issue()['labels']}")
-
-  console.print("Checking out the issue's environment ...")
-  try:
-    env.apply()
-  except Exception as e:
-    console.print(
-      f"Warning: Failed to reset HEAD to {env.get_hint_fix_commit()}: {e}",
-      color="yellow",
-    )
-    console.print("Sync the repository and try again.", color="yellow")
-    reset("main")
-    git_execute(["pull", "origin", "main"])
-    try:
-      env.apply()
-    except Exception as e:
-      panic(f"Failed to reset HEAD to {env.get_hint_fix_commit()}: {e}")
-
-  if not (Path(build_dir) / "bin" / "opt").exists():
-    env.build()
+  review_path = None
+  if args.review:
+    review_path = Path(args.review)
+    if review_path.exists() and not args.force:
+      panic(f"Review file {review_path} already exists.")
 
   llvm = LLVM()
 
-  # Start analyzing and repairing the issue
+  # Create PR environment
+  pr_env = PREnvironment(pr_info)
+
+  # Run PR review
   stats = RunStats(command=vars(args))
   stats.total_time_sec = time.time()
+
   try:
-    autoreview(agent, env, llvm, stats, build_dir)
-    if not stats.bugs:
-      raise NoAvailableBugFound("All efforts tried yet no available patches found.")
+    report = pr_review(
+      agent=agent,
+      pr_info=pr_info,
+      pr_env=pr_env,
+      llvm=llvm,
+      stats=stats,
+      build_dir=build_dir,
+    )
+    stats.report = report
   except Exception as e:
     import traceback
 
     stats.error = type(e).__name__
     stats.errmsg = str(e)
     stats.traceback = traceback.format_exc()
+    console.print(f"Error during PR review: {e}", color="red")
+    console.print(stats.traceback)
   finally:
+    stats.total_time_sec = time.time() - stats.total_time_sec
     stats.chat_rounds = agent.chat_stats["chat_rounds"]
     stats.input_tokens = agent.chat_stats["input_tokens"]
     stats.output_tokens = agent.chat_stats["output_tokens"]
     stats.cached_tokens = agent.chat_stats["cached_tokens"]
     stats.total_tokens = agent.chat_stats["total_tokens"]
     stats.chat_cost = agent.chat_stats["total_cost"]
-    stats.total_time_sec = time.time() - stats.total_time_sec
-    usage = []
-    for name in agent.tools.list(ignore_budget=False):
-      total = agent.tools.get_total_budget(name)
-      remaining = agent.tools.get_remaining_budget(name)
-      usage.append({"name": name, "usage": total - remaining})
-    stats.tool_usage = usage
+    # Source of truth: full chat history (covers both phases and removed tools such as `stop`).
+    history_usage = {}
+    for message in agent.get_history():
+      if getattr(message, "type", None) != "function_call":
+        continue
+      tool_name = getattr(message, "name", None)
+      if not tool_name:
+        continue
+      history_usage[tool_name] = history_usage.get(tool_name, 0) + 1
+
+    # Keep currently registered tools in output even if their usage is zero.
+    all_tool_names = set(agent.tools.list(ignore_budget=True)) | set(
+      history_usage.keys()
+    )
+    stats.tool_usage = [
+      {"name": name, "usage": history_usage.get(name, 0)}
+      for name in sorted(all_tool_names)
+    ]
+
     if stats_path:
       with stats_path.open("w") as fout:
         json.dump(stats.as_dict(), fout, indent=2)
       console.print(f"Generation statistics saved to {stats_path}.")
+
     if history_path:
       with history_path.open("w") as fout:
         json.dump([asdict(m) for m in agent.get_history()], fout, indent=2)
       console.print(f"Chat history saved to {history_path}.")
+
+    if review_path:
+      review_content = generate_review(pr_info, stats)
+      with review_path.open("w", encoding="utf-8") as fout:
+        fout.write(review_content)
+      console.print(f"Review saved to {review_path}.")
+
   console.print("Bugs Found")
   console.print("----------")
   for idx, bug in enumerate(stats.bugs):

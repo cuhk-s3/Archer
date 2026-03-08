@@ -1,0 +1,77 @@
+{
+  "pr_id": 178201,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/178201",
+  "state": "open",
+  "title": "[Reassociate] Distribute multiply over add to enable factorization",
+  "author": "hazarathayya",
+  "base_commit": "5a389d382b242bcbf4276b19fe21ee50fcdc988c",
+  "fix_commit": "48f1ac790cffc2cf4f577f543872ab192eff3431",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/Reassociate.cpp b/llvm/lib/Transforms/Scalar/Reassociate.cpp\nindex 010ff6e1fa5b4..9a5aacf271f03 100644\n--- a/llvm/lib/Transforms/Scalar/Reassociate.cpp\n+++ b/llvm/lib/Transforms/Scalar/Reassociate.cpp\n@@ -304,6 +304,83 @@ static BinaryOperator *LowerNegateToMultiply(Instruction *Neg) {\n   return Res;\n }\n \n+/// Try to distribute multiply over add when beneficial for reassociation\n+/// Transforms: (A + B) * C  \u2192  A*C + B*C\n+/// This enables further reassociation opportunities\n+static BinaryOperator *tryDistributeMul(BinaryOperator *I) {\n+  if (I->getOpcode() != Instruction::Mul)\n+    return nullptr;\n+\n+  Value *MulOp0 = I->getOperand(0);\n+  Value *MulOp1 = I->getOperand(1);\n+\n+  // We need one constant and one add\n+  ConstantInt *C = dyn_cast<ConstantInt>(MulOp1);\n+  BinaryOperator *Add = dyn_cast<BinaryOperator>(MulOp0);\n+\n+  // Try swapped operands if needed\n+  if (!C || !Add) {\n+    C = dyn_cast<ConstantInt>(MulOp0);\n+    Add = dyn_cast<BinaryOperator>(MulOp1);\n+  }\n+\n+  if (!C || !Add || Add->getOpcode() != Instruction::Add)\n+    return nullptr;\n+\n+  // Only distribute if the add has one use (avoid code bloat)\n+  if (!Add->hasOneUse())\n+    return nullptr;\n+\n+  // ===== NEW PROFITABILITY CHECK =====\n+  // Only distribute if both add operands are non-constant\n+  // This avoids distributing things like (x + 1) * 3 which don't help\n+  Value *AddLHS = Add->getOperand(0);\n+  Value *AddRHS = Add->getOperand(1);\n+\n+  bool AIsConstant = isa<Constant>(AddLHS);\n+  bool BIsConstant = isa<Constant>(AddRHS);\n+\n+  // Don't distribute if either operand is a constant\n+  // Distributing (x + 5) * 3 \u2192 x*3 + 15 doesn't create reassociation\n+  // opportunities\n+  if (AIsConstant || BIsConstant) {\n+    return nullptr;\n+  }\n+  // ===== END PROFITABILITY CHECK =====\n+\n+  // DEBUG: Print what we found\n+  dbgs() << \"DISTRIBUTING: \" << *I << \"\\n\";\n+  dbgs() << \"  Add: \" << *Add << \"\\n\";\n+  dbgs() << \"  Constant: \" << *C << \"\\n\";\n+\n+  Value *A = Add->getOperand(0);\n+  Value *B = Add->getOperand(1);\n+\n+  IRBuilder<> Builder(I);\n+\n+  // TODO: Reassociate pass needs comprehensive flag preservation.\n+  // Distribution preserves flags, but later passes may drop them.\n+  // Create with proper flags preserved\n+  Value *AC = Builder.CreateMul(A, C);\n+  Value *BC = Builder.CreateMul(B, C);\n+\n+  if (auto *MulInst = dyn_cast<BinaryOperator>(AC))\n+    MulInst->copyIRFlags(I); // Copy nsw/nuw from original mul\n+  if (auto *MulInst = dyn_cast<BinaryOperator>(BC))\n+    MulInst->copyIRFlags(I);\n+\n+  Value *NewAdd = Builder.CreateAdd(AC, BC);\n+  if (auto *AddInst = dyn_cast<BinaryOperator>(NewAdd))\n+    AddInst->copyIRFlags(Add); // Copy nsw/nuw from original add\n+\n+  // After creating the new operations:\n+  dbgs() << \"Created AC: \" << *AC << \"\\n\";\n+  dbgs() << \"Created BC: \" << *BC << \"\\n\";\n+  dbgs() << \"Created NewAdd: \" << *NewAdd << \"\\n\";\n+\n+  return cast<BinaryOperator>(NewAdd);\n+}\n+\n using RepeatedValue = std::pair<Value *, uint64_t>;\n \n /// Given an associative binary expression, return the leaf\n@@ -1606,7 +1683,10 @@ Value *ReassociatePass::OptimizeAdd(Instruction *I,\n         continue;\n \n       unsigned Occ = ++FactorOccurrences[Factor];\n-      if (Occ > MaxOcc) {\n+      if (Occ > MaxOcc ||\n+          (Occ == MaxOcc &&\n+           (isa<Instruction>(Factor) || isa<Argument>(Factor)) &&\n+           isa<Constant>(MaxOccVal) && !isa<UndefValue>(MaxOccVal))) {\n         MaxOcc = Occ;\n         MaxOccVal = Factor;\n       }\n@@ -1620,7 +1700,10 @@ Value *ReassociatePass::OptimizeAdd(Instruction *I,\n           if (!Duplicates.insert(Factor).second)\n             continue;\n           unsigned Occ = ++FactorOccurrences[Factor];\n-          if (Occ > MaxOcc) {\n+          if (Occ > MaxOcc ||\n+              (Occ == MaxOcc &&\n+               (isa<Instruction>(Factor) || isa<Argument>(Factor)) &&\n+               isa<Constant>(MaxOccVal) && !isa<UndefValue>(MaxOccVal))) {\n             MaxOcc = Occ;\n             MaxOccVal = Factor;\n           }\n@@ -1633,7 +1716,10 @@ Value *ReassociatePass::OptimizeAdd(Instruction *I,\n           if (!Duplicates.insert(Factor).second)\n             continue;\n           unsigned Occ = ++FactorOccurrences[Factor];\n-          if (Occ > MaxOcc) {\n+          if (Occ > MaxOcc ||\n+              (Occ == MaxOcc &&\n+               (isa<Instruction>(Factor) || isa<Argument>(Factor)) &&\n+               isa<Constant>(MaxOccVal) && !isa<UndefValue>(MaxOccVal))) {\n             MaxOcc = Occ;\n             MaxOccVal = Factor;\n           }\n@@ -2569,6 +2655,26 @@ PreservedAnalyses ReassociatePass::run(Function &F, FunctionAnalysisManager &) {\n \n   MadeChange = false;\n \n+  // Pre-process: Distribute multiplications to enable reassociation\n+  for (BasicBlock *BI : RPOT) {\n+    for (BasicBlock::iterator II = BI->begin(), IE = BI->end(); II != IE;) {\n+      Instruction *Inst = &*II;\n+      ++II; // Advance before modification\n+\n+      if (auto *Mul = dyn_cast<BinaryOperator>(Inst)) {\n+        if (Mul->getOpcode() == Instruction::Mul) {\n+          if (BinaryOperator *Dist = tryDistributeMul(Mul)) {\n+            LLVM_DEBUG(dbgs()\n+                       << \"Distributed: \" << *Mul << \" -> \" << *Dist << \"\\n\");\n+            Mul->replaceAllUsesWith(Dist);\n+            Mul->eraseFromParent();\n+            MadeChange = true;\n+          }\n+        }\n+      }\n+    }\n+  }\n+\n   // Traverse the same blocks that were analysed by BuildRankMap.\n   for (BasicBlock *BI : RPOT) {\n     assert(RankMap.count(&*BI) && \"BB should be ranked.\");\n",
+  "components": [
+    "Reassociate"
+  ],
+  "description": "### This patch improves ReassociatePass to handle patterns like:\r\n  (x*C1) - ((y+x)*C2) \u2192 x*(C1-C2) - (y*C2)\r\n\r\nThe optimization consists of two changes:\r\n\r\n1. Distribution pre-processing: Transform (A+B)*C \u2192 A*C + B*C when:\r\n    - The add has exactly one use (avoids code bloat)\r\n    - Both add operands are non-constant (avoids unprofitable cases)\r\n   \r\n   This exposes common factors that would otherwise be hidden inside\r\n   the addition, enabling subsequent factorization.\r\n\r\n2. Factorization heuristic: Prefer extracting non-constant factors\r\n   (Instructions/Arguments) over constant factors when occurrence \r\n   counts are equal. This enables better constant folding opportunities.\r\n   \r\n   Note: undef is excluded from this preference to maintain existing\r\n   test expectations.\r\n\r\nExample transformation:\r\n  Input IR:\r\n  ```\r\n  %add = add nsw i16 %y, %x\r\n    %mul1 = mul nsw i16 %x, 8697\r\n    %mul2 = mul nsw i16 %add, 6436\r\n    %sub = sub nsw i16 %mul1, %mul2\r\n    ret i16 %sub\r\n```\r\n\r\n  After distribution:\r\n```\r\n    %1 = mul nsw i16 %y, 6436\r\n    %2 = mul nsw i16 %x, 6436\r\n    %3 = add nsw i16 %1, %2\r\n    %sub = sub nsw i16 %mul1, %3\r\n```\r\n\r\n  After reassociation (factors %x, folds 8697-6436):\r\n```\r\n    %neg = mul i16 %y, -6436\r\n    %reass.mul = mul i16 %x, 2261\r\n    %result = add i16 %reass.mul, %neg\r\n```\r\n\r\nThe transformation preserves nsw/nuw flags during distribution.\r\nNote that flags may be dropped by subsequent reassociation passes;\r\ncomprehensive flag preservation can be addressed in future work.\r\n\r\nFixes #167190\r\n\r\nCC: @meghakrgowda @Pandey-Prachi",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Reassociate/reassociate-distribute.ll",
+      "commands": [
+        "opt -passes=reassociate -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_no_distribute_multiuse",
+          "test_body": "define i16 @test_no_distribute_multiuse(i16 %x, i16 %y) {\n  %add = add i16 %x, %y\n  %mul1 = mul i16 %add, 10\n  %mul2 = mul i16 %add, 20\n  %result = add i16 %mul1, %mul2\n  ret i16 %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions cpp -- llvm/lib/Transforms/Scalar/Reassociate.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/Scalar/Reassociate.cpp b/llvm/lib/Transforms/Scalar/Reassociate.cpp\nindex 74dc3cd08..9a5aacf27 100644\n--- a/llvm/lib/Transforms/Scalar/Reassociate.cpp\n+++ b/llvm/lib/Transforms/Scalar/Reassociate.cpp\n@@ -381,7 +381,6 @@ static BinaryOperator *tryDistributeMul(BinaryOperator *I) {\n   return cast<BinaryOperator>(NewAdd);\n }\n \n-\n using RepeatedValue = std::pair<Value *, uint64_t>;\n \n /// Given an associative binary expression, return the leaf\n@@ -1684,13 +1683,13 @@ Value *ReassociatePass::OptimizeAdd(Instruction *I,\n         continue;\n \n       unsigned Occ = ++FactorOccurrences[Factor];\n-      if (Occ > MaxOcc || \n-          (Occ == MaxOcc && \n-           (isa<Instruction>(Factor) || isa<Argument>(Factor)) && \n+      if (Occ > MaxOcc ||\n+          (Occ == MaxOcc &&\n+           (isa<Instruction>(Factor) || isa<Argument>(Factor)) &&\n            isa<Constant>(MaxOccVal) && !isa<UndefValue>(MaxOccVal))) {\n         MaxOcc = Occ;\n         MaxOccVal = Factor;\n-      }     \n+      }\n \n       // If Factor is a negative constant, add the negated value as a factor\n       // because we can percolate the negate out.  Watch for minint, which\n@@ -1701,9 +1700,9 @@ Value *ReassociatePass::OptimizeAdd(Instruction *I,\n           if (!Duplicates.insert(Factor).second)\n             continue;\n           unsigned Occ = ++FactorOccurrences[Factor];\n-          if (Occ > MaxOcc || \n-              (Occ == MaxOcc && \n-               (isa<Instruction>(Factor) || isa<Argument>(Factor)) && \n+          if (Occ > MaxOcc ||\n+              (Occ == MaxOcc &&\n+               (isa<Instruction>(Factor) || isa<Argument>(Factor)) &&\n                isa<Constant>(MaxOccVal) && !isa<UndefValue>(MaxOccVal))) {\n             MaxOcc = Occ;\n             MaxOccVal = Factor;\n@@ -1717,13 +1716,13 @@ Value *ReassociatePass::OptimizeAdd(Instruction *I,\n           if (!Duplicates.insert(Factor).second)\n             continue;\n           unsigned Occ = ++FactorOccurrences[Factor];\n-          if (Occ > MaxOcc || \n-              (Occ == MaxOcc && \n-               (isa<Instruction>(Factor) || isa<Argument>(Factor)) && \n+          if (Occ > MaxOcc ||\n+              (Occ == MaxOcc &&\n+               (isa<Instruction>(Factor) || isa<Argument>(Factor)) &&\n                isa<Constant>(MaxOccVal) && !isa<UndefValue>(MaxOccVal))) {\n             MaxOcc = Occ;\n             MaxOccVal = Factor;\n-          }         \n+          }\n         }\n       }\n     }\n@@ -2676,7 +2675,6 @@ PreservedAnalyses ReassociatePass::run(Function &F, FunctionAnalysisManager &) {\n     }\n   }\n \n-\n   // Traverse the same blocks that were analysed by BuildRankMap.\n   for (BasicBlock *BI : RPOT) {\n     assert(RankMap.count(&*BI) && \"BB should be ranked.\");\n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "hazarathayya",
+      "body": "@dtcxzyw could you review this and lmk if any modifications needed."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-27T13:34:00Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/Reassociate.cpp": [
+      [
+        304,
+        309
+      ],
+      [
+        1606,
+        1612
+      ],
+      [
+        1620,
+        1626
+      ],
+      [
+        1633,
+        1639
+      ],
+      [
+        2569,
+        2574
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/Reassociate.cpp": [
+      "LowerNegateToMultiply",
+      "ReassociatePass::OptimizeAdd",
+      "ReassociatePass::run"
+    ]
+  }
+}

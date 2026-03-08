@@ -1,0 +1,310 @@
+{
+  "pr_id": 182507,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182507",
+  "state": "closed",
+  "title": "[VPlan] Simplify ExitingIVValue and use for tail-folded IVs.",
+  "author": "fhahn",
+  "base_commit": "b101f01382d6ff53cebeedbcbf114d02947b10ce",
+  "fix_commit": "2b3d4eab0a5e7d27de4734baef164b9e7c04f6b5",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 9f1fa43d46066..0debab4a2a0ee 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8334,7 +8334,8 @@ VPlanPtr LoopVectorizationPlanner::tryToBuildVPlanWithVPRecipes(\n   // failures.\n   VPlanTransforms::addExitUsersForFirstOrderRecurrences(*Plan, Range);\n   DenseMap<VPValue *, VPValue *> IVEndValues;\n-  VPlanTransforms::updateScalarResumePhis(*Plan, IVEndValues);\n+  VPlanTransforms::updateScalarResumePhis(*Plan, IVEndValues,\n+                                          CM.foldTailByMasking());\n \n   // ---------------------------------------------------------------------------\n   // Transform initial VPlan: Apply previously taken decisions, in order, to\n@@ -8451,7 +8452,8 @@ VPlanPtr LoopVectorizationPlanner::tryToBuildVPlan(VFRange &Range) {\n   // TODO: We can't call runPass on the transform yet, due to verifier\n   // failures.\n   DenseMap<VPValue *, VPValue *> IVEndValues;\n-  VPlanTransforms::updateScalarResumePhis(*Plan, IVEndValues);\n+  VPlanTransforms::updateScalarResumePhis(*Plan, IVEndValues,\n+                                          /*FoldTail=*/false);\n \n   assert(verifyVPlanIsValid(*Plan) && \"VPlan is invalid\");\n   return Plan;\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex 7455129ff91e8..df66dd6cee59a 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -1267,8 +1267,7 @@ class LLVM_ABI_FOR_TEST VPInstruction : public VPRecipeWithIRFlags,\n     VScale,\n     /// Compute the exiting value of a wide induction after vectorization, that\n     /// is the value of the last lane of the induction increment (i.e. its\n-    /// backedge value). Takes the wide induction recipe and the original\n-    /// backedge value as operands.\n+    /// backedge value). Has the wide induction recipe as operand.\n     ExitingIVValue,\n     MaskedCond,\n     OpsEnd = MaskedCond,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex d7074a2ecf2c1..8c82e4be88ce4 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -638,8 +638,8 @@ createWidenInductionRecipe(PHINode *Phi, VPPhi *PhiR, VPIRValue *Start,\n                           Plan.getScalarPreheader()) &&\n              \"last lane must be extracted in the middle block\");\n       VPBuilder Builder(ExtractLastLane);\n-      ExtractLastLane->replaceAllUsesWith(Builder.createNaryOp(\n-          VPInstruction::ExitingIVValue, {WideIV, BackedgeVal}));\n+      ExtractLastLane->replaceAllUsesWith(\n+          Builder.createNaryOp(VPInstruction::ExitingIVValue, {WideIV}));\n       ExtractLastLane->eraseFromParent();\n       ExtractLastPart->eraseFromParent();\n     }\n@@ -1266,17 +1266,19 @@ bool VPlanTransforms::handleMaxMinNumReductions(VPlan &Plan) {\n   // Update resume phis for inductions in the scalar preheader. If AnyNaNLane is\n   // true, the resume from the start of the last vector iteration via the\n   // canonical IV, otherwise from the original value.\n+  auto IsTC = [&Plan](VPValue *V) {\n+    return V == &Plan.getVectorTripCount() || V == Plan.getTripCount();\n+  };\n   for (auto &R : Plan.getScalarPreheader()->phis()) {\n     auto *ResumeR = cast<VPPhi>(&R);\n     VPValue *VecV = ResumeR->getOperand(0);\n     if (RdxResults.contains(VecV))\n       continue;\n     if (auto *DerivedIV = dyn_cast<VPDerivedIVRecipe>(VecV)) {\n-      if (DerivedIV->getNumUsers() == 1 &&\n-          DerivedIV->getOperand(1) == &Plan.getVectorTripCount()) {\n-        auto *NewSel =\n-            MiddleBuilder.createSelect(AnyNaNLane, LoopRegion->getCanonicalIV(),\n-                                       &Plan.getVectorTripCount());\n+      VPValue *DIVTC = DerivedIV->getOperand(1);\n+      if (DerivedIV->getNumUsers() == 1 && IsTC(DIVTC)) {\n+        auto *NewSel = MiddleBuilder.createSelect(\n+            AnyNaNLane, LoopRegion->getCanonicalIV(), DIVTC);\n         DerivedIV->moveAfter(&*MiddleBuilder.getInsertPoint());\n         DerivedIV->setOperand(1, NewSel);\n         continue;\n@@ -1284,7 +1286,7 @@ bool VPlanTransforms::handleMaxMinNumReductions(VPlan &Plan) {\n     }\n     // Bail out and abandon the current, partially modified, VPlan if we\n     // encounter resume phi that cannot be updated yet.\n-    if (VecV != &Plan.getVectorTripCount()) {\n+    if (!IsTC(VecV)) {\n       LLVM_DEBUG(dbgs() << \"Found resume phi we cannot update for VPlan with \"\n                            \"FMaxNum/FMinNum reduction.\\n\");\n       return false;\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\nindex 7ba302733762a..2b582a607dddc 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n@@ -542,10 +542,10 @@ inline VPInstruction_match<VPInstruction::StepVector> m_StepVector() {\n   return m_VPInstruction<VPInstruction::StepVector>();\n }\n \n-template <typename Op0_t, typename Op1_t>\n-inline VPInstruction_match<VPInstruction::ExitingIVValue, Op0_t, Op1_t>\n-m_ExitingIVValue(const Op0_t &Op0, const Op1_t &Op1) {\n-  return m_VPInstruction<VPInstruction::ExitingIVValue>(Op0, Op1);\n+template <typename Op0_t>\n+inline VPInstruction_match<VPInstruction::ExitingIVValue, Op0_t>\n+m_ExitingIVValue(const Op0_t &Op0) {\n+  return m_VPInstruction<VPInstruction::ExitingIVValue>(Op0);\n }\n \n template <unsigned Opcode, typename Op0_t>\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp b/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\nindex dbc2e71c785ee..ad4fd69882f30 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\n@@ -328,9 +328,7 @@ void VPlanTransforms::introduceMasksAndLinearize(VPlan &Plan, bool FoldTail) {\n     VPBuilder B(Plan.getMiddleBlock()->getTerminator());\n     for (VPRecipeBase &R : *Plan.getMiddleBlock()) {\n       VPValue *Op;\n-      if (!match(&R, m_CombineOr(\n-                         m_ExitingIVValue(m_VPValue(), m_VPValue(Op)),\n-                         m_ExtractLastLane(m_ExtractLastPart(m_VPValue(Op))))))\n+      if (!match(&R, m_ExtractLastLane(m_ExtractLastPart(m_VPValue(Op)))))\n         continue;\n \n       // Compute the index of the last active lane.\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex f7810c65d000e..a61b9d71183a0 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -453,6 +453,7 @@ unsigned VPInstruction::getNumOperandsForOpcode() const {\n   case Instruction::Load:\n   case VPInstruction::BranchOnCond:\n   case VPInstruction::Broadcast:\n+  case VPInstruction::ExitingIVValue:\n   case VPInstruction::ExplicitVectorLength:\n   case VPInstruction::ExtractLastLane:\n   case VPInstruction::ExtractLastPart:\n@@ -469,7 +470,6 @@ unsigned VPInstruction::getNumOperandsForOpcode() const {\n   case Instruction::Store:\n   case VPInstruction::BranchOnCount:\n   case VPInstruction::BranchOnTwoConds:\n-  case VPInstruction::ExitingIVValue:\n   case VPInstruction::FirstOrderRecurrenceSplice:\n   case VPInstruction::LogicalAnd:\n   case VPInstruction::LogicalOr:\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex e62c0d58ec2ad..3c9d79a62db14 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -987,13 +987,15 @@ static VPValue *optimizeLatchExitInductionUser(\n     DenseMap<VPValue *, VPValue *> &EndValues, PredicatedScalarEvolution &PSE) {\n   VPValue *Incoming;\n   VPWidenInductionRecipe *WideIV = nullptr;\n-  if (match(Op, m_ExitingIVValue(m_VPValue(), m_VPValue(Incoming)))) {\n-    WideIV = getOptimizableIVOf(Op->getDefiningRecipe()->getOperand(0), PSE);\n-    assert(WideIV && \"must have an optimizable IV\");\n-  } else if (match(Op, m_ExtractLastLaneOfLastPart(m_VPValue(Incoming)))) {\n+  if (match(Op, m_ExitingIVValue(m_VPValue(Incoming)))) {\n     WideIV = getOptimizableIVOf(Incoming, PSE);\n+    assert(WideIV && \"must have an optimizable IV\");\n+    return EndValues.lookup(WideIV);\n   }\n \n+  if (match(Op, m_ExtractLastLaneOfLastPart(m_VPValue(Incoming))))\n+    WideIV = getOptimizableIVOf(Incoming, PSE);\n+\n   if (!WideIV)\n     return nullptr;\n \n@@ -5515,7 +5517,7 @@ static VPValue *tryToComputeEndValueForInduction(VPWidenInductionRecipe *WideIV,\n }\n \n void VPlanTransforms::updateScalarResumePhis(\n-    VPlan &Plan, DenseMap<VPValue *, VPValue *> &IVEndValues) {\n+    VPlan &Plan, DenseMap<VPValue *, VPValue *> &IVEndValues, bool FoldTail) {\n   VPTypeAnalysis TypeInfo(Plan);\n   auto *ScalarPH = Plan.getScalarPreheader();\n   auto *MiddleVPBB = cast<VPBasicBlock>(ScalarPH->getPredecessors()[0]);\n@@ -5530,8 +5532,12 @@ void VPlanTransforms::updateScalarResumePhis(\n     // pre-computed end value together in optimizeInductionExitUsers.\n     auto *VectorPhiR = cast<VPHeaderPHIRecipe>(ResumePhiR->getOperand(0));\n     if (auto *WideIVR = dyn_cast<VPWidenInductionRecipe>(VectorPhiR)) {\n+      // TODO: Check if tail is folded directly in VPlan.\n+      VPValue *TC = !FoldTail\n+                        ? static_cast<VPValue *>(&Plan.getVectorTripCount())\n+                        : Plan.getTripCount();\n       if (VPValue *EndValue = tryToComputeEndValueForInduction(\n-              WideIVR, VectorPHBuilder, TypeInfo, &Plan.getVectorTripCount())) {\n+              WideIVR, VectorPHBuilder, TypeInfo, TC)) {\n         IVEndValues[WideIVR] = EndValue;\n         ResumePhiR->setOperand(0, EndValue);\n         ResumePhiR->setName(\"bc.resume.val\");\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\nindex 3e86b4044bbb1..0dce486cb1c2c 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n@@ -463,9 +463,8 @@ struct VPlanTransforms {\n   /// Update the resume phis in the scalar preheader after creating wide recipes\n   /// for first-order recurrences, reductions and inductions. End values for\n   /// inductions are added to \\p IVEndValues.\n-  static void\n-  updateScalarResumePhis(VPlan &Plan,\n-                         DenseMap<VPValue *, VPValue *> &IVEndValues);\n+  static void updateScalarResumePhis(\n+      VPlan &Plan, DenseMap<VPValue *, VPValue *> &IVEndValues, bool FoldTail);\n \n   /// Handle users in the exit block for first order reductions in the original\n   /// exit block. The penultimate value of recurrences is fed to their LCSSA phi\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Now that we have ExitingIVValue, we can also use it for tail-folded loops; the only difference is that we have to compute the end value with the original trip count instead the vector trip count.\r\n\r\nThis allows removing the induction increment operand only used when tail-folding and also fixes a mis-compile in @fmaxnum_tailfold, where we previously were scaling with the vector trip count, not the original trip count.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/fold-tail-low-trip-count.ll",
+      "commands": [
+        "opt -p loop-vectorize -mtriple=aarch64-linux-gnu -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "low_trip_count_small_with_live_out",
+          "test_body": "define ptr @low_trip_count_small_with_live_out(i32 %x, ptr %dst) {\nentry:\n  %smax = call i32 @llvm.smax.i32(i32 %x, i32 1)\n  %umin = call i32 @llvm.umin.i32(i32 %smax, i32 4)\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %ptr = phi ptr [ %dst, %entry ], [ %ptr.next, %loop ]\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %ptr.next = getelementptr i8, ptr %ptr, i64 1\n  store i8 0, ptr %ptr.next, align 1\n  %iv.next = add i32 %iv, 1\n  %exitcond = icmp eq i32 %iv.next, %umin\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret ptr %ptr.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/fold-tail-low-trip-count.ll",
+      "commands": [
+        "opt -p loop-vectorize -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "low_trip_count_via_profile_info_with_live_out",
+          "test_body": "target triple = \"x86_64-pc-windows-gnu\"\n\ndefine i8 @low_trip_count_via_profile_info_with_live_out(ptr align 16 %start, ptr align 16 %end, ptr noalias %src) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %ptr = phi ptr [ %start, %entry ], [ %ptr.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %gep.src = getelementptr i8, ptr %src, i64 %iv.next\n  %l = load i8, ptr %gep.src, align 1\n  %ptr.next = getelementptr i8, ptr %ptr, i64 1\n  store i8 %l, ptr %ptr, align 1\n  %exitcond = icmp eq ptr %ptr, %end\n  br i1 %exitcond, label %exit, label %loop, !prof !0\n\nexit:                                             ; preds = %loop\n  ret i8 %l\n}\n\nattributes #0 = { \"prefer-vector-width\"=\"512\" \"target-cpu\"=\"tigerlake\" }\n\n!0 = !{!\"branch_weights\", i32 169702549, i32 116357656}\n"
+        },
+        {
+          "test_name": "low_trip_count_via_profile_info_with_iv_live_out",
+          "test_body": "target triple = \"x86_64-pc-windows-gnu\"\n\ndefine ptr @low_trip_count_via_profile_info_with_iv_live_out(ptr align 16 %start, ptr align 16 %end, ptr noalias %src) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %ptr = phi ptr [ %start, %entry ], [ %ptr.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %gep.src = getelementptr i8, ptr %src, i64 %iv.next\n  %l = load i8, ptr %gep.src, align 1\n  %ptr.next = getelementptr i8, ptr %ptr, i64 1\n  store i8 %l, ptr %ptr, align 1\n  %exitcond = icmp eq ptr %ptr, %end\n  br i1 %exitcond, label %exit, label %loop, !prof !0\n\nexit:                                             ; preds = %loop\n  ret ptr %ptr.next\n}\n\nattributes #0 = { \"prefer-vector-width\"=\"512\" \"target-cpu\"=\"tigerlake\" }\n\n!0 = !{!\"branch_weights\", i32 169702549, i32 116357656}\n"
+        },
+        {
+          "test_name": "low_trip_count_via_profile_info",
+          "test_body": "target triple = \"x86_64-pc-windows-gnu\"\n\ndefine void @low_trip_count_via_profile_info(ptr align 16 %start, ptr align 16 %end, ptr noalias %src) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %ptr = phi ptr [ %start, %entry ], [ %ptr.next, %loop ]\n  %iv.next = add i64 %iv, 1\n  %gep.src = getelementptr i8, ptr %src, i64 %iv.next\n  %l = load i8, ptr %gep.src, align 1\n  %ptr.next = getelementptr i8, ptr %ptr, i64 1\n  store i8 %l, ptr %ptr, align 1\n  %exitcond = icmp eq ptr %ptr, %end\n  br i1 %exitcond, label %exit, label %loop, !prof !0\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"prefer-vector-width\"=\"512\" \"target-cpu\"=\"tigerlake\" }\n\n!0 = !{!\"branch_weights\", i32 169702549, i32 116357656}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/small-size.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,dce,instcombine -force-vector-interleave=1 -force-vector-width=4 -loop-vectorize-with-block-frequency -S"
+      ],
+      "tests": [
+        {
+          "test_name": "example23d",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\n; Function Attrs: optsize\ndefine i64 @example23d(ptr noalias nocapture %src, ptr noalias nocapture %dst) #0 {\n  br label %1\n\n1:                                                ; preds = %1, %0\n  %.04 = phi ptr [ %src, %0 ], [ %2, %1 ]\n  %.013 = phi ptr [ %dst, %0 ], [ %6, %1 ]\n  %i.02 = phi i64 [ 0, %0 ], [ %7, %1 ]\n  %2 = getelementptr inbounds i16, ptr %.04, i64 1\n  %3 = load i16, ptr %.04, align 2\n  %4 = zext i16 %3 to i32\n  %5 = shl nuw nsw i32 %4, 7\n  %6 = getelementptr inbounds i32, ptr %.013, i64 1\n  store i32 %5, ptr %.013, align 4\n  %7 = add nsw i64 %i.02, 1\n  %exitcond = icmp eq i64 %7, 257\n  br i1 %exitcond, label %8, label %1\n\n8:                                                ; preds = %1\n  ret i64 %7\n}\n\nattributes #0 = { optsize }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/fmax-without-fast-math-flags-interleave.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=2 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fmaxnum_tailfold",
+          "test_body": "; Function Attrs: optsize\ndefine float @fmaxnum_tailfold(ptr %src, i64 %n) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %max = phi float [ 0.000000e+00, %entry ], [ %max.next, %loop ]\n  %gep = getelementptr inbounds float, ptr %src, i64 %iv\n  %l = load float, ptr %gep, align 4\n  %max.next = tail call float @llvm.maxnum.f32(float %max, float %l)\n  %iv.next = add i64 %iv, 1\n  %exitcond = icmp eq i64 %iv, %n\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret float %max.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #1\n\nattributes #0 = { optsize }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/lcssa-crashes.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test3",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @test3(ptr %p) {\nentry:\n  %add41 = add i32 3, 3\n  %idxprom4736 = zext i32 %add41 to i64\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %idxprom4738 = phi i64 [ %idxprom47, %while.body ], [ %idxprom4736, %entry ]\n  %pos.337 = phi i32 [ %inc46, %while.body ], [ %add41, %entry ]\n  %inc46 = add i32 %pos.337, 1\n  %arrayidx48 = getelementptr inbounds [1024 x i8], ptr %p, i64 0, i64 %idxprom4738\n  store i8 0, ptr %arrayidx48, align 1\n  %and43 = and i32 %inc46, 3\n  %cmp44 = icmp eq i32 %and43, 0\n  %idxprom47 = zext i32 %inc46 to i64\n  br i1 %cmp44, label %while.end, label %while.body\n\nwhile.end:                                        ; preds = %while.body\n  %add58 = add i32 %inc46, 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/use-scalar-epilogue-if-tp-fails.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue < %s",
+        "opt -S -passes=loop-vectorize < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "metadata",
+          "test_body": "target datalayout = \"e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64\"\n\ndefine void @metadata(ptr nocapture readonly %ptr, i32 %size, ptr %pos) {\nheader:\n  %ptr0 = load ptr, ptr %pos, align 4\n  br label %body\n\nbody:                                             ; preds = %body, %header\n  %dec66 = phi i32 [ %dec, %body ], [ %size, %header ]\n  %buff = phi ptr [ %incdec.ptr, %body ], [ %ptr, %header ]\n  %incdec.ptr = getelementptr inbounds i8, ptr %buff, i32 1\n  %dec = add nsw i32 %dec66, -1\n  %0 = load i8, ptr %incdec.ptr, align 1\n  store i8 %0, ptr %buff, align 1\n  %tobool11 = icmp eq i32 %dec, 0\n  br i1 %tobool11, label %end, label %body, !llvm.loop !0\n\nend:                                              ; preds = %body\n  store ptr %incdec.ptr, ptr %pos, align 4\n  ret void\n}\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n!2 = !{!\"llvm.loop.vectorize.enable\", i1 true}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-20T14:49:57Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        8334,
+        8340
+      ],
+      [
+        8451,
+        8457
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      [
+        1267,
+        1274
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        638,
+        645
+      ],
+      [
+        1266,
+        1282
+      ],
+      [
+        1284,
+        1290
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      [
+        542,
+        551
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp": [
+      [
+        328,
+        336
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        453,
+        458
+      ],
+      [
+        469,
+        475
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        987,
+        999
+      ],
+      [
+        5515,
+        5521
+      ],
+      [
+        5530,
+        5537
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.h": [
+      [
+        463,
+        471
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/fold-tail-low-trip-count.ll": [
+      [
+        81,
+        100
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/fold-tail-low-trip-count.ll": [
+      [
+        3,
+        26
+      ],
+      [
+        70,
+        76
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/small-size.ll": [
+      [
+        529,
+        535
+      ],
+      [
+        544,
+        550
+      ],
+      [
+        584,
+        601
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/fmax-without-fast-math-flags-interleave.ll": [
+      [
+        325,
+        331
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/lcssa-crashes.ll": [
+      [
+        89,
+        102
+      ],
+      [
+        123,
+        134
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/use-scalar-epilogue-if-tp-fails.ll": [
+      [
+        101,
+        106
+      ],
+      [
+        110,
+        116
+      ],
+      [
+        122,
+        138
+      ],
+      [
+        140,
+        145
+      ],
+      [
+        147,
+        152
+      ],
+      [
+        154,
+        159
+      ],
+      [
+        162,
+        171
+      ],
+      [
+        180,
+        185
+      ],
+      [
+        189,
+        195
+      ],
+      [
+        201,
+        217
+      ],
+      [
+        219,
+        224
+      ],
+      [
+        226,
+        231
+      ],
+      [
+        233,
+        238
+      ],
+      [
+        241,
+        250
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationPlanner::tryToBuildVPlanWithVPRecipes"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "VPlanTransforms::handleMaxMinNumReductions",
+      "createWidenInductionRecipe"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      "m_ExitingIVValue",
+      "m_StepVector",
+      "m_Unary"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp": [
+      "VPlanTransforms::introduceMasksAndLinearize"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPInstruction::getNumOperandsForOpcode"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::updateScalarResumePhis",
+      "optimizeLatchExitInductionUser"
+    ]
+  }
+}

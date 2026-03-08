@@ -1,0 +1,243 @@
+{
+  "pr_id": 181168,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/181168",
+  "state": "open",
+  "title": "[SLP]Initial compatibility support for shl v, 1 and add v, v",
+  "author": "alexey-bataev",
+  "base_commit": "844619e52653d084c898131e890e0c2411033e67",
+  "fix_commit": "e225bc35e105e1fb4e877137fea3911b66028096",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 4caa1707f0f27..2ae640d33ed17 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -1004,8 +1004,12 @@ class BinOpSameOpcodeHelper {\n     /// preventing us from determining which instruction it should convert to.\n     bool trySet(MaskType OpcodeInMaskForm, MaskType InterchangeableMask) {\n       if (Mask & InterchangeableMask) {\n-        SeenBefore |= OpcodeInMaskForm;\n-        Mask &= InterchangeableMask;\n+        MaskType TempSeenBefore = SeenBefore | OpcodeInMaskForm;\n+        MaskType TempMask = Mask & InterchangeableMask;\n+        if (!(TempMask & TempSeenBefore))\n+          return false;\n+        Mask = TempMask;\n+        SeenBefore = TempSeenBefore;\n         return true;\n       }\n       return false;\n@@ -1086,6 +1090,8 @@ class BinOpSameOpcodeHelper {\n       Constant *RHS;\n       switch (FromOpcode) {\n       case Instruction::Shl:\n+        if (ToOpcode == Instruction::Add && FromCIValue.isOne())\n+          return {I->getOperand(0), I->getOperand(0)};\n         if (ToOpcode == Instruction::Mul) {\n           RHS = ConstantInt::get(\n               RHSType, APInt::getOneBitSet(FromCIValueBitWidth,\n@@ -1206,6 +1212,8 @@ class BinOpSameOpcodeHelper {\n       case Instruction::Shl:\n         if (CIValue.ult(CIValue.getBitWidth()))\n           InterchangeableMask = CIValue.isZero() ? CanBeAll : MulBIT | ShlBIT;\n+        if (CIValue.isOne())\n+          InterchangeableMask |= AddBIT;\n         break;\n       case Instruction::Mul:\n         if (CIValue.isOne()) {\n@@ -1403,6 +1411,49 @@ class InstructionsState {\n            Converter.hasAltOp() || !Converter.hasCandidateOpcode(getOpcode());\n   }\n \n+  /// Checks if the value \\p V is a transformed instruction, compatible either\n+  /// with main or alternate ops.\n+  bool isExpandedBinOp(Value *V) const {\n+    assert(valid() && \"InstructionsState is invalid.\");\n+    if (isCopyableElement(V))\n+      return false;\n+    auto *I = dyn_cast<Instruction>(V);\n+    if (!I)\n+      return false;\n+    auto CheckForTransformedOpcode = [](const Instruction *Op, Instruction *I) {\n+      switch (Op->getOpcode()) {\n+      case Instruction::Add:\n+        switch (I->getOpcode()) {\n+        case Instruction::Shl:\n+          return match(I, m_Shl(m_Value(), m_One()));\n+        default:\n+          break;\n+        }\n+        break;\n+      default:\n+        break;\n+      }\n+      return false;\n+    };\n+    Instruction *Op = getMatchingMainOpOrAltOp(I);\n+    assert(Op &&\n+           \"The instruction should be compatible with either main or alt op.\");\n+    return CheckForTransformedOpcode(Op, I);\n+  }\n+\n+  /// Checks if the operand at index \\p Idx of instruction \\p I is an expanded\n+  /// operand.\n+  bool isExpandedOperand(Instruction *I, unsigned Idx) const {\n+    assert(isExpandedBinOp(I) && \"Expected an expanded binop.\");\n+    switch (I->getOpcode()) {\n+    case Instruction::Shl:\n+      assert(match(I, m_Shl(m_Value(), m_One())) && \"Expected shl x, 1 only.\");\n+      return Idx == 1;\n+    default:\n+      llvm_unreachable(\"Unexpected opcode for an expanded operand.\");\n+    }\n+  }\n+\n   /// Checks if the value is non-schedulable.\n   bool isNonSchedulable(Value *V) const {\n     assert(valid() && \"InstructionsState is invalid.\");\n@@ -4239,6 +4290,26 @@ class slpvectorizer::BoUpSLP {\n       return CopyableElements.contains(V);\n     }\n \n+    /// Checks if the value \\p V is a transformed instruction, compatible either\n+    /// with main or alternate ops.\n+    bool isExpandedBinOp(Value *V) const {\n+      assert(hasState() && \"InstructionsState is invalid.\");\n+      if (isCopyableElement(V))\n+        return false;\n+      return S.isExpandedBinOp(V);\n+    }\n+\n+    /// Checks if the operand at index \\p Idx of instruction \\p I is an expanded\n+    /// operand.\n+    bool isExpandedOperand(Instruction *I, unsigned Idx) const {\n+      assert(hasState() && \"InstructionsState is invalid.\");\n+      if (isCopyableElement(I))\n+        return false;\n+      if (!isExpandedBinOp(I))\n+        return false;\n+      return S.isExpandedOperand(I, Idx);\n+    }\n+\n     /// Returns true if any scalar in the list is a copyable element.\n     bool hasCopyableElements() const { return !CopyableElements.empty(); }\n \n@@ -4313,8 +4384,11 @@ class slpvectorizer::BoUpSLP {\n           dbgs().indent(2) << *V << \"\\n\";\n       }\n       dbgs() << \"Scalars: \\n\";\n-      for (Value *V : Scalars)\n-        dbgs().indent(2) << *V << \"\\n\";\n+      for (Value *V : Scalars) {\n+        dbgs().indent(2) << *V\n+                         << ((S && S.isExpandedBinOp(V)) ? \" [[Expanded]]\\n\"\n+                                                         : \"\\n\");\n+      }\n       dbgs() << \"State: \";\n       if (S && hasCopyableElements())\n         dbgs() << \"[[Copyable]] \";\n@@ -5725,8 +5799,18 @@ class slpvectorizer::BoUpSLP {\n             for (const Use &U : In->operands()) {\n               if (auto *I = dyn_cast<Instruction>(U.get())) {\n                 auto Res = OperandsUses.try_emplace(I, 0);\n-                ++Res.first->getSecond();\n-                ++TotalOpCount;\n+                unsigned Inc = 1;\n+                // Count all expanded operands in the binops.\n+                for (ScheduleBundle *Bundle : Bundles) {\n+                  if (const TreeEntry *TE = Bundle->getTreeEntry()) {\n+                    if (TE->isExpandedBinOp(In))\n+                      ++Inc;\n+                  } else if (S.isExpandedBinOp(In)) {\n+                    ++Inc;\n+                  }\n+                }\n+                Res.first->getSecond() += Inc;\n+                TotalOpCount += Inc;\n               }\n             }\n           }\n@@ -5735,7 +5819,8 @@ class slpvectorizer::BoUpSLP {\n           auto DecrUnschedForInst =\n               [&](Instruction *I, TreeEntry *UserTE, unsigned OpIdx,\n                   SmallDenseSet<std::pair<const ScheduleEntity *, unsigned>>\n-                      &Checked) {\n+                      &Checked,\n+                  bool IsExpandedOperand = false) {\n                 if (!ScheduleCopyableDataMap.empty()) {\n                   const EdgeInfo EI = {UserTE, OpIdx};\n                   if (ScheduleCopyableData *CD =\n@@ -5750,7 +5835,8 @@ class slpvectorizer::BoUpSLP {\n                 assert(It != OperandsUses.end() && \"Operand not found\");\n                 if (It->second > 0) {\n                   if (ScheduleData *OpSD = getScheduleData(I)) {\n-                    if (!Checked.insert(std::make_pair(OpSD, OpIdx)).second)\n+                    if (!IsExpandedOperand &&\n+                        !Checked.insert(std::make_pair(OpSD, OpIdx)).second)\n                       return;\n                     --It->getSecond();\n                     assert(TotalOpCount > 0 && \"No more operands to decrement\");\n@@ -5826,7 +5912,9 @@ class slpvectorizer::BoUpSLP {\n                         Bundle->getTreeEntry()->getOperand(OpIdx)[Lane])) {\n                   LLVM_DEBUG(dbgs() << \"SLP:   check for readiness (def): \"\n                                     << *I << \"\\n\");\n-                  DecrUnschedForInst(I, Bundle->getTreeEntry(), OpIdx, Checked);\n+                  DecrUnschedForInst(\n+                      I, Bundle->getTreeEntry(), OpIdx, Checked,\n+                      Bundle->getTreeEntry()->isExpandedOperand(In, OpIdx));\n                 }\n               // If parent node is schedulable, it will be handled correctly.\n               if (Bundle->getTreeEntry()->isCopyableElement(In))\n@@ -6014,6 +6102,7 @@ class slpvectorizer::BoUpSLP {\n     /// bundles which depend on the original bundle.\n     void calculateDependencies(ScheduleBundle &Bundle, bool InsertInReadyList,\n                                BoUpSLP *SLP,\n+                               const SmallPtrSetImpl<Value *> &ExpandedOps,\n                                ArrayRef<ScheduleData *> ControlDeps = {});\n \n     /// Sets all instruction in the scheduling region to un-scheduled.\n@@ -22723,6 +22812,7 @@ BoUpSLP::BlockScheduling::tryScheduleBundle(ArrayRef<Value *> VL, BoUpSLP *SLP,\n             (!EI.UserTE->hasCopyableElements() ||\n              !EI.UserTE->isCopyableElement(SD->getInst())))\n           SD->clearDirectDependencies();\n+        const bool IsExpandedBinOp = S.isExpandedBinOp(SD->getInst());\n         for (const Use &U : SD->getInst()->operands()) {\n           unsigned &NumOps =\n               UserOpToNumOps\n@@ -22738,6 +22828,15 @@ BoUpSLP::BlockScheduling::tryScheduleBundle(ArrayRef<Value *> VL, BoUpSLP *SLP,\n               if (RegionHasStackSave ||\n                   !isGuaranteedToTransferExecutionToSuccessor(OpSD->getInst()))\n                 ControlDependentMembers.push_back(OpSD);\n+              continue;\n+            }\n+          }\n+          if (IsExpandedBinOp) {\n+            if (ScheduleData *OpSD = getScheduleData(U.get());\n+                OpSD && OpSD->hasValidDependencies()) {\n+              OpSD->clearDirectDependencies();\n+              ControlDependentMembers.push_back(OpSD);\n+              continue;\n             }\n           }\n         }\n@@ -22764,20 +22863,24 @@ BoUpSLP::BlockScheduling::tryScheduleBundle(ArrayRef<Value *> VL, BoUpSLP *SLP,\n       });\n       ReSchedule = true;\n     }\n+    SmallPtrSet<Value *, 4> ExpandedOps;\n+    for (Value *V : VL) {\n+      if (S.isExpandedBinOp(V))\n+        ExpandedOps.insert(V);\n+    }\n     // Check if the bundle data has deps for copyable elements already. In\n     // this case need to reset deps and recalculate it.\n     if (Bundle && !Bundle.getBundle().empty()) {\n-      if (S.areInstructionsWithCopyableElements() ||\n-          !ScheduleCopyableDataMap.empty())\n+      if (!ScheduleCopyableDataMap.empty() || !ExpandedOps.empty())\n         CheckIfNeedToClearDeps(Bundle);\n       LLVM_DEBUG(dbgs() << \"SLP: try schedule bundle \" << Bundle << \" in block \"\n                         << BB->getName() << \"\\n\");\n       calculateDependencies(Bundle, /*InsertInReadyList=*/!ReSchedule, SLP,\n-                            ControlDependentMembers);\n+                            ExpandedOps, ControlDependentMembers);\n     } else if (!ControlDependentMembers.empty()) {\n       ScheduleBundle Invalid = ScheduleBundle::invalid();\n       calculateDependencies(Invalid, /*InsertInReadyList=*/!ReSchedule, SLP,\n-                            ControlDependentMembers);\n+                            ExpandedOps, ControlDependentMembers);\n     }\n \n     if (ReSchedule) {\n@@ -22842,7 +22945,8 @@ BoUpSLP::BlockScheduling::tryScheduleBundle(ArrayRef<Value *> VL, BoUpSLP *SLP,\n         ReadyInsts.remove(B);\n     }\n \n-    if (!S.isCopyableElement(V) && !BundleMember->isScheduled())\n+    if (!S.isCopyableElement(V) && !S.isExpandedBinOp(V) &&\n+        !BundleMember->isScheduled())\n       continue;\n     // A bundle member was scheduled as single instruction before and now\n     // needs to be scheduled as part of the bundle. We just get rid of the\n@@ -22878,6 +22982,15 @@ BoUpSLP::BlockScheduling::tryScheduleBundle(ArrayRef<Value *> VL, BoUpSLP *SLP,\n       if (S.isNonSchedulable(V))\n         continue;\n       auto *I = cast<Instruction>(V);\n+      if (S.isExpandedBinOp(I)) {\n+        for (Value *Op : I->operands()) {\n+          if (ScheduleData *OpSD = getScheduleData(Op);\n+              OpSD && OpSD->hasValidDependencies()) {\n+            OpSD->clearDirectDependencies();\n+            ControlDependentMembers.push_back(OpSD);\n+          }\n+        }\n+      }\n       if (S.isCopyableElement(I)) {\n         // Remove the copyable data from the scheduling region and restore\n         // previous mappings.\n@@ -22924,6 +23037,17 @@ BoUpSLP::BlockScheduling::tryScheduleBundle(ArrayRef<Value *> VL, BoUpSLP *SLP,\n           if (RegionHasStackSave ||\n               !isGuaranteedToTransferExecutionToSuccessor(OpSD->getInst()))\n             ControlDependentMembers.push_back(OpSD);\n+          if (any_of(VL, [&](Value *V) { return S.isExpandedBinOp(V); })) {\n+            // Clear scheduling data for all operands, if this node is operand\n+            // of the expanded instruction.\n+            for (Value *Op : I->operands()) {\n+              if (ScheduleData *OpSD = getScheduleData(Op);\n+                  OpSD && OpSD->hasValidDependencies()) {\n+                OpSD->clearDirectDependencies();\n+                ControlDependentMembers.push_back(OpSD);\n+              }\n+            }\n+          }\n         }\n         continue;\n       }\n@@ -22931,8 +23055,9 @@ BoUpSLP::BlockScheduling::tryScheduleBundle(ArrayRef<Value *> VL, BoUpSLP *SLP,\n     }\n     if (!ControlDependentMembers.empty()) {\n       ScheduleBundle Invalid = ScheduleBundle::invalid();\n+      SmallPtrSet<Value *, 4> ExpandedOps;\n       calculateDependencies(Invalid, /*InsertInReadyList=*/false, SLP,\n-                            ControlDependentMembers);\n+                            ExpandedOps, ControlDependentMembers);\n     }\n     return std::nullopt;\n   }\n@@ -23071,6 +23196,7 @@ void BoUpSLP::BlockScheduling::initScheduleData(Instruction *FromI,\n \n void BoUpSLP::BlockScheduling::calculateDependencies(\n     ScheduleBundle &Bundle, bool InsertInReadyList, BoUpSLP *SLP,\n+    const SmallPtrSetImpl<Value *> &ExpandedOps,\n     ArrayRef<ScheduleData *> ControlDeps) {\n   SmallVector<ScheduleEntity *> WorkList;\n   auto ProcessNode = [&](ScheduleEntity *SE) {\n@@ -23109,9 +23235,13 @@ void BoUpSLP::BlockScheduling::calculateDependencies(\n             }\n           } else if (Visited.insert(In).second) {\n             if (ScheduleData *UseSD = getScheduleData(In)) {\n-              CD->incDependencies();\n+              unsigned Inc = 1;\n+              // Increment twice, since the operand was expanded in binop.\n+              if (EI.UserTE && EI.UserTE->isExpandedBinOp(In))\n+                Inc = 2;\n+              for_each(seq(Inc), [&](unsigned) { CD->incDependencies(); });\n               if (!UseSD->isScheduled())\n-                CD->incrementUnscheduledDeps(1);\n+                CD->incrementUnscheduledDeps(Inc);\n               if (!UseSD->hasValidDependencies() ||\n                   (InsertInReadyList && UseSD->isReady()))\n                 WorkList.push_back(UseSD);\n@@ -23159,9 +23289,17 @@ void BoUpSLP::BlockScheduling::calculateDependencies(\n         if (areAllOperandsReplacedByCopyableData(\n                 cast<Instruction>(U), BundleMember->getInst(), *SLP, NumOps))\n           continue;\n-        BundleMember->incDependencies();\n+        unsigned Inc = 1;\n+        // Increment twice, since the operand was expanded in binop.\n+        for (const TreeEntry *UserTE : SLP->getTreeEntries(U)) {\n+          if (UserTE->isExpandedBinOp(U))\n+            ++Inc;\n+        }\n+        if (ExpandedOps.contains(U))\n+          ++Inc;\n+        for_each(seq(Inc), [&](unsigned) { BundleMember->incDependencies(); });\n         if (!UseSD->isScheduled())\n-          BundleMember->incrementUnscheduledDeps(1);\n+          BundleMember->incrementUnscheduledDeps(Inc);\n         if (!UseSD->hasValidDependencies() ||\n             (InsertInReadyList && UseSD->isReady()))\n           WorkList.push_back(UseSD);\n@@ -23433,15 +23571,21 @@ void BoUpSLP::scheduleBlock(const BoUpSLP &R, BlockScheduling *BS) {\n     if (!Bundles.empty()) {\n       for (ScheduleBundle *Bundle : Bundles) {\n         Bundle->setSchedulingPriority(Idx++);\n-        if (!Bundle->hasValidDependencies())\n-          BS->calculateDependencies(*Bundle, /*InsertInReadyList=*/false, this);\n+        if (!Bundle->hasValidDependencies()) {\n+          SmallPtrSet<Value *, 4> ExpandedOps;\n+          BS->calculateDependencies(*Bundle, /*InsertInReadyList=*/false, this,\n+                                    ExpandedOps);\n+        }\n       }\n       SmallVector<ScheduleCopyableData *> SDs = BS->getScheduleCopyableData(I);\n       for (ScheduleCopyableData *SD : reverse(SDs)) {\n         ScheduleBundle &Bundle = SD->getBundle();\n         Bundle.setSchedulingPriority(Idx++);\n-        if (!Bundle.hasValidDependencies())\n-          BS->calculateDependencies(Bundle, /*InsertInReadyList=*/false, this);\n+        if (!Bundle.hasValidDependencies()) {\n+          SmallPtrSet<Value *, 4> ExpandedOps;\n+          BS->calculateDependencies(Bundle, /*InsertInReadyList=*/false, this,\n+                                    ExpandedOps);\n+        }\n       }\n       continue;\n     }\n@@ -23467,14 +23611,19 @@ void BoUpSLP::scheduleBlock(const BoUpSLP &R, BlockScheduling *BS) {\n         // recalculate them.\n         ScheduleBundle Bundle;\n         Bundle.add(SD);\n-        BS->calculateDependencies(Bundle, /*InsertInReadyList=*/false, this);\n+        SmallPtrSet<Value *, 4> ExpandedOps;\n+        BS->calculateDependencies(Bundle, /*InsertInReadyList=*/false, this,\n+                                  ExpandedOps);\n       }\n     }\n     for (ScheduleCopyableData *SD : reverse(CopyableData)) {\n       ScheduleBundle &Bundle = SD->getBundle();\n       Bundle.setSchedulingPriority(Idx++);\n-      if (!Bundle.hasValidDependencies())\n-        BS->calculateDependencies(Bundle, /*InsertInReadyList=*/false, this);\n+      if (!Bundle.hasValidDependencies()) {\n+        SmallPtrSet<Value *, 4> ExpandedOps;\n+        BS->calculateDependencies(Bundle, /*InsertInReadyList=*/false, this,\n+                                  ExpandedOps);\n+      }\n     }\n   }\n   BS->initialFillReadyList(ReadyInsts);\n@@ -25658,6 +25807,33 @@ class HorizontalReduction {\n         ReducedVals.erase(std::next(ReducedVals.begin(), SelectIdx));\n       }\n     }\n+    // Check if shl %x, 1 can be merged with adds.\n+    auto ShlIt = UsedReductionOpIds.find(Instruction::Shl);\n+    auto AddIt = UsedReductionOpIds.find(Instruction::Add);\n+    if (ShlIt != UsedReductionOpIds.end() &&\n+        AddIt != UsedReductionOpIds.end()) {\n+      unsigned ShlIdx = ShlIt->second;\n+      unsigned AddIdx = AddIt->second;\n+      if (ReducedVals[ShlIdx].size() < ReductionLimit) {\n+        SmallVector<Value *> Shls;\n+        SmallVector<Value *> Remaining;\n+        for (Value *V : ReducedVals[ShlIdx]) {\n+          if (match(V, m_Shl(m_Value(), m_One())))\n+            Shls.push_back(V);\n+          else\n+            Remaining.push_back(V);\n+        }\n+        // Have compatible shls? Merge them to adds, if so.\n+        if (!Shls.empty()) {\n+          Shls.append(ReducedVals[AddIdx]);\n+          ReducedVals[AddIdx].swap(Shls);\n+          if (Remaining.empty())\n+            ReducedVals.erase(std::next(ReducedVals.begin(), ShlIdx));\n+          else\n+            ReducedVals[ShlIdx].swap(Remaining);\n+        }\n+      }\n+    }\n   }\n \n public:\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Allows to make shl v, 1 to be compatible with add operations by\nmodeling it as add v,v\n\nFixes #40801\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/entries-different-vf.ll",
+      "commands": [
+        "opt --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=icelake-server -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i1 @test(i64 %v) {\nentry:\n  %0 = shl i64 %v, 1\n  %1 = add i64 %v, 3\n  %2 = add i64 %v, 7\n  %3 = or i64 %2, %1\n  %cmp750 = icmp ult i64 %3, 0\n  %4 = or i64 %0, %1\n  %cmp752 = icmp ult i64 %4, 0\n  %or753 = or i1 %cmp750, %cmp752\n  %5 = or i64 0, %1\n  %cmp754 = icmp ult i64 %5, 0\n  %or755 = or i1 %or753, %cmp754\n  %6 = extractelement <16 x i64> zeroinitializer, i32 0\n  %7 = sub i64 %1, %6\n  %cmp756 = icmp ult i64 %7, 0\n  %or757 = or i1 %or755, %cmp756\n  %8 = sub i64 0, %2\n  %cmp758 = icmp ult i64 %8, 0\n  %or759 = or i1 %or757, %cmp758\n  %9 = or i64 0, %2\n  %cmp760 = icmp ult i64 %9, 0\n  %or761 = or i1 %or759, %cmp760\n  %10 = or i64 0, %6\n  %cmp762 = icmp ult i64 %10, 0\n  %or763 = or i1 %or761, %cmp762\n  %11 = or i64 0, %0\n  %cmp764 = icmp ult i64 %11, 0\n  %or765 = or i1 %or763, %cmp764\n  ret i1 %or765\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/shl-compatible-with-add.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=icelake-server -slp-threshold=-5 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "intrapred_luma",
+          "test_body": "define void @intrapred_luma(ptr %0, i16 %1, i32 %conv593) {\nentry:\n  %conv5952 = zext i16 %1 to i32\n  %add596 = add i32 %conv5952, 1\n  %add597 = or i32 %add596, %conv593\n  %shr598 = lshr i32 %add597, 1\n  %conv599 = trunc i32 %shr598 to i16\n  %.pre = load ptr, ptr %0, align 8\n  %arrayidx590 = getelementptr i8, ptr %.pre, i64 4304\n  store i16 %conv599, ptr %arrayidx590, align 2\n  %mul606 = shl i32 %conv5952, 1\n  %add611 = or i32 %mul606, %conv593\n  %shr612 = lshr i32 %add611, 2\n  %conv613 = trunc i32 %shr612 to i16\n  %arrayidx615 = getelementptr i8, ptr %.pre, i64 4306\n  store i16 %conv613, ptr %arrayidx615, align 2\n  %conv609 = zext i16 %1 to i32\n  %add621 = or i32 %conv593, %conv609\n  %shr622 = lshr i32 %add621, 1\n  %conv623 = trunc i32 %shr622 to i16\n  %arrayidx627 = getelementptr i8, ptr %.pre, i64 4308\n  store i16 %conv623, ptr %arrayidx627, align 2\n  %conv635 = zext i16 %1 to i32\n  %add633 = add i32 %conv635, 1\n  %add636 = add i32 %add633, %conv593\n  %add637 = add i32 %add636, 1\n  %shr638 = lshr i32 %add637, 1\n  %conv639 = trunc i32 %shr638 to i16\n  %arrayidx643 = getelementptr i8, ptr %.pre, i64 4310\n  store i16 %conv639, ptr %arrayidx643, align 2\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=icelake-server < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(ptr %src, i8 %0, i32 %conv2) {\nentry:\n  %conv65 = zext i8 %0 to i32\n  %add36 = add i32 %conv65, 1\n  %add37 = or i32 %add36, %conv2\n  %conv4 = zext i8 %0 to i32\n  %add38 = or i32 %add37, %conv4\n  %shr39 = lshr i32 %add38, 1\n  %conv40 = trunc i32 %shr39 to i8\n  %arrayidx41 = getelementptr i8, ptr %src, i64 1\n  store i8 %conv40, ptr %arrayidx41, align 1\n  %add = add i32 %conv4, 1\n  %add45 = or i32 %add, %conv2\n  %1 = load i8, ptr %src, align 1\n  %conv8 = zext i8 %1 to i32\n  %add46 = or i32 %add45, %conv8\n  %shr47 = lshr i32 %add46, 1\n  %conv48 = trunc i32 %shr47 to i8\n  %arrayidx49 = getelementptr i8, ptr %src, i64 2\n  store i8 %conv48, ptr %arrayidx49, align 1\n  %mul52 = shl i32 %conv8, 1\n  %add54 = or i32 %mul52, 1\n  %conv10 = zext i8 %0 to i32\n  %add55 = add i32 %add54, %conv10\n  %shr56 = lshr i32 %add55, 1\n  %conv57 = trunc i32 %shr56 to i8\n  %arrayidx58 = getelementptr i8, ptr %src, i64 3\n  store i8 %conv57, ptr %arrayidx58, align 1\n  %add63 = add i32 %conv8, 1\n  %add64 = or i32 %add63, %conv10\n  %shr66 = lshr i32 %add64, 1\n  %conv67 = trunc i32 %shr66 to i8\n  %arrayidx68 = getelementptr i8, ptr %src, i64 4\n  store i8 %conv67, ptr %arrayidx68, align 1\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation5.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=icelake-server -slp-threshold=-5 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "@st = external global [4 x [4 x i32]]\n\ndefine i32 @test(i32 %0, i32 %1) {\nentry:\n  %add110 = add i32 %0, %1\n  %sub124 = sub i32 0, %add110\n  store i32 %sub124, ptr getelementptr inbounds nuw (i8, ptr @st, i64 32), align 16\n  %shl127 = shl i32 %0, 1\n  store i32 %shl127, ptr getelementptr inbounds nuw (i8, ptr @st, i64 16), align 16\n  %shl.2 = shl i32 %0, 1\n  %sub124.1 = sub i32 0, %shl.2\n  store i32 %sub124.1, ptr getelementptr inbounds nuw (i8, ptr @st, i64 36), align 4\n  %sub115.1 = sub i32 0, %shl.2\n  store i32 %sub115.1, ptr getelementptr inbounds nuw (i8, ptr @st, i64 20), align 4\n  %2 = load i32, ptr getelementptr inbounds nuw (i8, ptr @st, i64 8), align 8\n  %add105.2 = sub i32 %2, %0\n  store i32 %add105.2, ptr getelementptr inbounds nuw (i8, ptr @st, i64 8), align 8\n  %shl127.2 = shl i32 %0, 1\n  store i32 %shl127.2, ptr getelementptr inbounds nuw (i8, ptr @st, i64 24), align 8\n  %.neg.neg = shl i32 %0, 1\n  %3 = load i32, ptr getelementptr inbounds nuw (i8, ptr @st, i64 12), align 4\n  %add105.3 = add i32 %.neg.neg, %3\n  store i32 %add105.3, ptr getelementptr inbounds nuw (i8, ptr @st, i64 12), align 4\n  %sub120.3 = or i32 %3, %.neg.neg\n  %shl127.3 = shl i32 %sub120.3, 1\n  store i32 %shl127.3, ptr getelementptr inbounds nuw (i8, ptr @st, i64 28), align 4\n  ret i32 0\n}\n"
+        },
+        {
+          "test_name": "test2",
+          "test_body": "@st = external global [4 x [4 x i32]]\n\ndefine i32 @test2(i32 %0) {\nentry:\n  %sub80.3 = or i32 %0, 1\n  %add110.3 = add i32 %0, 1\n  %add110.2 = or i32 %0, 1\n  %shl.1 = shl i32 %0, 1\n  store i32 %shl.1, ptr getelementptr inbounds nuw (i8, ptr @st, i64 20), align 4\n  %add105.3 = add i32 %sub80.3, %0\n  %shl.3 = shl i32 %sub80.3, 1\n  %add121.3 = add i32 %add110.3, %add105.3\n  %add121.2 = add i32 %add110.2, %0\n  %add121.1 = add i32 %shl.1, %shl.3\n  %sub120.1 = sub i32 0, %shl.3\n  %1 = insertelement <4 x i32> poison, i32 %sub120.1, i32 0\n  %2 = insertelement <4 x i32> %1, i32 %add121.1, i32 1\n  %3 = insertelement <4 x i32> %2, i32 %add121.2, i32 2\n  %4 = insertelement <4 x i32> %3, i32 %add121.3, i32 3\n  store <4 x i32> %4, ptr @st, align 4\n  ret i32 0\n}\n"
+        },
+        {
+          "test_name": "test1",
+          "test_body": "@st = external global [4 x [4 x i32]]\n\ndefine i32 @test1(ptr %0, ptr %1, i32 %2) {\nentry:\n  %3 = load i32, ptr %0, align 8\n  %4 = load i32, ptr %1, align 4\n  %sub80.1 = sub i32 0, %2\n  %add62.1 = add i32 %3, 1\n  %add53.1 = add i32 %4, %2\n  %add81.1 = or i32 %add62.1, %add53.1\n  %sub115 = add i32 %add81.1, 1\n  %add128 = or i32 %sub115, 1\n  store i32 %add128, ptr getelementptr inbounds nuw (i8, ptr @st, i64 16), align 16\n  %sub71.11 = add i32 %2, 1\n  %shl.1 = shl i32 %sub80.1, 1\n  %add89.1 = or i32 %sub71.11, %shl.1\n  %sub115.1 = or i32 %add89.1, %2\n  %add128.1 = or i32 %sub115.1, 1\n  store i32 %add128.1, ptr getelementptr inbounds nuw (i8, ptr @st, i64 20), align 4\n  %sub85.1 = sub i32 %add53.1, %add62.1\n  store i32 %sub85.1, ptr @st, align 8\n  %add128.2 = or i32 %sub85.1, 1\n  store i32 %add128.2, ptr getelementptr inbounds nuw (i8, ptr @st, i64 24), align 8\n  %sub94.1 = or i32 %sub80.1, 1\n  store i32 %sub94.1, ptr getelementptr inbounds nuw (i8, ptr @st, i64 28), align 4\n  ret i32 0\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {undef deprecator}-->\n\n\n:warning: undef deprecator found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff -U0 --pickaxe-regex -S '([^a-zA-Z0-9#_-]undef([^a-zA-Z0-9_-]|$)|UndefValue::get)' 'HEAD~1' HEAD llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp llvm/test/Transforms/SLPVectorizer/X86/entries-different-vf.ll llvm/test/Transforms/SLPVectorizer/X86/shl-compatible-with-add.ll llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation.ll llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation5.ll\n``````````\n\n</details>\n\n\nThe following files introduce new uses of undef:\n - llvm/test/Transforms/SLPVectorizer/X86/entries-different-vf.ll\n\n[Undef](https://llvm.org/docs/LangRef.html#undefined-values) is now deprecated and should only be used in the rare cases where no replacement is possible. For example, a load of uninitialized memory yields `undef`. You should use `poison` values for placeholders instead.\n\nIn tests, avoid using `undef` and having tests that trigger undefined behavior. If you need an operand with some unimportant value, you can add a new argument to the function and use that instead.\n\nFor example, this is considered a bad practice:\n```llvm\ndefine void @fn() {\n  ...\n  br i1 undef, ...\n}\n```\n\nPlease use the following instead:\n```llvm\ndefine void @fn(i1 %cond) {\n  ...\n  br i1 %cond, ...\n}\n```\n\nPlease refer to the [Undefined Behavior Manual](https://llvm.org/docs/UndefinedBehavior.html) for more information.\n\n"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> flyby question (sorry I don't have much time at the moment) but do we need to be careful about shl(undef,1) -> add(undef,undef) cases?\r\n\r\nLooks like correct https://alive2.llvm.org/ce/z/U2CNzK"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-12T15:52:28Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        1004,
+        1011
+      ],
+      [
+        1086,
+        1091
+      ],
+      [
+        1206,
+        1211
+      ],
+      [
+        1403,
+        1408
+      ],
+      [
+        4239,
+        4244
+      ],
+      [
+        4313,
+        4320
+      ],
+      [
+        5725,
+        5732
+      ],
+      [
+        5735,
+        5741
+      ],
+      [
+        5750,
+        5756
+      ],
+      [
+        5826,
+        5832
+      ],
+      [
+        6014,
+        6019
+      ],
+      [
+        22723,
+        22728
+      ],
+      [
+        22738,
+        22743
+      ],
+      [
+        22764,
+        22783
+      ],
+      [
+        22842,
+        22848
+      ],
+      [
+        22878,
+        22883
+      ],
+      [
+        22924,
+        22929
+      ],
+      [
+        22931,
+        22938
+      ],
+      [
+        23071,
+        23076
+      ],
+      [
+        23109,
+        23117
+      ],
+      [
+        23159,
+        23167
+      ],
+      [
+        23433,
+        23447
+      ],
+      [
+        23467,
+        23480
+      ],
+      [
+        25658,
+        25663
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/entries-different-vf.ll": [
+      [
+        5,
+        20
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/shl-compatible-with-add.ll": [
+      [
+        5,
+        27
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation.ll": [
+      [
+        5,
+        42
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/shl-to-add-transformation5.ll": [
+      [
+        7,
+        36
+      ],
+      [
+        65,
+        75
+      ],
+      [
+        119,
+        143
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::BlockScheduling::calculateDependencies",
+      "BoUpSLP::BlockScheduling::tryScheduleBundle",
+      "BoUpSLP::scheduleBlock",
+      "HorizontalReduction",
+      "add",
+      "dump",
+      "getOperand",
+      "hasCopyableElements",
+      "isCopyableElement",
+      "isNonSchedulable",
+      "optimizeReducedVals",
+      "trySet"
+    ]
+  }
+}

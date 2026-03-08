@@ -1,0 +1,143 @@
+{
+  "pr_id": 183773,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183773",
+  "state": "open",
+  "title": "[SLP] Fix logic for commuting copyable operands in buildInstructionsState()",
+  "author": "bababuck",
+  "base_commit": "975dba28633d2f3746a8a370741b17024b0f5f9b",
+  "fix_commit": "501969fa883c960eb3efd8b934397e887e3a8c07",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 4caa1707f0f27..714c7456ce10c 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -11621,17 +11621,11 @@ class InstructionsCompatibilityAnalysis {\n     // Check profitability if number of copyables > VL.size() / 2.\n     // 1. Reorder operands for better matching.\n     if (isCommutative(MainOp)) {\n-      for (auto &Ops : Operands) {\n-        // Make instructions the first operands.\n-        if (!isa<Instruction>(Ops.front()) && isa<Instruction>(Ops.back())) {\n-          std::swap(Ops.front(), Ops.back());\n-          continue;\n-        }\n-        // Make constants the second operands.\n-        if (isa<Constant>(Ops.front())) {\n-          std::swap(Ops.front(), Ops.back());\n-          continue;\n-        }\n+      for (auto [OpA, OpB] : zip(Operands.front(), Operands.back())) {\n+        // Make instructions the first operand and constants the second.\n+        if ((!isa<Instruction>(OpA) && isa<Instruction>(OpB)) ||\n+            isa<Constant>(OpA))\n+          std::swap(OpA, OpB);\n       }\n     }\n     // 2. Check, if operands can be vectorized.\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Noticed by inspection, if my understanding is correct the existing logic is incorrect.\r\n\r\nfor the following:\r\n%add = add i32 %0, %1\r\n%add = add i32 3, %3\r\n%add = add i32 %4, %5\r\n%urem = urem i32 %6, %7\r\n\r\nOperands would contain (since `urem`  will be `Copyable`):\r\n```\r\nOperands[0] = {%0, 3, %4, %6}\r\nOperands[1] = {%1, %3, %5, %7}\r\n```\r\nWith the existing logic, we would first compare `%0` and `%6`, and then compare `%1` and `%7`. What I believe is intended is to compare `%0` and `%1`, then `3` and `%3`, and so on.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/bv-root-part-of-graph.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test() {\nbb:\n  br label %bb1\n\nbb1:                                              ; preds = %bb1, %bb\n  %phi = phi i32 [ 0, %bb ], [ %or21, %bb1 ]\n  %sitofp = sitofp i32 0 to float\n  %fadd = fadd float %sitofp, %sitofp\n  %fadd2 = fadd float %fadd, 0.000000e+00\n  %fcmp = fcmp ogt float %fadd2, 0.000000e+00\n  %select = select i1 %fcmp, i32 0, i32 0\n  %select3 = select i1 false, i32 %select, i32 0\n  %fadd4 = fadd float %sitofp, 0.000000e+00\n  %fadd5 = fadd float %fadd4, 0.000000e+00\n  %fcmp6 = fcmp ogt float %fadd5, 0.000000e+00\n  %select7 = select i1 %fcmp6, i32 0, i32 0\n  %select8 = select i1 false, i32 %select7, i32 0\n  %or = or i32 %select3, %select8\n  %sitofp9 = sitofp i32 0 to float\n  %fmul = fmul float 0.000000e+00, 0.000000e+00\n  %fadd10 = fadd float %sitofp9, %fmul\n  %fadd11 = fadd float %fadd10, 0.000000e+00\n  %fcmp12 = fcmp ogt float %fadd11, 0.000000e+00\n  %select13 = select i1 %fcmp12, i32 0, i32 0\n  %select14 = select i1 false, i32 %select13, i32 0\n  %or15 = or i32 %select14, %or\n  %fadd16 = fadd float %fmul, 0.000000e+00\n  %fadd17 = fadd float %fadd16, 0.000000e+00\n  %fcmp18 = fcmp ogt float %fadd17, 0.000000e+00\n  %select19 = select i1 %fcmp18, i32 0, i32 0\n  %select20 = select i1 false, i32 %select19, i32 0\n  %or21 = or i32 %or15, %select20\n  br label %bb1\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/copyable-with-used-outside-bb.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -slp-threshold=-99999 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(i32 %arg) {\nbb:\n  br label %bb1\n\nbb1:                                              ; preds = %bb\n  %sub = sub i32 0, %arg\n  %add = add i32 7, 0\n  %icmp = icmp ult i32 %add, 0\n  br i1 false, label %bb2, label %bb3\n\nbb2:                                              ; preds = %bb1\n  br label %bb3\n\nbb3:                                              ; preds = %bb2, %bb1\n  %phi = phi i32 [ 7, %bb2 ], [ 0, %bb1 ]\n  %phi4 = phi i32 [ %sub, %bb2 ], [ %sub, %bb1 ]\n  %phi5 = phi i32 [ %add, %bb2 ], [ %add, %bb1 ]\n  %phi6 = phi i32 [ %add, %bb2 ], [ 0, %bb1 ]\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/non-schedulable-node-with-non-schedulable-parent.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -S -mtriple=x86_64 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define float @test() {\nbb:\n  %fadd = fadd float 0.000000e+00, 0.000000e+00\n  %load = load float, ptr null, align 4\n  %fadd1 = fadd float %fadd, %load\n  %fadd2 = fadd float 0.000000e+00, 0.000000e+00\n  %fmul = fmul float 0.000000e+00, 0.000000e+00\n  %fmul3 = fmul float 0.000000e+00, 0.000000e+00\n  %fadd4 = fadd float %fmul3, 0.000000e+00\n  br i1 false, label %bb5, label %bb6\n\nbb5:                                              ; preds = %bb\n  br label %bb8\n\nbb6:                                              ; preds = %bb\n  %fdiv = fdiv float %fadd1, 0.000000e+00\n  %fdiv7 = fdiv float %fadd2, 0.000000e+00\n  br label %bb8\n\nbb8:                                              ; preds = %bb6, %bb5\n  %phi = phi float [ 0.000000e+00, %bb5 ], [ %fdiv7, %bb6 ]\n  %phi9 = phi float [ %fmul, %bb5 ], [ 0.000000e+00, %bb6 ]\n  %phi10 = phi float [ %fadd4, %bb5 ], [ %load, %bb6 ]\n  %phi11 = phi float [ %fadd1, %bb5 ], [ %fdiv, %bb6 ]\n  ret float %phi11\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/split-vectorize-gathered-def-after-use.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -S -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i32 @test(i32 %add.i64326, i32 %call119) {\nentry:\n  %add.r = add i32 0, 0\n  %sext.mask = and i32 %add.r, 0\n  %call = tail call i32 (...) null()\n  %sext.mask323 = and i32 %call, 0\n  %call35 = tail call i32 (...) null()\n  %sext.mask324 = and i32 %call35, 0\n  %add.r63 = add i32 0, 0\n  %sext.mask325 = and i32 %add.r63, 0\n  %coerce36.sroa.2.0.extract.shift327 = add i32 %add.i64326, %call35\n  %call91 = tail call i32 (...) null()\n  %sext329.mask = and i32 %call91, 0\n  %0 = and i32 %call91, 0\n  %add.r131 = add i32 %call119, %add.i64326\n  %sext332.mask = and i32 %add.r131, 0\n  %coerce52.sroa.2.0.extract.shift335 = add i32 0, 0\n  %call1193 = tail call i32 (...) null()\n  %sext336.mask = and i32 %call1193, 0\n  %add.i132334 = and i32 %call1193, 0\n  %call211 = tail call i32 (...) null()\n  %sext339.mask = and i32 %call211, 0\n  %1 = and i32 %call211, 0\n  %call239 = tail call i32 (...) null()\n  %sext342.mask = and i32 %call239, 0\n  %add.i320 = and i32 %call, 0\n  %tobool31.not = icmp eq i32 %add.i320, 0\n  %add33 = select i1 %tobool31.not, i32 0, i32 0\n  %tobool25.not = icmp eq i32 %sext.mask323, 0\n  %add27 = select i1 %tobool25.not, i32 0, i32 0\n  %add12 = add i32 %add33, %add27\n  %tobool.not = icmp ult i32 0, 0\n  %add11 = select i1 %tobool.not, i32 0, i32 0\n  %add28 = add i32 %add12, %add11\n  %tobool47.not = icmp ult i32 1, 0\n  %add49 = select i1 %tobool47.not, i32 0, i32 0\n  %add34 = add i32 %add28, %add49\n  %cmp = icmp eq i32 %sext.mask, 0\n  %add = select i1 %cmp, i32 0, i32 0\n  %add44 = add i32 %add34, %add\n  %tobool41.not = icmp eq i32 %sext.mask324, 0\n  %add43 = select i1 %tobool41.not, i32 0, i32 0\n  %add50 = add i32 %add44, %add43\n  %tobool87.not = icmp ult i32 0, 0\n  %add89 = select i1 %tobool87.not, i32 0, i32 0\n  %add72 = add i32 %add50, %add89\n  %add159 = select i1 %tobool87.not, i32 0, i32 0\n  %add78 = add i32 %add72, %add159\n  %add83 = select i1 poison, i32 0, i32 0\n  %add84 = add i32 %add78, %add83\n  %add152 = select i1 poison, i32 0, i32 0\n  %add90 = add i32 %add84, %add152\n  %tobool69.not = icmp eq i32 %sext.mask325, 0\n  %add71 = select i1 %tobool69.not, i32 0, i32 0\n  %add112 = add i32 %add90, %add71\n  %tobool75.not = icmp ult i32 %coerce36.sroa.2.0.extract.shift327, 0\n  %add77 = select i1 %tobool75.not, i32 0, i32 0\n  %add118 = add i32 %add112, %add77\n  %tobool109.not = icmp eq i32 %sext329.mask, 0\n  %add111 = select i1 %tobool109.not, i32 0, i32 0\n  %add140 = add i32 %add118, %add111\n  %tobool115.not = icmp eq i32 %0, 0\n  %add117 = select i1 %tobool115.not, i32 0, i32 0\n  %add146 = add i32 %add140, %add117\n  %tobool175.not = icmp eq i32 %sext336.mask, 0\n  %add177 = select i1 %tobool175.not, i32 0, i32 0\n  %add153 = add i32 %add146, %add177\n  %tobool181.not = icmp eq i32 %add.i132334, 0\n  %add183 = select i1 %tobool181.not, i32 0, i32 0\n  %add160 = add i32 %add153, %add183\n  %tobool137.not = icmp eq i32 %sext332.mask, 0\n  %add139 = select i1 %tobool137.not, i32 0, i32 0\n  %add178 = add i32 %add160, %add139\n  %tobool143.not = icmp ult i32 %coerce52.sroa.2.0.extract.shift335, 0\n  %add145 = select i1 %tobool143.not, i32 0, i32 0\n  %add184 = add i32 %add178, %add145\n  %add202 = select i1 %tobool137.not, i32 0, i32 0\n  %add203 = add i32 %add184, %add202\n  %add209 = select i1 %tobool143.not, i32 0, i32 0\n  %add210 = add i32 %add203, %add209\n  %tobool229.not = icmp eq i32 %sext339.mask, 0\n  %add231 = select i1 %tobool229.not, i32 0, i32 0\n  %add232 = add i32 %add210, %add231\n  %tobool235.not = icmp eq i32 %1, 0\n  %add237 = select i1 %tobool235.not, i32 0, i32 0\n  %add238 = add i32 %add232, %add237\n  %tobool251.not = icmp ult i32 0, 0\n  %add253 = select i1 %tobool251.not, i32 0, i32 0\n  %add248 = add i32 %add238, %add253\n  %tobool245.not = icmp eq i32 %sext342.mask, 0\n  %add247 = select i1 %tobool245.not, i32 0, i32 0\n  %add254 = add i32 %add248, %add247\n  ret i32 %add254\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/extract-many-users-buildvector.ll",
+      "commands": [
+        "%if x86-registered-target %{ opt -S -passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu < %s",
+        "%if aarch64-registered-target %{ opt -S -passes=slp-vectorizer -mtriple=aarch64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i1 @test(float %0, double %1) {\n  %3 = fpext float %0 to double\n  %4 = fpext float 0.000000e+00 to double\n  %5 = fpext float 0.000000e+00 to double\n  %6 = fpext float 0.000000e+00 to double\n  %7 = fmul double 0.000000e+00, 0.000000e+00\n  %8 = fmul double 0.000000e+00, %1\n  %9 = fmul double 0.000000e+00, 0.000000e+00\n  %10 = fmul double 0.000000e+00, %5\n  %11 = fmul double 0.000000e+00, %6\n  %12 = fsub double %10, %11\n  %13 = fptrunc double %12 to float\n  %14 = fmul double %9, 0.000000e+00\n  %15 = fmul double 0.000000e+00, %3\n  %16 = fsub double %14, %15\n  %17 = fptrunc double %16 to float\n  %18 = fptrunc double %7 to float\n  %19 = fmul double %1, %6\n  %20 = fmul double 0.000000e+00, %4\n  %21 = fsub double %19, %20\n  %22 = fptrunc double %21 to float\n  %23 = fsub double 0.000000e+00, %8\n  %24 = fptrunc double %23 to float\n  %25 = fmul double 0.000000e+00, 0.000000e+00\n  %26 = fptrunc double %25 to float\n  %27 = fmul double %9, %4\n  %28 = fmul double 0.000000e+00, %5\n  %29 = fsub double %27, %28\n  %30 = fptrunc double %29 to float\n  %31 = fmul double %9, 0.000000e+00\n  %32 = fptrunc double %31 to float\n  %33 = fmul float %13, 0.000000e+00\n  %34 = fcmp oeq float %33, 0.000000e+00\n  %35 = fmul float %22, 0.000000e+00\n  %36 = fcmp oeq float %35, 0.000000e+00\n  %37 = select i1 %34, i1 %36, i1 false\n  %38 = fmul float %30, 0.000000e+00\n  %39 = fcmp oeq float %38, 0.000000e+00\n  %40 = select i1 %37, i1 %39, i1 false\n  %41 = fmul float %17, 0.000000e+00\n  %42 = fcmp oeq float %41, 0.000000e+00\n  %43 = select i1 %40, i1 %42, i1 false\n  %44 = fmul float %24, 0.000000e+00\n  %45 = fcmp oeq float %44, 0.000000e+00\n  %46 = select i1 %43, i1 %45, i1 false\n  %47 = fmul float %32, 0.000000e+00\n  %48 = fcmp oeq float %47, 0.000000e+00\n  %49 = select i1 %46, i1 %48, i1 false\n  %50 = fmul float %18, 0.000000e+00\n  %51 = fcmp oeq float %50, 0.000000e+00\n  %52 = select i1 %49, i1 %51, i1 false\n  %53 = fmul float %26, 0.000000e+00\n  %54 = fcmp oeq float %53, 0.000000e+00\n  %55 = select i1 %52, i1 %54, i1 false\n  ret i1 %55\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {undef deprecator}-->\n\n\n:warning: undef deprecator found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff -U0 --pickaxe-regex -S '([^a-zA-Z0-9#_-]undef([^a-zA-Z0-9_-]|$)|UndefValue::get)' 'HEAD~1' HEAD llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp llvm/test/Transforms/SLPVectorizer/X86/bv-root-part-of-graph.ll llvm/test/Transforms/SLPVectorizer/X86/copyable-with-used-outside-bb.ll llvm/test/Transforms/SLPVectorizer/X86/non-schedulable-node-with-non-schedulable-parent.ll llvm/test/Transforms/SLPVectorizer/X86/split-vectorize-gathered-def-after-use.ll llvm/test/Transforms/SLPVectorizer/extract-many-users-buildvector.ll\n``````````\n\n</details>\n\n\nThe following files introduce new uses of undef:\n - llvm/test/Transforms/SLPVectorizer/X86/bv-root-part-of-graph.ll\n - llvm/test/Transforms/SLPVectorizer/X86/non-schedulable-node-with-non-schedulable-parent.ll\n\n[Undef](https://llvm.org/docs/LangRef.html#undefined-values) is now deprecated and should only be used in the rare cases where no replacement is possible. For example, a load of uninitialized memory yields `undef`. You should use `poison` values for placeholders instead.\n\nIn tests, avoid using `undef` and having tests that trigger undefined behavior. If you need an operand with some unimportant value, you can add a new argument to the function and use that instead.\n\nFor example, this is considered a bad practice:\n```llvm\ndefine void @fn() {\n  ...\n  br i1 undef, ...\n}\n```\n\nPlease use the following instead:\n```llvm\ndefine void @fn(i1 %cond) {\n  ...\n  br i1 %cond, ...\n}\n```\n\nPlease refer to the [Undefined Behavior Manual](https://llvm.org/docs/UndefinedBehavior.html) for more information.\n\n"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> Noticed by inspection, if my understanding is correct the existing logic is incorrect.\r\n> \r\n> for the following: %add = add i32 %0, %1 %add = add i32 3, %3 %add = add i32 %4, %5 %urem = urem i32 %6, %7\r\n> \r\n> Operands would contain (since `urem` will be `Copyable`):\r\n> \r\n> ```\r\n> Operands[0] = {%0, 3, %4, %6}\r\n> Operands[1] = {%1, %3, %5, %7}\r\n> ```\r\n> \r\n> With the existing logic, we would first compare `%0` and `%6`, and then compare `%1` and `%7`. What I believe is intended is to compare `%0` and `%1`, then `3` and `%3`, and so on.\r\n\r\nNo, current logic is correct. We need to find matching operands by lanes, not by operands, so comparing 0 nd 6 and 1 and 7 is what is supposed to be"
+    },
+    {
+      "author": "bababuck",
+      "body": "> > Noticed by inspection, if my understanding is correct the existing logic is incorrect.\r\n> > for the following: %add = add i32 %0, %1 %add = add i32 3, %3 %add = add i32 %4, %5 %urem = urem i32 %6, %7\r\n> > Operands would contain (since `urem` will be `Copyable`):\r\n> > ```\r\n> > Operands[0] = {%0, 3, %4, %6}\r\n> > Operands[1] = {%1, %3, %5, %7}\r\n> > ```\r\n> > \r\n> > With the existing logic, we would first compare `%0` and `%6`, and then compare `%1` and `%7`. What I believe is intended is to compare `%0` and `%1`, then `3` and `%3`, and so on.\r\n> \r\n> No, current logic is correct. We need to find matching operands by lanes, not by operands, so comparing 0 nd 6 and 1 and 7 is what is supposed to be.\r\n\r\nLet's assume %0 is not an instruction, so when we call `std::swap(Ops.front(), Ops.back())`, in the original implementation, we would be updating.\r\n```\r\nOperands[0] = {%0, 3, %4, %6}\r\nOperands[1] = {%1, %3, %5, %7}\r\n```\r\nto\r\n```\r\nOperands[0] = {%6, 3, %4, %0}\r\nOperands[1] = {%1, %3, %5, %7}\r\n```\r\nthis seems wrong to me because effectively we swapped the operands between instructions:\r\nbefore:\r\n```\r\n%add = add i32 %0, %1\r\n...\r\n%add3 = add i32 %6, %7\r\n```\r\nAfter:\r\n```\r\n%add = add i32 %6, %1\r\n...\r\n%add3 = add i32 %0, %7\r\n```"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-27T17:10:15Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        11621,
+        11637
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/bv-root-part-of-graph.ll": [
+      [
+        4,
+        19
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/copyable-with-used-outside-bb.ll": [
+      [
+        9,
+        22
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/non-schedulable-node-with-non-schedulable-parent.ll": [
+      [
+        4,
+        24
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/split-vectorize-gathered-def-after-use.ll": [
+      [
+        15,
+        23
+      ],
+      [
+        27,
+        36
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/extract-many-users-buildvector.ll": [
+      [
+        32,
+        51
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "buildInstructionsState"
+    ]
+  }
+}

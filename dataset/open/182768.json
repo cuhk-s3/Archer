@@ -1,0 +1,130 @@
+{
+  "pr_id": 182768,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/182768",
+  "state": "open",
+  "title": "[VectorCombine] Merge duplicate shuffle instruction nodes",
+  "author": "kuroyukiasuna",
+  "base_commit": "d8f778935a5bf8a173a3c1d886fd736a4ef6cf05",
+  "fix_commit": "0be5964474426dcaa98b07bf6a31023cb37157f0",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 963e6e1076eec..5eb6f3478f4ca 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -40,6 +40,7 @@\n #include <optional>\n #include <queue>\n #include <set>\n+#include <tuple>\n \n #define DEBUG_TYPE \"vector-combine\"\n #include \"llvm/Transforms/Utils/InstructionWorklist.h\"\n@@ -104,6 +105,19 @@ class VectorCombine {\n   /// RecursivelyDeleteTriviallyDeadInstructions.\n   Instruction *NextInst;\n \n+  /// Cache for deduplicating shuffle instructions with identical operands and\n+  /// masks. Maps {operand0, operand1, mask} -> existing shuffle instruction,\n+  /// prevents creating duplicate shuffles when merging parallel intrinsic\n+  /// chains.\n+  DenseMap<std::tuple<Value *, Value *, SmallVector<int>>, Value *>\n+      ShuffleCache;\n+\n+  /// Get an existing shuffle or create a new one at the earliest safe insertion\n+  /// point, deduplicates shuffles with identical operands and masks across the\n+  /// function.\n+  Value *getOrCreateShuffle(Value *V0, Value *V1, ArrayRef<int> Mask);\n+  Instruction *findEarliestInsertionPoint(Value *V0, Value *V1);\n+\n   // TODO: Direct calls from the top-level \"run\" loop use a plain \"Instruction\"\n   //       parameter. That should be updated to specific sub-classes because the\n   //       run loop was changed to dispatch on opcode.\n@@ -3323,25 +3337,15 @@ bool VectorCombine::foldShuffleOfIntrinsics(Instruction &I) {\n     return false;\n \n   SmallVector<Value *> NewArgs;\n-  SmallDenseMap<std::pair<Value *, Value *>, Value *> ShuffleCache;\n-  for (unsigned I = 0, E = II0->arg_size(); I != E; ++I)\n+  for (unsigned I = 0, E = II0->arg_size(); I != E; ++I) {\n     if (isVectorIntrinsicWithScalarOpAtArg(IID, I, &TTI)) {\n       NewArgs.push_back(II0->getArgOperand(I));\n     } else {\n-      std::pair<Value *, Value *> OperandPair =\n-          std::make_pair(II0->getArgOperand(I), II1->getArgOperand(I));\n-      auto It = ShuffleCache.find(OperandPair);\n-      if (It != ShuffleCache.end()) {\n-        // Reuse previously created shuffle for this operand pair.\n-        NewArgs.push_back(It->second);\n-        continue;\n-      }\n-      Value *Shuf = Builder.CreateShuffleVector(II0->getArgOperand(I),\n-                                                II1->getArgOperand(I), OldMask);\n-      ShuffleCache[OperandPair] = Shuf;\n+      Value *Shuf = getOrCreateShuffle(II0->getArgOperand(I),\n+                                       II1->getArgOperand(I), OldMask);\n       NewArgs.push_back(Shuf);\n-      Worklist.pushValue(Shuf);\n     }\n+  }\n   Value *NewIntrinsic = Builder.CreateIntrinsic(ShuffleDstTy, IID, NewArgs);\n \n   // Intersect flags from the old intrinsics.\n@@ -5620,9 +5624,85 @@ bool VectorCombine::shrinkPhiOfShuffles(Instruction &I) {\n   return true;\n }\n \n+/// Find the earliest point where both V0 and V1 are available\n+/// This ensures the created shuffle will dominate all its uses\n+Instruction *VectorCombine::findEarliestInsertionPoint(Value *V0, Value *V1) {\n+  Instruction *I0 = dyn_cast<Instruction>(V0);\n+  Instruction *I1 = dyn_cast<Instruction>(V1);\n+\n+  // Not an instruction = available from entry\n+  // (includes constants, arguments, globals, functions)\n+  if (!I0 && !I1) {\n+    return &*F.getEntryBlock().getFirstInsertionPt();\n+  }\n+\n+  if (!I0) { // V0 is not instruction, V1 is instruction\n+    BasicBlock::iterator It(I1);\n+    return &*(++It);\n+  }\n+\n+  if (!I1) { // V1 is not instruction, V0 is instruction\n+    BasicBlock::iterator It(I0);\n+    return &*(++It);\n+  }\n+\n+  // Both are instructions, same block\n+  if (I0->getParent() == I1->getParent()) {\n+    Instruction *Later = I0->comesBefore(I1) ? I1 : I0;\n+    BasicBlock::iterator It(Later);\n+    return &*(++It);\n+  }\n+\n+  // Different blocks, fallback to current insertion point\n+  return &*Builder.GetInsertPoint();\n+}\n+\n+Value *VectorCombine::getOrCreateShuffle(Value *V0, Value *V1,\n+                                         ArrayRef<int> Mask) {\n+  SmallVector<int, 8> MaskVec(Mask.begin(), Mask.end());\n+  std::tuple<Value *, Value *, SmallVector<int>> Key =\n+      std::make_tuple(V0, V1, MaskVec);\n+  auto It = ShuffleCache.find(Key);\n+  if (It != ShuffleCache.end()) {\n+    Value *Cached = It->getSecond();\n+    // Validate cached instruction still exists\n+    if (auto *CachedInst = dyn_cast<Instruction>(Cached)) {\n+      if (!CachedInst->getParent()) {\n+        // Dead instruction, remove from cache\n+        ShuffleCache.erase(It);\n+      } else {\n+        return Cached;\n+      }\n+    } else {\n+      return Cached;\n+    }\n+  }\n+\n+  // Find earliest safe insertion point\n+  Instruction *InsertPt = findEarliestInsertionPoint(V0, V1);\n+\n+  // Save and restore Builder insertion point\n+  IRBuilder<>::InsertPointGuard Guard(Builder);\n+  Builder.SetInsertPoint(InsertPt);\n+\n+  // Create shuffle at earliest position\n+  Value *Shuf = Builder.CreateShuffleVector(V0, V1, Mask);\n+\n+  LLVM_DEBUG(dbgs() << \"VectorCombine: Created shuffle: \" << *Shuf << '\\n');\n+\n+  // Cache and add to worklist\n+  ShuffleCache[Key] = Shuf;\n+  Worklist.pushValue(Shuf);\n+\n+  return Shuf;\n+}\n+\n /// This is the entry point for all transforms. Pass manager differences are\n /// handled in the callers of this function.\n bool VectorCombine::run() {\n+  // Clear shuffle cache\n+  ShuffleCache.clear();\n+\n   if (DisableVectorCombine)\n     return false;\n \n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "Add caching at VectorCombine level to keep track of deduplicating shuffle instructions with identical operands and masks, reuse existing nodes instead of creating duplicate shuffle instructions when running the pass.\r\n\r\nExample in the test:\r\n```\r\n  %d0 = fadd <4 x float> %a0, splat (float -1.000000e+00)\r\n  %d1 = fadd <4 x float> %a1, splat (float -1.000000e+00)\r\n  %1 = shufflevector <4 x float> %d0, <4 x float> %d1, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\r\n  %2 = call <8 x float> @llvm.fma.v8f32(<8 x float> %1, <8 x float> splat (float 0x3F8DE8D040000000), <8 x float> splat (float 0xBFB3715EE0000000))\r\n  %3 = call <8 x float> @llvm.fma.v8f32(<8 x float> %2, <8 x float> %1, <8 x float> splat (float 0x3FC82778A0000000))\r\n  %4 = call <8 x float> @llvm.fma.v8f32(<8 x float> %3, <8 x float> %1, <8 x float> splat (float 0xBFD493F7E0000000))\r\n  %5 = call <8 x float> @llvm.fma.v8f32(<8 x float> %4, <8 x float> %1, <8 x float> splat (float 0x3FDE311220000000))\r\n  %6 = call <8 x float> @llvm.fma.v8f32(<8 x float> %5, <8 x float> %1, <8 x float> splat (float 0xBFE70BF2A0000000))\r\n  %res = call <8 x float> @llvm.fma.v8f32(<8 x float> %6, <8 x float> %1, <8 x float> splat (float 0x3FF71507C0000000))\r\n  ret <8 x float> %res\r\n```\r\n\r\nAlso, this PR removes the existing local `ShuffleCache` in `VectorCombine::foldShuffleOfIntrinsics` as it's redundant after introducing the global cache.\r\n\r\nFixes #170665",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/VectorCombine/AArch64/shuffle-of-intrinscis.ll",
+      "commands": [
+        "opt -mtriple=aarch64 -passes=vector-combine -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test3",
+          "test_body": "define <8 x i32> @test3(<4 x i32> %0, <4 x i32> %1, <4 x i32> %2, <4 x i32> %3) {\nentry:\n  %4 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %0, <4 x i32> %1)\n  %5 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %2, <4 x i32> %3)\n  %6 = shufflevector <4 x i32> %4, <4 x i32> %5, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x i32> %6\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/fma-shuffle-dedup.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -mtriple=x86_64-- -mcpu=x86-64-v3 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fma_parallel_chains",
+          "test_body": "define <8 x float> @fma_parallel_chains(<4 x float> %a0, <4 x float> %a1) {\n  %d0 = fadd <4 x float> %a0, splat (float -1.000000e+00)\n  %l0 = call <4 x float> @llvm.fma.v4f32(<4 x float> %d0, <4 x float> splat (float 0x3F8DE8D040000000), <4 x float> splat (float 0xBFB3715EE0000000))\n  %l1 = call <4 x float> @llvm.fma.v4f32(<4 x float> %l0, <4 x float> %d0, <4 x float> splat (float 0x3FC82778A0000000))\n  %l2 = call <4 x float> @llvm.fma.v4f32(<4 x float> %l1, <4 x float> %d0, <4 x float> splat (float 0xBFD493F7E0000000))\n  %l3 = call <4 x float> @llvm.fma.v4f32(<4 x float> %l2, <4 x float> %d0, <4 x float> splat (float 0x3FDE311220000000))\n  %l4 = call <4 x float> @llvm.fma.v4f32(<4 x float> %l3, <4 x float> %d0, <4 x float> splat (float 0xBFE70BF2A0000000))\n  %l5 = call <4 x float> @llvm.fma.v4f32(<4 x float> %l4, <4 x float> %d0, <4 x float> splat (float 0x3FF71507C0000000))\n  %d1 = fadd <4 x float> %a1, splat (float -1.000000e+00)\n  %h0 = call <4 x float> @llvm.fma.v4f32(<4 x float> %d1, <4 x float> splat (float 0x3F8DE8D040000000), <4 x float> splat (float 0xBFB3715EE0000000))\n  %h1 = call <4 x float> @llvm.fma.v4f32(<4 x float> %h0, <4 x float> %d1, <4 x float> splat (float 0x3FC82778A0000000))\n  %h2 = call <4 x float> @llvm.fma.v4f32(<4 x float> %h1, <4 x float> %d1, <4 x float> splat (float 0xBFD493F7E0000000))\n  %h3 = call <4 x float> @llvm.fma.v4f32(<4 x float> %h2, <4 x float> %d1, <4 x float> splat (float 0x3FDE311220000000))\n  %h4 = call <4 x float> @llvm.fma.v4f32(<4 x float> %h3, <4 x float> %d1, <4 x float> splat (float 0xBFE70BF2A0000000))\n  %h5 = call <4 x float> @llvm.fma.v4f32(<4 x float> %h4, <4 x float> %d1, <4 x float> splat (float 0x3FF71507C0000000))\n  %res = shufflevector <4 x float> %l5, <4 x float> %h5, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x float> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/shuffle-of-intrinsics.ll",
+      "commands": [
+        "opt -mtriple=x86_64-- -mcpu=x86-64 -passes=vector-combine -S %s",
+        "opt -mtriple=x86_64-- -mcpu=x86-64-v2 -passes=vector-combine -S %s",
+        "opt -mtriple=x86_64-- -mcpu=x86-64-v3 -passes=vector-combine -S %s",
+        "opt -mtriple=x86_64-- -mcpu=x86-64-v4 -passes=vector-combine -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_multiuse_one_side",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.abs.v4i32(<4 x i32>, i1 immarg) #0\n\ndefine <8 x i32> @test_multiuse_one_side(<4 x i32> %0, <4 x i32> %1) {\nentry:\n  %a = call <4 x i32> @llvm.abs.v4i32(<4 x i32> %0, i1 false)\n  %extra_use = extractelement <4 x i32> %a, i32 0\n  %b = call <4 x i32> @llvm.abs.v4i32(<4 x i32> %1, i1 false)\n  %r = shufflevector <4 x i32> %a, <4 x i32> %b, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  %res = add i32 %extra_use, 1\n  ret <8 x i32> %r\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test3",
+          "test_body": "define <8 x i32> @test3(<4 x i32> %0, <4 x i32> %1, <4 x i32> %2, <4 x i32> %3) {\nentry:\n  %4 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %0, <4 x i32> %1)\n  %5 = call <4 x i32> @llvm.smax.v4i32(<4 x i32> %2, <4 x i32> %3)\n  %6 = shufflevector <4 x i32> %4, <4 x i32> %5, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x i32> %6\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.smax.v4i32(<4 x i32>, <4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test7",
+          "test_body": "define <8 x float> @test7(<4 x float> %x0, <4 x float> %x1, <4 x float> %y0, <4 x float> %y1) {\n  %l0 = call <4 x float> @llvm.fma.v4f32(<4 x float> %x0, <4 x float> %x0, <4 x float> zeroinitializer)\n  %l1 = call <4 x float> @llvm.fma.v4f32(<4 x float> %x1, <4 x float> %x1, <4 x float> %l0)\n  %h0 = call <4 x float> @llvm.fma.v4f32(<4 x float> %y0, <4 x float> %y0, <4 x float> zeroinitializer)\n  %h1 = call <4 x float> @llvm.fma.v4f32(<4 x float> %y1, <4 x float> %y1, <4 x float> %h0)\n  %res = shufflevector <4 x float> %l1, <4 x float> %h1, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x float> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test6",
+          "test_body": "define <2 x float> @test6(<4 x float> %a1, <4 x float> %b1, <4 x float> %c1, <4 x float> %a2, <4 x float> %b2, <4 x float> %c2) {\n  %f1 = call <4 x float> @llvm.fma.v4f32(<4 x float> %a1, <4 x float> %b1, <4 x float> %c1)\n  %f2 = call <4 x float> @llvm.fma.v4f32(<4 x float> %a2, <4 x float> %b2, <4 x float> %c2)\n  %s = shufflevector <4 x float> %f1, <4 x float> %f2, <2 x i32> <i32 0, i32 4>\n  ret <2 x float> %s\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "dtcxzyw",
+      "body": "Compile-time: https://llvm-compile-time-tracker.com/compare.php?from=844619e52653d084c898131e890e0c2411033e67&to=49c9baa21bad7168a22eed0c24f822241c5c236e&stat=instructions:u"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-22T19:45:34Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        40,
+        45
+      ],
+      [
+        104,
+        109
+      ],
+      [
+        3323,
+        3347
+      ],
+      [
+        5620,
+        5628
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/AArch64/shuffle-of-intrinscis.ll": [
+      [
+        35,
+        41
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/X86/shuffle-of-intrinsics.ll": [
+      [
+        38,
+        44
+      ],
+      [
+        103,
+        109
+      ],
+      [
+        131,
+        138
+      ],
+      [
+        164,
+        172
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::foldShuffleOfIntrinsics",
+      "VectorCombine::run",
+      "VectorCombine::shrinkPhiOfShuffles"
+    ]
+  }
+}

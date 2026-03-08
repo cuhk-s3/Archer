@@ -1,0 +1,1179 @@
+{
+  "pr_id": 183729,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/183729",
+  "state": "closed",
+  "title": "[VPlan] Don't adjust trip count for DataAndControlFlowWithoutRuntimeCheck",
+  "author": "lukel97",
+  "base_commit": "5f22decefac061c6e1e01804d46669a8c3ebc06c",
+  "fix_commit": "ab6cc99bf765592efe54f01130e5615afd62b480",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 4c393f2f6f05a..3c2396626b5d7 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -2944,8 +2944,7 @@ void VPlanTransforms::addActiveLaneMask(\n       cast<VPWidenCanonicalIVRecipe>(*FoundWidenCanonicalIVUser);\n   VPSingleDefRecipe *LaneMask;\n   if (UseActiveLaneMaskForControlFlow) {\n-    LaneMask = addVPLaneMaskPhiAndUpdateExitBranch(\n-        Plan, DataAndControlFlowWithoutRuntimeCheck);\n+    LaneMask = addVPLaneMaskPhiAndUpdateExitBranch(Plan, false);\n   } else {\n     VPBuilder B = VPBuilder::getToInsertAfter(WideCanonicalIV);\n     VPValue *ALMMultiplier =\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Previously, the canonical IV increment may have overflowed to a non-zero value due to vscale being a non power-of-two. So we used to emit a runtime check for this.\r\n\r\nIf you didn't want the runtime check, DataAndControlFlowWithoutRuntimeCheck skipped it and instead tweaked the trip count so it wouldn't overflow.\r\n\r\nHowever #144963 stopped the check from ever being emitted because vscale is always a power-of-two on AArch64 and RISC-V, so it never overflowed to a non-zero value. And in #183292 the code to emit the check was removed. But we never restored the trip count back to normal when the target's vscale was a power-of-two. \r\n\r\nNow that vscale is always a power-of-two, this PR avoids adjusting it. A follow up NFC can then remove DataAndControlFlowWithoutRuntimeCheck.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/conditional-branches-cost.ll",
+      "commands": [
+        "opt -p loop-vectorize -S %s",
+        "opt -p loop-vectorize  -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "multiple_exit_conditions",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx14.0.0\"\n\ndefine void @multiple_exit_conditions(ptr %src, ptr noalias %dst) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %ptr.iv = phi ptr [ %dst, %entry ], [ %ptr.iv.next, %loop ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %l = load i16, ptr %src, align 2\n  %o = or i16 %l, 1\n  %conv = uitofp i16 %o to double\n  store double %conv, ptr %ptr.iv, align 8\n  %iv.next = add nsw i64 %iv, 2\n  %ptr.iv.next = getelementptr i8, ptr %ptr.iv, i64 8\n  %iv.clamp = and i64 %iv, 4294967294\n  %ec = icmp eq i64 %iv.clamp, 512\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"neoverse-512tvb\" }\n"
+        },
+        {
+          "test_name": "header_mask_and_invariant_compare",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx14.0.0\"\n\ndefine i32 @header_mask_and_invariant_compare(ptr %A, ptr %B, ptr %C, ptr %D, ptr %E, i64 %N) #0 {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %l.A = load i32, ptr %A, align 4\n  %l.B = load i32, ptr %B, align 4\n  %or = or i32 %l.B, %l.A\n  %l.C = load i32, ptr %C, align 4\n  %c.0 = icmp ugt i32 %l.C, %or\n  br i1 %c.0, label %if.then, label %loop.latch\n\nif.then:                                          ; preds = %loop.header\n  %gep.D = getelementptr i32, ptr %D, i64 %iv\n  store i32 %or, ptr %E, align 4\n  store i32 0, ptr %gep.D, align 4\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %if.then, %loop.header\n  %iv.next = add i64 %iv, 1\n  %c.1 = icmp eq i64 %iv, %N\n  br i1 %c.1, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret i32 0\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n"
+        },
+        {
+          "test_name": "pred_udiv_select_cost",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx14.0.0\"\n\ndefine void @pred_udiv_select_cost(ptr %A, ptr %B, ptr %C, i64 %n, i8 %y) #0 {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep.A = getelementptr i8, ptr %A, i64 %iv\n  %l.1 = load i8, ptr %gep.A, align 1\n  %l.1.to.float = uitofp i8 %l.1 to float\n  %gep.B = getelementptr i8, ptr %B, i64 %iv\n  %l.2 = load i8, ptr %gep.B, align 1\n  %c = icmp eq i8 %l.2, 0\n  br i1 %c, label %loop.latch, label %else\n\nelse:                                             ; preds = %loop.header\n  %x = xor i8 %l.1, 1\n  %ud = udiv i8 %x, %y\n  %c.sel = icmp ugt i8 %ud, 1\n  %sel = select i1 %c.sel, i32 0, i32 255\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %else, %loop.header\n  %p = phi i32 [ %sel, %else ], [ 0, %loop.header ]\n  %l.1.ext = zext i8 %l.1 to i32\n  %sub = sub i32 %p, %l.1.ext\n  %sub.to.float = sitofp i32 %sub to float\n  %muladd = tail call float @llvm.fmuladd.f32(float %sub.to.float, float 3.000000e+00, float %l.1.to.float)\n  %muladd.conv = fptoui float %muladd to i8\n  %gep.C = getelementptr i8, ptr %C, i64 %iv\n  store i8 %muladd.conv, ptr %gep.C, align 1\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, %n\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fmuladd.f32(float, float, float) #1\n\nattributes #0 = { \"target-cpu\"=\"neoverse-512tvb\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/conditional-scalar-assignment-fold-tail.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -prefer-predicate-over-epilogue=predicate-dont-vectorize -mattr=+sve -S < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "non_speculatable_find_last_reduction",
+          "test_body": "target triple = \"aarch64-linux-gnu\"\n\ndefine i32 @non_speculatable_find_last_reduction(ptr noalias %a, ptr noalias %b, i32 %default_val, i64 %N, i32 %threshold) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %latch ]\n  %data.phi = phi i32 [ %default_val, %entry ], [ %select.data, %latch ]\n  %a.addr = getelementptr inbounds nuw i32, ptr %a, i64 %iv\n  %ld.a = load i32, ptr %a.addr, align 4\n  %if.cond = icmp sgt i32 %ld.a, %threshold\n  br i1 %if.cond, label %if.then, label %latch\n\nif.then:                                          ; preds = %loop\n  %b.addr = getelementptr inbounds nuw i32, ptr %b, i64 %iv\n  %ld.b = load i32, ptr %b.addr, align 4\n  br label %latch\n\nlatch:                                            ; preds = %if.then, %loop\n  %select.data = phi i32 [ %ld.b, %if.then ], [ %data.phi, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %latch\n  ret i32 %select.data\n}\n"
+        },
+        {
+          "test_name": "simple_find_last_reduction",
+          "test_body": "target triple = \"aarch64-linux-gnu\"\n\ndefine i32 @simple_find_last_reduction(i64 %N, ptr %data, i32 %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %data.phi = phi i32 [ -1, %entry ], [ %select.data, %loop ]\n  %ld.addr = getelementptr inbounds i32, ptr %data, i64 %iv\n  %ld = load i32, ptr %ld.addr, align 4\n  %select.cmp = icmp slt i32 %a, %ld\n  %select.data = select i1 %select.cmp, i32 %ld, i32 %data.phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %select.data\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/divs-with-scalable-vfs.ll",
+      "commands": [
+        "opt -p loop-vectorize -mtriple aarch64 -mcpu=neoverse-v1 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "udiv_urem_feeding_gep",
+          "test_body": "define void @udiv_urem_feeding_gep(i64 %x, ptr %dst, i64 %N) {\nentry:\n  %mul.1.i = mul i64 %x, %x\n  %mul.2.i = mul i64 %mul.1.i, %x\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %div.i = udiv i64 %iv, %mul.2.i\n  %rem.i = urem i64 %iv, %mul.2.i\n  %div.1.i = udiv i64 %rem.i, %mul.1.i\n  %rem.1.i = urem i64 %rem.i, %mul.1.i\n  %div.2.i = udiv i64 %rem.1.i, %x\n  %rem.2.i = urem i64 %rem.1.i, %x\n  %mul.i = mul i64 %x, %div.i\n  %add.i = add i64 %mul.i, %div.1.i\n  %mul.1.i9 = mul i64 %add.i, %x\n  %add.1.i = add i64 %mul.1.i9, %div.2.i\n  %mul.2.i11 = mul i64 %add.1.i, %x\n  %add.2.i = add i64 %mul.2.i11, %rem.2.i\n  %sext.i = shl i64 %add.2.i, 32\n  %conv6.i = ashr i64 %sext.i, 32\n  %gep = getelementptr i64, ptr %dst, i64 %conv6.i\n  store i64 %div.i, ptr %gep, align 4\n  %iv.next = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv, %N\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "sdiv_feeding_gep_predicated",
+          "test_body": "define void @sdiv_feeding_gep_predicated(ptr %dst, i32 %x, i64 %M, i64 %conv6, i64 %N) {\nentry:\n  %conv61 = zext i32 %x to i64\n  br label %loop\n\nloop:                                             ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %c = icmp ule i64 %iv, %M\n  br i1 %c, label %then, label %loop.latch\n\nthen:                                             ; preds = %loop\n  %div18 = sdiv i64 %M, %conv6\n  %conv20 = trunc i64 %div18 to i32\n  %mul30 = mul i64 %div18, %conv61\n  %sub31 = sub i64 %iv, %mul30\n  %conv34 = trunc i64 %sub31 to i32\n  %mul35 = mul i32 %x, %conv20\n  %add36 = add i32 %mul35, %conv34\n  %idxprom = sext i32 %add36 to i64\n  %gep = getelementptr double, ptr %dst, i64 %idxprom\n  store double 0.000000e+00, ptr %gep, align 8\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %then, %loop\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, %N\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop.latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/fixed-wide-lane-mask.ll",
+      "commands": [
+        "-force-vector-width=4 -force-vector-interleave=1 < %s",
+        "-force-vector-width=4 -force-vector-interleave=4 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fixed_wide_active_lane_mask",
+          "test_body": "target triple = \"aarch64-unknown-linux\"\n\n; Function Attrs: nounwind\ndefine void @fixed_wide_active_lane_mask(ptr noalias %dst, ptr noalias readonly %src, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %ld = load i32, ptr %src, align 4\n  %arrayidx = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 %ld, ptr %arrayidx, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { nounwind \"target-features\"=\"+neon,+sve\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/induction-costs-sve.ll",
+      "commands": [
+        "opt -p loop-vectorize -S %s",
+        "opt -p loop-vectorize -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "iv_casts",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx14.0.0\"\n\ndefine void @iv_casts(ptr %dst, ptr %src, i32 %x, i64 %N) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.src = getelementptr i8, ptr %src, i64 %iv\n  %l = load i8, ptr %gep.src, align 1\n  %l.ext = zext i8 %l to i32\n  %mul = mul i32 %l.ext, %x\n  %iv.next = add i64 %iv, 1\n  %l.ext.2 = zext i8 %l to i32\n  %or = or i32 %mul, %l.ext.2\n  %lshr = lshr i32 %or, 1\n  %trunc = trunc i32 %lshr to i8\n  %gep.dst = getelementptr i8, ptr %dst, i64 %iv\n  store i8 %trunc, ptr %gep.dst, align 1\n  %ec = icmp eq i64 %iv, %N\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/masked-call-scalarize.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,instsimplify -force-vector-interleave=1 -S",
+        "opt < %s -passes=loop-vectorize,instsimplify,simplifycfg -force-vector-interleave=1 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S",
+        "opt < %s -passes=loop-vectorize,instsimplify,simplifycfg -force-vector-interleave=1 -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue -S",
+        "opt < %s -passes=loop-vectorize,instsimplify,simplifycfg -force-vector-interleave=2 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_widen_exp_v2",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @test_widen_exp_v2(ptr noalias %p2, ptr noalias %p, i64 %n) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.end, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.end ]\n  %ld = load double, ptr %p2, align 8\n  %exp = tail call double @llvm.exp.f64(double %ld) #2\n  %cond1 = fcmp ogt double %exp, 0.000000e+00\n  br i1 %cond1, label %loop.middle, label %loop.end\n\nloop.middle:                                      ; preds = %loop\n  br label %loop.end\n\nloop.end:                                         ; preds = %loop.middle, %loop\n  %sink = phi double [ 0.000000e+00, %loop.middle ], [ 1.000000e+00, %loop ]\n  store double %sink, ptr %p, align 8\n  %iv.next = add i64 %iv, 1\n  %cond2 = icmp eq i64 %iv, %n\n  br i1 %cond2, label %end, label %loop, !llvm.loop !0\n\nend:                                              ; preds = %loop.end\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.exp.f64(double) #1\n\nattributes #0 = { vscale_range(1,16) \"target-cpu\"=\"neoverse-v2\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #2 = { \"vector-function-abi-variant\"=\"_ZGV_LLVM_N2v_llvm.exp.f64(exp_fixed),_ZGVsMxv_llvm.exp.f64(exp_masked_scalable)\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 2}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/masked-call.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,instsimplify -force-vector-interleave=1 -S",
+        "opt < %s -passes=loop-vectorize,instsimplify,simplifycfg -force-vector-interleave=1 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S",
+        "opt < %s -passes=loop-vectorize,instsimplify,simplifycfg -force-vector-interleave=1 -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue -S",
+        "opt < %s -passes=loop-vectorize,instsimplify,simplifycfg -force-vector-interleave=2 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_widen_exp_v2",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @test_widen_exp_v2(ptr noalias %p2, ptr noalias %p, i64 %n) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.end, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.end ]\n  %ld = load double, ptr %p2, align 8\n  %exp = tail call double @llvm.exp.f64(double %ld) #2\n  %cond1 = fcmp ogt double %exp, 0.000000e+00\n  br i1 %cond1, label %loop.middle, label %loop.end\n\nloop.middle:                                      ; preds = %loop\n  br label %loop.end\n\nloop.end:                                         ; preds = %loop.middle, %loop\n  %sink = phi double [ 0.000000e+00, %loop.middle ], [ 1.000000e+00, %loop ]\n  store double %sink, ptr %p, align 8\n  %iv.next = add i64 %iv, 1\n  %cond2 = icmp eq i64 %iv, %n\n  br i1 %cond2, label %end, label %loop\n\nend:                                              ; preds = %loop.end\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.exp.f64(double) #1\n\nattributes #0 = { vscale_range(1,16) \"target-cpu\"=\"neoverse-v2\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #2 = { \"vector-function-abi-variant\"=\"_ZGV_LLVM_N2v_llvm.exp.f64(exp_fixed),_ZGVsMxv_llvm.exp.f64(exp_masked_scalable)\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/optsize_minsize.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -S < %s",
+        "opt -passes=forceattrs,loop-vectorize -force-attribute=optsize -S < %s",
+        "opt -passes=forceattrs,loop-vectorize -force-attribute=minsize -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sve_tail_predicate_without_minsize",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @sve_tail_predicate_without_minsize(ptr %p, i8 %a, i8 %b, i8 %c, i32 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %0 = trunc nuw nsw i64 %iv to i8\n  %mul = mul i8 %a, %0\n  %shr = lshr i8 %0, 1\n  %mul5 = mul i8 %shr, %b\n  %add = add i8 %mul5, %mul\n  %shr7 = lshr i8 %0, 2\n  %mul9 = mul i8 %shr7, %c\n  %add10 = add i8 %add, %mul9\n  %arrayidx = getelementptr inbounds i8, ptr %p, i64 %iv\n  store i8 %add10, ptr %arrayidx, align 1\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 15\n  br i1 %exitcond.not, label %for.cond.cleanup, label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-dot-product.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-interleave=1 -enable-epilogue-vectorization=false -S < %s",
+        "opt -passes=loop-vectorize -enable-epilogue-vectorization=false -S < %s",
+        "opt -passes=loop-vectorize -force-vector-interleave=1 -vectorizer-maximize-bandwidth -enable-epilogue-vectorization=false -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "dotp_predicated",
+          "test_body": "target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"aarch64-none-unknown-elf\"\n\n; Function Attrs: vscale_range(1,16)\ndefine i32 @dotp_predicated(i64 %N, ptr %a, ptr %b) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %accum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %gep.a = getelementptr inbounds i8, ptr %a, i64 %iv\n  %load.a = load i8, ptr %gep.a, align 1\n  %ext.a = sext i8 %load.a to i32\n  %gep.b = getelementptr inbounds i8, ptr %b, i64 %iv\n  %load.b = load i8, ptr %gep.b, align 1\n  %ext.b = sext i8 %load.b to i32\n  %mul = mul nsw i32 %ext.b, %ext.a\n  %add = add nsw i32 %mul, %accum\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %N\n  br i1 %exitcond.not, label %exit, label %for.body, !llvm.loop !0\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.mustprogress\"}\n!2 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n!3 = !{!\"llvm.loop.vectorize.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/reduction-recurrence-costs-sve.ll",
+      "commands": [
+        "opt -p loop-vectorize -S %s",
+        "opt -p loop-vectorize -mcpu=neoverse-v1 -S %s",
+        "opt -p loop-vectorize -mcpu=neoverse-v1 -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "reduce_udiv",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx14.0.0\"\n\ndefine i16 @reduce_udiv(ptr %src, i16 %x, i64 %N) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %red = phi i16 [ 0, %entry ], [ %red.next, %loop ]\n  %gep = getelementptr i16, ptr %src, i64 %iv\n  %l = load i16, ptr %gep, align 2\n  %div = udiv i16 %l, %x\n  %red.next = or i16 %div, %red\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, %N\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i16 %red.next\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n"
+        },
+        {
+          "test_name": "chained_recurrences",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx14.0.0\"\n\ndefine i32 @chained_recurrences(i32 %x, i64 %y, ptr %src.1, i32 %z, ptr %src.2) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %0 = phi i32 [ 0, %entry ], [ %3, %loop ]\n  %1 = phi i32 [ 0, %entry ], [ %0, %loop ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %sum.red = phi i32 [ 0, %entry ], [ %red.2, %loop ]\n  %2 = add i64 %y, 1\n  %gep.1 = getelementptr i32, ptr %src.1, i64 %2\n  %3 = load i32, ptr %gep.1, align 4\n  %or3 = or i32 %1, %x\n  %iv.next = add i64 %iv, 1\n  %shr = lshr i32 %x, 1\n  %4 = shl i32 %or3, 1\n  %5 = or i32 %4, 2\n  %shl19 = shl i32 %x, 1\n  %6 = or i32 %shr, %shl19\n  %7 = or i32 %6, %5\n  %8 = or i32 %7, %x\n  %or20 = or i32 %z, %x\n  %not = and i32 %or20, 1\n  %and = xor i32 %not, 1\n  %idx.ext.1 = zext i32 %and to i64\n  %gep.2 = getelementptr i32, ptr %src.2, i64 %idx.ext.1\n  %9 = load i32, ptr %gep.2, align 4\n  %shr24 = lshr i32 %8, 1\n  %idx.ext.2 = zext i32 %shr24 to i64\n  %gep.3 = getelementptr i32, ptr %src.2, i64 %idx.ext.2\n  %10 = load i32, ptr %gep.3, align 4\n  %red.1 = or i32 %9, %sum.red\n  %red.2 = or i32 %red.1, %10\n  %ec = icmp eq i64 %iv, %y\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %red.2\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/scalable-reductions-tf.ll",
+      "commands": [
+        "-mtriple aarch64-unknown-linux-gnu -mattr=+sve -S"
+      ],
+      "tests": [
+        {
+          "test_name": "invariant_store_red_exit_is_phi",
+          "test_body": "define void @invariant_store_red_exit_is_phi(ptr %dst, ptr readonly %src, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %red = phi i32 [ 0, %entry ], [ %storemerge, %for.body ]\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %arrayidx6 = getelementptr inbounds i32, ptr %src, i64 %indvars.iv\n  %load = load i32, ptr %arrayidx6, align 4\n  %storemerge = add i32 %red, %load\n  store i32 %storemerge, ptr %dst, align 4\n  %indvars.iv.next = add nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, %n\n  br i1 %exitcond.not, label %for.end.loopexit, label %for.body, !llvm.loop !0\n\nfor.end.loopexit:                                 ; preds = %for.body\n  br label %for.end\n\nfor.end:                                          ; preds = %for.end.loopexit\n  ret void\n}\n\n!0 = distinct !{!0, !1, !2, !3, !4}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n!3 = !{!\"llvm.loop.interleave.count\", i32 1}\n!4 = !{!\"llvm.loop.vectorize.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/scalable-strict-fadd.ll",
+      "commands": [
+        "-force-ordered-reductions=false -hints-allow-reordering=false -S",
+        "-force-ordered-reductions=false -hints-allow-reordering=true  -S",
+        "-force-ordered-reductions=true  -hints-allow-reordering=false -S",
+        "-force-ordered-reductions=true  -hints-allow-reordering=true  -S",
+        "-hints-allow-reordering=false -S",
+        "-hints-allow-reordering=false -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fmuladd_strict",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine float @fmuladd_strict(ptr %a, ptr %b, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %sum.07 = phi float [ 0.000000e+00, %entry ], [ %muladd, %for.body ]\n  %arrayidx = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %arrayidx, align 4\n  %arrayidx2 = getelementptr inbounds float, ptr %b, i64 %iv\n  %1 = load float, ptr %arrayidx2, align 4\n  %muladd = tail call float @llvm.fmuladd.f32(float %0, float %1, float %sum.07)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body\n  ret float %muladd\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fmuladd.f32(float, float, float) #1\n\nattributes #0 = { vscale_range(1,16) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 8}\n!2 = !{!\"llvm.loop.interleave.count\", i32 4}\n!3 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "fadd_strict_interleave",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine void @fadd_strict_interleave(ptr noalias nocapture readonly %a, ptr noalias nocapture readonly %b, i64 %n) #0 {\nentry:\n  %arrayidxa = getelementptr inbounds float, ptr %a, i64 1\n  %a1 = load float, ptr %a, align 4\n  %a2 = load float, ptr %arrayidxa, align 4\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %add.phi1 = phi float [ %a2, %entry ], [ %add2, %for.body ]\n  %add.phi2 = phi float [ %a1, %entry ], [ %add1, %for.body ]\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidxb1 = getelementptr inbounds float, ptr %b, i64 %iv\n  %0 = load float, ptr %arrayidxb1, align 4\n  %add1 = fadd float %0, %add.phi2\n  %or = or disjoint i64 %iv, 1\n  %arrayidxb2 = getelementptr inbounds float, ptr %b, i64 %or\n  %1 = load float, ptr %arrayidxb2, align 4\n  %add2 = fadd float %1, %add.phi1\n  %iv.next = add nuw nsw i64 %iv, 2\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body\n  store float %add1, ptr %a, align 4\n  store float %add2, ptr %arrayidxa, align 4\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.interleave.count\", i32 1}\n!3 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "fadd_strict",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine float @fadd_strict(ptr noalias nocapture readonly %a, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %sum.07 = phi float [ 0.000000e+00, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %arrayidx, align 4\n  %add = fadd float %0, %sum.07\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body\n  ret float %add\n}\n\nattributes #0 = { vscale_range(1,16) }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 8}\n!2 = !{!\"llvm.loop.interleave.count\", i32 1}\n!3 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "fadd_strict_unroll",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine float @fadd_strict_unroll(ptr noalias nocapture readonly %a, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %sum.07 = phi float [ 0.000000e+00, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %arrayidx, align 4\n  %add = fadd float %0, %sum.07\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body\n  ret float %add\n}\n\nattributes #0 = { vscale_range(1,16) }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 8}\n!2 = !{!\"llvm.loop.interleave.count\", i32 4}\n!3 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "fadd_conditional",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine float @fadd_conditional(ptr noalias nocapture readonly %a, ptr noalias nocapture readonly %b, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.inc ]\n  %res = phi float [ 1.000000e+00, %entry ], [ %fadd, %for.inc ]\n  %arrayidx = getelementptr inbounds float, ptr %b, i64 %iv\n  %0 = load float, ptr %arrayidx, align 4\n  %tobool = fcmp une float %0, 0.000000e+00\n  br i1 %tobool, label %if.then, label %for.inc\n\nif.then:                                          ; preds = %for.body\n  %arrayidx2 = getelementptr inbounds float, ptr %a, i64 %iv\n  %1 = load float, ptr %arrayidx2, align 4\n  br label %for.inc\n\nfor.inc:                                          ; preds = %if.then, %for.body\n  %phi = phi float [ %1, %if.then ], [ 3.000000e+00, %for.body ]\n  %fadd = fadd float %res, %phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.inc\n  %rdx = phi float [ %fadd, %for.inc ]\n  ret float %rdx\n}\n\nattributes #0 = { vscale_range(1,16) }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.interleave.count\", i32 1}\n!3 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "fadd_of_sum",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine float @fadd_of_sum(ptr noalias nocapture readonly %a, ptr noalias nocapture readonly %b, i64 %n) #0 {\nentry:\n  %arrayidx = getelementptr inbounds float, ptr %a, i64 1\n  %0 = load float, ptr %arrayidx, align 4\n  %cmp1 = fcmp ogt float %0, 5.000000e-01\n  br i1 %cmp1, label %for.body, label %for.end\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %res.014 = phi float [ 0.000000e+00, %entry ], [ %rdx, %for.body ]\n  %arrayidx2 = getelementptr inbounds float, ptr %a, i64 %iv\n  %1 = load float, ptr %arrayidx2, align 4\n  %arrayidx4 = getelementptr inbounds float, ptr %b, i64 %iv\n  %2 = load float, ptr %arrayidx4, align 4\n  %add = fadd float %1, %2\n  %rdx = fadd float %res.014, %add\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body, %entry\n  %res = phi float [ 0.000000e+00, %entry ], [ %rdx, %for.body ]\n  ret float %res\n}\n\nattributes #0 = { vscale_range(1,16) }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.interleave.count\", i32 1}\n!3 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "fmuladd_strict_fmf",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine float @fmuladd_strict_fmf(ptr %a, ptr %b, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %sum.07 = phi float [ 0.000000e+00, %entry ], [ %muladd, %for.body ]\n  %arrayidx = getelementptr inbounds float, ptr %a, i64 %iv\n  %0 = load float, ptr %arrayidx, align 4\n  %arrayidx2 = getelementptr inbounds float, ptr %b, i64 %iv\n  %1 = load float, ptr %arrayidx2, align 4\n  %muladd = tail call nnan float @llvm.fmuladd.f32(float %0, float %1, float %sum.07)\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body\n  ret float %muladd\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fmuladd.f32(float, float, float) #1\n\nattributes #0 = { vscale_range(1,16) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!0 = distinct !{!0, !1, !2, !3}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 8}\n!2 = !{!\"llvm.loop.interleave.count\", i32 4}\n!3 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/scalable-struct-return.ll",
+      "commands": [
+        "opt < %s -mattr=+sve -passes=loop-vectorize -force-vector-interleave=1 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S"
+      ],
+      "tests": [
+        {
+          "test_name": "struct_return_f32_widen",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @struct_return_f32_widen(ptr noalias %in, ptr noalias writeonly %out_a, ptr noalias writeonly %out_b) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds float, ptr %in, i64 %iv\n  %in_val = load float, ptr %arrayidx, align 4\n  %call = tail call { float, float } @foo(float %in_val) #0\n  %extract_a = extractvalue { float, float } %call, 0\n  %extract_b = extractvalue { float, float } %call, 1\n  %arrayidx2 = getelementptr inbounds float, ptr %out_a, i64 %iv\n  store float %extract_a, ptr %arrayidx2, align 4\n  %arrayidx4 = getelementptr inbounds float, ptr %out_b, i64 %iv\n  store float %extract_b, ptr %arrayidx4, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 1024\n  br i1 %exitcond.not, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n\ndeclare { float, float } @foo(float)\n\nattributes #0 = { nounwind \"vector-function-abi-variant\"=\"_ZGVsMxv_foo(scalable_vec_masked_foo)\" }\n"
+        },
+        {
+          "test_name": "struct_return_f32_widen_rt_checks",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @struct_return_f32_widen_rt_checks(ptr %in, ptr writeonly %out_a, ptr writeonly %out_b) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds float, ptr %in, i64 %iv\n  %in_val = load float, ptr %arrayidx, align 4\n  %call = tail call { float, float } @foo(float %in_val) #0\n  %extract_a = extractvalue { float, float } %call, 0\n  %extract_b = extractvalue { float, float } %call, 1\n  %arrayidx2 = getelementptr inbounds float, ptr %out_a, i64 %iv\n  store float %extract_a, ptr %arrayidx2, align 4\n  %arrayidx4 = getelementptr inbounds float, ptr %out_b, i64 %iv\n  store float %extract_b, ptr %arrayidx4, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 1024\n  br i1 %exitcond.not, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n\ndeclare { float, float } @foo(float)\n\nattributes #0 = { nounwind \"vector-function-abi-variant\"=\"_ZGVsMxv_foo(scalable_vec_masked_foo)\" }\n"
+        },
+        {
+          "test_name": "struct_return_f64_widen",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @struct_return_f64_widen(ptr noalias %in, ptr noalias writeonly %out_a, ptr noalias writeonly %out_b) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds double, ptr %in, i64 %iv\n  %in_val = load double, ptr %arrayidx, align 8\n  %call = tail call { double, double } @bar(double %in_val) #0\n  %extract_a = extractvalue { double, double } %call, 0\n  %extract_b = extractvalue { double, double } %call, 1\n  %arrayidx2 = getelementptr inbounds double, ptr %out_a, i64 %iv\n  store double %extract_a, ptr %arrayidx2, align 8\n  %arrayidx4 = getelementptr inbounds double, ptr %out_b, i64 %iv\n  store double %extract_b, ptr %arrayidx4, align 8\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 1024\n  br i1 %exitcond.not, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n\ndeclare { double, double } @bar(double)\n\nattributes #0 = { nounwind \"vector-function-abi-variant\"=\"_ZGVsMxv_bar(scalable_vec_masked_bar)\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/store-costs-sve.ll",
+      "commands": [
+        "opt -p loop-vectorize -S %s",
+        "opt -p loop-vectorize -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "cost_store_i8",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx14.0.0\"\n\ndefine void @cost_store_i8(ptr %dst) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep = getelementptr i8, ptr %dst, i64 %iv\n  store i8 0, ptr %gep, align 1\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 100\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/sve-interleaved-masked-accesses.ll",
+      "commands": [
+        "opt -mtriple=aarch64-none-linux-gnu -S -passes=loop-vectorize,instcombine -mattr=+sve -force-vector-width=16 -force-vector-interleave=1 -scalable-vectorization=on -prefer-predicate-over-epilogue=scalar-epilogue %s 2>&1",
+        "opt -mtriple=aarch64-none-linux-gnu -S -passes=loop-vectorize,instcombine -mattr=+sve -force-vector-width=16 -force-vector-interleave=1 -scalable-vectorization=on -prefer-predicate-over-epilogue=predicate-dont-vectorize %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "masked_strided_factor4",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine dso_local void @masked_strided_factor4(ptr noalias nocapture readonly %p, ptr noalias nocapture %q, i8 zeroext %guard) local_unnamed_addr {\nentry:\n  %conv = zext i8 %guard to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %ix.024 = phi i32 [ 0, %entry ], [ %inc, %for.inc ]\n  %cmp1 = icmp ugt i32 %ix.024, %conv\n  br i1 %cmp1, label %if.then, label %for.inc\n\nif.then:                                          ; preds = %for.body\n  %idx0 = shl nuw nsw i32 %ix.024, 2\n  %idx1 = add i32 %idx0, 1\n  %idx2 = add i32 %idx0, 2\n  %idx3 = add i32 %idx0, 3\n  %array1idx0 = getelementptr inbounds i8, ptr %p, i32 %idx0\n  %0 = load i8, ptr %array1idx0, align 1\n  %array1idx1 = getelementptr inbounds i8, ptr %p, i32 %idx1\n  %1 = load i8, ptr %array1idx1, align 1\n  %array1idx2 = getelementptr inbounds i8, ptr %p, i32 %idx2\n  %2 = load i8, ptr %array1idx2, align 1\n  %array1idx3 = getelementptr inbounds i8, ptr %p, i32 %idx3\n  %3 = load i8, ptr %array1idx3, align 1\n  %cmp.i1 = icmp slt i8 %0, %1\n  %spec.select.i1 = select i1 %cmp.i1, i8 %1, i8 %0\n  %sub1 = sub i8 0, %spec.select.i1\n  %cmp.i2 = icmp slt i8 %2, %3\n  %spec.select.i2 = select i1 %cmp.i2, i8 %3, i8 %2\n  %sub2 = sub i8 0, %spec.select.i2\n  %array3idx0 = getelementptr inbounds i8, ptr %q, i32 %idx0\n  store i8 %spec.select.i1, ptr %array3idx0, align 1\n  %array3idx1 = getelementptr inbounds i8, ptr %q, i32 %idx1\n  store i8 %sub1, ptr %array3idx1, align 1\n  %array3idx2 = getelementptr inbounds i8, ptr %q, i32 %idx2\n  store i8 %spec.select.i2, ptr %array3idx2, align 1\n  %array3idx3 = getelementptr inbounds i8, ptr %q, i32 %idx3\n  store i8 %sub2, ptr %array3idx3, align 1\n  br label %for.inc\n\nfor.inc:                                          ; preds = %if.then, %for.body\n  %inc = add nuw nsw i32 %ix.024, 1\n  %exitcond = icmp eq i32 %inc, 1024\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.inc\n  ret void\n}\n"
+        },
+        {
+          "test_name": "masked_strided2",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine dso_local void @masked_strided2(ptr noalias nocapture readnone %p, ptr noalias nocapture %q, i8 zeroext %guard) local_unnamed_addr {\nentry:\n  %conv = zext i8 %guard to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %ix.012 = phi i32 [ 0, %entry ], [ %inc, %for.inc ]\n  %mul = shl nuw nsw i32 %ix.012, 1\n  %arrayidx = getelementptr inbounds i8, ptr %q, i32 %mul\n  store i8 1, ptr %arrayidx, align 1\n  %cmp1 = icmp ugt i32 %ix.012, %conv\n  br i1 %cmp1, label %if.then, label %for.inc\n\nif.then:                                          ; preds = %for.body\n  %add = or disjoint i32 %mul, 1\n  %arrayidx3 = getelementptr inbounds i8, ptr %q, i32 %add\n  store i8 2, ptr %arrayidx3, align 1\n  br label %for.inc\n\nfor.inc:                                          ; preds = %if.then, %for.body\n  %inc = add nuw nsw i32 %ix.012, 1\n  %exitcond = icmp eq i32 %inc, 1024\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.inc\n  ret void\n}\n"
+        },
+        {
+          "test_name": "masked_strided3",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine dso_local void @masked_strided3(ptr noalias nocapture readnone %p, ptr noalias nocapture %q, i8 zeroext %guard1, i8 zeroext %guard2) local_unnamed_addr {\nentry:\n  %conv = zext i8 %guard1 to i32\n  %conv3 = zext i8 %guard2 to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %ix.018 = phi i32 [ 0, %entry ], [ %inc, %for.inc ]\n  %mul = shl nuw nsw i32 %ix.018, 1\n  %cmp1 = icmp ugt i32 %ix.018, %conv\n  br i1 %cmp1, label %if.then, label %if.end\n\nif.then:                                          ; preds = %for.body\n  %arrayidx = getelementptr inbounds i8, ptr %q, i32 %mul\n  store i8 1, ptr %arrayidx, align 1\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %for.body\n  %cmp4 = icmp ugt i32 %ix.018, %conv3\n  br i1 %cmp4, label %if.then6, label %for.inc\n\nif.then6:                                         ; preds = %if.end\n  %add = or disjoint i32 %mul, 1\n  %arrayidx7 = getelementptr inbounds i8, ptr %q, i32 %add\n  store i8 2, ptr %arrayidx7, align 1\n  br label %for.inc\n\nfor.inc:                                          ; preds = %if.then6, %if.end\n  %inc = add nuw nsw i32 %ix.018, 1\n  %exitcond = icmp eq i32 %inc, 1024\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.inc\n  ret void\n}\n"
+        },
+        {
+          "test_name": "masked_strided1",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine dso_local void @masked_strided1(ptr noalias nocapture readonly %p, ptr noalias nocapture %q, i8 zeroext %guard) local_unnamed_addr {\nentry:\n  %conv = zext i8 %guard to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %ix.024 = phi i32 [ 0, %entry ], [ %inc, %for.inc ]\n  %cmp1 = icmp ugt i32 %ix.024, %conv\n  br i1 %cmp1, label %if.then, label %for.inc\n\nif.then:                                          ; preds = %for.body\n  %mul = shl nuw nsw i32 %ix.024, 1\n  %arrayidx = getelementptr inbounds i8, ptr %p, i32 %mul\n  %0 = load i8, ptr %arrayidx, align 1\n  %add = or disjoint i32 %mul, 1\n  %arrayidx4 = getelementptr inbounds i8, ptr %p, i32 %add\n  %1 = load i8, ptr %arrayidx4, align 1\n  %cmp.i = icmp slt i8 %0, %1\n  %spec.select.i = select i1 %cmp.i, i8 %1, i8 %0\n  %arrayidx6 = getelementptr inbounds i8, ptr %q, i32 %mul\n  store i8 %spec.select.i, ptr %arrayidx6, align 1\n  %sub = sub i8 0, %spec.select.i\n  %arrayidx11 = getelementptr inbounds i8, ptr %q, i32 %add\n  store i8 %sub, ptr %arrayidx11, align 1\n  br label %for.inc\n\nfor.inc:                                          ; preds = %if.then, %for.body\n  %inc = add nuw nsw i32 %ix.024, 1\n  %exitcond = icmp eq i32 %inc, 1024\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.inc\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding-overflow-checks.ll",
+      "commands": [
+        "opt -passes='loop-vectorize,instcombine' -sve-tail-folding-insn-threshold=0 -sve-tail-folding=all -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "can_overflow_i64_induction_var",
+          "test_body": "target triple = \"aarch64\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @can_overflow_i64_induction_var(ptr noalias %dst, ptr readonly %src, i64 %N) #0 {\nentry:\n  %cmp6.not = icmp eq i64 %N, 0\n  br i1 %cmp6.not, label %for.cond.cleanup, label %for.body.preheader\n\nfor.body.preheader:                               ; preds = %entry\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %indvars.iv = phi i64 [ 0, %for.body.preheader ], [ %indvars.iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %src, i64 %indvars.iv\n  %0 = load i32, ptr %arrayidx, align 4\n  %add = add nsw i32 %0, 42\n  %arrayidx2 = getelementptr inbounds i32, ptr %dst, i64 %indvars.iv\n  store i32 %add, ptr %arrayidx2, align 4\n  %indvars.iv.next = add nuw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, %N\n  br i1 %exitcond.not, label %for.cond.cleanup, label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body, %entry\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding-reductions.ll",
+      "commands": [
+        "< %s",
+        "-prefer-inloop-reductions < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "add_reduction_i32",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine i32 @add_reduction_i32(ptr %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %red = phi i32 [ %red.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  %val = load i32, ptr %gep, align 4\n  %red.next = add i32 %red, %val\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret i32 %red.next\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "add_reduction_f32",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine float @add_reduction_f32(ptr %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %red = phi float [ %red.next, %while.body ], [ 0.000000e+00, %entry ]\n  %gep = getelementptr float, ptr %ptr, i64 %index\n  %val = load float, ptr %gep, align 4\n  %red.next = fadd float %red, %val\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret float %red.next\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "cond_xor_reduction",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine i32 @cond_xor_reduction(ptr noalias %a, ptr noalias %cond, i64 %N) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.inc ]\n  %rdx = phi i32 [ 7, %entry ], [ %res, %for.inc ]\n  %arrayidx = getelementptr inbounds i32, ptr %cond, i64 %iv\n  %0 = load i32, ptr %arrayidx, align 4\n  %tobool = icmp eq i32 %0, 5\n  br i1 %tobool, label %if.then, label %for.inc\n\nif.then:                                          ; preds = %for.body\n  %arrayidx2 = getelementptr inbounds i32, ptr %a, i64 %iv\n  %1 = load i32, ptr %arrayidx2, align 4\n  %xor = xor i32 %rdx, %1\n  br label %for.inc\n\nfor.inc:                                          ; preds = %if.then, %for.body\n  %res = phi i32 [ %rdx, %for.body ], [ %xor, %if.then ]\n  %iv.next = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %N\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.inc\n  ret i32 %res\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding-unroll.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue -force-vector-interleave=4 -force-vector-width=4 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "cond_memset",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @cond_memset(i32 %val, ptr noalias readonly %cond_ptr, ptr noalias %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.end, %entry\n  %index = phi i64 [ %index.next, %while.end ], [ 0, %entry ]\n  %cond_gep = getelementptr i32, ptr %cond_ptr, i64 %index\n  %cond_i32 = load i32, ptr %cond_gep, align 4\n  %cond_i1 = icmp ne i32 %cond_i32, 0\n  br i1 %cond_i1, label %do.store, label %while.end\n\ndo.store:                                         ; preds = %while.body\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  store i32 %val, ptr %gep, align 4\n  br label %while.end\n\nwhile.end:                                        ; preds = %do.store, %while.body\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.end\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "simple_memset",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @simple_memset(i32 %val, ptr %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  store i32 %val, ptr %gep, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding.ll",
+      "commands": [
+        "opt -S -hints-allow-reordering=false -passes=loop-vectorize -prefer-predicate-over-epilogue=predicate-else-scalar-epilogue < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "copy_stride4",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @copy_stride4(ptr noalias %dst, ptr noalias %src, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep1 = getelementptr i32, ptr %src, i64 %index\n  %val = load i32, ptr %gep1, align 4\n  %gep2 = getelementptr i32, ptr %dst, i64 %index\n  store i32 %val, ptr %gep2, align 4\n  %index.next = add nsw i64 %index, 4\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "simple_memcpy",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @simple_memcpy(ptr noalias %dst, ptr noalias %src, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep1 = getelementptr i32, ptr %src, i64 %index\n  %val = load i32, ptr %gep1, align 4\n  %gep2 = getelementptr i32, ptr %dst, i64 %index\n  store i32 %val, ptr %gep2, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "cond_uniform_load",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @cond_uniform_load(ptr noalias %dst, ptr noalias readonly %src, ptr noalias readonly %cond, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %if.end, %entry\n  %index = phi i64 [ %index.next, %if.end ], [ 0, %entry ]\n  %arrayidx = getelementptr inbounds i32, ptr %cond, i64 %index\n  %0 = load i32, ptr %arrayidx, align 4\n  %tobool.not = icmp eq i32 %0, 0\n  br i1 %tobool.not, label %if.end, label %if.then\n\nif.then:                                          ; preds = %for.body\n  %1 = load i32, ptr %src, align 4\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %for.body\n  %val.0 = phi i32 [ %1, %if.then ], [ 0, %for.body ]\n  %arrayidx1 = getelementptr inbounds i32, ptr %dst, i64 %index\n  store i32 %val.0, ptr %arrayidx1, align 4\n  %index.next = add nuw i64 %index, 1\n  %exitcond.not = icmp eq i64 %index.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %if.end\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "simple_idiv",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @simple_idiv(ptr noalias %dst, ptr noalias %src, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep1 = getelementptr i32, ptr %src, i64 %index\n  %gep2 = getelementptr i32, ptr %dst, i64 %index\n  %val1 = load i32, ptr %gep1, align 4\n  %val2 = load i32, ptr %gep2, align 4\n  %res = udiv i32 %val1, %val2\n  store i32 %res, ptr %gep2, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "simple_gather_scatter",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @simple_gather_scatter(ptr noalias %dst, ptr noalias %src, ptr noalias %ind, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep1 = getelementptr i32, ptr %ind, i64 %index\n  %ind_val = load i32, ptr %gep1, align 4\n  %gep2 = getelementptr i32, ptr %src, i32 %ind_val\n  %val = load i32, ptr %gep2, align 4\n  %gep3 = getelementptr i32, ptr %dst, i32 %ind_val\n  store i32 %val, ptr %gep3, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "simple_memset_v4i32",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @simple_memset_v4i32(i32 %val, ptr %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  store i32 %val, ptr %gep, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n"
+        },
+        {
+          "test_name": "uniform_store",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @uniform_store(ptr noalias %dst, ptr noalias readonly %src, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %src, i64 %indvars.iv\n  %val = load i32, ptr %arrayidx, align 4\n  store i32 %val, ptr %dst, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "simple_memset",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @simple_memset(i32 %val, ptr %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  store i32 %val, ptr %gep, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "uniform_load",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @uniform_load(ptr noalias %dst, ptr noalias readonly %src, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %val = load i32, ptr %src, align 4\n  %arrayidx = getelementptr inbounds i32, ptr %dst, i64 %indvars.iv\n  store i32 %val, ptr %arrayidx, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body, !llvm.loop !0\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        },
+        {
+          "test_name": "simple_fdiv",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @simple_fdiv(ptr noalias %dst, ptr noalias %src, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep1 = getelementptr float, ptr %src, i64 %index\n  %gep2 = getelementptr float, ptr %dst, i64 %index\n  %val1 = load float, ptr %gep1, align 4\n  %val2 = load float, ptr %gep2, align 4\n  %res = fdiv float %val1, %val2\n  store float %res, ptr %gep2, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.width\", i32 4}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/sve-wide-lane-mask.ll",
+      "commands": [
+        "opt -S --passes=loop-vectorize -prefer-predicate-over-epilogue=predicate-dont-vectorize -enable-wide-lane-mask -force-vector-interleave=1 < %s",
+        "opt -S --passes=loop-vectorize -prefer-predicate-over-epilogue=predicate-dont-vectorize -enable-wide-lane-mask -force-vector-interleave=4 < %s",
+        "opt -S --passes=loop-vectorize -enable-wide-lane-mask -prefer-predicate-over-epilogue=predicate-dont-vectorize < %s",
+        "opt -S --passes=forceattrs,loop-vectorize -enable-wide-lane-mask -prefer-predicate-over-epilogue=predicate-dont-vectorize -force-attribute=optsize < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "scalable_wide_active_lane_mask_double",
+          "test_body": "target triple = \"aarch64-unknown-linux\"\n\n; Function Attrs: nounwind vscale_range(1,16)\ndefine void @scalable_wide_active_lane_mask_double(ptr noalias %dst, ptr readonly %src, i64 %n) #0 {\nentry:\n  %cmp6 = icmp sgt i64 %n, 0\n  br i1 %cmp6, label %for.body, label %for.end\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidx1 = getelementptr inbounds double, ptr %src, i64 %iv\n  %ld = load double, ptr %arrayidx1, align 8\n  %mul = fmul double %ld, 3.000000e+00\n  %arrayidx2 = getelementptr inbounds double, ptr %dst, i64 %iv\n  store double %mul, ptr %arrayidx2, align 8\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body, %entry\n  ret void\n}\n\nattributes #0 = { nounwind vscale_range(1,16) \"target-features\"=\"+sve2p1\" }\n"
+        },
+        {
+          "test_name": "scalable_wide_active_lane_mask",
+          "test_body": "target triple = \"aarch64-unknown-linux\"\n\n; Function Attrs: nounwind vscale_range(1,16)\ndefine void @scalable_wide_active_lane_mask(ptr noalias %dst, ptr readonly %src, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidx1 = getelementptr inbounds i8, ptr %src, i64 %iv\n  %ld = load i8, ptr %arrayidx1, align 1\n  %mul = mul i8 %ld, 3\n  %arrayidx2 = getelementptr inbounds i8, ptr %dst, i64 %iv\n  store i8 %mul, ptr %arrayidx2, align 1\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { nounwind vscale_range(1,16) \"target-features\"=\"+sve2p1\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/sve2-histcnt.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,instcombine -enable-histogram-loop-vectorization -sve-gather-overhead=2 -sve-scatter-overhead=2 -debug-only=loop-vectorize -S 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "histogram_8bit",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @histogram_8bit(ptr noalias %buckets, ptr readonly %indices, i64 %N) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %gep.indices = getelementptr inbounds i32, ptr %indices, i64 %iv\n  %l.idx = load i32, ptr %gep.indices, align 4\n  %idxprom1 = zext i32 %l.idx to i64\n  %gep.bucket = getelementptr inbounds i8, ptr %buckets, i64 %idxprom1\n  %l.bucket = load i8, ptr %gep.bucket, align 4\n  %inc = add nsw i8 %l.bucket, 1\n  store i8 %inc, ptr %gep.bucket, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, %N\n  br i1 %exitcond, label %for.exit, label %for.body, !llvm.loop !0\n\nfor.exit:                                         ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve2\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.interleave.count\", i32 1}\n"
+        },
+        {
+          "test_name": "simple_histogram_tailfold",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: vscale_range(1,16)\ndefine void @simple_histogram_tailfold(ptr noalias %buckets, ptr readonly %indices, i64 %N) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %gep.indices = getelementptr inbounds i32, ptr %indices, i64 %iv\n  %l.idx = load i32, ptr %gep.indices, align 4\n  %idxprom1 = zext i32 %l.idx to i64\n  %gep.bucket = getelementptr inbounds i32, ptr %buckets, i64 %idxprom1\n  %l.bucket = load i32, ptr %gep.bucket, align 4\n  %inc = add nsw i32 %l.bucket, 1\n  store i32 %inc, ptr %gep.bucket, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, %N\n  br i1 %exitcond, label %for.exit, label %for.body, !llvm.loop !0\n\nfor.exit:                                         ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { vscale_range(1,16) \"target-features\"=\"+sve2\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/tail-fold-uniform-memops.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -scalable-vectorization=off -force-vector-width=4 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "cond_uniform_load",
+          "test_body": "target triple = \"aarch64-linux-gnu\"\n\n; Function Attrs: vscale_range(2,0)\ndefine void @cond_uniform_load(ptr noalias nocapture %dst, ptr nocapture readonly %src, ptr nocapture readonly %cond, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %if.end, %entry\n  %index = phi i64 [ %index.next, %if.end ], [ 0, %entry ]\n  %arrayidx = getelementptr inbounds i32, ptr %cond, i64 %index\n  %0 = load i32, ptr %arrayidx, align 4\n  %tobool.not = icmp eq i32 %0, 0\n  br i1 %tobool.not, label %if.end, label %if.then\n\nif.then:                                          ; preds = %for.body\n  %1 = load i32, ptr %src, align 4\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %for.body\n  %val.0 = phi i32 [ %1, %if.then ], [ 0, %for.body ]\n  %arrayidx1 = getelementptr inbounds i32, ptr %dst, i64 %index\n  store i32 %val.0, ptr %arrayidx1, align 4\n  %index.next = add nuw i64 %index, 1\n  %exitcond.not = icmp eq i64 %index.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %if.end\n  ret void\n}\n\nattributes #0 = { vscale_range(2,0) \"target-features\"=\"+neon,+sve,+v8.1a\" }\n"
+        },
+        {
+          "test_name": "uniform_load",
+          "test_body": "target triple = \"aarch64-linux-gnu\"\n\n; Function Attrs: vscale_range(2,0)\ndefine void @uniform_load(ptr noalias %dst, ptr noalias readonly %src, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %val = load i32, ptr %src, align 4\n  %arrayidx = getelementptr inbounds i32, ptr %dst, i64 %indvars.iv\n  store i32 %val, ptr %arrayidx, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, %n\n  br i1 %exitcond.not, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n\nattributes #0 = { vscale_range(2,0) \"target-features\"=\"+neon,+sve,+v8.1a\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/tail-folding-styles.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -force-tail-folding-style=none < %s",
+        "opt -S -passes=loop-vectorize -force-tail-folding-style=data < %s",
+        "opt -S -passes=loop-vectorize -force-tail-folding-style=data-without-lane-mask < %s",
+        "opt -S -passes=loop-vectorize -force-tail-folding-style=data-and-control < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "simple_memset_tailfold",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @simple_memset_tailfold(i32 %val, ptr %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  store i32 %val, ptr %gep, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2, !3, !4}\n!1 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n!3 = !{!\"llvm.loop.interleave.count\", i32 1}\n!4 = !{!\"llvm.loop.vectorize.width\", i32 4}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/uniform-args-call-variants.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,simplifycfg,instcombine -force-vector-interleave=1 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S",
+        "opt < %s -passes=loop-vectorize,simplifycfg,instcombine -force-vector-interleave=2 -prefer-predicate-over-epilogue=predicate-dont-vectorize -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_uniform_not_invariant",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @test_uniform_not_invariant(ptr noalias %dst, ptr readonly %src, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %gepsrc = getelementptr double, ptr %src, i64 %indvars.iv\n  %data = load double, ptr %gepsrc, align 8\n  %call = call double @foo(double %data, i64 %indvars.iv) #1\n  %gepdst = getelementptr inbounds double, ptr %dst, i64 %indvars.iv\n  store double %call, ptr %gepdst, align 8\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond = icmp eq i64 %indvars.iv.next, %n\n  br i1 %exitcond, label %for.cond.cleanup, label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n}\n\ndeclare double @foo(double, i64)\n\nattributes #0 = { \"target-features\"=\"+sve\" }\nattributes #1 = { nounwind \"vector-function-abi-variant\"=\"_ZGVsMxvu_foo(foo_uniform)\" }\n"
+        },
+        {
+          "test_name": "test_uniform",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @test_uniform(ptr noalias %dst, ptr readonly %src, i64 %uniform, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %gepsrc = getelementptr double, ptr %src, i64 %indvars.iv\n  %data = load double, ptr %gepsrc, align 8\n  %call = call double @foo(double %data, i64 %uniform) #1\n  %gepdst = getelementptr inbounds double, ptr %dst, i64 %indvars.iv\n  store double %call, ptr %gepdst, align 8\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond = icmp eq i64 %indvars.iv.next, %n\n  br i1 %exitcond, label %for.cond.cleanup, label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n}\n\ndeclare double @foo(double, i64)\n\nattributes #0 = { \"target-features\"=\"+sve\" }\nattributes #1 = { nounwind \"vector-function-abi-variant\"=\"_ZGVsMxvu_foo(foo_uniform)\" }\n"
+        },
+        {
+          "test_name": "test_uniform_smaller_scalar",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @test_uniform_smaller_scalar(ptr noalias %dst, ptr readonly %src, i32 %uniform, i64 %n) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %gepsrc = getelementptr double, ptr %src, i64 %indvars.iv\n  %data = load double, ptr %gepsrc, align 8\n  %call = call double @bar(double %data, i32 %uniform) #1\n  %gepdst = getelementptr inbounds double, ptr %dst, i64 %indvars.iv\n  store double %call, ptr %gepdst, align 8\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond = icmp eq i64 %indvars.iv.next, %n\n  br i1 %exitcond, label %for.cond.cleanup, label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n}\n\ndeclare double @bar(double, i32)\n\nattributes #0 = { \"target-features\"=\"+sve\" }\nattributes #1 = { nounwind \"vector-function-abi-variant\"=\"_ZGVsMxvu_bar(bar_uniform)\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/widen-gep-all-indices-invariant.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -mtriple=arm64-apple-macosx -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "gep_with_all_invariant_operands",
+          "test_body": "define i32 @gep_with_all_invariant_operands(ptr %src.0, ptr %src.1, i64 %n, i1 %cond) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ %iv.next, %loop ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %src.0, i64 %n\n  %ptr = select i1 %cond, ptr %src.1, ptr %gep\n  %val = load i32, ptr %ptr, align 4\n  %iv.next = add i64 %iv, 1\n  %cmp = icmp ult i64 %iv, %n\n  br i1 %cmp, label %loop, label %exit, !llvm.loop !0\n\nexit:                                             ; preds = %loop\n  ret i32 %val\n}\n\nattributes #0 = { \"target-cpu\"=\"neoverse-v2\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.vectorize.enable\", i1 true}\n!2 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/VPlan/AArch64/sve-tail-folding-forced.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -debug-only=loop-vectorize < %s 2>%t",
+        "cat %t"
+      ],
+      "tests": [
+        {
+          "test_name": "simple_memset",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine void @simple_memset(i32 %val, ptr %ptr, i64 %n) #0 {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  store i32 %val, ptr %gep, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/VPlan/AArch64/vplan-printing.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -debug-only=loop-vectorize -disable-output %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "print_partial_reduction_predication",
+          "test_body": "target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"aarch64-none-unknown-elf\"\n\ndefine i32 @print_partial_reduction_predication(ptr %a, ptr %b, i64 %N) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %accum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %gep.a = getelementptr i8, ptr %a, i64 %iv\n  %load.a = load i8, ptr %gep.a, align 1\n  %ext.a = zext i8 %load.a to i32\n  %gep.b = getelementptr i8, ptr %b, i64 %iv\n  %load.b = load i8, ptr %gep.b, align 1\n  %ext.b = zext i8 %load.b to i32\n  %mul = mul i32 %ext.b, %ext.a\n  %add = add i32 %mul, %accum\n  %iv.next = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %N\n  br i1 %exitcond.not, label %exit, label %for.body, !llvm.loop !0\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\nattributes #0 = { \"target-features\"=\"+sve\" }\n\n!0 = distinct !{!0, !1, !2}\n!1 = !{!\"llvm.loop.interleave.count\", i32 1}\n!2 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "paulwalker-arm",
+      "body": "If the goal of this PR is to remove a redundant parameter from `addVPLaneMaskPhiAndUpdateExitBranch`, can this be done using a single PR? I don't see value in changing the call site and then following up with a change to the called function. It seems like an artificial split to me."
+    },
+    {
+      "author": "lukel97",
+      "body": "> If the goal of this PR is to remove a redundant parameter from `addVPLaneMaskPhiAndUpdateExitBranch`, can this be done using a single PR? I don't see value in changing the call site and then following up with a change to the called function. It seems like an artificial split to me.\r\n\r\nThe subsequent change doesn't just remove the parameter but also the DataAndControlFlowWithoutRuntimeCheck enum itself which touches a good few places in LoopVectorizer.cpp, TTI etc., which is a fairly substantial diff.\r\n\r\nBut I mostly wanted to show the fact that removing DataAndControlFlowWithoutRuntimeCheck is NFC, once we stop adjusting the trip count which isn't NFC. I.e. it makes it easier to focus on correctness in this PR."
+    },
+    {
+      "author": "paulwalker-arm",
+      "body": "> > If the goal of this PR is to remove a redundant parameter from `addVPLaneMaskPhiAndUpdateExitBranch`, can this be done using a single PR? I don't see value in changing the call site and then following up with a change to the called function. It seems like an artificial split to me.\r\n> \r\n> The subsequent change doesn't just remove the parameter but also the DataAndControlFlowWithoutRuntimeCheck itself enum which touches a good few places in LoopVectorizer.cpp, TTI etc., which is a fairly substantial diff.\r\n> \r\n> But I mostly wanted to show the fact that removing DataAndControlFlowWithoutRuntimeCheck is NFC, once we stop adjusting the trip count which isn't NFC. I.e. it makes it easier to focus on correctness in this PR.\r\n\r\nThanks for explaining. I was taking the change too literally."
+    },
+    {
+      "author": "lukel97",
+      "body": "> > > If the goal of this PR is to remove a redundant parameter from `addVPLaneMaskPhiAndUpdateExitBranch`, can this be done using a single PR? I don't see value in changing the call site and then following up with a change to the called function. It seems like an artificial split to me.\r\n> > \r\n> > \r\n> > The subsequent change doesn't just remove the parameter but also the DataAndControlFlowWithoutRuntimeCheck itself enum which touches a good few places in LoopVectorizer.cpp, TTI etc., which is a fairly substantial diff.\r\n> > But I mostly wanted to show the fact that removing DataAndControlFlowWithoutRuntimeCheck is NFC, once we stop adjusting the trip count which isn't NFC. I.e. it makes it easier to focus on correctness in this PR.\r\n> \r\n> Thanks for explaining. I was taking the change too literally.\r\n\r\nI've put the NFC part up in https://github.com/llvm/llvm-project/pull/183762"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-27T12:26:17Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        2944,
+        2951
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/conditional-branches-cost.ll": [
+      [
+        514,
+        522
+      ],
+      [
+        535,
+        541
+      ],
+      [
+        621,
+        629
+      ],
+      [
+        638,
+        644
+      ],
+      [
+        913,
+        921
+      ],
+      [
+        1061,
+        1067
+      ],
+      [
+        1324,
+        1332
+      ],
+      [
+        1355,
+        1361
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/conditional-scalar-assignment-fold-tail.ll": [
+      [
+        11,
+        19
+      ],
+      [
+        32,
+        38
+      ],
+      [
+        78,
+        86
+      ],
+      [
+        104,
+        110
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/divs-with-scalable-vfs.ll": [
+      [
+        107,
+        115
+      ],
+      [
+        136,
+        142
+      ],
+      [
+        217,
+        225
+      ],
+      [
+        249,
+        255
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/fixed-wide-lane-mask.ll": [
+      [
+        12,
+        20
+      ],
+      [
+        26,
+        32
+      ],
+      [
+        37,
+        45
+      ],
+      [
+        64,
+        70
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/induction-costs-sve.ll": [
+      [
+        133,
+        141
+      ],
+      [
+        152,
+        158
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/masked-call-scalarize.ll": [
+      [
+        55,
+        70
+      ],
+      [
+        85,
+        91
+      ],
+      [
+        95,
+        103
+      ],
+      [
+        106,
+        112
+      ],
+      [
+        141,
+        149
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/masked-call.ll": [
+      [
+        912,
+        927
+      ],
+      [
+        933,
+        941
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/optsize_minsize.ll": [
+      [
+        441,
+        449
+      ],
+      [
+        470,
+        476
+      ],
+      [
+        487,
+        495
+      ],
+      [
+        516,
+        522
+      ],
+      [
+        533,
+        541
+      ],
+      [
+        562,
+        568
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-dot-product.ll": [
+      [
+        1296,
+        1304
+      ],
+      [
+        1315,
+        1321
+      ],
+      [
+        1332,
+        1340
+      ],
+      [
+        1351,
+        1357
+      ],
+      [
+        1368,
+        1376
+      ],
+      [
+        1387,
+        1393
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/reduction-recurrence-costs-sve.ll": [
+      [
+        182,
+        190
+      ],
+      [
+        232,
+        238
+      ],
+      [
+        433,
+        441
+      ],
+      [
+        450,
+        456
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/scalable-reductions-tf.ll": [
+      [
+        18,
+        26
+      ],
+      [
+        32,
+        38
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/scalable-strict-fadd.ll": [
+      [
+        122,
+        149
+      ],
+      [
+        307,
+        320
+      ],
+      [
+        326,
+        363
+      ],
+      [
+        554,
+        590
+      ],
+      [
+        772,
+        804
+      ],
+      [
+        971,
+        1003
+      ],
+      [
+        1335,
+        1348
+      ],
+      [
+        1354,
+        1403
+      ],
+      [
+        1590,
+        1603
+      ],
+      [
+        1609,
+        1658
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/scalable-struct-return.ll": [
+      [
+        13,
+        21
+      ],
+      [
+        31,
+        37
+      ],
+      [
+        70,
+        78
+      ],
+      [
+        88,
+        94
+      ],
+      [
+        145,
+        153
+      ],
+      [
+        163,
+        169
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/store-costs-sve.ll": [
+      [
+        77,
+        85
+      ],
+      [
+        88,
+        94
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/sve-interleaved-masked-accesses.ll": [
+      [
+        76,
+        117
+      ],
+      [
+        212,
+        246
+      ],
+      [
+        341,
+        379
+      ],
+      [
+        493,
+        538
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding-overflow-checks.ll": [
+      [
+        74,
+        80
+      ],
+      [
+        86,
+        92
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding-reductions.ll": [
+      [
+        14,
+        22
+      ],
+      [
+        28,
+        34
+      ],
+      [
+        45,
+        53
+      ],
+      [
+        60,
+        66
+      ],
+      [
+        94,
+        102
+      ],
+      [
+        108,
+        114
+      ],
+      [
+        124,
+        132
+      ],
+      [
+        138,
+        144
+      ],
+      [
+        171,
+        180
+      ],
+      [
+        190,
+        196
+      ],
+      [
+        206,
+        215
+      ],
+      [
+        225,
+        231
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding-unroll.ll": [
+      [
+        13,
+        21
+      ],
+      [
+        43,
+        55
+      ],
+      [
+        82,
+        90
+      ],
+      [
+        128,
+        140
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/sve-tail-folding.ll": [
+      [
+        12,
+        20
+      ],
+      [
+        25,
+        31
+      ],
+      [
+        56,
+        64
+      ],
+      [
+        69,
+        75
+      ],
+      [
+        102,
+        110
+      ],
+      [
+        115,
+        121
+      ],
+      [
+        153,
+        161
+      ],
+      [
+        172,
+        178
+      ],
+      [
+        208,
+        216
+      ],
+      [
+        223,
+        229
+      ],
+      [
+        261,
+        270
+      ],
+      [
+        275,
+        281
+      ],
+      [
+        313,
+        322
+      ],
+      [
+        332,
+        338
+      ],
+      [
+        378,
+        387
+      ],
+      [
+        392,
+        398
+      ],
+      [
+        427,
+        435
+      ],
+      [
+        442,
+        448
+      ],
+      [
+        480,
+        488
+      ],
+      [
+        496,
+        502
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/sve-wide-lane-mask.ll": [
+      [
+        14,
+        22
+      ],
+      [
+        28,
+        34
+      ],
+      [
+        42,
+        50
+      ],
+      [
+        80,
+        86
+      ],
+      [
+        98,
+        106
+      ],
+      [
+        120,
+        126
+      ],
+      [
+        157,
+        165
+      ],
+      [
+        171,
+        177
+      ],
+      [
+        188,
+        196
+      ],
+      [
+        226,
+        232
+      ],
+      [
+        247,
+        255
+      ],
+      [
+        269,
+        275
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/sve2-histcnt.ll": [
+      [
+        269,
+        274
+      ],
+      [
+        548,
+        554
+      ],
+      [
+        560,
+        566
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/tail-fold-uniform-memops.ll": [
+      [
+        14,
+        22
+      ],
+      [
+        28,
+        34
+      ],
+      [
+        64,
+        72
+      ],
+      [
+        83,
+        89
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/tail-folding-styles.ll": [
+      [
+        3,
+        9
+      ],
+      [
+        136,
+        170
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/uniform-args-call-variants.ll": [
+      [
+        12,
+        32
+      ],
+      [
+        36,
+        42
+      ],
+      [
+        44,
+        65
+      ],
+      [
+        87,
+        107
+      ],
+      [
+        111,
+        117
+      ],
+      [
+        119,
+        140
+      ],
+      [
+        166,
+        172
+      ],
+      [
+        178,
+        184
+      ],
+      [
+        188,
+        214
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/widen-gep-all-indices-invariant.ll": [
+      [
+        11,
+        19
+      ],
+      [
+        25,
+        31
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/VPlan/AArch64/sve-tail-folding-forced.ll": [
+      [
+        18,
+        24
+      ],
+      [
+        32,
+        39
+      ],
+      [
+        47,
+        55
+      ],
+      [
+        60,
+        66
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/VPlan/AArch64/vplan-printing.ll": [
+      [
+        136,
+        142
+      ],
+      [
+        155,
+        162
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::addActiveLaneMask"
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/conditional-scalar-assignment-fold-tail.ll": [
+      "non_speculatable_find_last_reduction"
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/scalable-struct-return.ll": [
+      "struct_return_f32_widen"
+    ]
+  }
+}

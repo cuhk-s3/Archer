@@ -1,0 +1,82 @@
+{
+  "pr_id": 184246,
+  "title": "[AggressiveInstCombine] trunc to i1 in any or all bits set check",
+  "author": "andjo403",
+  "base_commit": "c433ae7e2e572167b8ddc0c404747a9947f69859",
+  "fix_commit": "fd6e286b785e1f9f696e846b5dd7522fdfd98b20",
+  "patch": "diff --git a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\nindex 797fabde3f25c..5afb738eae7cb 100644\n--- a/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n+++ b/llvm/lib/Transforms/AggressiveInstCombine/AggressiveInstCombine.cpp\n@@ -288,6 +288,35 @@ static bool foldAnyOrAllBitsSet(Instruction &I) {\n   return true;\n }\n \n+static bool foldAnyOrAllBitsSetTrunc(Instruction &I) {\n+  if (!I.getType()->isIntOrIntVectorTy(1))\n+    return false;\n+\n+  bool MatchAllBitsSet;\n+  if (match(&I, m_Trunc(m_OneUse(m_And(m_Value(), m_Value())))))\n+    MatchAllBitsSet = true;\n+  else if (match(&I, m_Trunc(m_OneUse(m_Or(m_Value(), m_Value())))))\n+    MatchAllBitsSet = false;\n+  else\n+    return false;\n+  Value *X = I.getOperand(0);\n+\n+  MaskOps MOps(X->getType()->getScalarSizeInBits(), MatchAllBitsSet);\n+  if (!matchAndOrChain(X, MOps))\n+    return false;\n+\n+  // The pattern was found. Create a masked compare that replaces all of the\n+  // shift and logic ops.\n+  IRBuilder<> Builder(&I);\n+  Constant *Mask = ConstantInt::get(X->getType(), MOps.Mask);\n+  Value *And = Builder.CreateAnd(MOps.Root, Mask);\n+  Value *Cmp = MatchAllBitsSet ? Builder.CreateICmpEQ(And, Mask)\n+                               : Builder.CreateIsNotNull(And);\n+  I.replaceAllUsesWith(Cmp);\n+  ++NumAnyOrAllBitsSet;\n+  return true;\n+}\n+\n // Try to recognize below function as popcount intrinsic.\n // This is the \"best\" algorithm from\n // http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel\n@@ -1824,6 +1853,7 @@ static bool foldUnusualPatterns(Function &F, DominatorTree &DT,\n     // iteratively in this loop rather than waiting until the end.\n     for (Instruction &I : make_early_inc_range(llvm::reverse(BB))) {\n       MadeChange |= foldAnyOrAllBitsSet(I);\n+      MadeChange |= foldAnyOrAllBitsSetTrunc(I);\n       MadeChange |= foldGuardedFunnelShift(I, DT);\n       MadeChange |= tryToRecognizePopCount(I);\n       MadeChange |= tryToFPToSat(I, TTI);\n",
+  "components": [
+    "AggressiveInstCombine"
+  ],
+  "description": "trunc (or  (lshr X, C), ...)) to i1 --> (X & CMask) != 0\r\ntrunc (and (lshr X, C), ...)) to i1 --> (X & CMask) == CMask\r\n\r\nRegression noticed in https://github.com/llvm/llvm-project/pull/184182\r\n\r\nProof: https://alive2.llvm.org/ce/z/8QXWrq",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/AggressiveInstCombine/masked-cmp.ll",
+      "commands": [
+        "opt < %s -passes=aggressive-instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "anyset_two_bit_mask_trunc",
+          "test_body": "define i1 @anyset_two_bit_mask_trunc(i32 %x) {\n  %s = lshr i32 %x, 3\n  %o = or i32 %s, %x\n  %r = trunc i32 %o to i1\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "allset_two_bit_mask_uniform",
+          "test_body": "define <2 x i32> @allset_two_bit_mask_uniform(<2 x i32> %x) {\n  %s = lshr <2 x i32> %x, splat (i32 7)\n  %o = and <2 x i32> %s, %x\n  %r = and <2 x i32> %o, splat (i32 1)\n  ret <2 x i32> %r\n}\n"
+        },
+        {
+          "test_name": "anyset_three_bit_mask_all_shifted_bits",
+          "test_body": "define i32 @anyset_three_bit_mask_all_shifted_bits(i32 %x) {\n  %t1 = lshr i32 %x, 3\n  %t2 = lshr i32 %x, 5\n  %t3 = lshr i32 %x, 8\n  %o2 = or i32 %t2, %t3\n  %o3 = or i32 %t1, %o2\n  %r = and i32 %o3, 1\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "anyset_four_bit_mask_uniform",
+          "test_body": "define <2 x i32> @anyset_four_bit_mask_uniform(<2 x i32> %x) {\n  %t1 = lshr <2 x i32> %x, splat (i32 3)\n  %t2 = lshr <2 x i32> %x, splat (i32 5)\n  %t3 = lshr <2 x i32> %x, splat (i32 8)\n  %o1 = or <2 x i32> %t1, %x\n  %o2 = or <2 x i32> %t2, %t3\n  %o3 = or <2 x i32> %o1, %o2\n  %r = and <2 x i32> %o3, splat (i32 1)\n  ret <2 x i32> %r\n}\n"
+        },
+        {
+          "test_name": "allset_two_bit_mask_trunc_multiuse",
+          "test_body": "declare void @use(i32)\n\ndefine i1 @allset_two_bit_mask_trunc_multiuse(i32 %x) {\n  %s = lshr i32 %x, 7\n  %o = and i32 %s, %x\n  %r = trunc i32 %o to i1\n  call void @use(i32 %o)\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "anyset_two_bit_mask",
+          "test_body": "define i32 @anyset_two_bit_mask(i32 %x) {\n  %s = lshr i32 %x, 3\n  %o = or i32 %s, %x\n  %r = and i32 %o, 1\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "allset_two_bit_mask_trunc",
+          "test_body": "define i1 @allset_two_bit_mask_trunc(i32 %x) {\n  %s = lshr i32 %x, 7\n  %o = and i32 %s, %x\n  %r = trunc i32 %o to i1\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "allset_three_bit_mask_no_and1",
+          "test_body": "define i8 @allset_three_bit_mask_no_and1(i8 %x) {\n  %t1 = lshr i8 %x, 1\n  %t2 = lshr i8 %x, 2\n  %t3 = lshr i8 %x, 3\n  %a2 = and i8 %t1, %t2\n  %r = and i8 %a2, %t3\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "allset_two_bit_mask",
+          "test_body": "define i32 @allset_two_bit_mask(i32 %x) {\n  %s = lshr i32 %x, 7\n  %o = and i32 %s, %x\n  %r = and i32 %o, 1\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "anyset_four_bit_mask_uniform_trunc",
+          "test_body": "define <2 x i1> @anyset_four_bit_mask_uniform_trunc(<2 x i32> %x) {\n  %t1 = lshr <2 x i32> %x, splat (i32 3)\n  %t2 = lshr <2 x i32> %x, splat (i32 5)\n  %t3 = lshr <2 x i32> %x, splat (i32 8)\n  %o1 = or <2 x i32> %t1, %x\n  %o2 = or <2 x i32> %t2, %t3\n  %o3 = or <2 x i32> %o1, %o2\n  %r = trunc <2 x i32> %o3 to <2 x i1>\n  ret <2 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "anyset_two_bit_mask_uniform",
+          "test_body": "define <2 x i32> @anyset_two_bit_mask_uniform(<2 x i32> %x) {\n  %s = lshr <2 x i32> %x, splat (i32 3)\n  %o = or <2 x i32> %s, %x\n  %r = and <2 x i32> %o, splat (i32 1)\n  ret <2 x i32> %r\n}\n"
+        },
+        {
+          "test_name": "allset_two_bit_mask_uniform_trunc",
+          "test_body": "define <2 x i1> @allset_two_bit_mask_uniform_trunc(<2 x i32> %x) {\n  %s = lshr <2 x i32> %x, splat (i32 7)\n  %o = and <2 x i32> %s, %x\n  %r = trunc <2 x i32> %o to <2 x i1>\n  ret <2 x i1> %r\n}\n"
+        },
+        {
+          "test_name": "allset_four_bit_mask",
+          "test_body": "define i64 @allset_four_bit_mask(i64 %x) {\n  %t1 = lshr i64 %x, 1\n  %t2 = lshr i64 %x, 2\n  %t3 = lshr i64 %x, 3\n  %t4 = lshr i64 %x, 4\n  %a1 = and i64 %t4, 1\n  %a2 = and i64 %t2, %a1\n  %a3 = and i64 %a2, %t1\n  %r = and i64 %a3, %t3\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "anyset_two_bit_mask_trunc_multiuse",
+          "test_body": "declare void @use(i32)\n\ndefine i1 @anyset_two_bit_mask_trunc_multiuse(i32 %x) {\n  %s = lshr i32 %x, 3\n  %o = or i32 %s, %x\n  %r = trunc i32 %o to i1\n  call void @use(i32 %o)\n  ret i1 %r\n}\n"
+        },
+        {
+          "test_name": "allset_two_bit_mask_multiuse",
+          "test_body": "declare void @use(i32)\n\ndefine i32 @allset_two_bit_mask_multiuse(i32 %x) {\n  %s = lshr i32 %x, 7\n  %o = and i32 %s, %x\n  %r = and i32 %o, 1\n  call void @use(i32 %o)\n  ret i32 %r\n}\n"
+        }
+      ]
+    }
+  ]
+}

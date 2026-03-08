@@ -1,0 +1,87 @@
+{
+  "pr_id": 179504,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/179504",
+  "state": "closed",
+  "title": "[VPlan] Fix alias logic in canHoistOrSinkWithNoAliasCheck",
+  "author": "artagnon",
+  "base_commit": "b3f3b57aed375b53d1801d532333bd66417b11ef",
+  "fix_commit": "fb24a9741e10d92dd13eef2c4d7404fccd1ee666",
+  "patch": "diff --git a/llvm/include/llvm/Analysis/ScopedNoAliasAA.h b/llvm/include/llvm/Analysis/ScopedNoAliasAA.h\nindex dbe1afa50ee3a..9515a0e64ba39 100644\n--- a/llvm/include/llvm/Analysis/ScopedNoAliasAA.h\n+++ b/llvm/include/llvm/Analysis/ScopedNoAliasAA.h\n@@ -37,9 +37,11 @@ class ScopedNoAliasAAResult : public AAResultBase {\n     return false;\n   }\n \n+  LLVM_ABI static AliasResult alias(const MemoryLocation &LocA,\n+                                    const MemoryLocation &LocB);\n   LLVM_ABI AliasResult alias(const MemoryLocation &LocA,\n-                             const MemoryLocation &LocB, AAQueryInfo &AAQI,\n-                             const Instruction *CtxI);\n+                             const MemoryLocation &LocB, AAQueryInfo &,\n+                             const Instruction *);\n   LLVM_ABI ModRefInfo getModRefInfo(const CallBase *Call,\n                                     const MemoryLocation &Loc,\n                                     AAQueryInfo &AAQI);\ndiff --git a/llvm/lib/Analysis/ScopedNoAliasAA.cpp b/llvm/lib/Analysis/ScopedNoAliasAA.cpp\nindex d24ad0255256c..a76388281edb0 100644\n--- a/llvm/lib/Analysis/ScopedNoAliasAA.cpp\n+++ b/llvm/lib/Analysis/ScopedNoAliasAA.cpp\n@@ -52,9 +52,7 @@ static cl::opt<bool> EnableScopedNoAlias(\"enable-scoped-noalias\",\n                                          cl::init(true), cl::Hidden);\n \n AliasResult ScopedNoAliasAAResult::alias(const MemoryLocation &LocA,\n-                                         const MemoryLocation &LocB,\n-                                         AAQueryInfo &AAQI,\n-                                         const Instruction *) {\n+                                         const MemoryLocation &LocB) {\n   if (!EnableScopedNoAlias)\n     return AliasResult::MayAlias;\n \n@@ -72,6 +70,12 @@ AliasResult ScopedNoAliasAAResult::alias(const MemoryLocation &LocA,\n   return AliasResult::MayAlias;\n }\n \n+AliasResult ScopedNoAliasAAResult::alias(const MemoryLocation &LocA,\n+                                         const MemoryLocation &LocB,\n+                                         AAQueryInfo &, const Instruction *) {\n+  return alias(LocA, LocB);\n+}\n+\n ModRefInfo ScopedNoAliasAAResult::getModRefInfo(const CallBase *Call,\n                                                 const MemoryLocation &Loc,\n                                                 AAQueryInfo &AAQI) {\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 875bad9bfe17b..4b75d3f2bedfd 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -201,8 +201,6 @@ canHoistOrSinkWithNoAliasCheck(const MemoryLocation &MemLoc,\n   if (!MemLoc.AATags.Scope)\n     return false;\n \n-  const AAMDNodes &MemAA = MemLoc.AATags;\n-\n   for (VPBlockBase *Block = FirstBB; Block;\n        Block = Block->getSingleSuccessor()) {\n     assert(Block->getNumSuccessors() <= 1 &&\n@@ -222,16 +220,7 @@ canHoistOrSinkWithNoAliasCheck(const MemoryLocation &MemLoc,\n         // location.\n         return false;\n \n-      // For reads, check if they don't alias in the reverse direction and\n-      // skip if so.\n-      if (CheckReads && R.mayReadFromMemory() &&\n-          !ScopedNoAliasAAResult::mayAliasInScopes(Loc->AATags.Scope,\n-                                                   MemAA.NoAlias))\n-        continue;\n-\n-      // Check if the memory operations may alias in the forward direction.\n-      if (ScopedNoAliasAAResult::mayAliasInScopes(MemAA.Scope,\n-                                                  Loc->AATags.NoAlias))\n+      if (ScopedNoAliasAAResult::alias(*Loc, MemLoc) != AliasResult::NoAlias)\n         return false;\n     }\n \n",
+  "components": [
+    "LoopVectorize",
+    "ScopedNoAliasAA"
+  ],
+  "description": "The correct way to check if two memory locations may alias is outlined in ScopedNoAliasAAResult::alias: extract this into a helper, to fix the current logic.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/hoist-predicated-loads-with-predicated-stores.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-width=2 -force-vector-interleave=1 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_memory_op_between_loads_alias",
+          "test_body": "define void @test_memory_op_between_loads_alias(ptr %dst, ptr %src, ptr %cond, ptr %dst.1) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep.cond = getelementptr inbounds i32, ptr %cond, i32 %iv\n  %c = load i32, ptr %gep.cond, align 4\n  %c.0 = icmp ule i32 %c, 11\n  br i1 %c.0, label %then, label %middle\n\nmiddle:                                           ; preds = %loop\n  %gep.src.middle = getelementptr inbounds i32, ptr %src, i32 %iv\n  store i32 0, ptr %gep.src.middle, align 4\n  br label %else\n\nthen:                                             ; preds = %loop\n  %gep.src.then = getelementptr inbounds i32, ptr %src, i32 %iv\n  %l.src.then = load i32, ptr %gep.src.then, align 4\n  %gep.dst.then = getelementptr inbounds i32, ptr %dst, i32 %iv\n  store i32 %l.src.then, ptr %gep.dst.then, align 4\n  br label %loop.latch\n\nelse:                                             ; preds = %middle\n  %gep.src.else = getelementptr inbounds i32, ptr %src, i32 %iv\n  %l.src.else = load i32, ptr %gep.src.else, align 4\n  %add = add i32 %l.src.else, 10\n  %gep.dst.else = getelementptr inbounds i32, ptr %dst, i32 %iv\n  store i32 %add, ptr %gep.dst.else, align 4\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %else, %then\n  %iv.next = add nuw nsw i32 %iv, 1\n  %ec = icmp eq i32 %iv.next, 100\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop.latch\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "artagnon",
+      "body": "Gentle ping."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-03T17:13:43Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Analysis/ScopedNoAliasAA.h": [
+      [
+        37,
+        45
+      ]
+    ],
+    "llvm/lib/Analysis/ScopedNoAliasAA.cpp": [
+      [
+        52,
+        60
+      ],
+      [
+        72,
+        77
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        201,
+        208
+      ],
+      [
+        222,
+        237
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/hoist-predicated-loads-with-predicated-stores.ll": [
+      [
+        341,
+        395
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Analysis/ScopedNoAliasAA.h": [
+      "invalidate"
+    ],
+    "llvm/lib/Analysis/ScopedNoAliasAA.cpp": [
+      "ScopedNoAliasAAResult::alias",
+      "ScopedNoAliasAAResult::getModRefInfo"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "canHoistOrSinkWithNoAliasCheck"
+    ]
+  }
+}

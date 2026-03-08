@@ -1,0 +1,98 @@
+{
+  "pr_id": 180906,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180906",
+  "state": "closed",
+  "title": "[LangRef] Clarify nsz semantics",
+  "author": "nikic",
+  "base_commit": "ea0e2f000983bf2fc46f6416d28b418cebc005c6",
+  "fix_commit": "604c79ff795da9ae024816759b4b4bbcbcffd88f",
+  "patch": "diff --git a/llvm/docs/LangRef.rst b/llvm/docs/LangRef.rst\nindex 00a4a00c5bf95..b02a35c7088b5 100644\n--- a/llvm/docs/LangRef.rst\n+++ b/llvm/docs/LangRef.rst\n@@ -4162,9 +4162,9 @@ following flags to enable otherwise unsafe floating-point transformations.\n    produces a :ref:`poison value <poisonvalues>` instead.\n \n ``nsz``\n-   No Signed Zeros - Allow optimizations to treat the sign of a zero\n-   argument or zero result as insignificant. This does not imply that -0.0\n-   is poison and/or guaranteed to not exist in the operation.\n+   No Signed Zeros - Unless otherwise mentioned, the sign bit of 0.0 or -0.0\n+   input operands can be non-deterministically flipped. This does not imply\n+   that -0.0 is poison and/or guaranteed to not exist in the operation.\n \n Note: For :ref:`phi <i_phi>`, :ref:`select <i_select>`, and :ref:`call <i_call>`\n instructions, the following return types are considered to be floating-point\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 6476a38b8a545..a43d3f41a9ef5 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3109,10 +3109,11 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n         CallInst *AbsT = Builder.CreateCall(II->getCalledFunction(), {TVal});\n         CallInst *AbsF = Builder.CreateCall(II->getCalledFunction(), {FVal});\n         SelectInst *SI = SelectInst::Create(Cond, AbsT, AbsF);\n-        FastMathFlags FMF1 = II->getFastMathFlags();\n-        FastMathFlags FMF2 = cast<SelectInst>(Arg)->getFastMathFlags();\n-        FMF2.setNoSignedZeros(false);\n-        SI->setFastMathFlags(FMF1 | FMF2);\n+        SI->setFastMathFlags(II->getFastMathFlags() |\n+                             cast<SelectInst>(Arg)->getFastMathFlags());\n+        // Can't copy nsz to select, as even with the nsz flag the fabs result\n+        // always has the sign bit unset.\n+        SI->setHasNoSignedZeros(false);\n         return SI;\n       }\n       // fabs (select Cond, -FVal, FVal) --> fabs FVal\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "The current LangRef wording says that the sign of a zero argument or result is \"insignificant\", which is not really clear on what this means.\r\n\r\nAlive2 models this as non-deterministically flipping the zero sign bits for both inputs and outputs.\r\n\r\nThis PR proposes to specify this flag as non-deterministically flipping inputs only. A consequence of this is that fabs is guaranteed to have an unset sign bit even if the input is zero (that is, https://alive2.llvm.org/ce/z/irCftQ is no longer a valid transform), and that the copysign result sign only depends on the second operand (that is, https://alive2.llvm.org/ce/z/VnHdfh is no longer a valid transform).\r\n\r\nThese rules are still more liberal than we'd really like them to be, but at least avoid some of the issues with nsz.\r\n\r\nThis is based on the discussion in:\r\nhttps://discourse.llvm.org/t/rfc-clarify-the-behavior-of-fp-operations-on-bit-strings-with-nsz-flag/85981",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/intrinsic-select.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_fabs_select_fmf1",
+          "test_body": "define double @test_fabs_select_fmf1(i1 %cond, double %a) {\n  %sel1 = select nnan ninf nsz i1 %cond, double 0.000000e+00, double %a\n  %fabs = call double @llvm.fabs.f64(double %sel1)\n  ret double %fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.fabs.f64(double) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_fabs_select_fmf2",
+          "test_body": "define double @test_fabs_select_fmf2(i1 %cond, double %a) {\n  %sel1 = select i1 %cond, double 0.000000e+00, double %a\n  %fabs = call nnan ninf nsz double @llvm.fabs.f64(double %sel1)\n  ret double %fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.fabs.f64(double) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "nikic",
+      "body": "> This refinement still doesn't work for `select/phi nsz`, right?\r\n\r\nWhat do you mean by \"doesn't work\"? For select/phi the semantics stay the same (the input/output distinction is not relevant there)."
+    },
+    {
+      "author": "jcranmer-intel",
+      "body": "The user-level semantics of `nsz` are to permit any transformations that would be illegal (only) because of the distinction between `-0.0` and `+0.0`, and I want to make sure we never lose sight of that. It's also meant to never \"gratuitously\" change the sign, and the current semantics are (probably unavoidably) a little too permissive in that regard.\r\n\r\nI'm worried about the potential for cases that result in `-0.0` that we want to ignore but don't have an initial `-0.0` in the first place. Almost all of the special cases that result in `-0.0` for IEEE 754 operations either result from a `-0.0` input or a `-inf`. (The main exceptions I see are the *pi functions returning `-0.0` for some integers). It may make sense to also allow `nsz` to change the input sign of an infinity if that would change the sign of a `-0.0` or `+0.0` result."
+    },
+    {
+      "author": "jyknight",
+      "body": "> > This refinement still doesn't work for `select/phi nsz`, right?\r\n> \r\n> What do you mean by \"doesn't work\"? For select/phi the semantics stay the same (the input/output distinction is not relevant there).\r\n\r\nISTM that a guarantee of consistent output (from e.g. `fabs`) isn't be particularly useful from a _user_ point-of-view, so long as a phi (marked nsz) can change the sign arbitrarily anyhow.\r\n\r\nHaving phi, a pseudo-operation, defined as able to change values is just fundamentally weird. I understand the motivation based on wanting to transform `x < 0 ? -x : x` into `abs`, but it doesn't make it not weird...And the concrete implications on Clang's behavior are also odd: under `-fno-unsigned-zeros`, `float f(float a) { return a < 0 ? -a : a; }` can optimize to fabs (because clang emits phi nsz), yet `float f(float a) { float r; if(a < 0) r = -a; else r = a; return r; }` cannot (because there was no `phi nsz` in the input IR).\r\n\r\nThat said, since this clarification seems aimed at making it easier to write correct analyses easier inside LLVM, rather than making user-level semantics easier to understand, it does seem plausible.\r\n\r\n> It may make sense to also allow nsz to change the input sign of an infinity if that would change the sign of a -0.0 or +0.0 result.\r\n\r\nDo you have a particular transform in mind where that allowance would be used/useful? I didn't see any transform in current LLVM that looked to depend on that, but I could've missed it.  \r\n"
+    },
+    {
+      "author": "jcranmer-intel",
+      "body": "> > It may make sense to also allow nsz to change the input sign of an infinity if that would change the sign of a -0.0 or +0.0 result.\r\n> \r\n> Do you have a particular transform in mind where that allowance would be used/useful? I didn't see any transform in current LLVM that looked to depend on that, but I could've missed it.\r\n\r\nI don't have a specific transform in mind. Most of the obvious `nsz` transforms I can think of still rely on `-0.0` inputs. But I think the escape hatch of the output result was originally intended to catch operations that resulted in `-0.0` like `1.0/-inf`."
+    },
+    {
+      "author": "nunoplopes",
+      "body": "Here's one test that breaks with this semantics:\r\n```llvm\r\n; llvm/test/Transforms/InstCombine/intrinsic-select.ll\r\n\r\ndefine double @test_fabs_select_fmf2(i1 %cond, double %a) {\r\n  %sel1 = select i1 %cond, double 0.000000, double %a\r\n  %fabs = fabs nnan ninf nsz double %sel1\r\n  ret double %fabs\r\n}\r\n=>\r\ndefine double @test_fabs_select_fmf2(i1 %cond, double %a) {\r\n  %#1 = fabs double %a\r\n  %fabs = select nnan ninf nsz i1 %cond, double 0.000000, double %#1\r\n  ret double %fabs\r\n}\r\nTransformation doesn't verify! (unsound)\r\nERROR: Target's return value is more undefined\r\n\r\nExample:\r\ni1 %cond = #x0 (0)\r\ndouble %a = #x0000000000000000 (+0.0)\r\n\r\nSource:\r\ndouble %sel1 = #x0000000000000000 (+0.0)\r\ndouble %fabs = #x0000000000000000 (+0.0)\r\n\r\nTarget:\r\ndouble %#1 = #x0000000000000000 (+0.0)\r\ndouble %fabs = #x8000000000000000 (-0.0)\r\nSource value: #x0000000000000000 (+0.0)\r\nTarget value: #x8000000000000000 (-0.0)\r\n```"
+    },
+    {
+      "author": "nikic",
+      "body": "@nunoplopes Thanks! I've adjusted the fold to not preserve the nsz flag."
+    },
+    {
+      "author": "nikic",
+      "body": "> ISTM that a guarantee of consistent output (from e.g. fabs) isn't be particularly useful from a user point-of-view, so long as a phi (marked nsz) can change the sign arbitrarily anyhow.\r\n> [...]\r\n> That said, since this clarification seems aimed at making it easier to write correct analyses easier inside LLVM, rather than making user-level semantics easier to understand, it does seem plausible.\r\n\r\nYes, I don't think that the input/output distinction is meaningful from a user perspective, this is just to avoid at least some of the issues we currently have with nsz related miscompilations on the IR level.\r\n\r\nnsz generally has more non-determinism than we actually want, but I'm not sure how we can reduce it further, without giving up on operational semantics for nsz entirely, and making it a vibes-based rewrite flag instead..."
+    },
+    {
+      "author": "nikic",
+      "body": "If there's no more feedback, I plan to merge this by the end of the week."
+    }
+  ],
+  "knowledge_cutoff": "2026-02-11T09:54:17Z",
+  "patch_location_lineno": {
+    "llvm/docs/LangRef.rst": [
+      [
+        4162,
+        4170
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        3109,
+        3118
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/intrinsic-select.ll": [
+      [
+        337,
+        343
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst"
+    ]
+  }
+}

@@ -54,6 +54,14 @@ DEP_RE2C_SOURCE_DIR=${DEP_RE2C_DIR}/re2c-${DEP_RE2C_VERSION}
 DEP_RE2C_BUILD_DIR=${DEP_RE2C_DIR}/build
 
 #-================================
+# llvm-ub-aware-interpreter (llubi)
+#-================================
+
+DEP_LLUBI_DIR=${LLVM_AUTOREVIEW_DEPS_DIR}/llvm-ub-aware-interpreter
+DEP_LLUBI_SOURCE_DIR=${DEP_LLUBI_DIR}
+DEP_LLUBI_BUILD_DIR=${DEP_LLUBI_DIR}/build
+
+#-================================
 # Python dependencies
 #-================================
 

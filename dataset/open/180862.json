@@ -1,0 +1,217 @@
+{
+  "pr_id": 180862,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180862",
+  "state": "open",
+  "title": "[ConstraintElim] Use ConstantRange information for ConstraintElimination",
+  "author": "manasij7479",
+  "base_commit": "6f0b0ecaba1ba311717f86d8e4d8c6b2b4c4cd4b",
+  "fix_commit": "0f113fd3deb31747330497738b5fe827c10244da",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\nindex fc5ee2359a76f..f950f72455989 100644\n--- a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n@@ -25,6 +25,7 @@\n #include \"llvm/Analysis/ScalarEvolutionExpressions.h\"\n #include \"llvm/Analysis/TargetLibraryInfo.h\"\n #include \"llvm/Analysis/ValueTracking.h\"\n+#include \"llvm/IR/ConstantRange.h\"\n #include \"llvm/IR/DataLayout.h\"\n #include \"llvm/IR/DebugInfo.h\"\n #include \"llvm/IR/Dominators.h\"\n@@ -63,6 +64,11 @@ static cl::opt<bool> DumpReproducers(\n     \"constraint-elimination-dump-reproducers\", cl::init(false), cl::Hidden,\n     cl::desc(\"Dump IR to reproduce successful transformations.\"));\n \n+static cl::opt<bool> UseConstantRangeFacts(\n+    \"constraint-elimination-use-constant-range-facts\", cl::init(true),\n+    cl::Hidden,\n+    cl::desc(\"Use constant range facts from computeConstantRange.\"));\n+\n static int64_t MaxConstraintValue = std::numeric_limits<int64_t>::max();\n static int64_t MinSignedConstraintValue = std::numeric_limits<int64_t>::min();\n \n@@ -174,6 +180,7 @@ struct State {\n   ScalarEvolution &SE;\n   TargetLibraryInfo &TLI;\n   SmallVector<FactOrCheck, 64> WorkList;\n+  SmallPtrSet<Value *, 16> RangeFactsComputed;\n \n   State(DominatorTree &DT, LoopInfo &LI, ScalarEvolution &SE,\n         TargetLibraryInfo &TLI)\n@@ -182,6 +189,10 @@ struct State {\n   /// Process block \\p BB and add known facts to work-list.\n   void addInfoFor(BasicBlock &BB);\n \n+  /// Add constant range facts for \\p V at \\p DTN. Deduplicates using\n+  /// RangeFactsComputed.\n+  void addConstantRangeFact(Value *V, DomTreeNode *DTN);\n+\n   /// Try to add facts for loop inductions (AddRecs) in EQ/NE compares\n   /// controlling the loop header.\n   void addInfoForInductions(BasicBlock &BB);\n@@ -1125,6 +1136,28 @@ static bool getConstraintFromMemoryAccess(GetElementPtrInst &GEP,\n   return true;\n }\n \n+void State::addConstantRangeFact(Value *V, DomTreeNode *DTN) {\n+  if (!RangeFactsComputed.insert(V).second)\n+    return;\n+  Type *Ty = V->getType();\n+  if (!Ty->isIntegerTy() || Ty->getIntegerBitWidth() > 64)\n+    return;\n+\n+  ConstantRange CR =\n+      computeConstantRange(V, /*ForSigned=*/false, /*UseInstrInfo=*/true);\n+  if (CR.isFullSet() || CR.isEmptySet())\n+    return;\n+\n+  APInt UMin = CR.getUnsignedMin();\n+  APInt UMax = CR.getUnsignedMax();\n+  if (!UMin.isZero())\n+    WorkList.push_back(FactOrCheck::getConditionFact(\n+        DTN, CmpInst::ICMP_UGE, V, ConstantInt::get(Ty, UMin)));\n+  if (!UMax.isAllOnes())\n+    WorkList.push_back(FactOrCheck::getConditionFact(\n+        DTN, CmpInst::ICMP_ULE, V, ConstantInt::get(Ty, UMax)));\n+}\n+\n void State::addInfoFor(BasicBlock &BB) {\n   addInfoForInductions(BB);\n   auto &DL = BB.getDataLayout();\n@@ -1141,6 +1174,19 @@ void State::addInfoFor(BasicBlock &BB) {\n           continue;\n         WorkList.push_back(FactOrCheck::getCheck(DTN, &U));\n       }\n+      // Target operands feeding into comparisons for computeConstantRange.\n+      // Only explore two levels deep, and exclude eq and ne because of\n+      // outsized compile time impact and marginal benefit.\n+      if (UseConstantRangeFacts && !Cmp->isEquality()) {\n+        for (Value *Op : Cmp->operands()) {\n+          if (auto *OpI = dyn_cast<Instruction>(Op)) {\n+            addConstantRangeFact(OpI, DT.getNode(OpI->getParent()));\n+            for (Value *SubOp : OpI->operands())\n+              if (auto *SubI = dyn_cast<Instruction>(SubOp))\n+                addConstantRangeFact(SubI, DT.getNode(SubI->getParent()));\n+          }\n+        }\n+      }\n       continue;\n     }\n \n@@ -1843,7 +1889,15 @@ static bool eliminateConstraints(Function &F, DominatorTree &DT, LoopInfo &LI,\n   std::unique_ptr<Module> ReproducerModule(\n       DumpReproducers ? new Module(F.getName(), F.getContext()) : nullptr);\n \n-  // First, collect conditions implied by branches and blocks with their\n+  // Add range facts for function parameters.\n+  if (UseConstantRangeFacts) {\n+    DomTreeNode *EntryDTN = DT.getNode(&F.getEntryBlock());\n+    if (EntryDTN)\n+      for (Argument &Arg : F.args())\n+        S.addConstantRangeFact(&Arg, EntryDTN);\n+  }\n+\n+  // Collect conditions implied by branches and blocks with their\n   // Dominator DFS in and out numbers.\n   for (BasicBlock &BB : F) {\n     if (!DT.getNode(&BB))\n",
+  "components": [
+    "ConstraintElimination"
+  ],
+  "description": "Adds facts from calling computeConstantRange on the operands and operands of operands of comparisons.\r\nBrings in range information explicitly specified in metadata or parameter attributes into the constraint system.\r\n\r\nThis enables ConstraintElimination to simplify more comparisons, helping SimplifyCFG and InstCombine.\r\n\r\nhttps://alive2.llvm.org/ce/z/yBgMqx\r\n\r\noriginal idea from @regehr ",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/constantrange.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "arg_range_add_nuw",
+          "test_body": "define i1 @arg_range_add_nuw(i32 range(i32 0, 10) %x, i32 noundef %y, i32 noundef %z) {\nentry:\n  %w = add nuw i32 %x, %y\n  %off = add nuw i32 %y, 9\n  %cmp = icmp ugt i32 %z, %off\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %r = icmp ugt i32 %z, %w\n  ret i1 %r\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "neg_and_mask_tight",
+          "test_body": "define i1 @neg_and_mask_tight(i32 noundef %x, i32 noundef %y, i32 noundef %z) {\nentry:\n  %v = and i32 %x, 7\n  %w = add nuw i32 %v, %y\n  %off = add nuw i32 %y, 6\n  %cmp = icmp ugt i32 %z, %off\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %r = icmp ugt i32 %z, %w\n  ret i1 %r\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "and_mask_add_nuw",
+          "test_body": "define i1 @and_mask_add_nuw(i32 noundef %x, i32 noundef %y, i32 noundef %z) {\nentry:\n  %v = and i32 %x, 7\n  %w = add nuw i32 %v, %y\n  %off = add nuw i32 %y, 7\n  %cmp = icmp ugt i32 %z, %off\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %r = icmp ugt i32 %z, %w\n  ret i1 %r\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "or_add_nuw",
+          "test_body": "define i1 @or_add_nuw(i32 noundef %x, i32 noundef %y, i32 noundef %z) {\nentry:\n  %v = or i32 %x, 1\n  %w = add nuw i32 %v, %y\n  %cmp = icmp uge i32 %z, %w\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %r = icmp ugt i32 %z, %y\n  ret i1 %r\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "or_lower_bound_offset",
+          "test_body": "define i1 @or_lower_bound_offset(i32 noundef %x, i32 noundef %y, i32 noundef %z) {\nentry:\n  %v = or i32 %x, 4\n  %w = add nuw i32 %v, %y\n  %off = add nuw i32 %y, 3\n  %cmp = icmp ule i32 %z, %off\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %r = icmp ugt i32 %w, %z\n  ret i1 %r\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "call_range_add_nuw",
+          "test_body": "declare i32 @get_percent()\n\ndefine i1 @call_range_add_nuw(i32 noundef %y, i32 noundef %z) {\nentry:\n  %v = call range(i32 0, 100) i32 @get_percent()\n  %w = add nuw i32 %v, %y\n  %off = add nuw i32 %y, 99\n  %cmp = icmp ugt i32 %z, %off\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %r = icmp ugt i32 %z, %w\n  ret i1 %r\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        },
+        {
+          "test_name": "lshr_add_nuw",
+          "test_body": "define i1 @lshr_add_nuw(i32 noundef %x, i32 noundef %y, i32 noundef %z) {\nentry:\n  %v = lshr i32 %x, 2\n  %w = add nuw i32 %v, %y\n  %off = add nuw i32 %y, 1073741823\n  %cmp = icmp ugt i32 %z, %off\n  br i1 %cmp, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %r = icmp ugt i32 %z, %w\n  ret i1 %r\n\nelse:                                             ; preds = %entry\n  ret i1 false\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/large-constant-ints.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "add_nuw_decomp_recursive",
+          "test_body": "define i1 @add_nuw_decomp_recursive() {\n  %add = add nuw nsw i64 -9223372036854775808, 10\n  %cmp = icmp uge i64 %add, 10\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/loops-bottom-tested-base.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "loop_iv_cond_variable_bound",
+          "test_body": "declare void @use(i1)\n\ndefine void @loop_iv_cond_variable_bound(i32 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %t.1 = icmp ule i32 %iv, %n\n  call void @use(i1 %t.1)\n  %t.2 = icmp sge i32 %iv, 0\n  call void @use(i1 %t.2)\n  %t.3 = icmp sge i32 %iv, -1\n  call void @use(i1 %t.3)\n  %c.1 = icmp ult i32 %iv, %n\n  call void @use(i1 %c.1)\n  %c.2 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.2)\n  %cmp = icmp ult i32 %iv, %n\n  %iv.next = add nuw nsw i32 %iv, 1\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "loop_iv_cond_constant_bound",
+          "test_body": "declare void @use(i1)\n\ndefine void @loop_iv_cond_constant_bound() {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %t.1 = icmp ule i32 %iv, 2\n  call void @use(i1 %t.1)\n  %t.2 = icmp sge i32 %iv, 0\n  call void @use(i1 %t.2)\n  %t.3 = icmp sge i32 %iv, -1\n  call void @use(i1 %t.3)\n  %c.1 = icmp ult i32 %iv, 2\n  call void @use(i1 %c.1)\n  %c.2 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.2)\n  %cmp = icmp ult i32 %iv, 2\n  %iv.next = add nuw nsw i32 %iv, 1\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/reproducer-remarks.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -constraint-elimination-dump-reproducers -pass-remarks=constraint-elimination %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "test_one_known_fact_false_branch",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndeclare void @use(i1)\n\ndefine void @test_one_known_fact_false_branch(i8 %start, i8 %high) {\nentry:\n  %add.ptr.i = add nuw i8 %start, 3\n  %c.1 = icmp uge i8 %add.ptr.i, %high\n  br i1 %c.1, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  ret void\n\nif.end:                                           ; preds = %entry\n  %t.0 = icmp ult i8 %start, %high\n  call void @use(i1 %t.0)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_one_known_fact_true_branch",
+          "test_body": "target datalayout = \"e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndeclare void @use(i1)\n\ndefine void @test_one_known_fact_true_branch(i8 %start, i8 %high) {\nentry:\n  %add.ptr.i = add nuw i8 %start, 3\n  %c.1 = icmp ult i8 %add.ptr.i, %high\n  br i1 %c.1, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  %t.0 = icmp ult i8 %start, %high\n  call void @use(i1 %t.0)\n  ret void\n\nif.end:                                           ; preds = %entry\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/sub-nuw.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sub_nuw_i64_signed_min_const",
+          "test_body": "define i1 @sub_nuw_i64_signed_min_const(i64 %a) {\nentry:\n  %neg2 = sub nuw i64 0, -9223372036854775808\n  %c = icmp ugt i64 %neg2, 0\n  ret i1 %c\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "nikic",
+      "body": "Looks like the compile-time cost of doing this is very high: https://github.com/dtcxzyw/llvm-opt-benchmark/pull/3454#issuecomment-3881987708 (I expect this is due to the added constraints, not due to computeConstantRange.)"
+    },
+    {
+      "author": "manasij7479",
+      "body": " \r\n\r\n> Looks like the compile-time cost of doing this is very high: [dtcxzyw/llvm-opt-benchmark#3454 (comment)](https://github.com/dtcxzyw/llvm-opt-benchmark/pull/3454#issuecomment-3881987708) (I expect this is due to the added constraints, not due to computeConstantRange.)\r\n\r\nI have recovered the compile time hit to a large extent by restricting this to operands and operands of operands of (non eq/ne) icmp instructions. \r\n\r\n@dtcxzyw Could you please trigger another compile time and IR impact test? Thanks!"
+    },
+    {
+      "author": "artagnon",
+      "body": "The compile-time impact is due to computeKnownBits, and the additional compile-time from adding constraints is small: I already investigated this. If the compile-time impact is small enough, we can go forward with this, and later migrate it to use KnownBitsAnalysis, once that's ready."
+    },
+    {
+      "author": "manasij7479",
+      "body": "> This looks somewhat similar to @artagnon 's #176607. \r\n  \r\nKnownBits is going to be slightly better for analyzing certain expressions, and ConstantRange another (overlapping) subset. Ideally we need both, but this has to be experimentally determined. "
+    },
+    {
+      "author": "manasij7479",
+      "body": "> The compile-time impact is due to computeKnownBits, and the additional compile-time from adding constraints is small: I already investigated this. If the compile-time impact is small enough, we can go forward with this, and later migrate it to use KnownBitsAnalysis, once that's ready.\r\n\r\nConstantRange translates to precise linear constraints idiomatically, except for the disjunction implied by wrapped ranges.\r\nKnownBits would not work as well for all ranges inferred from computeConstantRange, and vice versa. It would surely work for some of the tests I added though!\r\n   \r\nMaybe `ConstantRange::fromKnownBits(computeKnownBits(...))` could be a good idea? With your known bits caching approach, this could be reasonably fast. \r\n"
+    },
+    {
+      "author": "manasij7479",
+      "body": "Huh rebase did something weird. Fixed with a force push. Sorry about the noise!"
+    },
+    {
+      "author": "manasij7479",
+      "body": ">  Would the current PR also allow remove `bool IsKnownNonNegative;`?\r\n\r\nDoesn't seem so, at least not without extra plumbing. Maybe `IsKnownNonNegative` can be improved a tiny bit by also checking the range along with known bits, but it does not seem feasible to remove the constraints derived from `IsKnownNonNegative` in this pass. \r\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-10T23:40:08Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+      [
+        25,
+        30
+      ],
+      [
+        63,
+        68
+      ],
+      [
+        174,
+        179
+      ],
+      [
+        182,
+        187
+      ],
+      [
+        1125,
+        1130
+      ],
+      [
+        1141,
+        1146
+      ],
+      [
+        1843,
+        1849
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/large-constant-ints.ll": [
+      [
+        307,
+        314
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/loops-bottom-tested-base.ll": [
+      [
+        11,
+        18
+      ],
+      [
+        58,
+        65
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/reproducer-remarks.ll": [
+      [
+        26,
+        36
+      ],
+      [
+        52,
+        62
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/sub-nuw.ll": [
+      [
+        372,
+        379
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+      "State::addInfoFor",
+      "eliminateConstraints",
+      "getConstraintFromMemoryAccess",
+      "getContextInstForUse"
+    ],
+    "llvm/test/Transforms/ConstraintElimination/sub-nuw.ll": [
+      "i64"
+    ]
+  }
+}

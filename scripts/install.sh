@@ -31,7 +31,7 @@ fi
 
 mkdir ${DEP_LLVM_DIR}
 git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
-git -C ${DEP_LLVM_SOURCE_DIR} checkout ${DEP_LLVM_VERSION} 
+git -C ${DEP_LLVM_SOURCE_DIR} checkout ${DEP_LLVM_VERSION}
 cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_RTTI=ON \
@@ -39,7 +39,7 @@ cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DLLVM_ENABLE_ASSERTIONS=ON \
   -DLLVM_ENABLE_OCAMLDOC=OFF \
   -DLLVM_ABI_BREAKING_CHECKS=WITH_ASSERTS \
-  -DLLVM_ENABLE_PROJECTS="llvm;clang" 
+  -DLLVM_ENABLE_PROJECTS="llvm;clang"
 ninja -C ${DEP_LLVM_BUILD_DIR}
 sudo ninja -C ${DEP_LLVM_BUILD_DIR} install
 
@@ -76,6 +76,16 @@ cmake -S ${DEP_ALIVE2_SOURCE_DIR} -B ${DEP_ALIVE2_BUILD_DIR} -G Ninja -DCMAKE_BU
 ninja -C ${DEP_ALIVE2_BUILD_DIR}
 sudo ninja -C ${DEP_ALIVE2_BUILD_DIR} install
 
+#-================================
+# llvm-ub-aware-interpreter (llubi)
+#-================================
+
+mkdir -p ${DEP_LLUBI_DIR}
+git clone https://github.com/dtcxzyw/llvm-ub-aware-interpreter ${DEP_LLUBI_SOURCE_DIR}
+cmake -S ${DEP_LLUBI_SOURCE_DIR} -B ${DEP_LLUBI_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=${DEP_LLVM_BUILD_DIR}/lib/cmake/llvm
+ninja -C ${DEP_LLUBI_BUILD_DIR}
+
 # ccache
 
 mkdir -p ${DEP_CCACHE_DIR}
@@ -105,6 +115,5 @@ ${PYTHON3} -m venv ${DEP_PY3_VENV_DIR}
 rm -rf ${DEP_LLVM_BUILD_DIR} \
   ${DEP_Z3_DIR} \
   ${DEP_RE2C_DIR} \
-  ${DEP_ALIVE2_DIR} \
   ${DEP_CCACHE_DIR}
 git -C ${DEP_LLVM_SOURCE_DIR} checkout main

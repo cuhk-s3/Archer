@@ -1,0 +1,51 @@
+{
+  "pr_id": 179640,
+  "title": "[ConstantFolding] Support bitcasting vectors to smaller element sizes with non-integer ratios.",
+  "author": "varev-dev",
+  "base_commit": "7e34aaeb91cfd537f8510c94c51df31ecd310ba5",
+  "fix_commit": "c1ed115cd06e1354c260379745d97d02acee3f0e",
+  "patch": "diff --git a/llvm/lib/Analysis/ConstantFolding.cpp b/llvm/lib/Analysis/ConstantFolding.cpp\nindex ab060b1b9320a..9d83c49c4b213 100644\n--- a/llvm/lib/Analysis/ConstantFolding.cpp\n+++ b/llvm/lib/Analysis/ConstantFolding.cpp\n@@ -217,13 +217,12 @@ Constant *FoldBitCast(Constant *C, Type *DestTy, const DataLayout &DL) {\n   // conversion here, which depends on whether the input or output has\n   // more elements.\n   bool isLittleEndian = DL.isLittleEndian();\n-\n+  unsigned SrcBitSize = SrcEltTy->getPrimitiveSizeInBits();\n   SmallVector<Constant*, 32> Result;\n   if (NumDstElt < NumSrcElt) {\n     // Handle: bitcast (<4 x i32> <i32 0, i32 1, i32 2, i32 3> to <2 x i64>)\n     Constant *Zero = Constant::getNullValue(DstEltTy);\n-    unsigned Ratio = NumSrcElt/NumDstElt;\n-    unsigned SrcBitSize = SrcEltTy->getPrimitiveSizeInBits();\n+    unsigned Ratio = NumSrcElt / NumDstElt;\n     unsigned SrcElt = 0;\n     for (unsigned i = 0; i != NumDstElt; ++i) {\n       // Build each element of the result.\n@@ -262,36 +261,64 @@ Constant *FoldBitCast(Constant *C, Type *DestTy, const DataLayout &DL) {\n   }\n \n   // Handle: bitcast (<2 x i64> <i64 0, i64 1> to <4 x i32>)\n+  //         bitcast (<3 x i64> <i64 0, i64 1, i64 2> to <8 x i24>)\n   unsigned Ratio = NumDstElt/NumSrcElt;\n   unsigned DstBitSize = DL.getTypeSizeInBits(DstEltTy);\n-\n-  // Loop over each source value, expanding into multiple results.\n-  for (unsigned i = 0; i != NumSrcElt; ++i) {\n-    auto *Element = C->getAggregateElement(i);\n-\n+  APInt Rest(SrcBitSize, 0);\n+  unsigned RestSize = 0;\n+  for (unsigned i = 0; Result.size() != NumDstElt;) {\n+    unsigned UnusedBits = SrcBitSize - RestSize;\n+    if (RestSize >= DstBitSize) {\n+      APInt Elt = isLittleEndian ? Rest.lshr(UnusedBits)\n+                                 : Rest << (RestSize - DstBitSize);\n+      Result.push_back(ConstantInt::get(DstEltTy, Elt.trunc(DstBitSize)));\n+      RestSize -= DstBitSize;\n+      continue;\n+    }\n+    auto *Element = C->getAggregateElement(i++);\n     if (!Element) // Reject constantexpr elements.\n       return ConstantExpr::getBitCast(C, DestTy);\n \n+    APInt NextVecElem;\n     if (isa<UndefValue>(Element)) {\n       // Correctly Propagate undef values.\n-      Result.append(Ratio, UndefValue::get(DstEltTy));\n-      continue;\n+      if (SrcBitSize % DstBitSize == 0) {\n+        Result.append(Ratio, UndefValue::get(DstEltTy));\n+        continue;\n+      }\n+      // Replace Undef with zeros to prevent partial corruption.\n+      NextVecElem = APInt::getZero(SrcBitSize);\n+    } else {\n+      auto *Src = dyn_cast<ConstantInt>(Element);\n+      if (!Src)\n+        return ConstantExpr::getBitCast(C, DestTy);\n+      NextVecElem = Src->getValue();\n     }\n-\n-    auto *Src = dyn_cast<ConstantInt>(Element);\n-    if (!Src)\n-      return ConstantExpr::getBitCast(C, DestTy);\n-\n-    unsigned ShiftAmt = isLittleEndian ? 0 : DstBitSize*(Ratio-1);\n+    APInt Value = Rest;\n+    if (SrcBitSize % DstBitSize)\n+      Rest = NextVecElem;\n+    if (RestSize != 0) {\n+      // Shift the Rest into the right place, shift NextVecElem to fit Rest.\n+      if (isLittleEndian) {\n+        Value.lshrInPlace(UnusedBits == SrcBitSize ? 0 : UnusedBits);\n+        NextVecElem <<= RestSize;\n+      } else {\n+        Value <<= UnusedBits;\n+        NextVecElem.lshrInPlace(RestSize);\n+      }\n+    }\n+    Value |= NextVecElem;\n+    unsigned ShiftAmt = isLittleEndian ? 0 : SrcBitSize - DstBitSize;\n     for (unsigned j = 0; j != Ratio; ++j) {\n       // Shift the piece of the value into the right place, depending on\n       // endianness.\n-      APInt Elt = Src->getValue().lshr(ShiftAmt);\n+      APInt Elt = Value.lshr(ShiftAmt);\n       ShiftAmt += isLittleEndian ? DstBitSize : -DstBitSize;\n \n       // Truncate and remember this piece.\n       Result.push_back(ConstantInt::get(DstEltTy, Elt.trunc(DstBitSize)));\n     }\n+    RestSize = SrcBitSize + RestSize - Ratio * DstBitSize;\n   }\n \n   return ConstantVector::get(Result);\n",
+  "components": [
+    "ConstantFold"
+  ],
+  "description": "This patch fixes a crash when constant folding bitcast from a vector with larger elements to a vector with smaller ones, where the element count ratio is not an integer (e.g., <3 x i32> to <4 x i24>).\r\n\r\nPreviously the logic assumed a uniform ratio, leading to an incorrect number of result elements and subsequent crashes in RAUW. This patch implements a bit-stream evaluation to correctly extract smaller elements from the source vector.\r\n\r\nFixes #179626 ",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstSimplify/bitcast-vector-fold.ll",
+      "commands": [
+        "opt < %s -passes=instsimplify -S",
+        "opt < %s -passes=instsimplify -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat -S"
+      ],
+      "tests": [
+        {
+          "test_name": "bitcast_constexpr_16i8_8i16_u256uuu256uu",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <16 x i8> @bitcast_constexpr_16i8_8i16_u256uuu256uu() {\n  %cast = bitcast <8 x i16> <i16 undef, i16 256, i16 undef, i16 undef, i16 undef, i16 256, i16 undef, i16 undef> to <16 x i8>\n  ret <16 x i8> %cast\n}\n"
+        },
+        {
+          "test_name": "test11",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <4 x i24> @test11() {\n  %c = bitcast <3 x i32> splat (i32 1) to <4 x i24>\n  ret <4 x i24> %c\n}\n"
+        },
+        {
+          "test_name": "bitcast_constexpr_4i24_3i32_u1u",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <4 x i24> @bitcast_constexpr_4i24_3i32_u1u() {\n  %cast = bitcast <3 x i32> <i32 undef, i32 1, i32 undef> to <4 x i24>\n  ret <4 x i24> %cast\n}\n"
+        },
+        {
+          "test_name": "test12",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <8 x i24> @test12() {\n  %c = bitcast <3 x i64> <i64 281474993487873, i64 72057598332895488, i64 1099511693312> to <8 x i24>\n  ret <8 x i24> %c\n}\n"
+        },
+        {
+          "test_name": "test10",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <1 x i1> @test10() {\n  %ret = icmp eq <1 x i64> splat (i64 -1), zeroinitializer\n  ret <1 x i1> %ret\n}\n"
+        },
+        {
+          "test_name": "bitcast_constexpr_scalar_fp_to_vector_int",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <1 x i32> @bitcast_constexpr_scalar_fp_to_vector_int() {\n  %res = bitcast float 1.000000e+00 to <1 x i32>\n  ret <1 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "foo",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-f64:32:64-v64:64:64-v128:128:128\"\n\ndefine <2 x float> @foo() {\n  %cast = bitcast i64 -1 to <2 x float>\n  ret <2 x float> %cast\n}\n"
+        }
+      ]
+    }
+  ]
+}

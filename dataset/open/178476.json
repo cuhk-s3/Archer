@@ -1,0 +1,513 @@
+{
+  "pr_id": 178476,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/178476",
+  "state": "open",
+  "title": "[LoopUnroll] Enhance the use of Optimization Remarks and `LLVM_DEBUG`",
+  "author": "justinfargnoli",
+  "base_commit": "54d54992718552114751020b2c43d5622bccb49b",
+  "fix_commit": "92ce1ed20b445d1f55b86b3ac3cb837d5ca2dc6c",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Utils/UnrollLoop.h b/llvm/include/llvm/Transforms/Utils/UnrollLoop.h\nindex a3efc43c62dc3..cdce8f5bf21dd 100644\n--- a/llvm/include/llvm/Transforms/Utils/UnrollLoop.h\n+++ b/llvm/include/llvm/Transforms/Utils/UnrollLoop.h\n@@ -145,8 +145,10 @@ class UnrollCostEstimator {\n                                const SmallPtrSetImpl<const Value *> &EphValues,\n                                unsigned BEInsns);\n \n-  /// Whether it is legal to unroll this loop.\n-  LLVM_ABI bool canUnroll() const;\n+  /// Whether it is legal to unroll this loop. If \\p ORE and \\p L are provided,\n+  /// emit an optimization remark on failure.\n+  LLVM_ABI bool canUnroll(OptimizationRemarkEmitter *ORE = nullptr,\n+                          const Loop *L = nullptr) const;\n \n   uint64_t getRolledLoopSize() const { return LoopSize.getValue(); }\n \ndiff --git a/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp b/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\nindex 526ec193e0779..81ab185cfd50c 100644\n--- a/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\n+++ b/llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp\n@@ -142,8 +142,8 @@ static cl::opt<unsigned> UnrollMaxUpperBound(\n \n static cl::opt<unsigned> PragmaUnrollThreshold(\n     \"pragma-unroll-threshold\", cl::init(16 * 1024), cl::Hidden,\n-    cl::desc(\"Unrolled size limit for loops with an unroll(full) or \"\n-             \"unroll_count pragma.\"));\n+    cl::desc(\"Unrolled size limit for loops with unroll metadata \"\n+             \"(full, enable, or count).\"));\n \n static cl::opt<unsigned> FlatLoopTripCountThreshold(\n     \"flat-loop-tripcount-threshold\", cl::init(5), cl::Hidden,\n@@ -368,12 +368,18 @@ static std::optional<EstimatedUnrollCost> analyzeLoopUnrollCost(\n \n   // Only analyze inner loops. We can't properly estimate cost of nested loops\n   // and we won't visit inner loops again anyway.\n-  if (!L->isInnermost())\n+  if (!L->isInnermost()) {\n+    LLVM_DEBUG(dbgs().indent(3)\n+               << \"Not analyzing loop cost: not an innermost loop.\\n\");\n     return std::nullopt;\n+  }\n \n   // Don't simulate loops with a big or unknown tripcount\n-  if (!TripCount || TripCount > MaxIterationsCountToAnalyze)\n+  if (!TripCount || TripCount > MaxIterationsCountToAnalyze) {\n+    LLVM_DEBUG(dbgs() << \"   Not analyzing loop cost: trip count \"\n+                      << (TripCount ? \"too large\" : \"unknown\") << \".\\n\");\n     return std::nullopt;\n+  }\n \n   SmallSetVector<BasicBlock *, 16> BBWorklist;\n   SmallSetVector<std::pair<BasicBlock *, BasicBlock *>, 4> ExitWorklist;\n@@ -716,20 +722,28 @@ UnrollCostEstimator::UnrollCostEstimator(\n     LoopSize = BEInsns + 1;\n }\n \n-bool UnrollCostEstimator::canUnroll() const {\n+bool UnrollCostEstimator::canUnroll(OptimizationRemarkEmitter *ORE,\n+                                    const Loop *L) const {\n+  auto ReportCannotUnroll = [&](StringRef Reason) {\n+    LLVM_DEBUG(dbgs().indent(1) << \"Not unrolling: \" << Reason << \".\\n\");\n+    if (ORE && L)\n+      ORE->emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"CannotUnrollLoop\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to unroll loop: \" << Reason;\n+      });\n+  };\n+\n   if (Convergence == ConvergenceKind::ExtendedLoop) {\n-    LLVM_DEBUG(dbgs().indent(1)\n-               << \"Not unrolling: contains convergent operations.\\n\");\n+    ReportCannotUnroll(\"contains convergent operations\");\n     return false;\n   }\n   if (!LoopSize.isValid()) {\n-    LLVM_DEBUG(dbgs().indent(1)\n-               << \"Not unrolling: loop size could not be computed.\\n\");\n+    ReportCannotUnroll(\"loop size could not be computed\");\n     return false;\n   }\n   if (NotDuplicatable) {\n-    LLVM_DEBUG(dbgs().indent(1)\n-               << \"Not unrolling: contains non-duplicatable instructions.\\n\");\n+    ReportCannotUnroll(\"contains non-duplicatable instructions\");\n     return false;\n   }\n   return true;\n@@ -807,38 +821,83 @@ static std::optional<unsigned>\n shouldPragmaUnroll(Loop *L, const PragmaInfo &PInfo,\n                    const unsigned TripMultiple, const unsigned TripCount,\n                    unsigned MaxTripCount, const UnrollCostEstimator UCE,\n-                   const TargetTransformInfo::UnrollingPreferences &UP) {\n+                   const TargetTransformInfo::UnrollingPreferences &UP,\n+                   OptimizationRemarkEmitter *ORE) {\n \n   // Using unroll pragma\n   // 1st priority is unroll count set by \"unroll-count\" option.\n \n   if (PInfo.UserUnrollCount) {\n     if (UP.AllowRemainder &&\n-        UCE.getUnrolledLoopSize(UP, (unsigned)UnrollCount) < UP.Threshold)\n+        UCE.getUnrolledLoopSize(UP, (unsigned)UnrollCount) < UP.Threshold) {\n+      LLVM_DEBUG(dbgs().indent(2) << \"Unrolling with user-specified count: \"\n+                                  << UnrollCount << \"\\n\");\n       return (unsigned)UnrollCount;\n+    }\n+    LLVM_DEBUG(dbgs().indent(2)\n+               << \"Not unrolling with user count \" << UnrollCount << \": \"\n+               << (!UP.AllowRemainder ? \"remainder not allowed\"\n+                                      : \"exceeds threshold\")\n+               << \".\\n\");\n   }\n \n   // 2nd priority is unroll count set by pragma.\n   if (PInfo.PragmaCount > 0) {\n-    if ((UP.AllowRemainder || (TripMultiple % PInfo.PragmaCount == 0)))\n+    if ((UP.AllowRemainder || (TripMultiple % PInfo.PragmaCount == 0))) {\n+      LLVM_DEBUG(dbgs().indent(2) << \"Unrolling with pragma count: \"\n+                                  << PInfo.PragmaCount << \"\\n\");\n       return PInfo.PragmaCount;\n+    }\n+    LLVM_DEBUG(dbgs().indent(2)\n+               << \"Not unrolling with pragma count \" << PInfo.PragmaCount\n+               << \": remainder not allowed, count does not divide trip \"\n+               << \"multiple \" << TripMultiple << \".\\n\");\n+    ORE->emit([&]() {\n+      return OptimizationRemarkMissed(DEBUG_TYPE, \"PragmaUnrollCountRejected\",\n+                                      L->getStartLoc(), L->getHeader())\n+             << \"unable to unroll loop with count \"\n+             << ore::NV(\"PragmaCount\", PInfo.PragmaCount)\n+             << \": remainder loop is restricted and count does not divide \"\n+                \"trip multiple \"\n+             << ore::NV(\"TripMultiple\", TripMultiple);\n+    });\n   }\n \n-  if (PInfo.PragmaFullUnroll && TripCount != 0) {\n-    // Certain cases with UBSAN can cause trip count to be calculated as\n-    // INT_MAX, Block full unrolling at a reasonable limit so that the compiler\n-    // doesn't hang trying to unroll the loop. See PR77842\n-    if (TripCount > PragmaUnrollFullMaxIterations) {\n-      LLVM_DEBUG(dbgs().indent(3) << \"Won't unroll; trip count is too large\\n\");\n-      return std::nullopt;\n-    }\n+  if (PInfo.PragmaFullUnroll) {\n+    if (TripCount != 0) {\n+      // Certain cases with UBSAN can cause trip count to be calculated as\n+      // INT_MAX, Block full unrolling at a reasonable limit so that the\n+      // compiler doesn't hang trying to unroll the loop. See PR77842\n+      if (TripCount > PragmaUnrollFullMaxIterations) {\n+        LLVM_DEBUG(dbgs().indent(3)\n+                   << \"Won't unroll; trip count is too large.\\n\");\n+        ORE->emit([&]() {\n+          return OptimizationRemarkMissed(DEBUG_TYPE,\n+                                          \"PragmaFullUnrollTripCountTooLarge\",\n+                                          L->getStartLoc(), L->getHeader())\n+                 << \"unable to fully unroll loop: trip count \"\n+                 << ore::NV(\"TripCount\", TripCount) << \" exceeds limit \"\n+                 << ore::NV(\"Limit\", PragmaUnrollFullMaxIterations);\n+        });\n+        return std::nullopt;\n+      }\n \n-    return TripCount;\n+      LLVM_DEBUG(dbgs().indent(2)\n+                 << \"Fully unrolling with trip count: \" << TripCount << \"\\n\");\n+      return TripCount;\n+    }\n+    // Note: ORE for unknown trip count is emitted later in computeUnrollCount\n+    // after we've exhausted all strategies.\n+    LLVM_DEBUG(dbgs().indent(2)\n+               << \"Not fully unrolling: unknown trip count.\\n\");\n   }\n \n   if (PInfo.PragmaEnableUnroll && !TripCount && MaxTripCount &&\n-      MaxTripCount <= UP.MaxUpperBound)\n+      MaxTripCount <= UP.MaxUpperBound) {\n+    LLVM_DEBUG(dbgs().indent(2)\n+               << \"Unrolling with max trip count: \" << MaxTripCount << \"\\n\");\n     return MaxTripCount;\n+  }\n \n   return std::nullopt;\n }\n@@ -847,16 +906,41 @@ static std::optional<unsigned> shouldFullUnroll(\n     Loop *L, const TargetTransformInfo &TTI, DominatorTree &DT,\n     ScalarEvolution &SE, const SmallPtrSetImpl<const Value *> &EphValues,\n     const unsigned FullUnrollTripCount, const UnrollCostEstimator UCE,\n-    const TargetTransformInfo::UnrollingPreferences &UP) {\n+    const TargetTransformInfo::UnrollingPreferences &UP,\n+    OptimizationRemarkEmitter *ORE) {\n   assert(FullUnrollTripCount && \"should be non-zero!\");\n \n-  if (FullUnrollTripCount > UP.FullUnrollMaxCount)\n+  const bool PragmaFullUnroll = hasUnrollFullPragma(L);\n+\n+  if (FullUnrollTripCount > UP.FullUnrollMaxCount) {\n+    LLVM_DEBUG(dbgs().indent(2)\n+               << \"Not unrolling: trip count \" << FullUnrollTripCount\n+               << \" exceeds max count \" << UP.FullUnrollMaxCount << \".\\n\");\n+    if (PragmaFullUnroll)\n+      ORE->emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE,\n+                                        \"FullUnrollTripCountTooLarge\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to fully unroll loop: trip count \"\n+               << ore::NV(\"TripCount\", FullUnrollTripCount)\n+               << \" exceeds maximum full unroll count \"\n+               << ore::NV(\"MaxFullUnrollCount\", UP.FullUnrollMaxCount);\n+      });\n     return std::nullopt;\n+  }\n \n   // When computing the unrolled size, note that BEInsns are not replicated\n   // like the rest of the loop body.\n-  if (UCE.getUnrolledLoopSize(UP) < UP.Threshold)\n+  uint64_t UnrolledSize = UCE.getUnrolledLoopSize(UP);\n+  if (UnrolledSize < UP.Threshold) {\n+    LLVM_DEBUG(dbgs().indent(2) << \"Unrolling: size \" << UnrolledSize\n+                                << \" < threshold \" << UP.Threshold << \".\\n\");\n     return FullUnrollTripCount;\n+  }\n+\n+  LLVM_DEBUG(dbgs().indent(2)\n+             << \"Unrolled size \" << UnrolledSize << \" exceeds threshold \"\n+             << UP.Threshold << \"; checking for cost benefit.\\n\");\n \n   // The loop isn't that small, but we still can fully unroll it if that\n   // helps to remove a significant number of instructions.\n@@ -866,9 +950,34 @@ static std::optional<unsigned> shouldFullUnroll(\n           UP.Threshold * UP.MaxPercentThresholdBoost / 100,\n           UP.MaxIterationsCountToAnalyze)) {\n     unsigned Boost =\n-      getFullUnrollBoostingFactor(*Cost, UP.MaxPercentThresholdBoost);\n-    if (Cost->UnrolledCost < UP.Threshold * Boost / 100)\n+        getFullUnrollBoostingFactor(*Cost, UP.MaxPercentThresholdBoost);\n+    unsigned BoostedThreshold = UP.Threshold * Boost / 100;\n+    if (Cost->UnrolledCost < BoostedThreshold) {\n+      LLVM_DEBUG(dbgs().indent(2) << \"Profitable after cost analysis.\\n\");\n       return FullUnrollTripCount;\n+    }\n+    LLVM_DEBUG(dbgs().indent(2)\n+               << \"Not unrolling: cost \" << Cost->UnrolledCost\n+               << \" >= boosted threshold \" << BoostedThreshold << \".\\n\");\n+    if (PragmaFullUnroll)\n+      ORE->emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"FullUnrollNotProfitable\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to fully unroll loop: estimated unrolled cost \"\n+               << ore::NV(\"UnrolledCost\", Cost->UnrolledCost)\n+               << \" exceeds boosted threshold \"\n+               << ore::NV(\"BoostedThreshold\", BoostedThreshold);\n+      });\n+  } else {\n+    LLVM_DEBUG(dbgs().indent(2) << \"Skipping: cost analysis unavailable.\\n\");\n+    if (PragmaFullUnroll)\n+      ORE->emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"FullUnrollSizeTooLarge\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to fully unroll loop: estimated unrolled size \"\n+               << ore::NV(\"UnrolledSize\", UnrolledSize) << \" exceeds threshold \"\n+               << ore::NV(\"Threshold\", UP.Threshold);\n+      });\n   }\n   return std::nullopt;\n }\n@@ -882,8 +991,8 @@ shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,\n     return std::nullopt;\n \n   if (!UP.Partial) {\n-    LLVM_DEBUG(dbgs().indent(3) << \"will not try to unroll partially because \"\n-                                << \"-unroll-allow-partial not given\\n\");\n+    LLVM_DEBUG(dbgs().indent(3) << \"Will not try to unroll partially because \"\n+                                << \"-unroll-allow-partial not given.\\n\");\n     return 0;\n   }\n   unsigned count = UP.Count;\n@@ -891,9 +1000,15 @@ shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,\n     count = TripCount;\n   if (UP.PartialThreshold != NoThreshold) {\n     // Reduce unroll count to be modulo of TripCount for partial unrolling.\n-    if (UCE.getUnrolledLoopSize(UP, count) > UP.PartialThreshold)\n-      count = (std::max(UP.PartialThreshold, UP.BEInsns + 1) - UP.BEInsns) /\n-        (LoopSize - UP.BEInsns);\n+    if (UCE.getUnrolledLoopSize(UP, count) > UP.PartialThreshold) {\n+      unsigned NewCount =\n+          (std::max(UP.PartialThreshold, UP.BEInsns + 1) - UP.BEInsns) /\n+          (LoopSize - UP.BEInsns);\n+      LLVM_DEBUG(dbgs().indent(2)\n+                 << \"Unrolled size exceeds threshold; reducing count \"\n+                 << \"from \" << count << \" to \" << NewCount << \".\\n\");\n+      count = NewCount;\n+    }\n     if (count > UP.MaxCount)\n       count = UP.MaxCount;\n     while (count != 0 && TripCount % count != 0)\n@@ -911,6 +1026,8 @@ shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,\n         count >>= 1;\n     }\n     if (count < 2) {\n+      LLVM_DEBUG(dbgs().indent(2)\n+                 << \"Will not partially unroll: no profitable count.\\n\");\n       count = 0;\n     }\n   } else {\n@@ -920,7 +1037,7 @@ shouldPartialUnroll(const unsigned LoopSize, const unsigned TripCount,\n     count = UP.MaxCount;\n \n   LLVM_DEBUG(dbgs().indent(3)\n-             << \"partially unrolling with count: \" << count << \"\\n\");\n+             << \"Partially unrolling with count: \" << count << \"\\n\");\n \n   return count;\n }\n@@ -943,6 +1060,11 @@ bool llvm::computeUnrollCount(\n \n   unsigned LoopSize = UCE.getRolledLoopSize();\n \n+  LLVM_DEBUG(dbgs().indent(1) << \"Computing unroll count: TripCount=\"\n+                              << TripCount << \", MaxTripCount=\" << MaxTripCount\n+                              << (MaxOrZero ? \" (MaxOrZero)\" : \"\")\n+                              << \", TripMultiple=\" << TripMultiple << \"\\n\");\n+\n   const bool UserUnrollCount = UnrollCount.getNumOccurrences() > 0;\n   const bool PragmaFullUnroll = hasUnrollFullPragma(L);\n   const unsigned PragmaCount = unrollCountPragmaValue(L);\n@@ -951,6 +1073,21 @@ bool llvm::computeUnrollCount(\n   const bool ExplicitUnroll = PragmaCount > 0 || PragmaFullUnroll ||\n                               PragmaEnableUnroll || UserUnrollCount;\n \n+  LLVM_DEBUG({\n+    if (ExplicitUnroll) {\n+      dbgs().indent(1) << \"Explicit unroll requested:\";\n+      if (UserUnrollCount)\n+        dbgs() << \" user-count\";\n+      if (PragmaFullUnroll)\n+        dbgs() << \" pragma-full\";\n+      if (PragmaCount > 0)\n+        dbgs() << \" pragma-count(\" << PragmaCount << \")\";\n+      if (PragmaEnableUnroll)\n+        dbgs() << \" pragma-enable\";\n+      dbgs() << \"\\n\";\n+    }\n+  });\n+\n   PragmaInfo PInfo(UserUnrollCount, PragmaFullUnroll, PragmaCount,\n                    PragmaEnableUnroll);\n   // Use an explicit peel count that has been specified for testing. In this\n@@ -960,6 +1097,8 @@ bool llvm::computeUnrollCount(\n       reportFatalUsageError(\"Cannot specify both explicit peel count and \"\n                             \"explicit unroll count\");\n     }\n+    LLVM_DEBUG(dbgs().indent(1)\n+               << \"Using explicit peel count: \" << PP.PeelCount << \"\\n\");\n     UP.Count = 1;\n     UP.Runtime = false;\n     return true;\n@@ -967,8 +1106,9 @@ bool llvm::computeUnrollCount(\n   // Check for explicit Count.\n   // 1st priority is unroll count set by \"unroll-count\" option.\n   // 2nd priority is unroll count set by pragma.\n+  LLVM_DEBUG(dbgs().indent(1) << \"Trying pragma unroll...\\n\");\n   if (auto UnrollFactor = shouldPragmaUnroll(L, PInfo, TripMultiple, TripCount,\n-                                             MaxTripCount, UCE, UP)) {\n+                                             MaxTripCount, UCE, UP, ORE)) {\n     UP.Count = *UnrollFactor;\n \n     if (UserUnrollCount || (PragmaCount > 0)) {\n@@ -990,11 +1130,12 @@ bool llvm::computeUnrollCount(\n \n   // 3rd priority is exact full unrolling.  This will eliminate all copies\n   // of some exit test.\n+  LLVM_DEBUG(dbgs().indent(1) << \"Trying full unroll...\\n\");\n   UP.Count = 0;\n   if (TripCount) {\n     UP.Count = TripCount;\n     if (auto UnrollFactor = shouldFullUnroll(L, TTI, DT, SE, EphValues,\n-                                             TripCount, UCE, UP)) {\n+                                             TripCount, UCE, UP, ORE)) {\n       UP.Count = *UnrollFactor;\n       UseUpperBound = false;\n       return ExplicitUnroll;\n@@ -1013,11 +1154,12 @@ bool llvm::computeUnrollCount(\n   // Note that the cost of bounded unrolling is always strictly greater than\n   // cost of exact full unrolling.  As such, if we have an exact count and\n   // found it unprofitable, we'll never chose to bounded unroll.\n+  LLVM_DEBUG(dbgs().indent(1) << \"Trying upper-bound unroll...\\n\");\n   if (!TripCount && MaxTripCount && (UP.UpperBound || MaxOrZero) &&\n       MaxTripCount <= UP.MaxUpperBound) {\n     UP.Count = MaxTripCount;\n     if (auto UnrollFactor = shouldFullUnroll(L, TTI, DT, SE, EphValues,\n-                                             MaxTripCount, UCE, UP)) {\n+                                             MaxTripCount, UCE, UP, ORE)) {\n       UP.Count = *UnrollFactor;\n       UseUpperBound = true;\n       return ExplicitUnroll;\n@@ -1025,8 +1167,11 @@ bool llvm::computeUnrollCount(\n   }\n \n   // 5th priority is loop peeling.\n+  LLVM_DEBUG(dbgs().indent(1) << \"Trying loop peeling...\\n\");\n   computePeelCount(L, LoopSize, PP, TripCount, DT, SE, TTI, AC, UP.Threshold);\n   if (PP.PeelCount) {\n+    LLVM_DEBUG(dbgs().indent(1)\n+               << \"Peeling with count: \" << PP.PeelCount << \"\\n\");\n     UP.Runtime = false;\n     UP.Count = 1;\n     return ExplicitUnroll;\n@@ -1039,56 +1184,80 @@ bool llvm::computeUnrollCount(\n \n   // 6th priority is partial unrolling.\n   // Try partial unroll only when TripCount could be statically calculated.\n+  LLVM_DEBUG(dbgs().indent(1) << \"Trying partial unroll...\\n\");\n   if (auto UnrollFactor = shouldPartialUnroll(LoopSize, TripCount, UCE, UP)) {\n     UP.Count = *UnrollFactor;\n \n-    if ((PragmaFullUnroll || PragmaEnableUnroll) && TripCount &&\n-        UP.Count != TripCount)\n+    if (UP.Count) {\n+      if (PragmaFullUnroll && UP.Count != TripCount) {\n+        LLVM_DEBUG(dbgs().indent(1)\n+                   << \"Partial unroll instead of full: unrolled size \"\n+                      \"too large. Unrolling \"\n+                   << UP.Count << \" times instead of \" << TripCount << \".\\n\");\n+        ORE->emit([&]() {\n+          return OptimizationRemarkMissed(DEBUG_TYPE,\n+                                          \"FullUnrollAsDirectedTooLarge\",\n+                                          L->getStartLoc(), L->getHeader())\n+                 << \"unable to fully unroll loop as directed by full unroll \"\n+                    \"pragma because unrolled size is too large\";\n+        });\n+      }\n+    } else if (PragmaFullUnroll || PragmaEnableUnroll) {\n+      LLVM_DEBUG(dbgs().indent(1)\n+                 << \"Not unrolling as directed: unrolled size too large.\\n\");\n       ORE->emit([&]() {\n-        return OptimizationRemarkMissed(DEBUG_TYPE,\n-                                        \"FullUnrollAsDirectedTooLarge\",\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"UnrollAsDirectedTooLarge\",\n                                         L->getStartLoc(), L->getHeader())\n-               << \"Unable to fully unroll loop as directed by unroll pragma \"\n-                  \"because \"\n-                  \"unrolled size is too large.\";\n+               << \"unable to unroll loop as directed by unroll pragma \"\n+                  \"because unrolled size is too large\";\n       });\n-\n-    if (UP.PartialThreshold != NoThreshold) {\n-      if (UP.Count == 0) {\n-        if (PragmaEnableUnroll)\n-          ORE->emit([&]() {\n-            return OptimizationRemarkMissed(DEBUG_TYPE,\n-                                            \"UnrollAsDirectedTooLarge\",\n-                                            L->getStartLoc(), L->getHeader())\n-                   << \"Unable to unroll loop as directed by unroll(enable) \"\n-                      \"pragma \"\n-                      \"because unrolled size is too large.\";\n-          });\n-      }\n     }\n+\n     return ExplicitUnroll;\n   }\n   assert(TripCount == 0 &&\n          \"All cases when TripCount is constant should be covered here.\");\n-  if (PragmaFullUnroll)\n+  if (PragmaFullUnroll) {\n+    LLVM_DEBUG(dbgs().indent(1)\n+               << \"Not fully unrolling as directed: loop has runtime \"\n+               << \"trip count.\\n\");\n     ORE->emit([&]() {\n       return OptimizationRemarkMissed(\n                  DEBUG_TYPE, \"CantFullUnrollAsDirectedRuntimeTripCount\",\n                  L->getStartLoc(), L->getHeader())\n-             << \"Unable to fully unroll loop as directed by unroll(full) \"\n-                \"pragma \"\n-                \"because loop has a runtime trip count.\";\n+             << \"unable to fully unroll loop as directed by full unroll \"\n+                \"pragma because loop has a runtime trip count\";\n     });\n+  }\n \n   // 7th priority is runtime unrolling.\n+  LLVM_DEBUG(dbgs().indent(1) << \"Trying runtime unroll...\\n\");\n   // Don't unroll a runtime trip count loop when it is disabled.\n   if (hasRuntimeUnrollDisablePragma(L)) {\n+    LLVM_DEBUG(dbgs().indent(1)\n+               << \"Not runtime unrolling: disabled by pragma.\\n\");\n     UP.Count = 0;\n     return false;\n   }\n \n   // Don't unroll a small upper bound loop unless user or TTI asked to do so.\n   if (MaxTripCount && !UP.Force && MaxTripCount < UP.MaxUpperBound) {\n+    LLVM_DEBUG(dbgs().indent(1)\n+               << \"Not runtime unrolling: max trip count \" << MaxTripCount\n+               << \" is small (< \" << UP.MaxUpperBound << \") and not forced.\\n\");\n+    // If user specified an unroll count but it was rejected earlier (e.g.,\n+    // remainder not allowed or threshold exceeded), they've already been\n+    // notified. Emit an additional remark since runtime unroll was their last\n+    // chance.\n+    if (PragmaCount > 0) {\n+      ORE->emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"SmallMaxTripCount\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to runtime unroll loop: max trip count \"\n+               << ore::NV(\"MaxTripCount\", MaxTripCount) << \" is too small (< \"\n+               << ore::NV(\"MaxUpperBound\", UP.MaxUpperBound) << \")\";\n+      });\n+    }\n     UP.Count = 0;\n     return false;\n   }\n@@ -1105,8 +1274,8 @@ bool llvm::computeUnrollCount(\n   UP.Runtime |= PragmaEnableUnroll || PragmaCount > 0 || UserUnrollCount;\n   if (!UP.Runtime) {\n     LLVM_DEBUG(dbgs().indent(2)\n-               << \"will not try to unroll loop with runtime trip count \"\n-               << \"-unroll-runtime not given\\n\");\n+               << \"Will not try to unroll loop with runtime trip count because \"\n+               << \"-unroll-runtime not given.\\n\");\n     UP.Count = 0;\n     return false;\n   }\n@@ -1148,7 +1317,7 @@ bool llvm::computeUnrollCount(\n                   \"unroll \"\n                   \"count that divides the loop trip multiple of \"\n                << NV(\"TripMultiple\", TripMultiple) << \".  Unrolling instead \"\n-               << NV(\"UnrollCount\", UP.Count) << \" time(s).\";\n+               << NV(\"UnrollCount\", UP.Count) << \" time(s)\";\n       });\n   }\n \n@@ -1158,10 +1327,11 @@ bool llvm::computeUnrollCount(\n   if (MaxTripCount && UP.Count > MaxTripCount)\n     UP.Count = MaxTripCount;\n \n-  LLVM_DEBUG(dbgs().indent(2)\n-             << \"runtime unrolling with count: \" << UP.Count << \"\\n\");\n   if (UP.Count < 2)\n     UP.Count = 0;\n+  else\n+    LLVM_DEBUG(dbgs().indent(2)\n+               << \"Runtime unrolling with count: \" << UP.Count << \"\\n\");\n   return ExplicitUnroll;\n }\n \n@@ -1183,10 +1353,29 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,\n \n   LLVM_DEBUG(dbgs() << \"Loop Unroll: F[\"\n                     << L->getHeader()->getParent()->getName() << \"] Loop %\"\n-                    << L->getHeader()->getName() << \"\\n\");\n+                    << L->getHeader()->getName()\n+                    << \" (depth=\" << L->getLoopDepth() << \")\\n\");\n   TransformationMode TM = hasUnrollTransformation(L);\n-  if (TM & TM_Disable)\n+\n+  if (TM & TM_ForcedByUser) {\n+    if (const DebugLoc &StartLoc = L->getStartLoc()) {\n+      if (const DILocation *InlinedAt = StartLoc->getInlinedAt()) {\n+        ORE.emit([&]() {\n+          return OptimizationRemarkAnalysis(DEBUG_TYPE, \"InlinedLoop\", StartLoc,\n+                                            L->getHeader())\n+                 << \"loop is from inlined function; call site is at \"\n+                 << ore::NV(\"CallSiteFile\", InlinedAt->getFilename()) << \":\"\n+                 << ore::NV(\"CallSiteLine\", InlinedAt->getLine());\n+        });\n+      }\n+    }\n+  }\n+\n+  if (TM & TM_Disable) {\n+    LLVM_DEBUG(dbgs() << \"Not unrolling: transformation disabled by \"\n+                      << \"metadata.\\n\");\n     return LoopUnrollResult::Unmodified;\n+  }\n \n   // If this loop isn't forced to be unrolled, avoid unrolling it when the\n   // parent loop has an explicit unroll-and-jam pragma. This is to prevent\n@@ -1215,13 +1404,23 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,\n   if (!L->isLoopSimplifyForm()) {\n     LLVM_DEBUG(dbgs().indent(1)\n                << \"Not unrolling loop which is not in loop-simplify form.\\n\");\n+    if (TM & TM_ForcedByUser) {\n+      ORE.emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"NotInLoopSimplifyForm\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to unroll loop: not in loop-simplify form\";\n+      });\n+    }\n     return LoopUnrollResult::Unmodified;\n   }\n \n   // When automatic unrolling is disabled, do not unroll unless overridden for\n   // this loop.\n-  if (OnlyWhenForced && !(TM & TM_Enable))\n+  if (OnlyWhenForced && !(TM & TM_Enable)) {\n+    LLVM_DEBUG(dbgs() << \"Not unrolling: automatic unrolling disabled and \"\n+                      << \"loop not explicitly enabled.\\n\");\n     return LoopUnrollResult::Unmodified;\n+  }\n \n   bool OptForSize = L->getHeader()->getParent()->hasOptSize();\n   TargetTransformInfo::UnrollingPreferences UP = gatherUnrollingPreferences(\n@@ -1234,14 +1433,23 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,\n   // Exit early if unrolling is disabled. For OptForSize, we pick the loop size\n   // as threshold later on.\n   if (UP.Threshold == 0 && (!UP.Partial || UP.PartialThreshold == 0) &&\n-      !OptForSize)\n+      !OptForSize) {\n+    LLVM_DEBUG(dbgs() << \"Not unrolling: all thresholds are zero.\\n\");\n+    if (TM & TM_ForcedByUser) {\n+      ORE.emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"UnrollThresholdsZero\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to unroll loop: unroll threshold is zero\";\n+      });\n+    }\n     return LoopUnrollResult::Unmodified;\n+  }\n \n   SmallPtrSet<const Value *, 32> EphValues;\n   CodeMetrics::collectEphemeralValues(L, &AC, EphValues);\n \n   UnrollCostEstimator UCE(L, TTI, EphValues, UP.BEInsns);\n-  if (!UCE.canUnroll())\n+  if (!UCE.canUnroll((TM & TM_ForcedByUser) ? &ORE : nullptr, L))\n     return LoopUnrollResult::Unmodified;\n \n   unsigned LoopSize = UCE.getRolledLoopSize();\n@@ -1255,6 +1463,14 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,\n   if (UCE.NumInlineCandidates != 0) {\n     LLVM_DEBUG(dbgs().indent(1)\n                << \"Not unrolling loop with inlinable calls.\\n\");\n+    if (TM & TM_ForcedByUser) {\n+      ORE.emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE,\n+                                        \"InlineCandidatesPreventUnroll\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to unroll loop: contains inlinable calls\";\n+      });\n+    }\n     return LoopUnrollResult::Unmodified;\n   }\n \n@@ -1307,8 +1523,17 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,\n   bool IsCountSetExplicitly = computeUnrollCount(\n       L, TTI, DT, LI, &AC, SE, EphValues, &ORE, TripCount, MaxTripCount,\n       MaxOrZero, TripMultiple, UCE, UP, PP, UseUpperBound);\n-  if (!UP.Count)\n+  if (!UP.Count) {\n+    LLVM_DEBUG(dbgs() << \"Not unrolling: no viable strategy found.\\n\");\n+    if (IsCountSetExplicitly && (TM & TM_ForcedByUser)) {\n+      ORE.emit([&]() {\n+        return OptimizationRemarkMissed(DEBUG_TYPE, \"NoUnrollStrategy\",\n+                                        L->getStartLoc(), L->getHeader())\n+               << \"unable to unroll loop: no viable unroll count found\";\n+      });\n+    }\n     return LoopUnrollResult::Unmodified;\n+  }\n \n   UP.Runtime &= UCE.ConvergenceAllowsRuntime;\n \n@@ -1352,6 +1577,32 @@ tryToUnrollLoop(Loop *L, DominatorTree &DT, LoopInfo *LI, ScalarEvolution &SE,\n   // Save loop properties before it is transformed.\n   MDNode *OrigLoopID = L->getLoopID();\n \n+  // Emit additional unrolling strategy context that difficult for UnrollLoop()\n+  // to re-compute.\n+  if (UseUpperBound) {\n+    LLVM_DEBUG(dbgs() << \"Attempting full unroll with upper bound trip count \"\n+                      << MaxTripCount << \"\\n\");\n+    ORE.emit([&]() {\n+      return OptimizationRemarkAnalysis(DEBUG_TYPE, \"AttemptUnrollUpperBound\",\n+                                        L->getStartLoc(), L->getHeader())\n+             << \"attempting full unroll using upper bound trip count \"\n+             << ore::NV(\"MaxTripCount\", MaxTripCount);\n+    });\n+  } else if (TripCount && TripCount > UP.Count && TripCount % UP.Count != 0) {\n+    LLVM_DEBUG(dbgs() << \"Attempting unroll by factor \" << UP.Count\n+                      << \" with remainder loop (trip count \" << TripCount\n+                      << \")\\n\");\n+    ORE.emit([&]() {\n+      return OptimizationRemarkAnalysis(DEBUG_TYPE,\n+                                        \"AttemptUnrollWithRemainder\",\n+                                        L->getStartLoc(), L->getHeader())\n+             << \"attempting unroll by factor \"\n+             << ore::NV(\"UnrollCount\", UP.Count)\n+             << \" with remainder loop (trip count \"\n+             << ore::NV(\"TripCount\", TripCount) << \")\";\n+    });\n+  }\n+\n   // Unroll the loop.\n   Loop *RemainderLoop = nullptr;\n   UnrollLoopOptions ULO;\ndiff --git a/llvm/lib/Transforms/Utils/LoopUnroll.cpp b/llvm/lib/Transforms/Utils/LoopUnroll.cpp\nindex d9422afe5e82a..77e7a827d2642 100644\n--- a/llvm/lib/Transforms/Utils/LoopUnroll.cpp\n+++ b/llvm/lib/Transforms/Utils/LoopUnroll.cpp\n@@ -618,11 +618,15 @@ llvm::UnrollLoop(Loop *L, UnrollLoopOptions ULO, LoopInfo *LI,\n                << NV(\"UnrollCount\", ULO.Count) << \" iterations\";\n       });\n   } else {\n-    LLVM_DEBUG(dbgs() << \"UNROLLING loop %\" << Header->getName() << \" by \"\n-                      << ULO.Count);\n-    if (ULO.Runtime)\n-      LLVM_DEBUG(dbgs() << \" with run-time trip count\");\n-    LLVM_DEBUG(dbgs() << \"!\\n\");\n+    LLVM_DEBUG({\n+      dbgs() << \"UNROLLING loop %\" << Header->getName() << \" by \" << ULO.Count;\n+      if (ULO.Runtime) {\n+        dbgs() << \" with run-time trip count\";\n+        if (ULO.UnrollRemainder)\n+          dbgs() << \" (remainder unrolled)\";\n+      }\n+      dbgs() << \"!\\n\";\n+    });\n \n     if (ORE)\n       ORE->emit([&]() {\n@@ -630,7 +634,8 @@ llvm::UnrollLoop(Loop *L, UnrollLoopOptions ULO, LoopInfo *LI,\n                                 L->getHeader());\n         Diag << \"unrolled loop by a factor of \" << NV(\"UnrollCount\", ULO.Count);\n         if (ULO.Runtime)\n-          Diag << \" with run-time trip count\";\n+          Diag << \" with run-time trip count\"\n+               << (ULO.UnrollRemainder ? \" (remainder unrolled)\" : \"\");\n         return Diag;\n       });\n   }\n",
+  "components": [
+    "LoopUnroll",
+    "LoopUnrollPass"
+  ],
+  "description": "Add/refine uses of `ORE` and `LLVM_DEBUG` to aid in debugging the unroller's heuristics. In particular:\r\n\r\n- Use `OptimizationRemarkMissed` when we fail to perform unrolling that the user requested.\r\n- Use generic terminology (e.g., \"full unroll pragma\" instead of \"unroll(full)\") in diagnostic messages to avoid tying LLVM to clang's pragma unrolling syntax.\r\n- Use indentation in `LLVM_DEBUG` output to reflect the depth of the call graph, making it easier to follow the unroller's logic when reading debug output.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/debug-and-remarks.ll",
+      "commands": [
+        "-pass-remarks-missed=loop-unroll -pass-remarks-analysis=loop-unroll < %s 2>&1",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "tests": [
+        {
+          "test_name": "switch_exit_partial_remainder_bug",
+          "test_body": "define i32 @switch_exit_partial_remainder_bug(ptr %A) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.latch, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %loop.latch ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %loop.latch ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  switch i32 %i, label %loop.latch [\n    i32 10, label %exit\n  ]\n\nloop.latch:                                       ; preds = %loop\n  br label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "single_use_helper",
+          "test_body": "define hidden i32 @single_use_helper(i32 %x) {\n  %add = add i32 %x, 42\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "no_profitable_count",
+          "test_body": "define i32 @no_profitable_count(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 100\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "auto_unroll_not_enabled",
+          "test_body": "define i32 @auto_unroll_not_enabled(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 4\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "nested_cost_analysis",
+          "test_body": "define i32 @nested_cost_analysis(ptr %A) {\nentry:\n  br label %outer.header\n\nouter.header:                                     ; preds = %outer.latch, %entry\n  %i = phi i32 [ 0, %entry ], [ %i.inc, %outer.latch ]\n  br label %inner.header\n\ninner.header:                                     ; preds = %inner.header, %outer.header\n  %j = phi i32 [ 0, %outer.header ], [ %j.inc, %inner.header ]\n  %sum = phi i32 [ 0, %outer.header ], [ %add, %inner.header ]\n  %idx = add i32 %i, %j\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %idx\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %j.inc = add i32 %j, 1\n  %inner.cmp = icmp ult i32 %j.inc, 100\n  br i1 %inner.cmp, label %inner.header, label %outer.latch, !llvm.loop !1\n\nouter.latch:                                      ; preds = %inner.header\n  %i.inc = add i32 %i, 1\n  %outer.cmp = icmp ult i32 %i.inc, 4\n  br i1 %outer.cmp, label %outer.header, label %exit\n\nexit:                                             ; preds = %outer.latch\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.disable\"}\n"
+        },
+        {
+          "test_name": "header_exit_with_remainder",
+          "test_body": "define i32 @header_exit_with_remainder(ptr %A) {\nentry:\n  br label %while.header\n\nwhile.header:                                     ; preds = %while.latch, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %while.latch ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %while.latch ]\n  %cmp = icmp ult i32 %i, 10\n  br i1 %cmp, label %while.body, label %exit\n\nwhile.body:                                       ; preds = %while.header\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  br label %while.latch\n\nwhile.latch:                                      ; preds = %while.body\n  %inc = add i32 %i, 1\n  br label %while.header\n\nexit:                                             ; preds = %while.header\n  ret i32 %sum\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "full_unroll_simple",
+          "test_body": "define i32 @full_unroll_simple(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 8\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "full_unroll_as_directed_fail",
+          "test_body": "define i32 @full_unroll_as_directed_fail(ptr %A, ptr %B, ptr %C, ptr %D) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add8, %for.body ]\n  %idx1 = add i32 %i, 0\n  %arrayidx1 = getelementptr inbounds i32, ptr %A, i32 %idx1\n  %load1 = load i32, ptr %arrayidx1, align 4\n  %idx2 = add i32 %i, 1\n  %arrayidx2 = getelementptr inbounds i32, ptr %B, i32 %idx2\n  %load2 = load i32, ptr %arrayidx2, align 4\n  %idx3 = add i32 %i, 2\n  %arrayidx3 = getelementptr inbounds i32, ptr %C, i32 %idx3\n  %load3 = load i32, ptr %arrayidx3, align 4\n  %idx4 = add i32 %i, 3\n  %arrayidx4 = getelementptr inbounds i32, ptr %D, i32 %idx4\n  %load4 = load i32, ptr %arrayidx4, align 4\n  %add1 = add i32 %sum, %load1\n  %add2 = add i32 %add1, %load2\n  %add3 = add i32 %add2, %load3\n  %add8 = add i32 %add3, %load4\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 100\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add8\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "no_strategy_pragma",
+          "test_body": "define void @no_strategy_pragma(ptr %A, i32 %n) {\nentry:\n  %cmp.entry = icmp ugt i32 %n, 0\n  br i1 %cmp.entry, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  store i32 %i, ptr %arrayidx, align 4\n  %inc = add nuw nsw i32 %i, 1\n  %cmp = icmp ult i32 %inc, %n\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body, %entry\n  ret void\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "multi_exit_known_and_unknown",
+          "test_body": "define i32 @multi_exit_known_and_unknown(ptr %A, i1 %cond) {\nentry:\n  br label %for.header\n\nfor.header:                                       ; preds = %for.latch, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.latch ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.latch ]\n  %cmp = icmp ult i32 %i, 4\n  br i1 %cmp, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.header\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  br i1 %cond, label %for.latch, label %exit\n\nfor.latch:                                        ; preds = %for.body\n  %inc = add i32 %i, 1\n  br label %for.header\n\nexit:                                             ; preds = %for.body, %for.header\n  %result = phi i32 [ %sum, %for.header ], [ %add, %for.body ]\n  ret i32 %result\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "explicit_peel",
+          "test_body": "define i32 @explicit_peel(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 100\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "runtime_unroll_simple",
+          "test_body": "define i32 @runtime_unroll_simple(ptr %A, i32 %n) {\nentry:\n  %cmp.entry = icmp sgt i32 %n, 0\n  br i1 %cmp.entry, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp slt i32 %inc, %n\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body, %entry\n  %result = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  ret i32 %result\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "upper_bound_unroll",
+          "test_body": "define i32 @upper_bound_unroll(ptr %A, i32 %n) {\nentry:\n  %n.clamped = and i32 %n, 3\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, %n.clamped\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "upper_bound_heuristic",
+          "test_body": "define i32 @upper_bound_heuristic(ptr %A, i32 %n) {\nentry:\n  %n.clamped = and i32 %n, 3\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, %n.clamped\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "full_unroll_cost_exceeds",
+          "test_body": "define i32 @full_unroll_cost_exceeds(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 100\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "partial_instead_of_full",
+          "test_body": "define i32 @partial_instead_of_full(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 5000\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "partial_unroll_user_count",
+          "test_body": "define i32 @partial_unroll_user_count(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 16\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "runtime_unroll_disabled_pragma",
+          "test_body": "define i32 @runtime_unroll_disabled_pragma(ptr %A, i32 %n) {\nentry:\n  %cmp.entry = icmp sgt i32 %n, 0\n  br i1 %cmp.entry, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp slt i32 %inc, %n\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body, %entry\n  %result = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  ret i32 %result\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.runtime.disable\"}\n"
+        },
+        {
+          "test_name": "partial_unroll_cost_analysis",
+          "test_body": "define i32 @partial_unroll_cost_analysis(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 200\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "caller_with_inlined_loop",
+          "test_body": "define i32 @caller_with_inlined_loop(ptr %A) !dbg !3 {\nentry:\n  br label %for.body.i, !dbg !6\n\nfor.body.i:                                       ; preds = %for.body.i, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body.i ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body.i ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i, !dbg !7\n  %load = load i32, ptr %arrayidx, align 4, !dbg !7\n  %add = add i32 %sum, %load, !dbg !7\n  %inc = add i32 %i, 1, !dbg !7\n  %cmp = icmp ult i32 %inc, 4, !dbg !7\n  br i1 %cmp, label %for.body.i, label %exit, !dbg !7, !llvm.loop !10\n\nexit:                                             ; preds = %for.body.i\n  ret i32 %add, !dbg !6\n}\n\n!llvm.dbg.cu = !{!0}\n!llvm.module.flags = !{!2}\n\n!0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !1, producer: \"clang\", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)\n!1 = !DIFile(filename: \"caller.c\", directory: \"/tmp\")\n!2 = !{i32 2, !\"Debug Info Version\", i32 3}\n!3 = distinct !DISubprogram(name: \"caller_with_inlined_loop\", scope: !1, file: !1, line: 8, type: !4, scopeLine: 8, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)\n!4 = !DISubroutineType(types: !5)\n!5 = !{null}\n!6 = !DILocation(line: 10, column: 3, scope: !3)\n!7 = !DILocation(line: 5, column: 3, scope: !8, inlinedAt: !6)\n!8 = distinct !DISubprogram(name: \"inlined_func\", scope: !9, file: !9, line: 1, type: !4, scopeLine: 1, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)\n!9 = !DIFile(filename: \"inlined.c\", directory: \"/tmp\")\n!10 = distinct !{!10, !7, !11}\n!11 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "inline_prevents_unroll",
+          "test_body": "declare hidden i32 @single_use_helper(i32)\n\ndefine i32 @inline_prevents_unroll(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %helper_result = call i32 @single_use_helper(i32 %load)\n  %add = add i32 %sum, %helper_result\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "extended_convergence",
+          "test_body": "; Function Attrs: convergent\ndeclare void @convergent_func() #0\n\n; Function Attrs: convergent nocallback nofree nosync nounwind willreturn memory(none)\ndeclare token @llvm.experimental.convergence.anchor() #1\n\ndefine i32 @extended_convergence(ptr %A, i32 %n) {\nentry:\n  br label %for.body, !llvm.loop !1\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %tok = call token @llvm.experimental.convergence.anchor()\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp slt i32 %inc, %n\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  call void @convergent_func() [ \"convergencectrl\"(token %tok) ]\n  ret i32 %add\n}\n\nattributes #0 = { convergent }\nattributes #1 = { convergent nocallback nofree nosync nounwind willreturn memory(none) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "cost_analysis_detailed",
+          "test_body": "define i32 @cost_analysis_detailed(ptr %A, ptr %B) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %arrayidx2 = getelementptr inbounds i32, ptr %B, i32 %i\n  %load2 = load i32, ptr %arrayidx2, align 4\n  %mul = mul i32 %load, %load2\n  %add = add i32 %sum, %mul\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "partial_unroll_with_remainder",
+          "test_body": "define i32 @partial_unroll_with_remainder(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "unroll_as_directed_fail",
+          "test_body": "define i32 @unroll_as_directed_fail(ptr %A, ptr %B, ptr %C, ptr %D) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add8, %for.body ]\n  %idx1 = add i32 %i, 0\n  %arrayidx1 = getelementptr inbounds i32, ptr %A, i32 %idx1\n  %load1 = load i32, ptr %arrayidx1, align 4\n  %idx2 = add i32 %i, 1\n  %arrayidx2 = getelementptr inbounds i32, ptr %B, i32 %idx2\n  %load2 = load i32, ptr %arrayidx2, align 4\n  %idx3 = add i32 %i, 2\n  %arrayidx3 = getelementptr inbounds i32, ptr %C, i32 %idx3\n  %load3 = load i32, ptr %arrayidx3, align 4\n  %idx4 = add i32 %i, 3\n  %arrayidx4 = getelementptr inbounds i32, ptr %D, i32 %idx4\n  %load4 = load i32, ptr %arrayidx4, align 4\n  %add1 = add i32 %sum, %load1\n  %add2 = add i32 %add1, %load2\n  %add3 = add i32 %add2, %load3\n  %add8 = add i32 %add3, %load4\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 100\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add8\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "pragma_full_unroll",
+          "test_body": "define i32 @pragma_full_unroll(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 4\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "pragma_full_unroll_unknown_tc",
+          "test_body": "define i32 @pragma_full_unroll_unknown_tc(ptr %A, i32 %n) {\nentry:\n  %cmp.entry = icmp sgt i32 %n, 0\n  br i1 %cmp.entry, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp slt i32 %inc, %n\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body, %entry\n  %result = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  ret i32 %result\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "thresholds_zero",
+          "test_body": "define i32 @thresholds_zero(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "noduplicate_prevents_unroll",
+          "test_body": "; Function Attrs: noduplicate\ndeclare void @noduplicate_func() #0\n\ndefine i32 @noduplicate_prevents_unroll(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  call void @noduplicate_func()\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 8\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\nattributes #0 = { noduplicate }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "indirectbr_loop",
+          "test_body": "define i32 @indirectbr_loop(ptr %A, ptr %target) {\nentry:\n  indirectbr ptr %target, [label %for.body, label %exit]\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body, %entry\n  %result = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  ret i32 %result\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "user_count_rejected",
+          "test_body": "define i32 @user_count_rejected(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "pragma_count_rejected",
+          "test_body": "define i32 @pragma_count_rejected(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.count\", i32 4}\n"
+        },
+        {
+          "test_name": "pragma_full_tc_too_large",
+          "test_body": "define i32 @pragma_full_tc_too_large(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 200\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "user_count_exceed",
+          "test_body": "define void @user_count_exceed(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  store i32 %i, ptr %arrayidx, align 4\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 16\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "small_max_trip_count",
+          "test_body": "define void @small_max_trip_count(ptr %A, i32 %n) {\nentry:\n  %clamped = call i32 @llvm.umin.i32(i32 %n, i32 5)\n  %cmp.entry = icmp ugt i32 %clamped, 0\n  br i1 %cmp.entry, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  store i32 %i, ptr %arrayidx, align 4\n  %inc = add nuw nsw i32 %i, 1\n  %cmp = icmp ult i32 %inc, %clamped\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body, %entry\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.count\", i32 4}\n"
+        },
+        {
+          "test_name": "cost_not_profitable",
+          "test_body": "define i32 @cost_not_profitable(ptr %A, ptr %B, ptr %C) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add3, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load1 = load i32, ptr %arrayidx, align 4\n  %arrayidx2 = getelementptr inbounds i32, ptr %B, i32 %i\n  %load2 = load i32, ptr %arrayidx2, align 4\n  %arrayidx3 = getelementptr inbounds i32, ptr %C, i32 %i\n  %load3 = load i32, ptr %arrayidx3, align 4\n  %mul1 = mul i32 %load1, %load2\n  %mul2 = mul i32 %mul1, %load3\n  %add1 = add i32 %sum, %mul2\n  %add2 = add i32 %add1, %load1\n  %add3 = add i32 %add2, %load2\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 8\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add3\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.enable\"}\n"
+        },
+        {
+          "test_name": "pragma_full_cost_not_profitable",
+          "test_body": "define i32 @pragma_full_cost_not_profitable(ptr %A, ptr %B) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %arrayidx2 = getelementptr inbounds i32, ptr %B, i32 %i\n  %load2 = load i32, ptr %arrayidx2, align 4\n  %mul = mul i32 %load, %load2\n  %add = add i32 %sum, %mul\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "tc_exceeds_max_ore",
+          "test_body": "define i32 @tc_exceeds_max_ore(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 20\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "runtime_small_max_tc",
+          "test_body": "define i32 @runtime_small_max_tc(ptr %A, i32 %n) {\nentry:\n  %n.clamped = and i32 %n, 3\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, %n.clamped\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "unroll_disabled_metadata",
+          "test_body": "define i32 @unroll_disabled_metadata(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 8\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.disable\"}\n"
+        },
+        {
+          "test_name": "exceeds_max_count",
+          "test_body": "define i32 @exceeds_max_count(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 20\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "heuristic_peel",
+          "test_body": "define i32 @heuristic_peel(ptr %A, i32 %n) {\nentry:\n  %cmp.entry = icmp sgt i32 %n, 0\n  br i1 %cmp.entry, label %for.header, label %exit.early\n\nfor.header:                                       ; preds = %for.latch, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.latch ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.latch ]\n  %first = icmp eq i32 %i, 0\n  br i1 %first, label %special, label %normal\n\nspecial:                                          ; preds = %for.header\n  %load1 = load i32, ptr %A, align 4\n  br label %for.latch\n\nnormal:                                           ; preds = %for.header\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load2 = load i32, ptr %arrayidx, align 4\n  br label %for.latch\n\nfor.latch:                                        ; preds = %normal, %special\n  %val = phi i32 [ %load1, %special ], [ %load2, %normal ]\n  %add = add i32 %sum, %val\n  %inc = add i32 %i, 1\n  %cmp = icmp slt i32 %inc, %n\n  br i1 %cmp, label %for.header, label %exit\n\nexit:                                             ; preds = %for.latch\n  ret i32 %add\n\nexit.early:                                       ; preds = %entry\n  ret i32 0\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "pragma_unroll_count",
+          "test_body": "define i32 @pragma_unroll_count(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 16\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !1\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n!1 = distinct !{!1, !2}\n!2 = !{!\"llvm.loop.unroll.count\", i32 4}\n"
+        },
+        {
+          "test_name": "switch_exit_full_unroll_bug",
+          "test_body": "define i32 @switch_exit_full_unroll_bug(ptr %A) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.latch, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %loop.latch ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %loop.latch ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  switch i32 %i, label %loop.latch [\n    i32 4, label %exit\n  ]\n\nloop.latch:                                       ; preds = %loop\n  br label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %add\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/debug.ll",
+      "commands": [
+        "opt -disable-output -passes=loop-unroll -debug-only=loop-unroll < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "full_unroll_cost_exceeds",
+          "test_body": "define i32 @full_unroll_cost_exceeds(ptr %A) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 100\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %add\n}\n"
+        },
+        {
+          "test_name": "pragma_full_unroll_unknown_tc",
+          "test_body": "define i32 @pragma_full_unroll_unknown_tc(ptr %A, i32 %n) {\nentry:\n  %cmp.entry = icmp sgt i32 %n, 0\n  br i1 %cmp.entry, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp slt i32 %inc, %n\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !0\n\nexit:                                             ; preds = %for.body, %entry\n  %result = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  ret i32 %result\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.full\"}\n"
+        },
+        {
+          "test_name": "full_unroll_profitability_analysis",
+          "test_body": "define i32 @full_unroll_profitability_analysis(ptr %A, ptr %B) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %result, %for.body ]\n  %idxA = getelementptr inbounds i32, ptr %A, i32 %i\n  %loadA = load i32, ptr %idxA, align 4\n  %idxB = getelementptr inbounds i32, ptr %B, i32 %i\n  %loadB = load i32, ptr %idxB, align 4\n  %mul1 = mul i32 %loadA, %loadB\n  %add1 = add i32 %mul1, %loadA\n  %mul2 = mul i32 %add1, %loadB\n  %sub1 = sub i32 %mul2, %loadA\n  %add2 = add i32 %sub1, %loadB\n  %mul3 = mul i32 %add2, %loadA\n  %sub2 = sub i32 %mul3, %loadB\n  %xor1 = xor i32 %sub2, %loadA\n  %or1 = or i32 %xor1, %loadB\n  %result = add i32 %sum, %or1\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body\n  ret i32 %result\n}\n"
+        },
+        {
+          "test_name": "indirectbr_loop",
+          "test_body": "define i32 @indirectbr_loop(ptr %A, ptr %target) {\nentry:\n  indirectbr ptr %target, [label %for.body, label %exit]\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %sum = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i32 %i\n  %load = load i32, ptr %arrayidx, align 4\n  %add = add i32 %sum, %load\n  %inc = add i32 %i, 1\n  %cmp = icmp ult i32 %inc, 10\n  br i1 %cmp, label %for.body, label %exit, !llvm.loop !0\n\nexit:                                             ; preds = %for.body, %entry\n  %result = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  ret i32 %result\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.enable\"}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/full-unroll-avoid-partial.ll",
+      "commands": [
+        "opt -S -passes=loop-unroll --debug-only=loop-unroll < %s 2>&1",
+        "opt -S -passes='require<opt-remark-emit>,loop(loop-unroll-full)' --debug-only=loop-unroll < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "pragma_unroll_count1",
+          "test_body": "%struct.HIP_vector_type = type { %union.anon }\n%union.anon = type { <2 x float> }\n\ndefine void @pragma_unroll_count1(ptr %queue, i32 %num_elements) {\nentry:\n  %cmp5 = icmp sgt i32 %num_elements, 0\n  br i1 %cmp5, label %for.body.preheader, label %for.cond.cleanup\n\nfor.body.preheader:                               ; preds = %entry\n  br label %for.body\n\nfor.cond.cleanup.loopexit:                        ; preds = %for.body\n  br label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond.cleanup.loopexit, %entry\n  ret void\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %i.06 = phi i32 [ %add, %for.body ], [ 0, %for.body.preheader ]\n  %add = add nuw nsw i32 %i.06, 1\n  %idxprom = zext i32 %add to i64\n  %arrayidx = getelementptr inbounds %struct.HIP_vector_type, ptr %queue, i64 %idxprom\n  %idxprom1 = zext i32 %i.06 to i64\n  %arrayidx2 = getelementptr inbounds %struct.HIP_vector_type, ptr %queue, i64 %idxprom1\n  %0 = load i64, ptr %arrayidx, align 8\n  store i64 %0, ptr %arrayidx2, align 8\n  %exitcond = icmp ne i32 %add, %num_elements\n  br i1 %exitcond, label %for.body, label %for.cond.cleanup.loopexit, !llvm.loop !0\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 5}\n"
+        },
+        {
+          "test_name": "pragma_unroll_count2",
+          "test_body": "define void @pragma_unroll_count2(i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.cond, %entry\n  %i = phi i64 [ 0, %entry ], [ %inc, %for.cond ]\n  %cmp = icmp ult i64 %i, %n\n  br i1 %cmp, label %for.cond, label %for.cond.cleanup\n\nfor.cond:                                         ; preds = %for.body\n  %inc = add i64 %i, 8\n  br label %for.body, !llvm.loop !0\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.count\", i32 5}\n"
+        },
+        {
+          "test_name": "pragma_unroll",
+          "test_body": "%struct.HIP_vector_type = type { %union.anon }\n%union.anon = type { <2 x float> }\n\ndefine void @pragma_unroll(ptr %queue, i32 %num_elements) {\nentry:\n  %cmp5 = icmp sgt i32 %num_elements, 0\n  br i1 %cmp5, label %for.body.preheader, label %for.cond.cleanup\n\nfor.body.preheader:                               ; preds = %entry\n  br label %for.body\n\nfor.cond.cleanup.loopexit:                        ; preds = %for.body\n  br label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond.cleanup.loopexit, %entry\n  ret void\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %i.06 = phi i32 [ %add, %for.body ], [ 0, %for.body.preheader ]\n  %add = add nuw nsw i32 %i.06, 1\n  %idxprom = zext i32 %add to i64\n  %arrayidx = getelementptr inbounds %struct.HIP_vector_type, ptr %queue, i64 %idxprom\n  %idxprom1 = zext i32 %i.06 to i64\n  %arrayidx2 = getelementptr inbounds %struct.HIP_vector_type, ptr %queue, i64 %idxprom1\n  %0 = load i64, ptr %arrayidx, align 8\n  store i64 %0, ptr %arrayidx2, align 8\n  %exitcond = icmp ne i32 %add, %num_elements\n  br i1 %exitcond, label %for.body, label %for.cond.cleanup.loopexit, !llvm.loop !0\n}\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.unroll.enable\"}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/gh-issue77118-broken-lcssa-form.ll",
+      "commands": [
+        "opt -passes=loop-unroll -unroll-peel-count=2 -S -disable-output -debug-only=loop-unroll < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test() {\nentry:\n  br label %loop1\n\nloop1:                                            ; preds = %loop1.latch, %entry\n  %phi = phi i32 [ 1, %entry ], [ 0, %loop1.latch ]\n  br label %loop2\n\nloop2:                                            ; preds = %loop2.latch, %loop1\n  %phi3 = phi i64 [ 0, %loop1 ], [ %sext, %loop2.latch ]\n  br label %loop3\n\nloop3:                                            ; preds = %loop3.latch, %loop2\n  %phi5 = phi i64 [ %phi3, %loop2 ], [ %sext, %loop3.latch ]\n  %phi6 = phi i32 [ 1, %loop2 ], [ %add10, %loop3.latch ]\n  %trunc = trunc i64 %phi5 to i32\n  br i1 true, label %loop3.latch, label %exit\n\nloop3.latch:                                      ; preds = %loop3\n  %add = add i32 1, %phi\n  %sext = sext i32 %add to i64\n  %add10 = add i32 %phi6, 1\n  %icmp = icmp ugt i32 %add10, 2\n  br i1 %icmp, label %loop2.latch, label %loop3\n\nloop2.latch:                                      ; preds = %loop3.latch\n  br i1 false, label %loop4.preheader, label %loop2\n\nloop4.preheader:                                  ; preds = %loop2.latch\n  br label %loop4\n\nloop4:                                            ; preds = %loop4, %loop4.preheader\n  br i1 false, label %loop1.latch, label %loop4\n\nloop1.latch:                                      ; preds = %loop4\n  br label %loop1\n\nexit:                                             ; preds = %loop3\n  %phi8 = phi i32 [ %trunc, %loop3 ]\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/guard-cost-for-unrolling.ll",
+      "commands": [
+        "opt -S -disable-output -unroll-partial-threshold=16 -debug-only=loop-unroll -passes='loop-unroll<runtime>' < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "test_guard_as_branch",
+          "test_body": "define void @test_guard_as_branch(ptr %arr, i64 %n, i64 %bound) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %guarded, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %guarded ]\n  %gep = getelementptr i64, ptr %arr, i64 %iv\n  %bound_check = icmp ult i64 %iv, %bound\n  %widenable_cond = call i1 @llvm.experimental.widenable.condition()\n  %exiplicit_guard_cond = and i1 %bound_check, %widenable_cond\n  br i1 %exiplicit_guard_cond, label %guarded, label %deopt, !prof !0\n\ndeopt:                                            ; preds = %loop\n  call void (...) @llvm.experimental.deoptimize.isVoid() [ \"deopt\"() ]\n  ret void\n\nguarded:                                          ; preds = %loop\n  store i64 %iv, ptr %gep, align 8\n  store i64 %iv, ptr %gep, align 8\n  %iv.next = add i64 %iv, 1\n  %loop_cond = icmp ult i64 %iv, %n\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %guarded\n  ret void\n}\n\ndeclare void @llvm.experimental.deoptimize.isVoid(...)\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(inaccessiblemem: readwrite)\ndeclare noundef i1 @llvm.experimental.widenable.condition() #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(inaccessiblemem: readwrite) }\n\n!0 = !{!\"branch_weights\", i32 1048576, i32 1}\n"
+        },
+        {
+          "test_name": "test_guard_as_intrinsic",
+          "test_body": "define void @test_guard_as_intrinsic(ptr %arr, i64 %n, i64 %bound) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep = getelementptr i64, ptr %arr, i64 %iv\n  %bound_check = icmp ult i64 %iv, %bound\n  call void (i1, ...) @llvm.experimental.guard(i1 %bound_check) [ \"deopt\"() ]\n  store i64 %iv, ptr %gep, align 8\n  store i64 %iv, ptr %gep, align 8\n  %iv.next = add i64 %iv, 1\n  %loop_cond = icmp ult i64 %iv, %n\n  br i1 %loop_cond, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\ndeclare void @llvm.experimental.guard(i1, ...)\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-28T18:14:50Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Utils/UnrollLoop.h": [
+      [
+        145,
+        152
+      ]
+    ],
+    "llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp": [
+      [
+        142,
+        149
+      ],
+      [
+        368,
+        379
+      ],
+      [
+        716,
+        735
+      ],
+      [
+        807,
+        844
+      ],
+      [
+        847,
+        862
+      ],
+      [
+        866,
+        874
+      ],
+      [
+        882,
+        889
+      ],
+      [
+        891,
+        899
+      ],
+      [
+        911,
+        916
+      ],
+      [
+        920,
+        926
+      ],
+      [
+        943,
+        948
+      ],
+      [
+        951,
+        956
+      ],
+      [
+        960,
+        965
+      ],
+      [
+        967,
+        974
+      ],
+      [
+        990,
+        1000
+      ],
+      [
+        1013,
+        1023
+      ],
+      [
+        1025,
+        1032
+      ],
+      [
+        1039,
+        1094
+      ],
+      [
+        1105,
+        1112
+      ],
+      [
+        1148,
+        1154
+      ],
+      [
+        1158,
+        1167
+      ],
+      [
+        1183,
+        1192
+      ],
+      [
+        1215,
+        1227
+      ],
+      [
+        1234,
+        1247
+      ],
+      [
+        1255,
+        1260
+      ],
+      [
+        1307,
+        1314
+      ],
+      [
+        1352,
+        1357
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/LoopUnroll.cpp": [
+      [
+        618,
+        628
+      ],
+      [
+        630,
+        636
+      ]
+    ],
+    "llvm/test/Transforms/LoopUnroll/debug.ll": [
+      [
+        2,
+        10
+      ],
+      [
+        26,
+        34
+      ],
+      [
+        48,
+        54
+      ],
+      [
+        74,
+        80
+      ],
+      [
+        98,
+        104
+      ],
+      [
+        120,
+        126
+      ],
+      [
+        148,
+        156
+      ],
+      [
+        163,
+        169
+      ]
+    ],
+    "llvm/test/Transforms/LoopUnroll/full-unroll-avoid-partial.ll": [
+      [
+        8,
+        25
+      ],
+      [
+        48,
+        63
+      ],
+      [
+        86,
+        102
+      ]
+    ],
+    "llvm/test/Transforms/LoopUnroll/gh-issue77118-broken-lcssa-form.ll": [
+      [
+        4,
+        19
+      ]
+    ],
+    "llvm/test/Transforms/LoopUnroll/guard-cost-for-unrolling.ll": [
+      [
+        9,
+        15
+      ],
+      [
+        31,
+        37
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Transforms/Utils/UnrollLoop.h": [
+      "getRolledLoopSize"
+    ],
+    "llvm/lib/Transforms/Scalar/LoopUnrollPass.cpp": [
+      "UnrollCostEstimator::UnrollCostEstimator",
+      "UnrollCostEstimator::canUnroll",
+      "analyzeLoopUnrollCost",
+      "llvm::computeUnrollCount",
+      "shouldFullUnroll",
+      "shouldPartialUnroll",
+      "shouldPragmaUnroll",
+      "tryToUnrollLoop"
+    ],
+    "llvm/lib/Transforms/Utils/LoopUnroll.cpp": [
+      "llvm::UnrollLoop"
+    ]
+  }
+}

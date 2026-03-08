@@ -1,0 +1,161 @@
+{
+  "pr_id": 180635,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/180635",
+  "state": "closed",
+  "title": "[SLP]Support for zext i1 %x modeling as select %x, 1, 0",
+  "author": "alexey-bataev",
+  "base_commit": "d69ccf3b34e7ca8fa42e4c078f026b6e898e2c90",
+  "fix_commit": "c978bfeac7c8d21ba3e4bc95c995db37c27f2d08",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex f89c22fafcf04..f18b6fc4dd957 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -5761,12 +5761,15 @@ class slpvectorizer::BoUpSLP {\n               // moment are extracts where their second (immediate) operand is\n               // not added. Since immediates do not affect scheduler behavior\n               // this is considered okay.\n-              assert(In &&\n-                     (isa<ExtractValueInst, ExtractElementInst, CallBase>(In) ||\n-                      In->getNumOperands() ==\n-                          Bundle->getTreeEntry()->getNumOperands() ||\n-                      Bundle->getTreeEntry()->isCopyableElement(In)) &&\n-                     \"Missed TreeEntry operands?\");\n+              assert(\n+                  In &&\n+                  (isa<ExtractValueInst, ExtractElementInst, CallBase>(In) ||\n+                   In->getNumOperands() ==\n+                       Bundle->getTreeEntry()->getNumOperands() ||\n+                   (isa<ZExtInst>(In) && Bundle->getTreeEntry()->getOpcode() ==\n+                                             Instruction::Select) ||\n+                   Bundle->getTreeEntry()->isCopyableElement(In)) &&\n+                  \"Missed TreeEntry operands?\");\n \n               // Count the number of unique phi nodes, which are the parent for\n               // parent entry, and exit, if all the unique phis are processed.\n@@ -11345,7 +11348,6 @@ class InstructionsCompatibilityAnalysis {\n     case Instruction::BitCast:\n     case Instruction::ICmp:\n     case Instruction::FCmp:\n-    case Instruction::Select:\n     case Instruction::FNeg:\n     case Instruction::Add:\n     case Instruction::FAdd:\n@@ -11381,6 +11383,30 @@ class InstructionsCompatibilityAnalysis {\n           Ops[Idx] = ConvertedOps[OpIdx];\n       }\n       return;\n+    case Instruction::Select:\n+      Operands.assign(VL0->getNumOperands(), {VL.size(), nullptr});\n+      for (auto [Idx, V] : enumerate(VL)) {\n+        auto *I = dyn_cast<Instruction>(V);\n+        if (!I) {\n+          for (auto [OpIdx, Ops] : enumerate(Operands))\n+            Ops[Idx] = PoisonValue::get(VL0->getOperand(OpIdx)->getType());\n+          continue;\n+        }\n+        if (isa<ZExtInst>(I)) {\n+          // Special case for select + zext i1 to avoid explosion of different\n+          // types. We want to keep the condition as i1 to be able to match\n+          // different selects together and reuse the vectorized condition\n+          // rather than trying to gather it.\n+          Operands[0][Idx] = I->getOperand(0);\n+          Operands[1][Idx] = ConstantInt::get(I->getType(), 1);\n+          Operands[2][Idx] = ConstantInt::getNullValue(I->getType());\n+          continue;\n+        }\n+        auto [Op, ConvertedOps] = convertTo(I, S);\n+        for (auto [OpIdx, Ops] : enumerate(Operands))\n+          Ops[Idx] = ConvertedOps[OpIdx];\n+      }\n+      return;\n     case Instruction::GetElementPtr: {\n       Operands.assign(2, {VL.size(), nullptr});\n       // Need to cast all indices to the same type before vectorization to\n@@ -11453,6 +11479,22 @@ class InstructionsCompatibilityAnalysis {\n                               : getSameOpcode(VL, TLI);\n     if (S)\n       return S;\n+    // Check if series of selects + zext i1 %x to in can be combined into\n+    // selects + select %x, i32 1, i32 0.\n+    Instruction *SelectOp = nullptr;\n+    if (allSameBlock(VL) && all_of(VL, [&](Value *V) {\n+          if (match(V, m_Select(m_Value(), m_Value(), m_Value()))) {\n+            if (!SelectOp)\n+              SelectOp = cast<Instruction>(V);\n+            return true;\n+          }\n+          auto *ZExt = dyn_cast<ZExtInst>(V);\n+          return (ZExt && ZExt->getSrcTy()->isIntegerTy(1)) ||\n+                 isa<PoisonValue>(V);\n+        })) {\n+      if (SelectOp)\n+        return InstructionsState(SelectOp, SelectOp);\n+    }\n     if (!VectorizeCopyableElements || !TryCopyableElementsVectorization)\n       return S;\n     findAndSetMainInstruction(VL, R);\n@@ -15481,6 +15523,10 @@ BoUpSLP::getEntryCost(const TreeEntry *E, ArrayRef<Value *> VectorizedVals,\n       if (isa<PoisonValue>(UniqueValues[Idx]))\n         return InstructionCost(TTI::TCC_Free);\n \n+      if (!isa<SelectInst>(UniqueValues[Idx]))\n+        return TTI->getInstructionCost(cast<Instruction>(UniqueValues[Idx]),\n+                                       CostKind);\n+\n       auto *VI = cast<Instruction>(UniqueValues[Idx]);\n       CmpPredicate CurrentPred = ScalarTy->isFloatingPointTy()\n                                      ? CmpInst::BAD_FCMP_PREDICATE\n@@ -25243,6 +25289,32 @@ class HorizontalReduction {\n            (I && !isa<LoadInst>(I) && isValidForAlternation(I->getOpcode()));\n   }\n \n+  /// Optimizes original placement of the reduced values for the reduction tree.\n+  /// For example, if there is a zext i1 + selects, we can merge select\n+  /// into zext and improve emission of the reductions.\n+  void optimizeReducedVals() {\n+    SmallDenseMap<unsigned, unsigned> UsedReductionOpIds;\n+    for (const auto [Idx, Vals] : enumerate(ReducedVals)) {\n+      if (auto *I = dyn_cast<Instruction>(Vals.front()))\n+        UsedReductionOpIds.try_emplace(I->getOpcode(), Idx);\n+    }\n+    // Check if zext i1 can be merged with select.\n+    auto ZExtIt = UsedReductionOpIds.find(Instruction::ZExt);\n+    auto SelectIt = UsedReductionOpIds.find(Instruction::Select);\n+    if (ZExtIt != UsedReductionOpIds.end() &&\n+        SelectIt != UsedReductionOpIds.end()) {\n+      unsigned ZExtIdx = ZExtIt->second;\n+      unsigned SelectIdx = SelectIt->second;\n+      auto *ZExt = cast<ZExtInst>(ReducedVals[ZExtIdx].front());\n+      // ZExt is compatible with Select? Merge select to zext, if so.\n+      if (ZExt->getSrcTy()->isIntegerTy(1) &&\n+          ZExt->getType() == ReducedVals[SelectIdx].front()->getType()) {\n+        ReducedVals[ZExtIdx].append(ReducedVals[SelectIdx]);\n+        ReducedVals.erase(std::next(ReducedVals.begin(), SelectIdx));\n+      }\n+    }\n+  }\n+\n public:\n   HorizontalReduction() = default;\n   HorizontalReduction(Instruction *I, ArrayRef<Value *> Ops)\n@@ -25418,6 +25490,9 @@ class HorizontalReduction {\n         ReducedVals.back().append(Data.rbegin(), Data.rend());\n       }\n     }\n+    // Post optimize reduced values to get better reduction sequences and sort\n+    // them by size.\n+    optimizeReducedVals();\n     // Sort the reduced values by number of same/alternate opcode and/or pointer\n     // operand.\n     stable_sort(ReducedVals, [](ArrayRef<Value *> P1, ArrayRef<Value *> P2) {\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Model zext i1 %x to in as select i1 %x, in 1, in 0 in case, if there are\nother select instructions, which can be combined into a bundle.\n\nFixes #178403\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/bool-mask.ll",
+      "commands": [
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64    -S",
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64-v2 -S",
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64-v3 -S",
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown -mcpu=x86-64-v4 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "bitmask_8xi64",
+          "test_body": "define i64 @bitmask_8xi64(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i64, ptr %src, align 8\n  %tobool.not = icmp ne i64 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i64, ptr %src, i64 1\n  %1 = load i64, ptr %arrayidx.1, align 8\n  %tobool.not.1 = icmp eq i64 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i64, ptr %src, i64 2\n  %2 = load i64, ptr %arrayidx.2, align 8\n  %tobool.not.2 = icmp eq i64 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i64, ptr %src, i64 3\n  %3 = load i64, ptr %arrayidx.3, align 8\n  %tobool.not.3 = icmp eq i64 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i64, ptr %src, i64 4\n  %4 = load i64, ptr %arrayidx.4, align 8\n  %tobool.not.4 = icmp eq i64 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i64, ptr %src, i64 5\n  %5 = load i64, ptr %arrayidx.5, align 8\n  %tobool.not.5 = icmp eq i64 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i64, ptr %src, i64 6\n  %6 = load i64, ptr %arrayidx.6, align 8\n  %tobool.not.6 = icmp eq i64 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i64, ptr %src, i64 7\n  %7 = load i64, ptr %arrayidx.7, align 8\n  %tobool.not.7 = icmp eq i64 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  ret i64 %mask.1.7\n}\n"
+        },
+        {
+          "test_name": "bitmask_4xi16",
+          "test_body": "define i64 @bitmask_4xi16(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i16, ptr %src, align 2\n  %tobool.not = icmp ne i16 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i16, ptr %src, i64 1\n  %1 = load i16, ptr %arrayidx.1, align 2\n  %tobool.not.1 = icmp eq i16 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i16, ptr %src, i64 2\n  %2 = load i16, ptr %arrayidx.2, align 2\n  %tobool.not.2 = icmp eq i16 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i16, ptr %src, i64 3\n  %3 = load i16, ptr %arrayidx.3, align 2\n  %tobool.not.3 = icmp eq i16 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i16, ptr %src, i64 4\n  %4 = load i16, ptr %arrayidx.4, align 2\n  %tobool.not.4 = icmp eq i16 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i16, ptr %src, i64 5\n  %5 = load i16, ptr %arrayidx.5, align 2\n  %tobool.not.5 = icmp eq i16 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i16, ptr %src, i64 6\n  %6 = load i16, ptr %arrayidx.6, align 2\n  %tobool.not.6 = icmp eq i16 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i16, ptr %src, i64 7\n  %7 = load i16, ptr %arrayidx.7, align 2\n  %tobool.not.7 = icmp eq i16 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  ret i64 %mask.1.7\n}\n"
+        },
+        {
+          "test_name": "bitmask_8xi32",
+          "test_body": "define i64 @bitmask_8xi32(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i32, ptr %src, align 4\n  %tobool.not = icmp ne i32 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i32, ptr %src, i64 1\n  %1 = load i32, ptr %arrayidx.1, align 4\n  %tobool.not.1 = icmp eq i32 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i32, ptr %src, i64 2\n  %2 = load i32, ptr %arrayidx.2, align 4\n  %tobool.not.2 = icmp eq i32 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i32, ptr %src, i64 3\n  %3 = load i32, ptr %arrayidx.3, align 4\n  %tobool.not.3 = icmp eq i32 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i32, ptr %src, i64 4\n  %4 = load i32, ptr %arrayidx.4, align 4\n  %tobool.not.4 = icmp eq i32 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i32, ptr %src, i64 5\n  %5 = load i32, ptr %arrayidx.5, align 4\n  %tobool.not.5 = icmp eq i32 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i32, ptr %src, i64 6\n  %6 = load i32, ptr %arrayidx.6, align 4\n  %tobool.not.6 = icmp eq i32 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i32, ptr %src, i64 7\n  %7 = load i32, ptr %arrayidx.7, align 4\n  %tobool.not.7 = icmp eq i32 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  ret i64 %mask.1.7\n}\n"
+        },
+        {
+          "test_name": "bitmask_16xi8",
+          "test_body": "define i64 @bitmask_16xi8(ptr nocapture noundef readonly %src) {\nentry:\n  %0 = load i8, ptr %src, align 1\n  %tobool.not = icmp ne i8 %0, 0\n  %or = zext i1 %tobool.not to i64\n  %arrayidx.1 = getelementptr inbounds i8, ptr %src, i64 1\n  %1 = load i8, ptr %arrayidx.1, align 1\n  %tobool.not.1 = icmp eq i8 %1, 0\n  %or.1 = select i1 %tobool.not.1, i64 0, i64 2\n  %mask.1.1 = or i64 %or.1, %or\n  %arrayidx.2 = getelementptr inbounds i8, ptr %src, i64 2\n  %2 = load i8, ptr %arrayidx.2, align 1\n  %tobool.not.2 = icmp eq i8 %2, 0\n  %or.2 = select i1 %tobool.not.2, i64 0, i64 4\n  %mask.1.2 = or i64 %or.2, %mask.1.1\n  %arrayidx.3 = getelementptr inbounds i8, ptr %src, i64 3\n  %3 = load i8, ptr %arrayidx.3, align 1\n  %tobool.not.3 = icmp eq i8 %3, 0\n  %or.3 = select i1 %tobool.not.3, i64 0, i64 8\n  %mask.1.3 = or i64 %or.3, %mask.1.2\n  %arrayidx.4 = getelementptr inbounds i8, ptr %src, i64 4\n  %4 = load i8, ptr %arrayidx.4, align 1\n  %tobool.not.4 = icmp eq i8 %4, 0\n  %or.4 = select i1 %tobool.not.4, i64 0, i64 16\n  %mask.1.4 = or i64 %or.4, %mask.1.3\n  %arrayidx.5 = getelementptr inbounds i8, ptr %src, i64 5\n  %5 = load i8, ptr %arrayidx.5, align 1\n  %tobool.not.5 = icmp eq i8 %5, 0\n  %or.5 = select i1 %tobool.not.5, i64 0, i64 32\n  %mask.1.5 = or i64 %or.5, %mask.1.4\n  %arrayidx.6 = getelementptr inbounds i8, ptr %src, i64 6\n  %6 = load i8, ptr %arrayidx.6, align 1\n  %tobool.not.6 = icmp eq i8 %6, 0\n  %or.6 = select i1 %tobool.not.6, i64 0, i64 64\n  %mask.1.6 = or i64 %or.6, %mask.1.5\n  %arrayidx.7 = getelementptr inbounds i8, ptr %src, i64 7\n  %7 = load i8, ptr %arrayidx.7, align 1\n  %tobool.not.7 = icmp eq i8 %7, 0\n  %or.7 = select i1 %tobool.not.7, i64 0, i64 128\n  %mask.1.7 = or i64 %or.7, %mask.1.6\n  %arrayidx.8 = getelementptr inbounds i8, ptr %src, i64 8\n  %8 = load i8, ptr %arrayidx.8, align 1\n  %tobool.not.8 = icmp eq i8 %8, 0\n  %or.8 = select i1 %tobool.not.8, i64 0, i64 256\n  %mask.1.8 = or i64 %or.8, %mask.1.7\n  %arrayidx.9 = getelementptr inbounds i8, ptr %src, i64 9\n  %9 = load i8, ptr %arrayidx.9, align 1\n  %tobool.not.9 = icmp eq i8 %9, 0\n  %or.9 = select i1 %tobool.not.9, i64 0, i64 512\n  %mask.1.9 = or i64 %or.9, %mask.1.8\n  %arrayidx.10 = getelementptr inbounds i8, ptr %src, i64 10\n  %10 = load i8, ptr %arrayidx.10, align 1\n  %tobool.not.10 = icmp eq i8 %10, 0\n  %or.10 = select i1 %tobool.not.10, i64 0, i64 1024\n  %mask.1.10 = or i64 %or.10, %mask.1.9\n  %arrayidx.11 = getelementptr inbounds i8, ptr %src, i64 11\n  %11 = load i8, ptr %arrayidx.11, align 1\n  %tobool.not.11 = icmp eq i8 %11, 0\n  %or.11 = select i1 %tobool.not.11, i64 0, i64 2048\n  %mask.1.11 = or i64 %or.11, %mask.1.10\n  %arrayidx.12 = getelementptr inbounds i8, ptr %src, i64 12\n  %12 = load i8, ptr %arrayidx.12, align 1\n  %tobool.not.12 = icmp eq i8 %12, 0\n  %or.12 = select i1 %tobool.not.12, i64 0, i64 4096\n  %mask.1.12 = or i64 %or.12, %mask.1.11\n  %arrayidx.13 = getelementptr inbounds i8, ptr %src, i64 13\n  %13 = load i8, ptr %arrayidx.13, align 1\n  %tobool.not.13 = icmp eq i8 %13, 0\n  %or.13 = select i1 %tobool.not.13, i64 0, i64 8192\n  %mask.1.13 = or i64 %or.13, %mask.1.12\n  %arrayidx.14 = getelementptr inbounds i8, ptr %src, i64 14\n  %14 = load i8, ptr %arrayidx.14, align 1\n  %tobool.not.14 = icmp eq i8 %14, 0\n  %or.14 = select i1 %tobool.not.14, i64 0, i64 16384\n  %mask.1.14 = or i64 %or.14, %mask.1.13\n  %arrayidx.15 = getelementptr inbounds i8, ptr %src, i64 15\n  %15 = load i8, ptr %arrayidx.15, align 1\n  %tobool.not.15 = icmp eq i8 %15, 0\n  %or.15 = select i1 %tobool.not.15, i64 0, i64 32768\n  %mask.1.15 = or i64 %or.15, %mask.1.14\n  ret i64 %mask.1.15\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/subvector-minbitwidth-unsigned-value.ll",
+      "commands": [
+        "opt -S --passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define i1 @test(i64 %v1, ptr %v2, i32 %v3, i1 %v4) {\nnewFuncRoot:\n  %conv.i147.i1756.3 = uitofp i32 %v3 to float\n  %div.i.i.i1749.3 = fdiv float 0.000000e+00, %conv.i147.i1756.3\n  %cond.i.i.i1751.3 = select i1 %v4, float 0.000000e+00, float %div.i.i.i1749.3\n  %conv.i147.i1756.2 = uitofp i32 %v3 to float\n  %div.i.i.i1749.2 = fdiv float 0.000000e+00, %conv.i147.i1756.2\n  %cond.i.i.i1751.2 = select i1 %v4, float 0.000000e+00, float %div.i.i.i1749.2\n  %0 = lshr i64 %v1, 40\n  %1 = trunc i64 %0 to i32\n  %tt2 = and i32 %1, 255\n  %cmp1.i.i.i1746.1 = icmp eq i32 %tt2, 0\n  %conv.i147.i1756.1 = uitofp i32 %tt2 to float\n  %div.i.i.i1749.1 = fdiv float 0.000000e+00, %conv.i147.i1756.1\n  %cond.i.i.i1751.1 = select i1 %cmp1.i.i.i1746.1, float 0.000000e+00, float %div.i.i.i1749.1\n  %tt3 = lshr i64 %v1, 32\n  %2 = trunc i64 %tt3 to i32\n  %tt1 = and i32 %2, 1\n  %cmp1.i.i.i1746 = icmp eq i32 %tt1, 0\n  %conv.i147.i1756 = uitofp i32 %tt1 to float\n  %div.i.i.i1749 = fdiv float 0.000000e+00, %conv.i147.i1756\n  %cond.i.i.i1751 = select i1 %cmp1.i.i.i1746, float 0.000000e+00, float %div.i.i.i1749\n  %3 = bitcast float %cond.i.i.i1751.3 to i32\n  %cmp.i99.i1736.3 = icmp ult i32 %3, 1333788672\n  %conv.i.i1743.3 = fptoui float %cond.i.i.i1751.3 to i32\n  %4 = icmp ne i32 %conv.i.i1743.3, 0\n  %narrow = select i1 %cmp.i99.i1736.3, i1 %4, i1 false\n  %5 = bitcast float %cond.i.i.i1751.2 to i32\n  %cmp.i99.i1736.2 = icmp ult i32 %5, 1333788672\n  %conv.i.i1743.2 = fptoui float %cond.i.i.i1751.2 to i32\n  %narrow1 = select i1 %cmp.i99.i1736.2, i32 %conv.i.i1743.2, i32 0\n  %6 = zext i1 %narrow to i32\n  %7 = or i32 %narrow1, %6\n  %8 = bitcast float %cond.i.i.i1751.1 to i32\n  %cmp.i99.i1736.1 = icmp ult i32 %8, 1333788672\n  %conv.i.i1743.1 = fptoui float %cond.i.i.i1751.1 to i32\n  %narrow2 = select i1 %cmp.i99.i1736.1, i32 %conv.i.i1743.1, i32 0\n  %rv3 = or i32 %7, %narrow2\n  %9 = bitcast float %cond.i.i.i1751 to i32\n  %cmp.i99.i1736 = icmp ult i32 %9, 1333788672\n  %conv.i.i1743 = fptoui float %cond.i.i.i1751 to i32\n  %narrow4 = select i1 %cmp.i99.i1736, i32 %conv.i.i1743, i32 0\n  %rt5 = or i32 %rv3, %narrow4\n  %rt = zext i32 %rt5 to i64\n  store i64 %rt, ptr %v2, align 1\n  ret i1 false\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "Andarwinux",
+      "body": "```\r\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace, preprocessed source, and associated run script.\r\nStack dump:\r\n0.      Program arguments: clang++ -std=c++20 -O3 X86ISelLowering-ca360a.cpp -c -w\r\n1.      <eof> parser at end of file\r\n2.      Optimizer\r\n3.      Running pass \"function<eager-inv>(drop-unnecessary-assumes,float2int,lower-constant-intrinsics,chr,loop(loop-rotate<header-duplication;no-prepare-for-lto>,loop-deletion),loop-distribute,inject-tli-mappings,loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>,drop-unnecessary-assumes,infer-alignment,loop-load-elim,instcombine<max-iterations=1;no-verify-fixpoint>,simplifycfg<bonus-inst-threshold=1;forward-switch-cond;switch-range-to-icmp;switch-to-arithmetic;switch-to-lookup;no-keep-loops;hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>,slp-vectorizer,vector-combine,instcombine<max-iterations=1;no-verify-fixpoint>,loop-unroll<O3>,transform-warning,sroa<preserve-cfg>,infer-alignment,instcombine<max-iterations=1;no-verify-fixpoint>,loop-mssa(licm<allowspeculation>),alignment-from-assumptions,loop-sink,instsimplify,div-rem-pairs,tailcallelim,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;speculate-unpredictables>)\" on module \"X86ISelLowering-ca360a.cpp\"\r\n4.      Running pass \"slp-vectorizer\" on function \"_ZNK4llvm17X86TargetLowering17LowerBUILD_VECTORENS_7SDValueERNS_12SelectionDAGE\"\r\n#0 0x000060c573247f26 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) Signals.cpp:0:0\r\n```\r\n[X86ISelLowering-ca360a.cpp](https://github.com/user-attachments/files/25213843/X86ISelLowering-ca360a.cpp)\r\n"
+    },
+    {
+      "author": "DKLoehr",
+      "body": "@Andarwinux: Thanks for reporting this and especially providing a repro file! I'm here to report a similar-looking crash when compiling chromium, it would be good to confirm they're the same:\r\n```\r\nAssertion failed: (detail::isPresent(Val) && \"dyn_cast on a non-existent value\"), function dyn_cast, file Casting.h, line 656.\r\n```\r\n\r\nLines (3) and (4) look the same as the above snippet so I suspect it's the same issue."
+    },
+    {
+      "author": "mstorsjo",
+      "body": "I'm hitting asserts after this change. Reduced repro:\r\n```c\r\nstruct {\r\n  long a;\r\n  long b\r\n} *c;\r\nlong d, e, f;\r\nint g;\r\nvoid h() {\r\n  long a = 2;\r\n  g = d == 0;\r\n  a -= g;\r\n  long b = g;\r\n  if (e)\r\n    ;\r\n  else\r\n    g = a -= b += f;\r\n  c[0].a = a;\r\n  c[0].b = b;\r\n}\r\n```\r\n```console\r\n$ clang -target aarch64-w64-mingw32 -c repro.c -O2\r\nclang: ../lib/Transforms/Vectorize/SLPVectorizer.cpp:2690: int llvm::slpvectorizer::BoUpSLP::LookAheadHeuristics::getScoreAtLevelRec(llvm::Value*, llvm::Value*, llvm::Instruction*, llvm::Instruction*, int, llvm::ArrayRef<llvm::Value*>) const: Assertion `FromIdx <= ToIdx && \"Bad index\"' failed.\r\n```"
+    },
+    {
+      "author": "RKSimon",
+      "body": "@mstorsjo Is this after the 78490acb329de7f9515134d2936963cd73f19ccc recommit?"
+    },
+    {
+      "author": "mstorsjo",
+      "body": "> @mstorsjo Is this after the [78490ac](https://github.com/llvm/llvm-project/commit/78490acb329de7f9515134d2936963cd73f19ccc) recommit?\r\n\r\nYes, this bisected down to specifically that commit - and it still reproduces on git main."
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> I'm hitting asserts after this change. Reduced repro:\r\n> \r\n> ```c\r\n> struct {\r\n>   long a;\r\n>   long b\r\n> } *c;\r\n> long d, e, f;\r\n> int g;\r\n> void h() {\r\n>   long a = 2;\r\n>   g = d == 0;\r\n>   a -= g;\r\n>   long b = g;\r\n>   if (e)\r\n>     ;\r\n>   else\r\n>     g = a -= b += f;\r\n>   c[0].a = a;\r\n>   c[0].b = b;\r\n> }\r\n> ```\r\n> \r\n> ```\r\n> $ clang -target aarch64-w64-mingw32 -c repro.c -O2\r\n> clang: ../lib/Transforms/Vectorize/SLPVectorizer.cpp:2690: int llvm::slpvectorizer::BoUpSLP::LookAheadHeuristics::getScoreAtLevelRec(llvm::Value*, llvm::Value*, llvm::Instruction*, llvm::Instruction*, int, llvm::ArrayRef<llvm::Value*>) const: Assertion `FromIdx <= ToIdx && \"Bad index\"' failed.\r\n> ```\r\n\r\nWill fix ASAP, thanks"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> I'm hitting asserts after this change. Reduced repro:\r\n> \r\n> ```c\r\n> struct {\r\n>   long a;\r\n>   long b\r\n> } *c;\r\n> long d, e, f;\r\n> int g;\r\n> void h() {\r\n>   long a = 2;\r\n>   g = d == 0;\r\n>   a -= g;\r\n>   long b = g;\r\n>   if (e)\r\n>     ;\r\n>   else\r\n>     g = a -= b += f;\r\n>   c[0].a = a;\r\n>   c[0].b = b;\r\n> }\r\n> ```\r\n> \r\n> ```\r\n> $ clang -target aarch64-w64-mingw32 -c repro.c -O2\r\n> clang: ../lib/Transforms/Vectorize/SLPVectorizer.cpp:2690: int llvm::slpvectorizer::BoUpSLP::LookAheadHeuristics::getScoreAtLevelRec(llvm::Value*, llvm::Value*, llvm::Instruction*, llvm::Instruction*, int, llvm::ArrayRef<llvm::Value*>) const: Assertion `FromIdx <= ToIdx && \"Bad index\"' failed.\r\n> ```\r\n\r\nFixed in 54cdd903b87211f71972f684b8532357c435aa7a"
+    }
+  ],
+  "knowledge_cutoff": "2026-02-09T22:57:15Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        5761,
+        5772
+      ],
+      [
+        11345,
+        11351
+      ],
+      [
+        11381,
+        11386
+      ],
+      [
+        11453,
+        11458
+      ],
+      [
+        15481,
+        15486
+      ],
+      [
+        25243,
+        25248
+      ],
+      [
+        25418,
+        25423
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/bool-mask.ll": [
+      [
+        17,
+        126
+      ],
+      [
+        208,
+        291
+      ],
+      [
+        333,
+        416
+      ],
+      [
+        500,
+        583
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/subvector-minbitwidth-unsigned-value.ll": [
+      [
+        9,
+        24
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::getEntryCost",
+      "HorizontalReduction",
+      "buildInstructionsState",
+      "buildOriginalOperands",
+      "isGoodForReduction",
+      "matchAssociativeReduction",
+      "schedule"
+    ]
+  }
+}
