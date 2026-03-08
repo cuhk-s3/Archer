@@ -1,0 +1,98 @@
+{
+  "bug_id": "113520",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/113520",
+  "bug_type": "miscompilation",
+  "base_commit": "907c13638819b36ecc5154775217068b1a1f4cfc",
+  "knowledge_cutoff": "2024-10-24T04:03:39Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "hints": {
+    "fix_commit": "e914421d7fbf22059ea2180233add0c914ec80f0",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          12068,
+          12075
+        ],
+        [
+          15784,
+          15791
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "BoUpSLP::getTreeCost",
+        "BoUpSLP::vectorizeTree"
+      ]
+    }
+  },
+  "patch": "commit e914421d7fbf22059ea2180233add0c914ec80f0\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Thu Oct 24 08:57:07 2024 -0700\n\n    [SLP]Do correct signedness analysis for externally used scalars\n    \n    If the scalars is used externally is in the root node, it may have\n    incorrect signedness info because of the conflict with the demanded bits\n    analysis. Need to perform exact signedness analysis and compute it\n    rather than rely on the precomputed value, which might be incorrect for\n    alternate zext/sext nodes.\n    \n    Fixes #113520\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 012d85353f08..2afd02dae3a8 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -12068,8 +12068,9 @@ InstructionCost BoUpSLP::getTreeCost(ArrayRef<Value *> VectorizedVals) {\n     auto It = MinBWs.find(Entry);\n     if (It != MinBWs.end()) {\n       auto *MinTy = IntegerType::get(F->getContext(), It->second.first);\n-      unsigned Extend =\n-          It->second.second ? Instruction::SExt : Instruction::ZExt;\n+      unsigned Extend = isKnownNonNegative(EU.Scalar, SimplifyQuery(*DL))\n+                            ? Instruction::ZExt\n+                            : Instruction::SExt;\n       VecTy = getWidenedType(MinTy, BundleWidth);\n       ExtraCost = TTI->getExtractWithExtendCost(Extend, EU.Scalar->getType(),\n                                                 VecTy, EU.Lane);\n@@ -15784,8 +15785,9 @@ BoUpSLP::vectorizeTree(const ExtraValueToDebugLocsMap &ExternallyUsedValues,\n           // to the larger type.\n           ExV = Ex;\n           if (Scalar->getType() != Ex->getType())\n-            ExV = Builder.CreateIntCast(Ex, Scalar->getType(),\n-                                        MinBWs.find(E)->second.second);\n+            ExV = Builder.CreateIntCast(\n+                Ex, Scalar->getType(),\n+                !isKnownNonNegative(Scalar, SimplifyQuery(*DL)));\n           auto *I = dyn_cast<Instruction>(Ex);\n           ScalarToEEs[Scalar].try_emplace(I ? I->getParent()\n                                             : &F->getEntryBlock(),\n",
+  "tests": [
+    {
+      "file": "<issue>",
+      "commands": [
+        "opt -S --passes=slp-vectorizer < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "add3_i96",
+          "test_body": "@0 = external global i1\n\ndefine <3 x i32> @add3_i96.2(<3 x i32> %0, <3 x i32> %1) {\n  %4 = extractelement <3 x i32> %0, i64 0\n  %5 = sext i32 %4 to i64\n  %6 = extractelement <3 x i32> %1, i64 0\n  %7 = zext i32 %6 to i64\n  %8 = add nuw nsw i64 %7, %5\n  %9 = extractelement <3 x i32> %0, i64 1\n  %10 = zext i32 %9 to i64\n  %11 = extractelement <3 x i32> %1, i64 1\n  %12 = zext i32 %11 to i64\n  %13 = add nuw nsw i64 %12, %10\n  %14 = lshr i64 %8, 32\n  %15 = add nuw nsw i64 %13, %14\n  %16 = extractelement <3 x i32> %0, i64 2\n  %17 = extractelement <3 x i32> %1, i64 2\n  %18 = add i32 %17, %16\n  %19 = or i64 %15, 32\n  %20 = trunc i64 %19 to i32\n  %21 = add i32 %18, %17\n  %22 = trunc i64 %8 to i32\n  %23 = insertelement <3 x i32> %1, i32 %22, i32 0\n  ret <3 x i32> %23\n}\n"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "`slp-vectorizer` miscompilation",
+    "body": "Alive2 report: https://alive2.llvm.org/ce/z/FmxNvP\r\n\r\n```llvm\r\n----------------------------------------\r\ndefine <3 x i32> @add3_i96.2(<3 x i32> %#0, <3 x i32> %#1) {\r\n#2:\r\n  %#3 = extractelement <3 x i32> %#0, i64 0\r\n  %#4 = sext i32 %#3 to i64\r\n  %#5 = extractelement <3 x i32> %#1, i64 0\r\n  %#6 = zext i32 %#5 to i64\r\n  %#7 = add nsw nuw i64 %#6, %#4\r\n  %#21 = trunc i64 %#7 to i32\r\n  %#22 = insertelement <3 x i32> %#1, i32 %#21, i32 0\r\n  ret <3 x i32> %#22\r\n}\r\n=>\r\ndefine <3 x i32> @add3_i96.2(<3 x i32> %#0, <3 x i32> %#1) {\r\n#2:\r\n  %#3 = shufflevector <3 x i32> %#1, <3 x i32> %#0, 0, 3\r\n  %#4 = extractelement <2 x i32> %#3, i32 0\r\n  %#5 = sext i32 %#4 to i64\r\n  %#6 = extractelement <2 x i32> %#3, i32 1\r\n  %#7 = sext i32 %#6 to i64\r\n  %#8 = add nsw nuw i64 %#5, %#7\r\n  %#22 = trunc i64 %#8 to i32\r\n  %#23 = insertelement <3 x i32> %#1, i32 %#22, i32 0\r\n  ret <3 x i32> %#23\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nExample:\r\n<3 x i32> %#0 = < #x00000008 (8), #x00000000 (0), #x00000000 (0) >\r\n<3 x i32> %#1 = < #xfffffff9 (4294967289, -7), #x00000000 (0), #x00000000 (0) >\r\n\r\nSource:\r\ni32 %#3 = #x00000008 (8)\r\ni64 %#4 = #x0000000000000008 (8)\r\ni32 %#5 = #xfffffff9 (4294967289, -7)\r\ni64 %#6 = #x00000000fffffff9 (4294967289)\r\ni64 %#7 = #x0000000100000001 (4294967297)\r\ni32 %#21 = #x00000001 (1)\r\n<3 x i32> %#22 = < #x00000001 (1), #x00000000 (0), #x00000000 (0) >\r\n\r\nTarget:\r\n<2 x i32> %#3 = < #xfffffff9 (4294967289, -7), #x00000008 (8) >\r\ni32 %#4 = #xfffffff9 (4294967289, -7)\r\ni64 %#5 = #xfffffffffffffff9 (18446744073709551609, -7)\r\ni32 %#6 = #x00000008 (8)\r\ni64 %#7 = #x0000000000000008 (8)\r\ni64 %#8 = poison\r\ni32 %#22 = poison\r\n<3 x i32> %#23 = < poison, #x00000000 (0), #x00000000 (0) >\r\nSource value: < #x00000001 (1), #x00000000 (0), #x00000000 (0) >\r\nTarget value: < poison, #x00000000 (0), #x00000000 (0) >\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```",
+    "author": "bongjunj",
+    "labels": [
+      "miscompilation",
+      "llvm:SLPVectorizer"
+    ],
+    "comments": []
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "bisect": "07a566793b2f94d0de6b95b7e6d1146b0d7ffe49",
+  "history": {
+    "commit_sha": "07a566793b2f94d0de6b95b7e6d1146b0d7ffe49",
+    "commit_sha_short": "07a566793b2f",
+    "commit_subject": "[SLP]Fix PR87477: fix alternate node cast cost/codegen.",
+    "commit_message": "[SLP]Fix PR87477: fix alternate node cast cost/codegen.\n\nHave to compare actual type size to pick up proper cast operation\nopcode.",
+    "commit_author": "Alexey Bataev <a.bataev@outlook.com>",
+    "commit_date": "2024-04-03T09:37:23-07:00",
+    "components": [
+      "SLPVectorizer"
+    ],
+    "changed_files": [
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp",
+      "llvm/test/Transforms/SLPVectorizer/SystemZ/ext-alt-node-must-ext.ll"
+    ],
+    "patch": "commit 07a566793b2f94d0de6b95b7e6d1146b0d7ffe49\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Wed Apr 3 09:37:23 2024 -0700\n\n    [SLP]Fix PR87477: fix alternate node cast cost/codegen.\n    \n    Have to compare actual type size to pick up proper cast operation\n    opcode.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex cb55992051eb..7928d29d6dfa 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -9063,25 +9063,35 @@ BoUpSLP::getEntryCost(const TreeEntry *E, ArrayRef<Value *> VectorizedVals,\n             cast<CmpInst>(E->getAltOp())->getPredicate(), CostKind,\n             E->getAltOp());\n       } else {\n-        Type *Src0SclTy = E->getMainOp()->getOperand(0)->getType();\n-        Type *Src1SclTy = E->getAltOp()->getOperand(0)->getType();\n-        auto *Src0Ty = FixedVectorType::get(Src0SclTy, VL.size());\n-        auto *Src1Ty = FixedVectorType::get(Src1SclTy, VL.size());\n-        if (It != MinBWs.end()) {\n-          if (!MinBWs.contains(getOperandEntry(E, 0)))\n-            VecCost =\n-                TTIRef.getCastInstrCost(Instruction::Trunc, VecTy, Src0Ty,\n-                                        TTI::CastContextHint::None, CostKind);\n-          LLVM_DEBUG({\n-            dbgs() << \"SLP: alternate extension, which should be truncated.\\n\";\n-            E->dump();\n-          });\n-          return VecCost;\n+        Type *SrcSclTy = E->getMainOp()->getOperand(0)->getType();\n+        auto *SrcTy = FixedVectorType::get(SrcSclTy, VL.size());\n+        if (SrcSclTy->isIntegerTy() && ScalarTy->isIntegerTy()) {\n+          auto SrcIt = MinBWs.find(getOperandEntry(E, 0));\n+          unsigned BWSz = DL->getTypeSizeInBits(ScalarTy);\n+          unsigned SrcBWSz =\n+              DL->getTypeSizeInBits(E->getMainOp()->getOperand(0)->getType());\n+          if (SrcIt != MinBWs.end()) {\n+            SrcBWSz = SrcIt->second.first;\n+            SrcSclTy = IntegerType::get(SrcSclTy->getContext(), SrcBWSz);\n+            SrcTy = FixedVectorType::get(SrcSclTy, VL.size());\n+          }\n+          if (BWSz <= SrcBWSz) {\n+            if (BWSz < SrcBWSz)\n+              VecCost =\n+                  TTIRef.getCastInstrCost(Instruction::Trunc, VecTy, SrcTy,\n+                                          TTI::CastContextHint::None, CostKind);\n+            LLVM_DEBUG({\n+              dbgs()\n+                  << \"SLP: alternate extension, which should be truncated.\\n\";\n+              E->dump();\n+            });\n+            return VecCost;\n+          }\n         }\n-        VecCost = TTIRef.getCastInstrCost(E->getOpcode(), VecTy, Src0Ty,\n+        VecCost = TTIRef.getCastInstrCost(E->getOpcode(), VecTy, SrcTy,\n                                           TTI::CastContextHint::None, CostKind);\n         VecCost +=\n-            TTIRef.getCastInstrCost(E->getAltOpcode(), VecTy, Src1Ty,\n+            TTIRef.getCastInstrCost(E->getAltOpcode(), VecTy, SrcTy,\n                                     TTI::CastContextHint::None, CostKind);\n       }\n       SmallVector<int> Mask;\n@@ -12591,15 +12601,20 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E, bool PostponedPHIs) {\n         CmpInst::Predicate AltPred = AltCI->getPredicate();\n         V1 = Builder.CreateCmp(AltPred, LHS, RHS);\n       } else {\n-        if (It != MinBWs.end()) {\n-          if (!MinBWs.contains(getOperandEntry(E, 0)))\n-            LHS = Builder.CreateIntCast(LHS, VecTy, It->second.first);\n-          assert(LHS->getType() == VecTy && \"Expected same type as operand.\");\n-          if (auto *I = dyn_cast<Instruction>(LHS))\n-            LHS = propagateMetadata(I, E->Scalars);\n-          E->VectorizedValue = LHS;\n-          ++NumVectorInstructions;\n-          return LHS;\n+        if (LHS->getType()->isIntOrIntVectorTy() && ScalarTy->isIntegerTy()) {\n+          unsigned SrcBWSz = DL->getTypeSizeInBits(\n+              cast<VectorType>(LHS->getType())->getElementType());\n+          unsigned BWSz = DL->getTypeSizeInBits(ScalarTy);\n+          if (BWSz <= SrcBWSz) {\n+            if (BWSz < SrcBWSz)\n+              LHS = Builder.CreateIntCast(LHS, VecTy, It->second.first);\n+            assert(LHS->getType() == VecTy && \"Expected same type as operand.\");\n+            if (auto *I = dyn_cast<Instruction>(LHS))\n+              LHS = propagateMetadata(I, E->Scalars);\n+            E->VectorizedValue = LHS;\n+            ++NumVectorInstructions;\n+            return LHS;\n+          }\n         }\n         V0 = Builder.CreateCast(\n             static_cast<Instruction::CastOps>(E->getOpcode()), LHS, VecTy);\n",
+    "tests": [
+      {
+        "file": "llvm/test/Transforms/SLPVectorizer/SystemZ/ext-alt-node-must-ext.ll",
+        "commands": [
+          [
+            "opt -S --passes=slp-vectorizer -mtriple=systemz-unknown -mcpu=z15 < %s -slp-threshold=-10",
+            "FileCheck %s"
+          ]
+        ],
+        "tests": [
+          {
+            "test_name": "test",
+            "test_body": "define i32 @test(ptr %0, ptr %1) {\n  %3 = load i64, ptr inttoptr (i64 32 to ptr), align 32\n  %4 = load ptr, ptr %1, align 8\n  %5 = getelementptr inbounds i8, ptr %4, i64 32\n  %6 = load i64, ptr %5, align 8\n  %7 = icmp ne i64 %3, 0\n  %8 = zext i1 %7 to i32\n  %9 = icmp ne i64 %6, 0\n  %.neg = sext i1 %9 to i32\n  %10 = add nsw i32 %.neg, %8\n  ret i32 %10\n}\n"
+          }
+        ]
+      }
+    ]
+  }
+}

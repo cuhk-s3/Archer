@@ -1,0 +1,139 @@
+{
+  "bug_id": "91957",
+  "issue_url": "https://github.com/llvm/llvm-project/issues/91957",
+  "bug_type": "miscompilation",
+  "base_commit": "c2a9a974ca85e4ac4509e368d4b9acae7e67bf71",
+  "knowledge_cutoff": "2024-05-13T13:05:21Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LICM"
+  ],
+  "hints": {
+    "fix_commit": "70091dc943ade280d75cea1e5ea5e93d9a8f934a",
+    "components": [
+      "LICM"
+    ],
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/LICM.cpp": [
+        [
+          2751,
+          2757
+        ],
+        [
+          2759,
+          2766
+        ]
+      ]
+    },
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/LICM.cpp": [
+        "hoistMulAddAssociation"
+      ]
+    }
+  },
+  "patch": "commit 70091dc943ade280d75cea1e5ea5e93d9a8f934a\nAuthor: Antonio Frighetto <me@antoniofrighetto.com>\nDate:   Sat May 18 16:52:17 2024 +0200\n\n    [LICM] Invalidate cached SCEV results in `hoistMulAddAssociation`\n    \n    While reassociating expressions, LICM is required to invalidate SCEV\n    results, as otherwise subsequent passes in the pipeline that leverage\n    LICM foldings (e.g. IndVars), may reason on invalid expressions; thus\n    miscompiling. This is achieved by rewriting the reassociable\n    instruction from scratch.\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/91957.\n\ndiff --git a/llvm/lib/Transforms/Scalar/LICM.cpp b/llvm/lib/Transforms/Scalar/LICM.cpp\nindex 6aa4188d1cc4..5eccf7b4adb6 100644\n--- a/llvm/lib/Transforms/Scalar/LICM.cpp\n+++ b/llvm/lib/Transforms/Scalar/LICM.cpp\n@@ -2751,7 +2751,7 @@ static bool hoistMulAddAssociation(Instruction &I, Loop &L,\n   IRBuilder<> Builder(Preheader->getTerminator());\n   for (auto *U : Changes) {\n     assert(L.isLoopInvariant(U->get()));\n-    Instruction *Ins = cast<Instruction>(U->getUser());\n+    auto *Ins = cast<BinaryOperator>(U->getUser());\n     Value *Mul;\n     if (I.getType()->isIntOrIntVectorTy()) {\n       Mul = Builder.CreateMul(U->get(), Factor, \"factor.op.mul\");\n@@ -2759,8 +2759,20 @@ static bool hoistMulAddAssociation(Instruction &I, Loop &L,\n       Ins->dropPoisonGeneratingFlags();\n     } else\n       Mul = Builder.CreateFMulFMF(U->get(), Factor, Ins, \"factor.op.fmul\");\n-    U->set(Mul);\n+\n+    // Rewrite the reassociable instruction.\n+    unsigned OpIdx = U->getOperandNo();\n+    auto *LHS = OpIdx == 0 ? Mul : Ins->getOperand(0);\n+    auto *RHS = OpIdx == 1 ? Mul : Ins->getOperand(1);\n+    auto *NewBO = BinaryOperator::Create(Ins->getOpcode(), LHS, RHS,\n+                                         Ins->getName() + \".reass\", Ins);\n+    NewBO->copyIRFlags(Ins);\n+    if (VariantOp == Ins)\n+      VariantOp = NewBO;\n+    Ins->replaceAllUsesWith(NewBO);\n+    eraseInstruction(*Ins, SafetyInfo, MSSAU);\n   }\n+\n   I.replaceAllUsesWith(VariantOp);\n   eraseInstruction(I, SafetyInfo, MSSAU);\n   return true;\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LICM/update-scev-after-hoist.ll",
+      "commands": [
+        "opt -S -passes='loop-unroll,loop-mssa(licm,indvars)' -unroll-count=4 < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "main",
+          "test_body": "define i16 @main() {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %mul = phi i16 [ 1, %entry ], [ %mul.n, %loop ]\n  %div = phi i16 [ 32767, %entry ], [ %div.n, %loop ]\n  %mul.n = mul i16 %mul, 2\n  %div.n = sdiv i16 %div, 2\n  %cmp = icmp sgt i16 %div, 0\n  br i1 %cmp, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i16 %mul\n}\n",
+          "additional_args": "-src-unroll=16 -tgt-unroll=16"
+        }
+      ]
+    }
+  ],
+  "issue": {
+    "title": "Miscompile with opt -passes=\"loop-unroll,loop-mssa(licm,indvars)\" -unroll-count=4 ",
+    "body": "llvm commit: e76b257483e6c\r\nReproduce with:\r\n```opt -passes=\"loop-unroll,loop-mssa(licm,indvars)\" -unroll-count=4 bbi-95405.ll -S -o -```\r\n\r\nThe input function returns 32768, but after running the passes as above we get\r\n```\r\ndefine i16 @foo() {\r\nentry:\r\n  br label %loop\r\n\r\nloop:                                             ; preds = %loop, %entry\r\n  br i1 false, label %loop, label %end, !llvm.loop !0\r\n\r\nend:                                              ; preds = %loop\r\n  ret i16 8192\r\n}\r\n\r\n!0 = distinct !{!0, !1}\r\n!1 = !{!\"llvm.loop.unroll.disable\"}\r\n```\r\nSo now the function returns 8192 instead.\r\n\r\nIf I extract the IR after loop-unroll or licm and run the rest of the passes instead I get the correct result.\r\n\r\n[bbi-95405.ll.gz](https://github.com/llvm/llvm-project/files/15294896/bbi-95405.ll.gz)\r\n",
+    "author": "mikaelholmen",
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "comments": [
+      {
+        "author": "mikaelholmen",
+        "body": "This starts happening with https://github.com/llvm/llvm-project/pull/67736 , commit 2dd52046816\r\n```\r\nRecommit \"[LICM] Support integer mul/add in hoistFPAssociation. (#67736)\"\r\n\r\nWith a fix for build bot failure. I was accessing the type of a deleted\r\nInstruction.\r\n\r\nOriginal message:\r\n\r\nThe reassociation this is trying to repair can happen for integer types\r\ntoo.\r\n\r\nThis patch adds support for integer mul/add to hoistFPAssociation. The\r\nfunction has been renamed to hoistMulAddAssociation. I've used separate\r\nstatistics and limits for integer to allow tuning flexibility.\r\n```\r\n"
+      },
+      {
+        "author": "nikic",
+        "body": "Without looking into this in detail, it's possible that the way the LICM code modifies instructions in place results incorrect cached SCEV results."
+      },
+      {
+        "author": "mikaelholmen",
+        "body": "> Without looking into this in detail, it's possible that the way the LICM code modifies instructions in place results incorrect cached SCEV results.\r\n\r\nI added some printouts and see that when IndVarSimplify run rewriteLoopExitValues we do\r\n```\r\nconst SCEV *ExitValue = SE->getSCEVAtScope(Inst, L->getParentLoop());\r\n```\r\nfor Inst being\r\n```\r\n%mul.n = mul i16 %mul, 8\r\n```\r\nand then we get the SCEV\r\n```\r\n(2 * %mul)\r\n```\r\nwhich looks wrong.\r\n\r\nIf I split up the pipeline in several opt runs we instead get the SCEV\r\n```\r\n(8 * %mul)\r\n```\r\nwhich looks more reasonable (and then we also get the correct result).\r\nLICM changed\r\n```\r\n%mul.n = mul i16 %mul, 2\r\n```\r\nto\r\n```\r\n%mul.n = mul i16 %mul, 8\r\n```\r\nso yeah, it should perhaps do something (more) about SCEV."
+      },
+      {
+        "author": "mikaelholmen",
+        "body": "@antoniofrighetto : nice that you work on this!\r\n\r\nBut oh it's annoying that I don't get any emails from github about that there was activity here with a linked PR with a fix etc even if I wrote this issue. :( I do get emails when there are comments but not when the issue was assigned or the PR was created. :("
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "@mikaelholmen This is a bit inconvenient indeed, GH doesn’t seem to send notifications wrt that :( Closed this, thanks for reporting!"
+      },
+      {
+        "author": "mikaelholmen",
+        "body": "> @mikaelholmen This is a bit inconvenient indeed, GH doesn’t seem to send notifications wrt that :( Closed this, thanks for reporting!\r\n\r\nThank you!"
+      }
+    ]
+  },
+  "verified": true,
+  "properties": {
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "bisect": "2dd52046816ac706a25d588efac77705793d8778",
+  "history": {
+    "commit_sha": "2dd52046816ac706a25d588efac77705793d8778",
+    "commit_sha_short": "2dd52046816a",
+    "commit_subject": "Recommit \"[LICM] Support integer mul/add in hoistFPAssociation. (#67736)\"",
+    "commit_message": "Recommit \"[LICM] Support integer mul/add in hoistFPAssociation. (#67736)\"\n\nWith a fix for build bot failure. I was accessing the type of a deleted\nInstruction.\n\nOriginal message:\n\nThe reassociation this is trying to repair can happen for integer types\ntoo.\n\nThis patch adds support for integer mul/add to hoistFPAssociation. The\nfunction has been renamed to hoistMulAddAssociation. I've used separate\nstatistics and limits for integer to allow tuning flexibility.",
+    "commit_author": "Craig Topper <craig.topper@sifive.com>",
+    "commit_date": "2024-02-12T20:28:09-08:00",
+    "components": [
+      "LICM"
+    ],
+    "changed_files": [
+      "llvm/lib/Transforms/Scalar/LICM.cpp",
+      "llvm/test/Transforms/LICM/expr-reassociate-int.ll"
+    ],
+    "patch": "commit 2dd52046816ac706a25d588efac77705793d8778\nAuthor: Craig Topper <craig.topper@sifive.com>\nDate:   Mon Feb 12 20:28:09 2024 -0800\n\n    Recommit \"[LICM] Support integer mul/add in hoistFPAssociation. (#67736)\"\n    \n    With a fix for build bot failure. I was accessing the type of a deleted\n    Instruction.\n    \n    Original message:\n    \n    The reassociation this is trying to repair can happen for integer types\n    too.\n    \n    This patch adds support for integer mul/add to hoistFPAssociation. The\n    function has been renamed to hoistMulAddAssociation. I've used separate\n    statistics and limits for integer to allow tuning flexibility.\n\ndiff --git a/llvm/lib/Transforms/Scalar/LICM.cpp b/llvm/lib/Transforms/Scalar/LICM.cpp\nindex f3e40a5cb809..9ec9c31e48e0 100644\n--- a/llvm/lib/Transforms/Scalar/LICM.cpp\n+++ b/llvm/lib/Transforms/Scalar/LICM.cpp\n@@ -110,6 +110,9 @@ STATISTIC(NumAddSubHoisted, \"Number of add/subtract expressions reassociated \"\n                             \"and hoisted out of the loop\");\n STATISTIC(NumFPAssociationsHoisted, \"Number of invariant FP expressions \"\n                                     \"reassociated and hoisted out of the loop\");\n+STATISTIC(NumIntAssociationsHoisted,\n+          \"Number of invariant int expressions \"\n+          \"reassociated and hoisted out of the loop\");\n \n /// Memory promotion is enabled by default.\n static cl::opt<bool>\n@@ -135,6 +138,12 @@ static cl::opt<unsigned> FPAssociationUpperLimit(\n         \"Set upper limit for the number of transformations performed \"\n         \"during a single round of hoisting the reassociated expressions.\"));\n \n+cl::opt<unsigned> IntAssociationUpperLimit(\n+    \"licm-max-num-int-reassociations\", cl::init(5U), cl::Hidden,\n+    cl::desc(\n+        \"Set upper limit for the number of transformations performed \"\n+        \"during a single round of hoisting the reassociated expressions.\"));\n+\n // Experimental option to allow imprecision in LICM in pathological cases, in\n // exchange for faster compile. This is to be removed if MemorySSA starts to\n // address the same issue. LICM calls MemorySSAWalker's\n@@ -2661,21 +2670,29 @@ static bool hoistAddSub(Instruction &I, Loop &L, ICFLoopSafetyInfo &SafetyInfo,\n   return false;\n }\n \n+static bool isReassociableOp(Instruction *I, unsigned IntOpcode,\n+                             unsigned FPOpcode) {\n+  if (I->getOpcode() == IntOpcode)\n+    return true;\n+  if (I->getOpcode() == FPOpcode && I->hasAllowReassoc() &&\n+      I->hasNoSignedZeros())\n+    return true;\n+  return false;\n+}\n+\n /// Try to reassociate expressions like ((A1 * B1) + (A2 * B2) + ...) * C where\n /// A1, A2, ... and C are loop invariants into expressions like\n /// ((A1 * C * B1) + (A2 * C * B2) + ...) and hoist the (A1 * C), (A2 * C), ...\n /// invariant expressions. This functions returns true only if any hoisting has\n /// actually occured.\n-static bool hoistFPAssociation(Instruction &I, Loop &L,\n-                               ICFLoopSafetyInfo &SafetyInfo,\n-                               MemorySSAUpdater &MSSAU, AssumptionCache *AC,\n-                               DominatorTree *DT) {\n-  using namespace PatternMatch;\n-  Value *VariantOp = nullptr, *InvariantOp = nullptr;\n-\n-  if (!match(&I, m_FMul(m_Value(VariantOp), m_Value(InvariantOp))) ||\n-      !I.hasAllowReassoc() || !I.hasNoSignedZeros())\n+static bool hoistMulAddAssociation(Instruction &I, Loop &L,\n+                                   ICFLoopSafetyInfo &SafetyInfo,\n+                                   MemorySSAUpdater &MSSAU, AssumptionCache *AC,\n+                                   DominatorTree *DT) {\n+  if (!isReassociableOp(&I, Instruction::Mul, Instruction::FMul))\n     return false;\n+  Value *VariantOp = I.getOperand(0);\n+  Value *InvariantOp = I.getOperand(1);\n   if (L.isLoopInvariant(VariantOp))\n     std::swap(VariantOp, InvariantOp);\n   if (L.isLoopInvariant(VariantOp) || !L.isLoopInvariant(InvariantOp))\n@@ -2689,15 +2706,17 @@ static bool hoistFPAssociation(Instruction &I, Loop &L,\n     Worklist.push_back(VariantBinOp);\n   while (!Worklist.empty()) {\n     BinaryOperator *BO = Worklist.pop_back_val();\n-    if (!BO->hasOneUse() || !BO->hasAllowReassoc() || !BO->hasNoSignedZeros())\n+    if (!BO->hasOneUse())\n       return false;\n-    BinaryOperator *Op0, *Op1;\n-    if (match(BO, m_FAdd(m_BinOp(Op0), m_BinOp(Op1)))) {\n-      Worklist.push_back(Op0);\n-      Worklist.push_back(Op1);\n+    if (isReassociableOp(BO, Instruction::Add, Instruction::FAdd) &&\n+        isa<BinaryOperator>(BO->getOperand(0)) &&\n+        isa<BinaryOperator>(BO->getOperand(1))) {\n+      Worklist.push_back(cast<BinaryOperator>(BO->getOperand(0)));\n+      Worklist.push_back(cast<BinaryOperator>(BO->getOperand(1)));\n       continue;\n     }\n-    if (BO->getOpcode() != Instruction::FMul || L.isLoopInvariant(BO))\n+    if (!isReassociableOp(BO, Instruction::Mul, Instruction::FMul) ||\n+        L.isLoopInvariant(BO))\n       return false;\n     Use &U0 = BO->getOperandUse(0);\n     Use &U1 = BO->getOperandUse(1);\n@@ -2707,7 +2726,10 @@ static bool hoistFPAssociation(Instruction &I, Loop &L,\n       Changes.push_back(&U1);\n     else\n       return false;\n-    if (Changes.size() > FPAssociationUpperLimit)\n+    unsigned Limit = I.getType()->isIntOrIntVectorTy()\n+                         ? IntAssociationUpperLimit\n+                         : FPAssociationUpperLimit;\n+    if (Changes.size() > Limit)\n       return false;\n   }\n   if (Changes.empty())\n@@ -2720,7 +2742,12 @@ static bool hoistFPAssociation(Instruction &I, Loop &L,\n   for (auto *U : Changes) {\n     assert(L.isLoopInvariant(U->get()));\n     Instruction *Ins = cast<Instruction>(U->getUser());\n-    U->set(Builder.CreateFMulFMF(U->get(), Factor, Ins, \"factor.op.fmul\"));\n+    Value *Mul;\n+    if (I.getType()->isIntOrIntVectorTy())\n+      Mul = Builder.CreateMul(U->get(), Factor, \"factor.op.mul\");\n+    else\n+      Mul = Builder.CreateFMulFMF(U->get(), Factor, Ins, \"factor.op.fmul\");\n+    U->set(Mul);\n   }\n   I.replaceAllUsesWith(VariantOp);\n   eraseInstruction(I, SafetyInfo, MSSAU);\n@@ -2754,9 +2781,13 @@ static bool hoistArithmetics(Instruction &I, Loop &L,\n     return true;\n   }\n \n-  if (hoistFPAssociation(I, L, SafetyInfo, MSSAU, AC, DT)) {\n+  bool IsInt = I.getType()->isIntOrIntVectorTy();\n+  if (hoistMulAddAssociation(I, L, SafetyInfo, MSSAU, AC, DT)) {\n     ++NumHoisted;\n-    ++NumFPAssociationsHoisted;\n+    if (IsInt)\n+      ++NumIntAssociationsHoisted;\n+    else\n+      ++NumFPAssociationsHoisted;\n     return true;\n   }\n \n",
+    "tests": [
+      {
+        "file": "llvm/test/Transforms/LICM/expr-reassociate-int.ll",
+        "commands": [
+          [
+            "opt -passes='loop-mssa(licm)' -S < %s",
+            "FileCheck %s --check-prefixes=CHECK,NOT_CONSTRAINED"
+          ],
+          [
+            "opt -passes='loop-mssa(licm)' -licm-max-num-int-reassociations=1 -S < %s",
+            "FileCheck %s --check-prefixes=CHECK,CONSTRAINED"
+          ]
+        ],
+        "tests": [
+          {
+            "test_name": "innermost_loop_1d_shouldhoist",
+            "test_body": "define void @innermost_loop_1d_shouldhoist(i32 %i, i64 %d1, i64 %delta, ptr %cells) {\nentry:\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.body, %entry\n  %j = phi i32 [ 0, %entry ], [ %add.j.1, %for.body ]\n  %cmp.not = icmp sgt i32 %j, %i\n  br i1 %cmp.not, label %for.end, label %for.body\n\nfor.body:                                         ; preds = %for.cond\n  %add.j.1 = add nuw nsw i32 %j, 1\n  %idxprom.j.1 = zext i32 %add.j.1 to i64\n  %arrayidx.j.1 = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j.1\n  %cell.1 = load i64, ptr %arrayidx.j.1, align 8\n  %mul.1 = mul i64 %delta, %d1\n  %mul.2 = mul i64 %mul.1, %cell.1\n  %idxprom.j = zext i32 %j to i64\n  %arrayidx.j = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j\n  store i64 %mul.2, ptr %arrayidx.j, align 8\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.cond\n  ret void\n}\n"
+          },
+          {
+            "test_name": "innermost_loop_3d_reassociated_different",
+            "test_body": "define void @innermost_loop_3d_reassociated_different(i32 %i, i64 %d1, i64 %d2, i64 %delta, ptr %cells) {\nentry:\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.body, %entry\n  %j = phi i32 [ 0, %entry ], [ %add.j.1, %for.body ]\n  %cmp.not = icmp sgt i32 %j, %i\n  br i1 %cmp.not, label %for.end, label %for.body\n\nfor.body:                                         ; preds = %for.cond\n  %add.j.1 = add nuw nsw i32 %j, 1\n  %idxprom.j.1 = zext i32 %add.j.1 to i64\n  %arrayidx.j.1 = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j.1\n  %cell.1 = load i64, ptr %arrayidx.j.1, align 8\n  %idxprom.j.2 = zext i32 %add.j.1 to i64\n  %arrayidx.j.2 = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j.2\n  %cell.2 = load i64, ptr %arrayidx.j.2, align 8\n  %idxprom.j.3 = zext i32 %add.j.1 to i64\n  %cell.3 = load i64, ptr %arrayidx.j.2, align 8\n  %idxprom.j = zext i32 %j to i64\n  %arrayidx.j = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j\n  %cell.4 = load i64, ptr %arrayidx.j, align 8\n  %mul.1 = mul i64 %cell.1, %d1\n  %mul.2 = mul i64 %cell.4, %d2\n  %extra.mul = mul i64 %cell.3, %cell.2\n  %reass.add = add i64 %extra.mul, %mul.1\n  %extra.add = add i64 %reass.add, %mul.2\n  %reass.mul = mul i64 %extra.add, %delta\n  store i64 %reass.mul, ptr %arrayidx.j, align 8\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.cond\n  ret void\n}\n"
+          },
+          {
+            "test_name": "innermost_loop_2d",
+            "test_body": "define void @innermost_loop_2d(i32 %i, i64 %d1, i64 %d2, i64 %delta, ptr %cells) {\nentry:\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.body, %entry\n  %j = phi i32 [ 0, %entry ], [ %add.j.1, %for.body ]\n  %cmp.not = icmp sgt i32 %j, %i\n  br i1 %cmp.not, label %for.end, label %for.body\n\nfor.body:                                         ; preds = %for.cond\n  %add.j.1 = add nuw nsw i32 %j, 1\n  %idxprom.j.1 = zext i32 %add.j.1 to i64\n  %arrayidx.j.1 = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j.1\n  %cell.1 = load i64, ptr %arrayidx.j.1, align 8\n  %mul.1 = mul i64 %cell.1, %d1\n  %idxprom.j = zext i32 %j to i64\n  %arrayidx.j = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j\n  %cell.2 = load i64, ptr %arrayidx.j, align 8\n  %mul.2 = mul i64 %cell.2, %d2\n  %reass.add = add i64 %mul.2, %mul.1\n  %reass.mul = mul i64 %reass.add, %delta\n  store i64 %reass.mul, ptr %arrayidx.j, align 8\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.cond\n  ret void\n}\n"
+          },
+          {
+            "test_name": "innermost_loop_3d",
+            "test_body": "define void @innermost_loop_3d(i32 %i, i64 %d1, i64 %d2, i64 %d3, i64 %delta, ptr %cells) {\nentry:\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.body, %entry\n  %j = phi i32 [ 0, %entry ], [ %add.j.1, %for.body ]\n  %cmp.not = icmp sgt i32 %j, %i\n  br i1 %cmp.not, label %for.end, label %for.body\n\nfor.body:                                         ; preds = %for.cond\n  %add.j.1 = add nuw nsw i32 %j, 1\n  %idxprom.j.1 = zext i32 %add.j.1 to i64\n  %arrayidx.j.1 = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j.1\n  %cell.1 = load i64, ptr %arrayidx.j.1, align 8\n  %mul.1 = mul i64 %cell.1, %d1\n  %idxprom.j = zext i32 %j to i64\n  %arrayidx.j = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j\n  %cell.2 = load i64, ptr %arrayidx.j, align 8\n  %mul.2 = mul i64 %cell.2, %d2\n  %add.j.2 = add nuw nsw i32 %j, 2\n  %idxprom.j.2 = zext i32 %add.j.2 to i64\n  %arrayidx.j.2 = getelementptr inbounds i64, ptr %cells, i64 %idxprom.j.2\n  %cell.3 = load i64, ptr %arrayidx.j.2, align 8\n  %mul.3 = mul i64 %cell.3, %d3\n  %reass.add = add i64 %mul.2, %mul.1\n  %reass.add1 = add i64 %reass.add, %mul.3\n  %reass.mul = mul i64 %reass.add1, %delta\n  store i64 %reass.mul, ptr %arrayidx.j.2, align 8\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.cond\n  ret void\n}\n"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "140994",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 2139,
+  "output_tokens": 5513,
+  "cached_tokens": 0,
+  "total_tokens": 7652,
+  "chat_cost": 0.070434,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 80.56028008460999,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Incorrect Fast-Math Flag Propagation from Comparison to Selection\n\n**Description**: \nThe bug is triggered by a pattern involving a floating-point selection operation that depends on a floating-point comparison, where fast-math flags are improperly handled during optimization:\n\n1. A floating-point comparison instruction is defined with specific fast-math flags (such as `nsz` for no signed zeros) that relax strict IEEE-754 floating-point semantics.\n2. A selection instruction (e.g., `select`) uses the boolean result of this comparison as its condition to choose between two floating-point values. Crucially, the selection instruction itself does not possess these fast-math flags and is expected to adhere to strict floating-point rules.\n3. During compiler optimizations\u2014such as canonicalizing the pattern by inverting the comparison predicate and swapping the true/false operands of the selection\u2014the compiler generates a new selection instruction.\n4. The compiler incorrectly propagates the fast-math flags from the comparison instruction directly to the newly created selection instruction.\n5. This improper flag propagation illegally relaxes the semantics of the selection operation. It enables subsequent invalid simplifications, such as completely folding the selection into one of its operands. This leads to a miscompilation when the original strict semantics (like correctly distinguishing and preserving the sign of zero) are violated at runtime."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define float @test(float %x) {\n  %cmp = fcmp nsz une float %x, 0.000000e+00\n  %sel = select i1 %cmp, float %x, float 0.000000e+00\n  ret float %sel\n}",
+      "transformed_ir": "define float @test(float %x) {\n  ret float %x\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in InstCombine: \n\nReproducer: https://alive2.llvm.org/ce/z/_FgncC\n```\ndefine double @src(double %x, double %y) {\n  %cmp = fcmp nsz une double %x, %y\n  %cond = select i1 %cmp, double %x, double %y\n  ret double %cond\n}\n\ndefine double @tgt(double returned %x, double %y) {\n  ret double %x\n}\n```\n```\nTransformation doesn't verify!\n\nERROR: Value mismatch\n\nExample:\ndouble %x = #x8000000000000000 (-0.0)\ndouble %y = #x0000000000000000 (+0.0)\n\nSource:\ni1 %cmp = #x0 (0)\ndouble %cond = #x0000000000000000 (+0.0)\n\nTarget:\nSource value: #x0000000000000000 (+0.0)\nTarget value: #x8000000000000000 (-0.0)\n```\n`nsz` flag should not be propagated from fcmp into select.\n\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 3ec0c5c7fef03985b43432c6b914c289d8a5435e\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sat May 31 16:25:10 2025 +0800\n\n    [InstCombine] Propagate FMF from select instead of fcmp (#141010)\n    \n    Previously,\n    https://github.com/llvm/llvm-project/commit/3d6b53980ce4ee855484fc8ae6ac3f99c85e48c3\n    propagates FMF from fcmp to avoid performance regressions. With the help\n    of https://github.com/llvm/llvm-project/pull/139861,\n    https://github.com/llvm/llvm-project/pull/141015, and\n    https://github.com/llvm/llvm-project/pull/141914, we can still convert\n    SPF into fabs/minnum/maxnum intrinsics even if some flags are missing.\n    This patch propagates FMF from select to address the long-standing\n    issue.\n    \n    Closes https://github.com/llvm/llvm-project/issues/140994.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex a791fc5db669..cca5705f6b58 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -25,6 +25,7 @@\n #include \"llvm/IR/ConstantRange.h\"\n #include \"llvm/IR/Constants.h\"\n #include \"llvm/IR/DerivedTypes.h\"\n+#include \"llvm/IR/FMF.h\"\n #include \"llvm/IR/IRBuilder.h\"\n #include \"llvm/IR/InstrTypes.h\"\n #include \"llvm/IR/Instruction.h\"\n@@ -3879,11 +3880,16 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n       // (X ugt Y) ? X : Y -> (X ole Y) ? Y : X\n       if (FCmp->hasOneUse() && FCmpInst::isUnordered(Pred)) {\n         FCmpInst::Predicate InvPred = FCmp->getInversePredicate();\n-        // FIXME: The FMF should propagate from the select, not the fcmp.\n         Value *NewCond = Builder.CreateFCmpFMF(InvPred, Cmp0, Cmp1, FCmp,\n                                                FCmp->getName() + \".inv\");\n+        // Propagate ninf/nnan from fcmp to select.\n+        FastMathFlags FMF = SI.getFastMathFlags();\n+        if (FCmp->hasNoNaNs())\n+          FMF.setNoNaNs(true);\n+        if (FCmp->hasNoInfs())\n+          FMF.setNoInfs(true);\n         Value *NewSel =\n-            Builder.CreateSelectFMF(NewCond, FalseVal, TrueVal, FCmp);\n+            Builder.CreateSelectFMF(NewCond, FalseVal, TrueVal, FMF);\n         return replaceInstUsesWith(SI, NewSel);\n       }\n     }\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Incorrect Fast-Math Flag Propagation from Comparison to Selection\n\n**Description**: \nThe bug is triggered by a pattern involving a floating-point selection operation that depends on a floating-point comparison, where fast-math flags are improperly handled during optimization:\n\n1. A floating-point comparison instruction is defined with specific fast-math flags (such as `nsz` for no signed zeros) that relax strict IEEE-754 floating-point semantics.\n2. A selection instruction (e.g., `select`) uses the boolean result of this comparison as its condition to choose between two floating-point values. Crucially, the selection instruction itself does not possess these fast-math flags and is expected to adhere to strict floating-point rules.\n3. During compiler optimizations\u2014such as canonicalizing the pattern by inverting the comparison predicate and swapping the true/false operands of the selection\u2014the compiler generates a new selection instruction.\n4. The compiler incorrectly propagates the fast-math flags from the comparison instruction directly to the newly created selection instruction.\n5. This improper flag propagation illegally relaxes the semantics of the selection operation. It enables subsequent invalid simplifications, such as completely folding the selection into one of its operands. This leads to a miscompilation when the original strict semantics (like correctly distinguishing and preserving the sign of zero) are violated at runtime."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Incorrect Fast-Math Flag Propagation from Comparison to Selection\n\n**Description**: \nThe bug is triggered by a pattern involving a floating-point selection operation that depends on a floating-point comparison, where fast-math flags are improperly handled during optimization:\n\n1. A floating-point comparison instruction is defined with specific fast-math flags (such as `nsz` for no signed zeros) that relax strict IEEE-754 floating-point semantics.\n2. A selection instruction (e.g., `select`) uses the boolean result of this comparison as its condition to choose between two floating-point values. Crucially, the selection instruction itself does not possess these fast-math flags and is expected to adhere to strict floating-point rules.\n3. During compiler optimizations\u2014such as canonicalizing the pattern by inverting the comparison predicate and swapping the true/false operands of the selection\u2014the compiler generates a new selection instruction.\n4. The compiler incorrectly propagates the fast-math flags from the comparison instruction directly to the newly created selection instruction.\n5. This improper flag propagation illegally relaxes the semantics of the selection operation. It enables subsequent invalid simplifications, such as completely folding the selection into one of its operands. This leads to a miscompilation when the original strict semantics (like correctly distinguishing and preserving the sign of zero) are violated at runtime.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define float @test(float %x) {\\n  %cmp = fcmp nsz une float %x, 0.000000e+00\\n  %sel = select i1 %cmp, float %x, float 0.000000e+00\\n  ret float %sel\\n}\",\n  \"optimized_ir\": \"define float @test(float %x) {\\n  ret float %x\\n}\"\n}\n```"
+    }
+  ]
+}

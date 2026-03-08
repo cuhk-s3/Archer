@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "136650",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1993,
+  "output_tokens": 3826,
+  "cached_tokens": 0,
+  "total_tokens": 5819,
+  "chat_cost": 0.049898,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 54.901703119277954,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Incorrect Folding of Logical AND Involving Floating-Point Comparisons and Sign-Manipulating Operations\n\n**Description**:\nThe bug is triggered when a logical AND operation (typically represented in LLVM IR as a `select` instruction where the false value is `false`/`0`) combines two floating-point comparisons (`fcmp`). \n\nThe pattern involves:\n1. A first comparison that checks if a base floating-point value is ordered (e.g., `ord`) or finite.\n2. A second comparison that evaluates a derived value\u2014created by applying sign-manipulating operations (such as `copysign` or `fabs`) to the base value\u2014against infinity or a specific magnitude.\n\nThe optimization incorrectly folds this logical AND into a single floating-point comparison that directly evaluates the derived value. This transformation fails to account for the short-circuiting semantics of a logical AND. \n\nIn the original IR, if the base value is a NaN, the first comparison evaluates to false, and the second comparison is never evaluated. If the sign-manipulating operation introduces a `poison` value (for instance, if the sign operand of a `copysign` is `poison`), the original logical AND safely masks the poison and returns false. However, the optimized single comparison unconditionally evaluates the derived value, resulting in `poison`. This breaks the short-circuiting behavior, making the target code more poisonous than the source and causing a miscompilation."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "declare double @llvm.copysign.f64(double, double)\n\ndefine i1 @test(double %x, double %y) {\n  %ord = fcmp ord double %x, 0.0\n  %derived = call double @llvm.copysign.f64(double %x, double %y)\n  %cmp = fcmp oeq double %derived, 0x7FF0000000000000\n  %and = select i1 %ord, i1 %cmp, i1 false\n  ret i1 %and\n}",
+      "transformed_ir": "declare double @llvm.copysign.f64(double, double)\n\ndefine i1 @test(double %x, double %y) {\n  %derived = call double @llvm.copysign.f64(double %x, double %y)\n  %cmp = fcmp oeq double %derived, 0x7FF0000000000000\n  ret i1 %cmp\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in InstCombine: \n\nReproducer: https://alive2.llvm.org/ce/z/Qcvvgi\n```\n----------------------------------------\ndefine i1 @src(half %x, half %y) {\n#0:\n  %copysign.x = copysign half %x, %y\n  %ord = fcmp ord half %x, 0x0000\n  %cmp = fcmp uge half %copysign.x, 0x7c00\n  %#1 = select i1 %ord, i1 %cmp, i1 0\n  ret i1 %#1\n}\n=>\ndefine i1 @src(half %x, half %y) nofree willreturn memory(none) {\n#0:\n  %copysign.x = copysign half %x, %y\n  %#1 = fcmp oeq half %copysign.x, 0x7c00\n  ret i1 %#1\n}\nTransformation doesn't verify!\n\nERROR: Target is more poisonous than source\n\nExample:\nhalf %x = #x7c02 (SNaN)\nhalf %y = poison\n\nSource:\nhalf %copysign.x = poison\ni1 %ord = #x0 (0)\ni1 %cmp = poison\ni1 %#1 = #x0 (0)\n\nTarget:\nhalf %copysign.x = poison\ni1 %#1 = poison\nSource value: #x0 (0)\nTarget value: poison\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n```\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 8abc917fe04140b6c6088a67e0398f637efde808\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Thu Apr 24 00:12:30 2025 +0800\n\n    [InstCombine] Do not fold logical is_finite test (#136851)\n    \n    This patch disables the fold for logical is_finite test (i.e., `and\n    (fcmp ord x, 0), (fcmp u* x, inf) -> fcmp o* x, inf`).\n    It is still possible to allow this fold for several logical cases (e.g.,\n    `stripSignOnlyFPOps(RHS0)` does not strip any operations). Since this\n    patch has no real-world impact, I decided to disable this fold for all\n    logical cases.\n    \n    Alive2: https://alive2.llvm.org/ce/z/aH4LC7\n    Closes https://github.com/llvm/llvm-project/issues/136650.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex f1b225c0f238..979a9cbedf2e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -1480,7 +1480,9 @@ Value *InstCombinerImpl::foldLogicOfFCmps(FCmpInst *LHS, FCmpInst *RHS,\n     }\n   }\n \n-  if (IsAnd && stripSignOnlyFPOps(LHS0) == stripSignOnlyFPOps(RHS0)) {\n+  // This transform is not valid for a logical select.\n+  if (!IsLogicalSelect && IsAnd &&\n+      stripSignOnlyFPOps(LHS0) == stripSignOnlyFPOps(RHS0)) {\n     // and (fcmp ord x, 0), (fcmp u* x, inf) -> fcmp o* x, inf\n     // and (fcmp ord x, 0), (fcmp u* fabs(x), inf) -> fcmp o* x, inf\n     if (Value *Left = matchIsFiniteTest(Builder, LHS, RHS))\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Incorrect Folding of Logical AND Involving Floating-Point Comparisons and Sign-Manipulating Operations\n\n**Description**:\nThe bug is triggered when a logical AND operation (typically represented in LLVM IR as a `select` instruction where the false value is `false`/`0`) combines two floating-point comparisons (`fcmp`). \n\nThe pattern involves:\n1. A first comparison that checks if a base floating-point value is ordered (e.g., `ord`) or finite.\n2. A second comparison that evaluates a derived value\u2014created by applying sign-manipulating operations (such as `copysign` or `fabs`) to the base value\u2014against infinity or a specific magnitude.\n\nThe optimization incorrectly folds this logical AND into a single floating-point comparison that directly evaluates the derived value. This transformation fails to account for the short-circuiting semantics of a logical AND. \n\nIn the original IR, if the base value is a NaN, the first comparison evaluates to false, and the second comparison is never evaluated. If the sign-manipulating operation introduces a `poison` value (for instance, if the sign operand of a `copysign` is `poison`), the original logical AND safely masks the poison and returns false. However, the optimized single comparison unconditionally evaluates the derived value, resulting in `poison`. This breaks the short-circuiting behavior, making the target code more poisonous than the source and causing a miscompilation."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Incorrect Folding of Logical AND Involving Floating-Point Comparisons and Sign-Manipulating Operations\n\n**Description**:\nThe bug is triggered when a logical AND operation (typically represented in LLVM IR as a `select` instruction where the false value is `false`/`0`) combines two floating-point comparisons (`fcmp`). \n\nThe pattern involves:\n1. A first comparison that checks if a base floating-point value is ordered (e.g., `ord`) or finite.\n2. A second comparison that evaluates a derived value\u2014created by applying sign-manipulating operations (such as `copysign` or `fabs`) to the base value\u2014against infinity or a specific magnitude.\n\nThe optimization incorrectly folds this logical AND into a single floating-point comparison that directly evaluates the derived value. This transformation fails to account for the short-circuiting semantics of a logical AND. \n\nIn the original IR, if the base value is a NaN, the first comparison evaluates to false, and the second comparison is never evaluated. If the sign-manipulating operation introduces a `poison` value (for instance, if the sign operand of a `copysign` is `poison`), the original logical AND safely masks the poison and returns false. However, the optimized single comparison unconditionally evaluates the derived value, resulting in `poison`. This breaks the short-circuiting behavior, making the target code more poisonous than the source and causing a miscompilation.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"declare double @llvm.copysign.f64(double, double)\\n\\ndefine i1 @test(double %x, double %y) {\\n  %ord = fcmp ord double %x, 0.0\\n  %derived = call double @llvm.copysign.f64(double %x, double %y)\\n  %cmp = fcmp oeq double %derived, 0x7FF0000000000000\\n  %and = select i1 %ord, i1 %cmp, i1 false\\n  ret i1 %and\\n}\",\n  \"optimized_ir\": \"declare double @llvm.copysign.f64(double, double)\\n\\ndefine i1 @test(double %x, double %y) {\\n  %derived = call double @llvm.copysign.f64(double %x, double %y)\\n  %cmp = fcmp oeq double %derived, 0x7FF0000000000000\\n  ret i1 %cmp\\n}\"\n}\n```"
+    }
+  ]
+}

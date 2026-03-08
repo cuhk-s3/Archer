@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "121432",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 2002,
+  "output_tokens": 4833,
+  "cached_tokens": 0,
+  "total_tokens": 6835,
+  "chat_cost": 0.062,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 50.41662049293518,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Incorrect FastMathFlags Propagation in Nested Floating-Point Operations Simplification\n\n**Description**:\nThe bug is triggered when the compiler simplifies nested floating-point operations (e.g., nested `copysign` intrinsics) where the outer operation is decorated with FastMathFlags (FMF) such as `nnan`, `ninf`, or `nsz`, while the inner operation lacks these flags.\n\nDuring the optimization, the compiler folds the sequence by bypassing the inner operation and directly feeding one of its operands into the outer operation. In doing so, it incorrectly retains the FMF of the outer operation on the newly folded instruction. \n\nThis transformation is flawed because the inner operation may act as a filter or mask for special floating-point values. For instance, an inner operation might only extract the sign bit of a NaN, Infinity, or Zero operand, yielding a normal floating-point value. Consequently, the original outer operation would receive a normal value and safely execute without violating its FMF. However, by eliminating the inner operation, the raw operand is directly exposed to the FMF-bearing outer operation. If the operand is a special value, it will violate the FMF assumptions, causing the folded instruction to incorrectly produce `poison` (making the target more poisonous than the source). \n\nTo maintain correctness, the optimization must intersect the FastMathFlags of both the inner and outer operations rather than blindly propagating the outer operation's flags."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "declare float @llvm.copysign.f32(float, float)\n\ndefine float @test_copysign_fold(float %x, float %y) {\n  %inner = call float @llvm.copysign.f32(float %x, float %y)\n  %outer = call nnan ninf nsz float @llvm.copysign.f32(float 1.000000e+00, float %inner)\n  ret float %outer\n}",
+      "transformed_ir": "declare float @llvm.copysign.f32(float, float)\n\ndefine float @test_copysign_fold(float %x, float %y) {\n  %outer = call nnan ninf nsz float @llvm.copysign.f32(float 1.000000e+00, float %y)\n  ret float %outer\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in InstCombine: \n\nAlive2: https://alive2.llvm.org/ce/z/ajCxTh\n```\ndefine float @src1(float noundef %x, float noundef %y, float noundef %z) {\n  %s = call float @llvm.copysign.f32(float %y, float %z)\n  %r = call nnan float @llvm.copysign.f32(float %x, float %s)\n  ret float %r\n}\n\ndefine float @tgt1(float noundef %x, float noundef %y, float noundef %z) {\n  %r = call nnan float @llvm.copysign.f32(float %x, float %z)\n  ret float %r\n}\n\ndefine float @src2(float noundef %x, float noundef %y, float noundef %z) {\n  %s = call float @llvm.copysign.f32(float %y, float %z)\n  %r = call ninf float @llvm.copysign.f32(float %x, float %s)\n  ret float %r\n}\n\ndefine float @tgt2(float noundef %x, float noundef %y, float noundef %z) {\n  %r = call ninf float @llvm.copysign.f32(float %x, float %z)\n  ret float %r\n}\n\ndefine float @src3(float noundef %x, float noundef %y, float noundef %z) {\n  %s = call float @llvm.copysign.f32(float %y, float %z)\n  %r = call nsz float @llvm.copysign.f32(float %x, float %s)\n  ret float %r\n}\n\ndefine float @tgt3(float noundef %x, float noundef %y, float noundef %z) {\n  %r = call nsz float @llvm.copysign.f32(float %x, float %z)\n  ret float %r\n}\n```\n\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit c05599966cd594c15834378f57669719d221c4d4\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Mon Jan 6 16:23:46 2025 +0800\n\n    [InstCombine] Fix FMF propagation in `copysign Mag, (copysign ?, X) -> copysign Mag, X` (#121574)\n    \n    Closes https://github.com/llvm/llvm-project/issues/121432.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex cdb2c11ef046..5494c70b34b1 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -2673,8 +2673,12 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n     // Propagate sign argument through nested calls:\n     // copysign Mag, (copysign ?, X) --> copysign Mag, X\n     Value *X;\n-    if (match(Sign, m_Intrinsic<Intrinsic::copysign>(m_Value(), m_Value(X))))\n-      return replaceOperand(*II, 1, X);\n+    if (match(Sign, m_Intrinsic<Intrinsic::copysign>(m_Value(), m_Value(X)))) {\n+      Value *CopySign = Builder.CreateCopySign(\n+          Mag, X,\n+          II->getFastMathFlags() & cast<Instruction>(Sign)->getFastMathFlags());\n+      return replaceInstUsesWith(*II, CopySign);\n+    }\n \n     // Clear sign-bit of constant magnitude:\n     // copysign -MagC, X --> copysign MagC, X\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Incorrect FastMathFlags Propagation in Nested Floating-Point Operations Simplification\n\n**Description**:\nThe bug is triggered when the compiler simplifies nested floating-point operations (e.g., nested `copysign` intrinsics) where the outer operation is decorated with FastMathFlags (FMF) such as `nnan`, `ninf`, or `nsz`, while the inner operation lacks these flags.\n\nDuring the optimization, the compiler folds the sequence by bypassing the inner operation and directly feeding one of its operands into the outer operation. In doing so, it incorrectly retains the FMF of the outer operation on the newly folded instruction. \n\nThis transformation is flawed because the inner operation may act as a filter or mask for special floating-point values. For instance, an inner operation might only extract the sign bit of a NaN, Infinity, or Zero operand, yielding a normal floating-point value. Consequently, the original outer operation would receive a normal value and safely execute without violating its FMF. However, by eliminating the inner operation, the raw operand is directly exposed to the FMF-bearing outer operation. If the operand is a special value, it will violate the FMF assumptions, causing the folded instruction to incorrectly produce `poison` (making the target more poisonous than the source). \n\nTo maintain correctness, the optimization must intersect the FastMathFlags of both the inner and outer operations rather than blindly propagating the outer operation's flags."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Incorrect FastMathFlags Propagation in Nested Floating-Point Operations Simplification\n\n**Description**:\nThe bug is triggered when the compiler simplifies nested floating-point operations (e.g., nested `copysign` intrinsics) where the outer operation is decorated with FastMathFlags (FMF) such as `nnan`, `ninf`, or `nsz`, while the inner operation lacks these flags.\n\nDuring the optimization, the compiler folds the sequence by bypassing the inner operation and directly feeding one of its operands into the outer operation. In doing so, it incorrectly retains the FMF of the outer operation on the newly folded instruction. \n\nThis transformation is flawed because the inner operation may act as a filter or mask for special floating-point values. For instance, an inner operation might only extract the sign bit of a NaN, Infinity, or Zero operand, yielding a normal floating-point value. Consequently, the original outer operation would receive a normal value and safely execute without violating its FMF. However, by eliminating the inner operation, the raw operand is directly exposed to the FMF-bearing outer operation. If the operand is a special value, it will violate the FMF assumptions, causing the folded instruction to incorrectly produce `poison` (making the target more poisonous than the source). \n\nTo maintain correctness, the optimization must intersect the FastMathFlags of both the inner and outer operations rather than blindly propagating the outer operation's flags.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"declare float @llvm.copysign.f32(float, float)\\n\\ndefine float @test_copysign_fold(float %x, float %y) {\\n  %inner = call float @llvm.copysign.f32(float %x, float %y)\\n  %outer = call nnan ninf nsz float @llvm.copysign.f32(float 1.000000e+00, float %inner)\\n  ret float %outer\\n}\",\n  \"optimized_ir\": \"declare float @llvm.copysign.f32(float, float)\\n\\ndefine float @test_copysign_fold(float %x, float %y) {\\n  %outer = call nnan ninf nsz float @llvm.copysign.f32(float 1.000000e+00, float %y)\\n  ret float %outer\\n}\"\n}\n```"
+    }
+  ]
+}

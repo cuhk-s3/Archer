@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "61984",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 2272,
+  "output_tokens": 2607,
+  "cached_tokens": 0,
+  "total_tokens": 4879,
+  "chat_cost": 0.035828,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 37.19188189506531,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Incorrect Elimination of Bitcast Between Same-Width Floating-Point Types\n\n**Description:**\nThe bug is triggered by a sequence of cast instructions involving floating-point types that share the same bit width but have different internal representations (such as `bfloat` and `half`). Specifically, the pattern consists of a `bitcast` instruction converting a value from one floating-point type to another of the same width, immediately followed by a floating-point cast instruction (such as a floating-point extension or truncation).\n\nThe compiler's optimization logic incorrectly assumes that a `bitcast` between any two floating-point types of the same size is a semantic no-op. Based on this flawed assumption, it attempts to optimize the cast pair by eliminating the `bitcast` entirely and applying the second floating-point cast directly to the original source type. \n\nHowever, because the source and destination types of the `bitcast` have different binary representations (e.g., different allocations for exponent and mantissa bits), the `bitcast` fundamentally alters the interpreted numerical value. Bypassing the `bitcast` and directly casting the original type leads to an incorrect conversion. This causes subsequent operations, such as constant folding or comparisons, to operate on the wrong numerical value, ultimately resulting in a miscompilation."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define float @test_bitcast_bfloat_to_half_fpext(bfloat %x) {\nentry:\n  %bc = bitcast bfloat %x to half\n  %ext = fpext half %bc to float\n  ret float %ext\n}\n",
+      "transformed_ir": "define float @test_bitcast_bfloat_to_half_fpext(bfloat %x) {\nentry:\n  %ext = fpext bfloat %x to float\n  ret float %ext\n}\n",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in IR: \n\nThis code is miscompiled when targeting AArch64:\r\n\r\n```c\r\nstruct S80 {\r\n  __bf16 M0;\r\n  __fp16 M1;\r\n};\r\n\r\nint F54(struct S80 P0) {\r\n  return P0.M1 == 1025.0f;\r\n}\r\n```\r\n\r\n```console\r\n$ /work/llvm/build/bin/clang --target=aarch64--none-eabi -march=armv8.2-a+fp16+bf16 -c test.c -O2 -o - -S\r\n        .text\r\n        .file   \"test.c\"\r\n        .globl  F54                             // -- Begin function F54\r\n        .p2align        2\r\n        .type   F54,@function\r\nF54:                                    // @F54\r\n        .cfi_startproc\r\n// %bb.0:                               // %entry\r\n        mov     w0, wzr\r\n        ret\r\n.Lfunc_end0:\r\n        .size   F54, .Lfunc_end0-F54\r\n        .cfi_endproc\r\n                                        // -- End function\r\n        .ident  \"clang version 17.0.0 (git@github.com:llvm/llvm-project.git 626b7e5dd249f569203e024141c1a2a0f618df9c)\"\r\n        .section        \".note.GNU-stack\",\"\",@progbits\r\n        .addrsig\r\n```\r\n\r\nThe value `1025.0` is representable by `__fp16` (checked with https://evanw.github.io/float-toy/), so there should be no reason to remove the comparison.\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit d309261d05cf173e6a18b20be986877fd87fe4f3\nAuthor: Nashe Mncube <nashe.mncube@arm.com>\nDate:   Wed Jan 31 11:42:10 2024 +0000\n\n    [llvm][InstCombine] bitcast bfloat half castpair bug (#79832)\n    \n    Miscompilation arises due to instruction combining of cast pairs of the\n    type `bitcast bfloat to half` + `<FPOp> bfloat to half` or `bitcast half\n    to bfloat` + `<FPOp half to bfloat`. For example `bitcast bfloat to\n    half`+`fpext half to double` or `bitcast bfloat to half`+`fpext bfloat\n    to double` respectively reduce to `fpext bfloat to double` and `fpext\n    half to double`. This is an incorrect conversion as it assumes the\n    representation of `bfloat` and `half` are equivalent due to having the\n    same width. As a consequence miscompilation arises.\n    \n    Fixes #61984\n\ndiff --git a/llvm/lib/IR/Instructions.cpp b/llvm/lib/IR/Instructions.cpp\nindex 87874c3abc46..ce0df53d9ffb 100644\n--- a/llvm/lib/IR/Instructions.cpp\n+++ b/llvm/lib/IR/Instructions.cpp\n@@ -3164,7 +3164,7 @@ unsigned CastInst::isEliminableCastPair(\n     { 99,99,99, 2, 2,99,99, 8, 2,99,99, 4, 0}, // FPExt          |\n     {  1, 0, 0,99,99, 0, 0,99,99,99, 7, 3, 0}, // PtrToInt       |\n     { 99,99,99,99,99,99,99,99,99,11,99,15, 0}, // IntToPtr       |\n-    {  5, 5, 5, 6, 6, 5, 5, 6, 6,16, 5, 1,14}, // BitCast        |\n+    {  5, 5, 5, 0, 0, 5, 5, 0, 0,16, 5, 1,14}, // BitCast        |\n     {  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,13,12}, // AddrSpaceCast -+\n   };\n \n@@ -3213,12 +3213,6 @@ unsigned CastInst::isEliminableCastPair(\n       if (SrcTy->isIntegerTy())\n         return secondOp;\n       return 0;\n-    case 6:\n-      // No-op cast in first op implies secondOp as long as the SrcTy\n-      // is a floating point.\n-      if (SrcTy->isFloatingPointTy())\n-        return secondOp;\n-      return 0;\n     case 7: {\n       // Disable inttoptr/ptrtoint optimization if enabled.\n       if (DisableI2pP2iOpt)\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Incorrect Elimination of Bitcast Between Same-Width Floating-Point Types\n\n**Description:**\nThe bug is triggered by a sequence of cast instructions involving floating-point types that share the same bit width but have different internal representations (such as `bfloat` and `half`). Specifically, the pattern consists of a `bitcast` instruction converting a value from one floating-point type to another of the same width, immediately followed by a floating-point cast instruction (such as a floating-point extension or truncation).\n\nThe compiler's optimization logic incorrectly assumes that a `bitcast` between any two floating-point types of the same size is a semantic no-op. Based on this flawed assumption, it attempts to optimize the cast pair by eliminating the `bitcast` entirely and applying the second floating-point cast directly to the original source type. \n\nHowever, because the source and destination types of the `bitcast` have different binary representations (e.g., different allocations for exponent and mantissa bits), the `bitcast` fundamentally alters the interpreted numerical value. Bypassing the `bitcast` and directly casting the original type leads to an incorrect conversion. This causes subsequent operations, such as constant folding or comparisons, to operate on the wrong numerical value, ultimately resulting in a miscompilation."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Incorrect Elimination of Bitcast Between Same-Width Floating-Point Types\n\n**Description:**\nThe bug is triggered by a sequence of cast instructions involving floating-point types that share the same bit width but have different internal representations (such as `bfloat` and `half`). Specifically, the pattern consists of a `bitcast` instruction converting a value from one floating-point type to another of the same width, immediately followed by a floating-point cast instruction (such as a floating-point extension or truncation).\n\nThe compiler's optimization logic incorrectly assumes that a `bitcast` between any two floating-point types of the same size is a semantic no-op. Based on this flawed assumption, it attempts to optimize the cast pair by eliminating the `bitcast` entirely and applying the second floating-point cast directly to the original source type. \n\nHowever, because the source and destination types of the `bitcast` have different binary representations (e.g., different allocations for exponent and mantissa bits), the `bitcast` fundamentally alters the interpreted numerical value. Bypassing the `bitcast` and directly casting the original type leads to an incorrect conversion. This causes subsequent operations, such as constant folding or comparisons, to operate on the wrong numerical value, ultimately resulting in a miscompilation.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define float @test_bitcast_bfloat_to_half_fpext(bfloat %x) {\\nentry:\\n  %bc = bitcast bfloat %x to half\\n  %ext = fpext half %bc to float\\n  ret float %ext\\n}\\n\",\n  \"optimized_ir\": \"define float @test_bitcast_bfloat_to_half_fpext(bfloat %x) {\\nentry:\\n  %ext = fpext bfloat %x to float\\n  ret float %ext\\n}\\n\"\n}\n```"
+    }
+  ]
+}

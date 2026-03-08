@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "121430",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 2060,
+  "output_tokens": 3094,
+  "cached_tokens": 0,
+  "total_tokens": 5154,
+  "chat_cost": 0.041248,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 35.31609272956848,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Incorrect Fast-Math Flag Propagation from Conditionally Selected Floating-Point Operations\n\n**Description**: \nThe bug is triggered by a pattern involving a floating-point comparison, a floating-point operation (such as negation) decorated with fast-math flags (e.g., `ninf` or `nnan`), and a `select` instruction that chooses between the original floating-point value and the result of the modified operation based on the comparison. \n\nThe compiler's optimization pass incorrectly propagates the fast-math flags from the conditionally selected floating-point operation directly to the `select` instruction. This transformation is flawed because the modified operation might not be chosen at runtime. If the original value violates the fast-math flags (for example, if it is an infinity or NaN) and is the value actually chosen by the `select`, the incorrectly propagated flags on the `select` instruction will result in a contradiction, leading to poison values or miscompilations. \n\nTo be valid, fast-math flags should only be propagated to the `select` if they are guaranteed to hold regardless of which branch is chosen, such as deriving them from the comparison instruction itself, or if the selection condition strictly guarantees the flag's validity for the chosen path."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define float @test(float %x) {\n  %cmp = fcmp ogt float %x, 0.000000e+00\n  %neg = fneg nnan ninf float %x\n  %sel = select i1 %cmp, float %x, float %neg\n  ret float %sel\n}",
+      "transformed_ir": "define float @test(float %x) {\n  %cmp = fcmp ogt float %x, 0.000000e+00\n  %neg = fneg nnan ninf float %x\n  %sel = select nnan ninf i1 %cmp, float %x, float %neg\n  ret float %sel\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in InstCombine: \n\nAlive2: https://alive2.llvm.org/ce/z/4CP8y6\n```\ndefine double @src(double noundef %x) {\n  %cmp = fcmp ult double %x, 0.000000e+00\n  %negX = fneg ninf double %x\n  %sel = select i1 %cmp, double %x, double %negX\n  ret double %sel\n}\n\ndefine double @tgt(double noundef %x) {\n  %cmp = fcmp ult double %x, 0.000000e+00\n  %negX = fneg ninf double %x\n  %sel = select ninf i1 %cmp, double %x, double %negX\n  ret double %sel\n}\n```\n\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 3ec6a6b85aed838b7d56bd6843cad52e822b9111\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sat Feb 1 15:14:17 2025 +0800\n\n    [InstCombine] Fix FMF propagation in `foldSelectWithFCmpToFabs` (#121580)\n    \n    Consider the following pattern:\n    ```\n    %cmp = fcmp <pred> double %x, 0.000000e+00\n    %negX = fneg <fmf> double %x\n    %sel = select i1 %cmp, double %x, double %negX\n    ```\n    We cannot propagate ninf from fneg to select since `%negX` may not be\n    chosen. Similarly, we cannot propagate nnan unless `%negX` is guaranteed\n    to be selected when `%x` is NaN.\n    This patch also propagates nnan/ninf from fcmp to avoid regression in\n    `PhaseOrdering/generate-fabs.ll`.\n    \n    Alive2: https://alive2.llvm.org/ce/z/t6U-tA\n    Closes https://github.com/llvm/llvm-project/issues/121430 and\n    https://github.com/llvm/llvm-project/issues/113989.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex e2af4d4c5636..29c5cef84ccd 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -2852,10 +2852,10 @@ static Instruction *foldSelectWithFCmpToFabs(SelectInst &SI,\n     if (!match(TrueVal, m_FNeg(m_Specific(X))))\n       return nullptr;\n \n-    // Forward-propagate nnan and ninf from the fneg to the select.\n+    // Forward-propagate nnan and ninf from the fcmp to the select.\n     // If all inputs are not those values, then the select is not either.\n     // Note: nsz is defined differently, so it may not be correct to propagate.\n-    FastMathFlags FMF = cast<FPMathOperator>(TrueVal)->getFastMathFlags();\n+    FastMathFlags FMF = cast<FPMathOperator>(CondVal)->getFastMathFlags();\n     if (FMF.noNaNs() && !SI.hasNoNaNs()) {\n       SI.setHasNoNaNs(true);\n       ChangedFMF = true;\n@@ -2864,6 +2864,13 @@ static Instruction *foldSelectWithFCmpToFabs(SelectInst &SI,\n       SI.setHasNoInfs(true);\n       ChangedFMF = true;\n     }\n+    // Forward-propagate nnan from the fneg to the select.\n+    // The nnan flag can be propagated iff fneg is selected when X is NaN.\n+    if (!SI.hasNoNaNs() && cast<FPMathOperator>(TrueVal)->hasNoNaNs() &&\n+        (Swap ? FCmpInst::isOrdered(Pred) : FCmpInst::isUnordered(Pred))) {\n+      SI.setHasNoNaNs(true);\n+      ChangedFMF = true;\n+    }\n \n     // With nsz, when 'Swap' is false:\n     // fold (X < +/-0.0) ? -X : X or (X <= +/-0.0) ? -X : X to fabs(X)\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Incorrect Fast-Math Flag Propagation from Conditionally Selected Floating-Point Operations\n\n**Description**: \nThe bug is triggered by a pattern involving a floating-point comparison, a floating-point operation (such as negation) decorated with fast-math flags (e.g., `ninf` or `nnan`), and a `select` instruction that chooses between the original floating-point value and the result of the modified operation based on the comparison. \n\nThe compiler's optimization pass incorrectly propagates the fast-math flags from the conditionally selected floating-point operation directly to the `select` instruction. This transformation is flawed because the modified operation might not be chosen at runtime. If the original value violates the fast-math flags (for example, if it is an infinity or NaN) and is the value actually chosen by the `select`, the incorrectly propagated flags on the `select` instruction will result in a contradiction, leading to poison values or miscompilations. \n\nTo be valid, fast-math flags should only be propagated to the `select` if they are guaranteed to hold regardless of which branch is chosen, such as deriving them from the comparison instruction itself, or if the selection condition strictly guarantees the flag's validity for the chosen path."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Incorrect Fast-Math Flag Propagation from Conditionally Selected Floating-Point Operations\n\n**Description**: \nThe bug is triggered by a pattern involving a floating-point comparison, a floating-point operation (such as negation) decorated with fast-math flags (e.g., `ninf` or `nnan`), and a `select` instruction that chooses between the original floating-point value and the result of the modified operation based on the comparison. \n\nThe compiler's optimization pass incorrectly propagates the fast-math flags from the conditionally selected floating-point operation directly to the `select` instruction. This transformation is flawed because the modified operation might not be chosen at runtime. If the original value violates the fast-math flags (for example, if it is an infinity or NaN) and is the value actually chosen by the `select`, the incorrectly propagated flags on the `select` instruction will result in a contradiction, leading to poison values or miscompilations. \n\nTo be valid, fast-math flags should only be propagated to the `select` if they are guaranteed to hold regardless of which branch is chosen, such as deriving them from the comparison instruction itself, or if the selection condition strictly guarantees the flag's validity for the chosen path.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define float @test(float %x) {\\n  %cmp = fcmp ogt float %x, 0.000000e+00\\n  %neg = fneg nnan ninf float %x\\n  %sel = select i1 %cmp, float %x, float %neg\\n  ret float %sel\\n}\",\n  \"optimized_ir\": \"define float @test(float %x) {\\n  %cmp = fcmp ogt float %x, 0.000000e+00\\n  %neg = fneg nnan ninf float %x\\n  %sel = select nnan ninf i1 %cmp, float %x, float %neg\\n  ret float %sel\\n}\"\n}\n```"
+    }
+  ]
+}

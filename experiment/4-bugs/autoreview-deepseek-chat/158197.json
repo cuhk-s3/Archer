@@ -1,0 +1,115 @@
+{
+  "command": {
+    "issue": "158197",
+    "model": "deepseek-chat",
+    "driver": "openai",
+    "stats": "autoreview-deepseek-chat/158197.json",
+    "history": "autoreview-deepseek-chat/history/158197.json",
+    "debug": false
+  },
+  "error": "NoAvailableBugFound",
+  "errmsg": "All efforts tried yet no available patches found.",
+  "traceback": "Traceback (most recent call last):\n  File \"/data/yunboni/projects/ReviewAgent/experiment/4-bugs/repro.py\", line 219, in main\n    raise NoAvailableBugFound(\nmain.NoAvailableBugFound: All efforts tried yet no available patches found.\n",
+  "input_tokens": 1249133,
+  "output_tokens": 8350,
+  "cached_tokens": 1177280,
+  "total_tokens": 1257483,
+  "chat_cost": 0.0,
+  "chat_rounds": 39,
+  "phase1_round": 17,
+  "phase2_round": 22,
+  "total_time_sec": 1651.6035284996033,
+  "tool_usage": [
+    {
+      "name": "find250",
+      "usage": 1
+    },
+    {
+      "name": "grep250",
+      "usage": 5
+    },
+    {
+      "name": "list250",
+      "usage": 1
+    },
+    {
+      "name": "read250",
+      "usage": 6
+    },
+    {
+      "name": "langref",
+      "usage": 2
+    },
+    {
+      "name": "trans",
+      "usage": 11
+    },
+    {
+      "name": "verify",
+      "usage": 9
+    },
+    {
+      "name": "difftest",
+      "usage": 1
+    },
+    {
+      "name": "stop",
+      "usage": 2
+    },
+    {
+      "name": "report",
+      "usage": 1
+    }
+  ],
+  "strategies": [
+    {
+      "name": "Element Size Overflow",
+      "target": "Vector element type size",
+      "rationale": "Test with vector elements of 64+ bits to trigger overflow in mask calculation (1ull << SrcEltSizeInBits) - 1",
+      "expected_issue": "Undefined behavior in C++ or incorrect mask generation"
+    },
+    {
+      "name": "Big-Endian Edge Cases",
+      "target": "Vector size and index combinations",
+      "rationale": "Test edge cases: single-element vectors, maximum index, power-of-two vs non-power-of-two element sizes on big-endian targets",
+      "expected_issue": "Incorrect shift amount calculation or out-of-bounds shifts"
+    },
+    {
+      "name": "Non-Byte-Sized Elements",
+      "target": "Element type bitwidth",
+      "rationale": "Test with i1, i3, i7, i9 etc. element types on both endiannesses",
+      "expected_issue": "Misaligned bit extraction due to memory vs bitwise representation mismatch"
+    },
+    {
+      "name": "Poison Propagation",
+      "target": "Input value poison bits",
+      "rationale": "Test with poison values in specific bit positions that become significant after shifting",
+      "expected_issue": "UB from poison in shift amount or incorrect poison propagation"
+    },
+    {
+      "name": "Type Size Edge Cases",
+      "target": "Vector and scalar type sizes",
+      "rationale": "Test with unusual type combinations where total bits match but element counts differ",
+      "expected_issue": "Incorrect transformation due to size calculation edge cases"
+    },
+    {
+      "name": "Out-of-Bounds Indices",
+      "target": "Extractelement index values",
+      "rationale": "Test with constant indices equal to or exceeding vector length",
+      "expected_issue": "Should produce poison but transformation might generate invalid shifts"
+    }
+  ],
+  "reason_thou": "# Fix Understanding\n\nThe fix addresses a miscompilation in the `scalarizeExtExtract` transformation in VectorCombine. The transformation converts a vector `zext` feeding only `extractelement` instructions into scalar bitwise operations. The original code assumed little-endian lane ordering when calculating shift amounts for extracting vector elements from a packed integer representation.\n\n## Key changes made in the patch:\n\n1. **Added endianness-aware shift calculation**: Instead of using `Idx * SrcEltSizeInBits` for all targets, the fix now uses:\n   - For little-endian: `Idx * SrcEltSizeInBits` (unchanged)\n   - For big-endian: `TotalBits - SrcEltSizeInBits - Idx * SrcEltSizeInBits`\n\n2. **Added proper mask type**: Changed from using a scalar mask value `EltBitMask` to a properly typed mask `Mask` of type `PackedTy` (the packed integer type).\n\n3. **Added TotalBits calculation**: Extracted `TotalBits = DL->getTypeSizeInBits(SrcTy)` for reuse in shift calculation.\n\n# Assumptions Identified\n\n1. **FixedVectorType assumption**: The transformation only works on `FixedVectorType` (checked at line 1970).\n\n2. **Size equality assumption**: Requires `DL->getTypeSizeInBits(SrcTy) == DL->getTypeSizeInBits(ScalarDstTy)` (line 1975-1976).\n\n3. **Constant index assumption**: All `extractelement` indices must be constant integers (checked at line 1985).\n\n4. **ZExt-only assumption**: Only handles `ZExtInst`, not `SExtInst` (line 1962).\n\n5. **Poison safety**: The input value is frozen if not guaranteed to be poison-free (lines 2009-2011).\n\n6. **Shift amount safety**: The shift amount calculation assumes `ShiftAmt < TotalBits` for all valid indices.\n\n7. **Element size assumption**: Assumes `SrcEltSizeInBits` fits in 64 bits for the mask calculation `(1ull << SrcEltSizeInBits) - 1`.\n\n8. **Endianness calculation correctness**: The formula `TotalBits - SrcEltSizeInBits - Idx * SrcEltSizeInBits` correctly maps vector lanes to bit positions for big-endian.\n\n# Potential Cases to Break Assumptions\n\n## 1. **Element size overflow** (Assumption 7)\nWhen `SrcEltSizeInBits >= 64`, the mask calculation `(1ull << SrcEltSizeInBits) - 1` overflows (undefined behavior in C++). This could happen with vectors of `i64` elements being extended to `i128` or larger.\n\n## 2. **Invalid shift amount** (Assumption 6)\nFor big-endian with `Idx = 0`, the shift amount is `TotalBits - SrcEltSizeInBits`. If `TotalBits == SrcEltSizeInBits` (single-element vector), this becomes 0, which is fine. But we need to ensure the shift amount is always less than `TotalBits` for all valid indices.\n\n## 3. **Mixed endianness scenarios** (Assumption 8)\nThe fix assumes a simple mapping, but there could be edge cases:\n- Vectors with element size not a power of 2\n- Vectors where `TotalBits` is not a multiple of `SrcEltSizeInBits` (should be prevented by type constraints)\n- Very large vectors where index calculations could overflow\n\n## 4. **Poison propagation in shift** (Assumption 5 + Pattern 1)\nThe `CreateLShr` could introduce UB if the shift amount is poison or exceeds the bitwidth. While the index is constant, if `ScalarV` contains poison bits in positions that become significant after shifting, this could affect results.\n\n## 5. **Type size mismatch edge cases** (Assumption 2)\nThe check `DL->getTypeSizeInBits(SrcTy) != DL->getTypeSizeInBits(ScalarDstTy)` might have edge cases with padding or unusual type layouts.\n\n## 6. **Non-byte-sized elements** (Subsystem Knowledge Pattern 3)\nIf vector elements are not byte-sized (e.g., `i1`, `i3`), the bitwise extraction might not align with memory representation assumptions, especially for big-endian.\n\n## 7. **Out-of-bounds indices** (Subsystem Knowledge)\nWhile indices are checked to be constant, they might still be out-of-bounds for the vector type, which should produce poison but the transformation might not handle this correctly.\n\n## 8. **Interaction with other transformations** \nThe scalarized operations (lshr, and) might interact poorly with other optimizations, especially around poison propagation and UB-sensitive operations.",
+  "bugs": [],
+  "test_traj": [
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpinm2tjb3/orig.ll', '/data/tmp/tmpinm2tjb3/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64_be-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmp9qpap0e_/orig.ll', '/data/tmp/tmp9qpap0e_/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpfxg12okm/orig.ll', '/data/tmp/tmpfxg12okm/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpsbyz1i34/orig.ll', '/data/tmp/tmpsbyz1i34/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpphyc9ysb/orig.ll', '/data/tmp/tmpphyc9ysb/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpfkjucmq_/orig.ll', '/data/tmp/tmpfkjucmq_/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpw97x3q8n/orig.ll', '/data/tmp/tmpw97x3q8n/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64_be-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpwx8gj_y8/orig.ll', '/data/tmp/tmpwx8gj_y8/transformed.ll']' returned non-zero exit status 1.",
+    "Error: Failed to verify the LLVM IR code transformation. Command '['/usr/local/bin/alive-tv', '-passes=vector-combine', '-mtriple=aarch64-unknown-linux-gnu', '--disable-undef-input', '/data/tmp/tmpmoxzlyxv/orig.ll', '/data/tmp/tmpmoxzlyxv/transformed.ll']' returned non-zero exit status 1."
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "173784",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1939,
+  "output_tokens": 3263,
+  "cached_tokens": 0,
+  "total_tokens": 5202,
+  "chat_cost": 0.043034,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 46.569331645965576,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Vectorization of Short-Circuiting Boolean Logic into Eager Reductions Introducing Poison\n\n**Description**: \nThe bug is triggered when a chain of scalar boolean logical operations (such as logical OR or AND, often represented by `select` instructions) is vectorized into a horizontal vector reduction. \n\nIn the original scalar IR, these operations exhibit short-circuiting behavior: if the final result can be determined by the first operand (e.g., a `true` in a logical OR chain), the subsequent operands are not evaluated. This short-circuiting is crucial for correctness when the unevaluated operands might be `poison` or `undef`, as it prevents the undefined behavior from affecting the final result.\n\nDuring vectorization, the compiler groups these scalar operands into a vector and replaces the logical chain with a vector reduction intrinsic (e.g., `llvm.vector.reduce.or`). However, unlike scalar short-circuiting logic, vector reductions evaluate all lanes eagerly. If any of the vector lanes contain a `poison` value that would have been safely bypassed in the scalar version, the eager evaluation of the reduction observes it and propagates the `poison` to the final result. \n\nThis transformation breaks the original semantics by introducing `poison` into the program in cases where the scalar code would have safely produced a well-defined value, leading to a miscompilation."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define i1 @test(<4 x i1> %v) {\nentry:\n  %e0 = extractelement <4 x i1> %v, i32 0\n  %e1 = extractelement <4 x i1> %v, i32 1\n  %s1 = select i1 %e0, i1 true, i1 %e1\n  %e2 = extractelement <4 x i1> %v, i32 2\n  %s2 = select i1 %s1, i1 true, i1 %e2\n  %e3 = extractelement <4 x i1> %v, i32 3\n  %s3 = select i1 %s2, i1 true, i1 %e3\n  ret i1 %s3\n}",
+      "transformed_ir": "declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)\n\ndefine i1 @test(<4 x i1> %v) {\nentry:\n  %0 = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %v)\n  ret i1 %0\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in SLPVectorizer: \n\nIn https://github.com/llvm/llvm-project/commit/899336735aeb2b41a48b6ac2c895da5e0f22dbf0, there seems to be an uncovered correctness issue in the handling of boolean select chains involving poison. \n\nConsider the following scalar IR:\n\n```llvm\n%op1 = select i1 %a, i1 true, i1 poison\n%op2 = select i1 %b, i1 true, i1 poison\n%res = select i1 %op1, i1 true, i1 %op2\nret i1 %res\n```\n\nSemantically, this code is safe:\nif `%a` is true, `%op1` is true, and `%res` immediately becomes true.\nIn this case, the value of `%op2` (and the poison on its false branch) is never observed.\n\nAfter the current transformation, this pattern is rewritten by grouping `%op1` and `%op2` into a vector and lowering the logic to a `llvm.vector.reduce.or`. This transformation eagerly evaluates all vector lanes.\n\nAs a result, if `%op2` is poison, the reduction observes that poison and produces a poison result, even when `%op1` is true. This introduces poison in cases where the original scalar code would have produced a well-defined true.\n\nAlive2 proof: https://alive2.llvm.org/ce/z/oE2h69\n\ncc @alexey-bataev \n\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit d9ce80db7aaa985160276aa59a405e5f47fd7354\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Sun Dec 28 11:20:42 2025 -0800\n\n    [SLP]FIx order of bool logical ops, if the right op is used in the first reduction operarion\n    \n    If the LHS of the first reduction op is not a first operand, but RHS is,\n    and RHS is the second operand of the first reductoin op, still need to\n    emit RHS as a second reduction operand, though without freeze of the\n    LHS operand\n    \n    https://alive2.llvm.org/ce/z/2_JLBu\n    \n    Fixes #173784\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 6e05fcfe421c..a7b41631594d 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -25024,13 +25024,21 @@ public:\n                                         getRdxOperand(RedOp1, 0) == LHS ||\n                                         isGuaranteedNotToBePoison(LHS, AC)))\n             return;\n+          bool NeedFreeze = LHS != VectorizedTree;\n           if (isBoolLogicOp(RedOp2) && ((!InitStep && RHS == VectorizedTree) ||\n                                         getRdxOperand(RedOp2, 0) == RHS ||\n                                         isGuaranteedNotToBePoison(RHS, AC))) {\n-            std::swap(LHS, RHS);\n-            return;\n+            if ((InitStep || RHS != VectorizedTree) &&\n+                getRdxOperand(RedOp2, 0) == RHS &&\n+                (!isBoolLogicOp(RedOp1) ||\n+                 getRdxOperand(RedOp1, 1) == RedOp2)) {\n+              NeedFreeze = false;\n+            } else {\n+              std::swap(LHS, RHS);\n+              return;\n+            }\n           }\n-          if (LHS != VectorizedTree)\n+          if (NeedFreeze)\n             LHS = Builder.CreateFreeze(LHS);\n         };\n     // Finish the reduction.\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Vectorization of Short-Circuiting Boolean Logic into Eager Reductions Introducing Poison\n\n**Description**: \nThe bug is triggered when a chain of scalar boolean logical operations (such as logical OR or AND, often represented by `select` instructions) is vectorized into a horizontal vector reduction. \n\nIn the original scalar IR, these operations exhibit short-circuiting behavior: if the final result can be determined by the first operand (e.g., a `true` in a logical OR chain), the subsequent operands are not evaluated. This short-circuiting is crucial for correctness when the unevaluated operands might be `poison` or `undef`, as it prevents the undefined behavior from affecting the final result.\n\nDuring vectorization, the compiler groups these scalar operands into a vector and replaces the logical chain with a vector reduction intrinsic (e.g., `llvm.vector.reduce.or`). However, unlike scalar short-circuiting logic, vector reductions evaluate all lanes eagerly. If any of the vector lanes contain a `poison` value that would have been safely bypassed in the scalar version, the eager evaluation of the reduction observes it and propagates the `poison` to the final result. \n\nThis transformation breaks the original semantics by introducing `poison` into the program in cases where the scalar code would have safely produced a well-defined value, leading to a miscompilation."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Vectorization of Short-Circuiting Boolean Logic into Eager Reductions Introducing Poison\n\n**Description**: \nThe bug is triggered when a chain of scalar boolean logical operations (such as logical OR or AND, often represented by `select` instructions) is vectorized into a horizontal vector reduction. \n\nIn the original scalar IR, these operations exhibit short-circuiting behavior: if the final result can be determined by the first operand (e.g., a `true` in a logical OR chain), the subsequent operands are not evaluated. This short-circuiting is crucial for correctness when the unevaluated operands might be `poison` or `undef`, as it prevents the undefined behavior from affecting the final result.\n\nDuring vectorization, the compiler groups these scalar operands into a vector and replaces the logical chain with a vector reduction intrinsic (e.g., `llvm.vector.reduce.or`). However, unlike scalar short-circuiting logic, vector reductions evaluate all lanes eagerly. If any of the vector lanes contain a `poison` value that would have been safely bypassed in the scalar version, the eager evaluation of the reduction observes it and propagates the `poison` to the final result. \n\nThis transformation breaks the original semantics by introducing `poison` into the program in cases where the scalar code would have safely produced a well-defined value, leading to a miscompilation.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define i1 @test(<4 x i1> %v) {\\nentry:\\n  %e0 = extractelement <4 x i1> %v, i32 0\\n  %e1 = extractelement <4 x i1> %v, i32 1\\n  %s1 = select i1 %e0, i1 true, i1 %e1\\n  %e2 = extractelement <4 x i1> %v, i32 2\\n  %s2 = select i1 %s1, i1 true, i1 %e2\\n  %e3 = extractelement <4 x i1> %v, i32 3\\n  %s3 = select i1 %s2, i1 true, i1 %e3\\n  ret i1 %s3\\n}\",\n  \"optimized_ir\": \"declare i1 @llvm.vector.reduce.or.v4i1(<4 x i1>)\\n\\ndefine i1 @test(<4 x i1> %v) {\\nentry:\\n  %0 = call i1 @llvm.vector.reduce.or.v4i1(<4 x i1> %v)\\n  ret i1 %0\\n}\"\n}\n```"
+    }
+  ]
+}

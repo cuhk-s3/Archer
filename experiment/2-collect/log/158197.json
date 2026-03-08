@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "158197",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1772,
+  "output_tokens": 4959,
+  "cached_tokens": 0,
+  "total_tokens": 6731,
+  "chat_cost": 0.063052,
+  "chat_rounds": 2,
+  "phase1_round": 1,
+  "phase2_round": 1,
+  "total_time_sec": 83.6212956905365,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Endian-Unaware Vector-to-Scalar Packing and Extraction\n\n**Description**: \nThe bug is triggered by a transformation that attempts to optimize vector element extractions by packing an entire vector into a single, large scalar integer. Once packed, the optimization replaces the original vector extraction instructions with scalar bitwise operations, specifically logical right shifts and bitwise AND masks, to isolate the desired vector lane. \n\nThe vulnerability lies in the calculation of the shift amount used to locate the specific element within the packed integer. The transformation hardcodes a little-endian assumption, calculating the bit offset simply as the element index multiplied by the element size (i.e., assuming the element at index 0 resides in the least significant bits). \n\nOn big-endian targets, the memory layout dictates that the first vector element occupies the most significant bits of the packed integer. Because the transformation fails to query the target's data layout to adjust the bit offset accordingly, it shifts by the wrong amount and extracts incorrect bits. To trigger this issue, the input LLVM IR must contain vector extraction operations that the compiler attempts to scalarize into bitwise arithmetic while compiling for a target with a big-endian data layout."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "target datalayout = \"E-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64\"\ntarget triple = \"powerpc-unknown-linux-gnu\"\n\ndefine i8 @test_extract(<4 x i8> %v) {\nentry:\n  %ext = extractelement <4 x i8> %v, i32 1\n  ret i8 %ext\n}",
+      "transformed_ir": "target datalayout = \"E-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64\"\ntarget triple = \"powerpc-unknown-linux-gnu\"\n\ndefine i8 @test_extract(<4 x i8> %v) {\nentry:\n  %0 = bitcast <4 x i8> %v to i32\n  %1 = lshr i32 %0, 8\n  %2 = trunc i32 %1 to i8\n  ret i8 %2\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in VectorCombine: \n\nThe `scalarizeExtExtract` combine packs <N x i8> into i(N*8) and then extracts lanes via lshr/and. The shift amount assumes little-endian ordering which is incorrect for big-endian targets.\n\nThis causes miscompiles on big-endian targets such as AIX/PowerPC under -O3 -flto. \n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 994a6a39e13dcc335247a127a5da05905d1ac541\nAuthor: Uyiosa Iyekekpolor <96444432+uyoyo0@users.noreply.github.com>\nDate:   Mon Sep 15 06:08:16 2025 -0400\n\n    [VectorCombine] Fix scalarizeExtExtract for big-endian (#157962)\n    \n    The scalarizeExtExtract transform assumed little-endian lane ordering,\n    causing miscompiles on big-endian targets such as AIX/PowerPC under -O3\n    -flto.\n    \n    This patch updates the shift calculation to handle endianness correctly\n    for big-endian targets. No functional change\n    for little-endian targets.\n    \n    Fixes #158197.\n    \n    ---------\n    \n    Co-authored-by: Simon Pilgrim <llvm-dev@redking.me.uk>\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex a84b6f59971c..0ef933f59660 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -2014,12 +2014,19 @@ bool VectorCombine::scalarizeExtExtract(Instruction &I) {\n       IntegerType::get(SrcTy->getContext(), DL->getTypeSizeInBits(SrcTy)));\n   uint64_t SrcEltSizeInBits = DL->getTypeSizeInBits(SrcTy->getElementType());\n   uint64_t EltBitMask = (1ull << SrcEltSizeInBits) - 1;\n+  uint64_t TotalBits = DL->getTypeSizeInBits(SrcTy);\n+  Type *PackedTy = IntegerType::get(SrcTy->getContext(), TotalBits);\n+  Value *Mask = ConstantInt::get(PackedTy, EltBitMask);\n   for (User *U : Ext->users()) {\n     auto *Extract = cast<ExtractElementInst>(U);\n     uint64_t Idx =\n         cast<ConstantInt>(Extract->getIndexOperand())->getZExtValue();\n-    Value *LShr = Builder.CreateLShr(ScalarV, Idx * SrcEltSizeInBits);\n-    Value *And = Builder.CreateAnd(LShr, EltBitMask);\n+    uint64_t ShiftAmt =\n+        DL->isBigEndian()\n+            ? (TotalBits - SrcEltSizeInBits - Idx * SrcEltSizeInBits)\n+            : (Idx * SrcEltSizeInBits);\n+    Value *LShr = Builder.CreateLShr(ScalarV, ShiftAmt);\n+    Value *And = Builder.CreateAnd(LShr, Mask);\n     U->replaceAllUsesWith(And);\n   }\n   return true;\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Endian-Unaware Vector-to-Scalar Packing and Extraction\n\n**Description**: \nThe bug is triggered by a transformation that attempts to optimize vector element extractions by packing an entire vector into a single, large scalar integer. Once packed, the optimization replaces the original vector extraction instructions with scalar bitwise operations, specifically logical right shifts and bitwise AND masks, to isolate the desired vector lane. \n\nThe vulnerability lies in the calculation of the shift amount used to locate the specific element within the packed integer. The transformation hardcodes a little-endian assumption, calculating the bit offset simply as the element index multiplied by the element size (i.e., assuming the element at index 0 resides in the least significant bits). \n\nOn big-endian targets, the memory layout dictates that the first vector element occupies the most significant bits of the packed integer. Because the transformation fails to query the target's data layout to adjust the bit offset accordingly, it shifts by the wrong amount and extracts incorrect bits. To trigger this issue, the input LLVM IR must contain vector extraction operations that the compiler attempts to scalarize into bitwise arithmetic while compiling for a target with a big-endian data layout."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Endian-Unaware Vector-to-Scalar Packing and Extraction\n\n**Description**: \nThe bug is triggered by a transformation that attempts to optimize vector element extractions by packing an entire vector into a single, large scalar integer. Once packed, the optimization replaces the original vector extraction instructions with scalar bitwise operations, specifically logical right shifts and bitwise AND masks, to isolate the desired vector lane. \n\nThe vulnerability lies in the calculation of the shift amount used to locate the specific element within the packed integer. The transformation hardcodes a little-endian assumption, calculating the bit offset simply as the element index multiplied by the element size (i.e., assuming the element at index 0 resides in the least significant bits). \n\nOn big-endian targets, the memory layout dictates that the first vector element occupies the most significant bits of the packed integer. Because the transformation fails to query the target's data layout to adjust the bit offset accordingly, it shifts by the wrong amount and extracts incorrect bits. To trigger this issue, the input LLVM IR must contain vector extraction operations that the compiler attempts to scalarize into bitwise arithmetic while compiling for a target with a big-endian data layout.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"target datalayout = \\\"E-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64\\\"\\ntarget triple = \\\"powerpc-unknown-linux-gnu\\\"\\n\\ndefine i8 @test_extract(<4 x i8> %v) {\\nentry:\\n  %ext = extractelement <4 x i8> %v, i32 1\\n  ret i8 %ext\\n}\",\n  \"optimized_ir\": \"target datalayout = \\\"E-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64\\\"\\ntarget triple = \\\"powerpc-unknown-linux-gnu\\\"\\n\\ndefine i8 @test_extract(<4 x i8> %v) {\\nentry:\\n  %0 = bitcast <4 x i8> %v to i32\\n  %1 = lshr i32 %0, 8\\n  %2 = trunc i32 %1 to i8\\n  ret i8 %2\\n}\"\n}\n```"
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "command": {
+    "issue": "89390",
+    "model": "google/gemini-3.1-pro-preview",
+    "dataset_dir": "../dataset",
+    "passes_dir": "passes",
+    "output_dir": "output",
+    "log_dir": "log",
+    "debug": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 2645,
+  "output_tokens": 3710,
+  "cached_tokens": 0,
+  "total_tokens": 6355,
+  "chat_cost": 0.048284,
+  "chat_rounds": 3,
+  "phase1_round": 1,
+  "phase2_round": 2,
+  "total_time_sec": 83.66192817687988,
+  "tool_usage": [],
+  "strategies": [
+    {
+      "content": "## Hoisting Shufflevector with Poison Mask Above Division/Remainder Operations\n\n**Description**:\nThe bug is triggered by an incorrect optimization that folds a `shufflevector` of two binary operations into a binary operation of two `shufflevector`s. The specific pattern involves:\n\n1. A `shufflevector` instruction that operates on the results of two identical integer division or remainder instructions (e.g., `sdiv`, `udiv`, `srem`, or `urem`).\n2. The mask of the `shufflevector` instruction contains one or more `poison` (or `undef`) elements.\n3. The compiler attempts to optimize this by hoisting the `shufflevector` above the binary operations. It creates new `shufflevector` instructions for the operands and then applies the division/remainder operation to the results of these new shuffles.\n4. Because the original shuffle mask contained `poison`, the newly created `shufflevector` instructions produce `poison` in the corresponding lanes. \n5. When these `poison` values are fed into the new division or remainder instruction\u2014specifically into the divisor operand\u2014it triggers immediate Undefined Behavior (UB). \n\nIn the original IR, the division/remainder operations were executed before the shuffle, meaning the divisors were valid, and the `poison` only safely appeared in the final shuffled result. The transformation incorrectly introduces full UB by forcing the division/remainder operation to evaluate with a `poison` divisor."
+    }
+  ],
+  "reason_thou": "<not-provided>",
+  "bugs": [
+    {
+      "original_ir": "define <2 x i32> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {\n  %div1 = sdiv <2 x i32> %a, %b\n  %div2 = sdiv <2 x i32> %c, %d\n  %shuf = shufflevector <2 x i32> %div1, <2 x i32> %div2, <2 x i32> <i32 0, i32 poison>\n  ret <2 x i32> %shuf\n}",
+      "transformed_ir": "define <2 x i32> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {\n  %shuf.a = shufflevector <2 x i32> %a, <2 x i32> %c, <2 x i32> <i32 0, i32 poison>\n  %shuf.b = shufflevector <2 x i32> %b, <2 x i32> %d, <2 x i32> <i32 0, i32 poison>\n  %shuf = sdiv <2 x i32> %shuf.a, %shuf.b\n  ret <2 x i32> %shuf\n}",
+      "log": "Reproduced"
+    }
+  ],
+  "test_traj": [],
+  "history": [
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provided an LLVM optimization bug and maintainers proposed a patch to fix. Fixes in the same pass might share similar issues, such as elements frequently missed and high-level patterns that are not well handled. \n\n## Your Task ##\nYour task is to analyze a compiler bug report and its patch.\nSummarize the bug triggering strategy at the LLVM IR level. \n\n## You Will Receive ##\n- The original bug report, including the bug description.\n- The patch that is proposed to fix the bug, including the code region that was modified and the commit message describing the fix.\n"
+    },
+    {
+      "role": "user",
+      "content": "There is a miscompilation issue report in VectorCombine: \n\nhttps://alive2.llvm.org/ce/z/HRAkAK\r\n\r\nthis:\r\n```llvm\r\ndefine <4 x i32> @f(<4 x i32> %0, <4 x i32> %1) {\r\n  %3 = srem <4 x i32> %1, %0\r\n  %4 = srem <4 x i32> <i32 1, i32 1, i32 1, i32 1>, %0\r\n  %5 = shufflevector <4 x i32> %3, <4 x i32> %4, <4 x i32> <i32 0, i32 poison, i32 6, i32 3>\r\n  ret <4 x i32> %5\r\n}\r\n```\r\nis getting vector-combined to this:\r\n```llvm\r\ndefine <4 x i32> @f(<4 x i32> %0, <4 x i32> %1) {\r\n  %3 = shufflevector <4 x i32> %1, <4 x i32> <i32 1, i32 1, i32 1, i32 1>, <4 x i32> <i32 0, i32 poison, i32 6, i32 3>\r\n  %4 = shufflevector <4 x i32> %0, <4 x i32> poison, <4 x i32> <i32 0, i32 poison, i32 2, i32 3>\r\n  %5 = srem <4 x i32> %3, %4\r\n  ret <4 x i32> %5\r\n}\r\n```\r\n\r\nbut that poison in lane 1 is now problematic, this gives us full UB when it hits the srem\r\n\r\ncc @nunoplopes @hatsunespica\r\n\n\nThe maintainers proposed the following patch to fix the issue:\n\ncommit 4cc9c6d98dfef90d1ffa69977d13ffa2894a10f7\nAuthor: Simon Pilgrim <llvm-dev@redking.me.uk>\nDate:   Mon Apr 22 09:00:20 2024 +0100\n\n    [VectorCombine] foldShuffleOfBinops - don't fold shuffle(divrem(x,y),divrem(z,w)) if mask contains poison\n    \n    Fixes #89390\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 4918cee1fa82..f23b10540338 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -1405,6 +1405,11 @@ bool VectorCombine::foldShuffleOfBinops(Instruction &I) {\n       B0->getOpcode() != B1->getOpcode() || B0->getType() != VecTy)\n     return false;\n \n+  // Don't introduce poison into div/rem.\n+  if (any_of(Mask, [](int M) { return M == PoisonMaskElem; }) &&\n+      B0->isIntDivRem())\n+    return false;\n+\n   // Try to replace a binop with a shuffle if the shuffle is not costly.\n   // The new shuffle will choose from a single, common operand, so it may be\n   // cheaper than the existing two-operand shuffle.\n\n\n## Your Task ##\nSummarize the bug triggering strategy at the LLVM IR level. \nDescribe the strategy in natural language, focusing strictly on the incorrect transformation logic. \nBe general and abstract, focusing on the pattern of instructions or transformations that caused the issue. \nFor example, instead of saying 'fadd instruction', consider if it applies to other floating point operations or binary operators. \nDo NOT reference specific commits, file names, or implementation details of the fix code. \n\n## Output Format ##\nThe output should be in Markdown format and follow this structure:\n\n- **Summary Title**: A concise title summarizing the bug triggering strategy, which starts with a level-2 heading (##).\n- **Description**: A detailed description of the bug triggering strategy.\n\nPlease do not include any implementation details of the fix, such as specific code changes, file names, or commit messages. \nFocus solely on the high-level pattern of instructions or transformations that led to the issue.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "## Hoisting Shufflevector with Poison Mask Above Division/Remainder Operations\n\n**Description**:\nThe bug is triggered by an incorrect optimization that folds a `shufflevector` of two binary operations into a binary operation of two `shufflevector`s. The specific pattern involves:\n\n1. A `shufflevector` instruction that operates on the results of two identical integer division or remainder instructions (e.g., `sdiv`, `udiv`, `srem`, or `urem`).\n2. The mask of the `shufflevector` instruction contains one or more `poison` (or `undef`) elements.\n3. The compiler attempts to optimize this by hoisting the `shufflevector` above the binary operations. It creates new `shufflevector` instructions for the operands and then applies the division/remainder operation to the results of these new shuffles.\n4. Because the original shuffle mask contained `poison`, the newly created `shufflevector` instructions produce `poison` in the corresponding lanes. \n5. When these `poison` values are fed into the new division or remainder instruction\u2014specifically into the divisor operand\u2014it triggers immediate Undefined Behavior (UB). \n\nIn the original IR, the division/remainder operations were executed before the shuffle, meaning the divisors were valid, and the `poison` only safely appeared in the final shuffled result. The transformation incorrectly introduces full UB by forcing the division/remainder operation to evaluate with a `poison` divisor."
+    },
+    {
+      "role": "system",
+      "content": "You are an expert in LLVM IR and compiler optimizations. \n\n## Context ##\nUsers provide a bug-triggering strategy at the LLVM IR level, which is a high-level description of the pattern of instructions or transformations that can trigger a compiler bug. \nThis strategy needs to be verified to ensure that it accurately captures the conditions that can lead to the bug.\n\n## Your Task ##\nGenerate a minimal reproducible test case in LLVM IR that follows the provided bug-triggering strategy. \n\n## You Will Receive ##\n- The bug-triggering strategy, which describes the pattern of instructions or transformations that can trigger the\n"
+    },
+    {
+      "role": "user",
+      "content": "Here is a bug-triggering strategy at the LLVM IR level:\n\n## Hoisting Shufflevector with Poison Mask Above Division/Remainder Operations\n\n**Description**:\nThe bug is triggered by an incorrect optimization that folds a `shufflevector` of two binary operations into a binary operation of two `shufflevector`s. The specific pattern involves:\n\n1. A `shufflevector` instruction that operates on the results of two identical integer division or remainder instructions (e.g., `sdiv`, `udiv`, `srem`, or `urem`).\n2. The mask of the `shufflevector` instruction contains one or more `poison` (or `undef`) elements.\n3. The compiler attempts to optimize this by hoisting the `shufflevector` above the binary operations. It creates new `shufflevector` instructions for the operands and then applies the division/remainder operation to the results of these new shuffles.\n4. Because the original shuffle mask contained `poison`, the newly created `shufflevector` instructions produce `poison` in the corresponding lanes. \n5. When these `poison` values are fed into the new division or remainder instruction\u2014specifically into the divisor operand\u2014it triggers immediate Undefined Behavior (UB). \n\nIn the original IR, the division/remainder operations were executed before the shuffle, meaning the divisors were valid, and the `poison` only safely appeared in the final shuffled result. The transformation incorrectly introduces full UB by forcing the division/remainder operation to evaluate with a `poison` divisor.\n\n## Your Task ##\nBased on the provided bug-triggering strategy, generate a minimal reproducible test case in LLVM IR that follows the strategy. \nThe test case should be as simple as possible while still triggering the bug, and it should be suitable for use in the LLVM test suite.\nThe test cases should be a pair of original LLVM IR code and optimized LLVM IR code, where the original code can trigger the bug and the optimized code is the result of applying the optimization pass that contains the bug.\n\n## Output Format ##\nOnly output the LLVM IR code without any explanation. The output should be in JSON format and follow this structure:\n\n```json\n{\n  \"original_ir\": \"The original LLVM IR code that can trigger the bug.\",\n  \"optimized_ir\": \"The optimized LLVM IR code after applying the optimization pass, which should demonstrate the incorrect transformation.\"\n}\n```\n"
+    },
+    {
+      "role": "assistant",
+      "content": "```json\n{\n  \"original_ir\": \"define <2 x i32> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {\\n  %div1 = sdiv <2 x i32> %a, %b\\n  %div2 = sdiv <2 x i32> %c, %d\\n  %shuf = shufflevector <2 x i32> %div1, <2 x i32> %div2, <2 x i32> <i32 0, i32 poison>\\n  ret <2 x i32> %shuf\\n}\",\n  \"optimized_ir\": \"define <2 x i32> @test(<2 x i32> %a, <2 x i32> %b, <2 x i32> %c, <2 x i32> %d) {\\n  %shuf.a = shufflevector <2 x i32> %a, <2 x i32> %c, <2 x i32> <i32 0, i32 poison>\\n  %shuf.b = shufflevector <2 x i32> %b, <2 x i32> %d, <2 x i32> <i32 0, i32 poison>\\n  %shuf = sdiv <2 x i32> %shuf.a, %shuf.b\\n  ret <2 x i32> %shuf\\n}\"\n}\n```"
+    }
+  ]
+}
