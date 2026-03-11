@@ -1,0 +1,697 @@
+{
+  "pr_id": 177821,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177821",
+  "state": "closed",
+  "title": "[InstCombine] Don't convert a compare+select into a minnum/maxnum intrinsic that can't be lowered back to a compare+select",
+  "author": "valadaptive",
+  "base_commit": "cf9adf58fdd01739dc014402b67104cf73f32179",
+  "fix_commit": "82bf42340beb8276f94f5f64fa647021771bc023",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 6ead1fd52403d..00f4118d538d8 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -4357,7 +4357,20 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n \n     // Canonicalize select of FP values where NaN and -0.0 are not valid as\n     // minnum/maxnum intrinsics.\n-    if (SIFPOp->hasNoNaNs() &&\n+    //\n+    // Note that the `nnan` flag is propagated from the comparison, not from the\n+    // select. While it's technically possible to transform a `fcmp` + `select\n+    // nnan` to a `minnum`/`maxnum` call *without* an `nnan`, that would be a\n+    // pessimization in practice. Many targets can't map `minnum`/`maxnum` to a\n+    // single instruction, and if they cannot prove the absence of NaN, must\n+    // lower it to a routine or a libcall. There are additional reasons besides\n+    // performance to avoid introducing libcalls where none existed before\n+    // (https://github.com/llvm/llvm-project/issues/54554).\n+    //\n+    // As such, we want to ensure that the generated `minnum`/`maxnum` intrinsic\n+    // has the `nnan nsz` flags, which allow it to be lowered *back* to a\n+    // fcmp+select if that's the best way to express it on the target.\n+    if (FCmp && FCmp->hasNoNaNs() &&\n         (SIFPOp->hasNoSignedZeros() ||\n          (SIFPOp->hasOneUse() &&\n           canIgnoreSignBitOfZero(*SIFPOp->use_begin())))) {\n@@ -4366,8 +4379,18 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n         Value *BinIntr =\n             Builder.CreateBinaryIntrinsic(Intrinsic::maxnum, X, Y, &SI);\n         if (auto *BinIntrInst = dyn_cast<Instruction>(BinIntr)) {\n-          BinIntrInst->setHasNoNaNs(FCmp->hasNoNaNs());\n+          // `ninf` must be propagated from the comparison too, rather than the\n+          // select: https://github.com/llvm/llvm-project/pull/136433\n           BinIntrInst->setHasNoInfs(FCmp->hasNoInfs());\n+          // The `nsz` flag is a precondition, so let's ensure it's always added\n+          // to the min/max operation, even if it wasn't on the select. This\n+          // could happen if `canIgnoreSignBitOfZero` is true--for instance, if\n+          // the select doesn't have `nsz`, but the result is being used in an\n+          // operation that doesn't care about signed zero.\n+          BinIntrInst->setHasNoSignedZeros(true);\n+          // As mentioned above, `nnan` is also a precondition, so we always set\n+          // the flag.\n+          BinIntrInst->setHasNoNaNs(true);\n         }\n         return replaceInstUsesWith(SI, BinIntr);\n       }\n@@ -4376,8 +4399,9 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n         Value *BinIntr =\n             Builder.CreateBinaryIntrinsic(Intrinsic::minnum, X, Y, &SI);\n         if (auto *BinIntrInst = dyn_cast<Instruction>(BinIntr)) {\n-          BinIntrInst->setHasNoNaNs(FCmp->hasNoNaNs());\n           BinIntrInst->setHasNoInfs(FCmp->hasNoInfs());\n+          BinIntrInst->setHasNoSignedZeros(true);\n+          BinIntrInst->setHasNoNaNs(true);\n         }\n         return replaceInstUsesWith(SI, BinIntr);\n       }\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This is a step on the yak-shaving expedition to properly implement the new `minnum`/`maxnum` signed-zero semantics.\r\n\r\n`InstCombineSelect` will convert a `fcmp`+`select` sequence to a `minnum`/`maxnum` intrinsic. It doesn't require the `fcmp` to have any particular fast-math flags, just that the `select` has `nnan` and `nsz` (or is being used in a context where the result doesn't care about signed zero).\r\n\r\nIt's not correct to propagate the `nnan` flag from the `fcmp` instruction for poison-propagation reasons. Patches like https://github.com/llvm/llvm-project/pull/117977 and https://github.com/llvm/llvm-project/pull/141010 have *generously* made it so that if `fcmp` doesn't have fast-math flags, we can still perform the transformation by simply dropping the flags on the generated intrinsic.\r\n\r\nUnfortunately, converting an `fcmp`+`select` with fast-math flags, to a `minnum`/`maxnum` without fast-math flags, is actually a *pessimization*. Common ISAs like x86 and WebAssembly do not provide single floating-point minimum/maximum instructions that handle NaN in the same way as `minnum`/`maxnum`. They have to fall back to a routine or a libcall, which causes its own problems (https://github.com/llvm/llvm-project/issues/54554).\r\n\r\n[Here's an example](https://llvm.godbolt.org/z/avYxa7ccK). Using just `llc`, the function compiles to a single `maxss`. But with `clang -O3`, which enables InstCombine optimizations, we end up with a much larger (and completely unnecessary) routine for handling NaNs.\r\n\r\nWe should only perform this transformation if it's safe to add `nnan` and `nsz` to the `minnum`/`maxnum` call, since those are the flags necessary for lowering it *back* into an `fcmp`+`select` (or equivalent code).\r\n\r\nThere's currently one case where we might end up without `nsz` on the intrinsic call: if the output has one use, and that use doesn't care about signed zero. To account for that, we should also unconditionally set `nsz` on the generated intrinsic call.\r\n\r\nWith this in place, it should be safe to eventually revert https://reviews.llvm.org/D122610 and further consolidate `minnum`/`maxnum` handling.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/fcmp-fadd-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_fcmp_ule_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_ule_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan ule float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ugt_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_ugt_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan ugt <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ugt_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_ugt_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan ugt float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ole_fadd_select_constant",
+          "test_body": "define float @test_fcmp_ole_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan ole float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_uge_fadd_select_constant",
+          "test_body": "define float @test_fcmp_uge_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan uge float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ogt_fadd_select_rewrite_flags1",
+          "test_body": "define float @test_fcmp_ogt_fadd_select_rewrite_flags1(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 0.000000e+00\n  %add = fadd reassoc arcp contract afn float %in, 1.000000e+00\n  %sel = select reassoc nnan nsz arcp contract afn i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_oge_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_oge_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan oge <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_arg_non_zero",
+          "test_body": "define float @test_fcmp_arg_non_zero(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 1.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ogt_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_ogt_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ult_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_ult_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan ult float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_olt_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_olt_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan olt <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_uge_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_uge_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan uge float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ole_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_ole_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan ole float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ult_fadd_select_constant",
+          "test_body": "define float @test_fcmp_ult_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan ult float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_olt_fadd_select_constant",
+          "test_body": "define float @test_fcmp_olt_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan olt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_olt_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_olt_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan olt float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_oge_fadd_select_constant",
+          "test_body": "define float @test_fcmp_oge_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan oge float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ule_fadd_select_constant",
+          "test_body": "define float @test_fcmp_ule_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan ule float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ule_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_ule_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan ule float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_oge_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_oge_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan oge float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ogt_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_ogt_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_oge_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_oge_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan oge float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ole_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_ole_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan ole float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ugt_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_ugt_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan ugt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ole_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_ole_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan ole float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ole_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_ole_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan ole <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_uge_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_uge_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan uge float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_oge_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_oge_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan oge float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_olt_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_olt_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan olt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_olt_fadd_select_fastmath_preserve",
+          "test_body": "define float @test_fcmp_olt_fadd_select_fastmath_preserve(float %in) {\n  %cmp1 = fcmp nnan olt float %in, 0.000000e+00\n  %add = fadd nnan float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ogt_fadd_select_rewrite_flags2",
+          "test_body": "define float @test_fcmp_ogt_fadd_select_rewrite_flags2(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 0.000000e+00\n  %add = fadd reassoc float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ogt_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_ogt_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan ogt <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ogt_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_ogt_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ule_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_ule_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan ule float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ult_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_ult_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan ult float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ult_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_ult_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan ult float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_fadd_arg_mismatch",
+          "test_body": "define float @test_fcmp_fadd_arg_mismatch(float %in, float %in2) {\n  %cmp1 = fcmp nnan ogt float %in2, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_uge_fadd_select_constant_swapped",
+          "test_body": "define float @test_fcmp_uge_fadd_select_constant_swapped(float %in) {\n  %cmp1 = fcmp nnan uge float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float 1.000000e+00, float %add\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_without_nnan_nsz",
+          "test_body": "define float @test_fcmp_without_nnan_nsz(float %in) {\n  %cmp1 = fcmp ogt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_select_without_nnan_nsz",
+          "test_body": "define float @test_select_without_nnan_nsz(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ugt_fadd_select_neg_constant",
+          "test_body": "define float @test_fcmp_ugt_fadd_select_neg_constant(float %in) {\n  %cmp1 = fcmp nnan ugt float %in, -0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_multiple_uses",
+          "test_body": "define float @test_fcmp_multiple_uses(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %add.2 = fadd float %in, 1.000000e+00\n  %sel.1 = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  %sel.2 = select nnan nsz i1 %cmp1, float 2.000000e+00, float %add.2\n  %res = fadd float %sel.1, %sel.2\n  ret float %res\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ugt_fadd_select_constant",
+          "test_body": "define float @test_fcmp_ugt_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan ugt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_uge_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_uge_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan uge <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ogt_fadd_select_constant",
+          "test_body": "define float @test_fcmp_ogt_fadd_select_constant(float %in) {\n  %cmp1 = fcmp nnan ogt float %in, 0.000000e+00\n  %add = fadd float %in, 1.000000e+00\n  %sel = select nnan nsz i1 %cmp1, float %add, float 1.000000e+00\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ule_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_ule_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan ule <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ult_fadd_select_constant_vectors",
+          "test_body": "define <2 x float> @test_fcmp_ult_fadd_select_constant_vectors(<2 x float> %in) {\n  %cmp1 = fcmp nnan ult <2 x float> %in, zeroinitializer\n  %add = fadd <2 x float> %in, splat (float 1.000000e+00)\n  %sel = select nnan nsz <2 x i1> %cmp1, <2 x float> %add, <2 x float> splat (float 1.000000e+00)\n  ret <2 x float> %sel\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fcmp-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_fcmp_select_maxnum",
+          "test_body": "define double @test_fcmp_select_maxnum(double %x) {\n  %cmp1 = fcmp nnan ogt double %x, 1.000000e+00\n  %sel1 = select nsz i1 %cmp1, double %x, double 1.000000e+00\n  %cmp2 = fcmp nnan olt double %sel1, 2.550000e+02\n  %sel2 = select nsz i1 %cmp2, double %sel1, double 2.550000e+02\n  ret double %sel2\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_select_clamp",
+          "test_body": "define double @test_fcmp_select_clamp(double %x) {\n  %cmp1 = fcmp ogt double %x, 9.000000e-01\n  %sel1 = select i1 %cmp1, double 9.000000e-01, double %x\n  %cmp2 = fcmp olt double %sel1, 5.000000e-01\n  %sel2 = select i1 %cmp2, double 5.000000e-01, double %sel1\n  ret double %sel2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fneg.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine -use-constant-fp-for-fixed-length-splat -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_fneg_select_maxnum",
+          "test_body": "define float @test_fneg_select_maxnum(float %x) {\n  %cmp1 = fcmp nnan ogt float %x, 1.000000e+00\n  %sel1 = select nnan nsz i1 %cmp1, float %x, float 1.000000e+00\n  %neg = fneg float %sel1\n  ret float %neg\n}\n"
+        },
+        {
+          "test_name": "test_fneg_select_constant_var_multiuse",
+          "test_body": "declare void @use(float)\n\ndefine float @test_fneg_select_constant_var_multiuse(i1 %cond, float %x) {\n  %sel1 = select i1 %cond, float 0.000000e+00, float %x\n  call void @use(float %sel1)\n  %neg = fneg float %sel1\n  ret float %neg\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-fp.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "minnum_olt_fmf_on_select",
+          "test_body": "define float @minnum_olt_fmf_on_select(float %a, float %b) {\n  %cond = fcmp nnan olt float %a, %b\n  %f = select nsz i1 %cond, float %a, float %b\n  ret float %f\n}\n"
+        },
+        {
+          "test_name": "maxnum_no_nsz",
+          "test_body": "define float @maxnum_no_nsz(float %a, float %b) {\n  %cond = fcmp nnan ogt float %a, %b\n  %f = select i1 %cond, float %a, float %b\n  ret float %f\n}\n"
+        },
+        {
+          "test_name": "minnum_ole_fmf_on_fcmp",
+          "test_body": "define <2 x float> @minnum_ole_fmf_on_fcmp(<2 x float> %a, <2 x float> %b) {\n  %cond = fcmp nnan ninf nsz ole <2 x float> %a, %b\n  %f = select <2 x i1> %cond, <2 x float> %a, <2 x float> %b\n  ret <2 x float> %f\n}\n"
+        },
+        {
+          "test_name": "maxnum_oge_fmf_on_select",
+          "test_body": "define <2 x float> @maxnum_oge_fmf_on_select(<2 x float> %a, <2 x float> %b) {\n  %cond = fcmp nnan oge <2 x float> %a, %b\n  %f = select nsz <2 x i1> %cond, <2 x float> %a, <2 x float> %b\n  ret <2 x float> %f\n}\n"
+        },
+        {
+          "test_name": "maxnum_no_nnan",
+          "test_body": "define float @maxnum_no_nnan(float %a, float %b) {\n  %cond = fcmp oge float %a, %b\n  %f = select nsz i1 %cond, float %a, float %b\n  ret float %f\n}\n"
+        },
+        {
+          "test_name": "minnum_no_nsz",
+          "test_body": "define float @minnum_no_nsz(float %a, float %b) {\n  %cond = fcmp nnan olt float %a, %b\n  %f = select i1 %cond, float %a, float %b\n  ret float %f\n}\n"
+        },
+        {
+          "test_name": "minnum_olt_fmf_on_select_both_ninf",
+          "test_body": "define float @minnum_olt_fmf_on_select_both_ninf(float %a, float %b) {\n  %cond = fcmp nnan ninf olt float %a, %b\n  %f = select ninf nsz i1 %cond, float %a, float %b\n  ret float %f\n}\n"
+        },
+        {
+          "test_name": "fneg_fmin",
+          "test_body": "define double @fneg_fmin(double %x, double %y) {\n  %n1 = fneg double %x\n  %n2 = fneg double %y\n  %cond = fcmp nnan nsz ule double %n1, %n2\n  %max = select i1 %cond, double %n1, double %n2\n  ret double %max\n}\n"
+        },
+        {
+          "test_name": "maxnum_ogt_fmf_on_select",
+          "test_body": "define float @maxnum_ogt_fmf_on_select(float %a, float %b) {\n  %cond = fcmp nnan ogt float %a, %b\n  %f = select nsz i1 %cond, float %a, float %b\n  ret float %f\n}\n"
+        },
+        {
+          "test_name": "t9",
+          "test_body": "define i8 @t9(float %a) {\n  %1 = fcmp ult float %a, 0.000000e+00\n  %2 = fptosi float %a to i8\n  %3 = select i1 %1, i8 %2, i8 0\n  ret i8 %3\n}\n"
+        },
+        {
+          "test_name": "maxnum_oge_fmf_on_fcmp",
+          "test_body": "define <2 x float> @maxnum_oge_fmf_on_fcmp(<2 x float> %a, <2 x float> %b) {\n  %cond = fcmp nnan ninf nsz oge <2 x float> %a, %b\n  %f = select <2 x i1> %cond, <2 x float> %a, <2 x float> %b\n  ret <2 x float> %f\n}\n"
+        },
+        {
+          "test_name": "minnum_ole_fmf_on_select",
+          "test_body": "define <2 x float> @minnum_ole_fmf_on_select(<2 x float> %a, <2 x float> %b) {\n  %cond = fcmp nnan ole <2 x float> %a, %b\n  %f = select ninf nsz <2 x i1> %cond, <2 x float> %a, <2 x float> %b\n  ret <2 x float> %f\n}\n"
+        },
+        {
+          "test_name": "t12",
+          "test_body": "define i8 @t12(float %a, float %b) {\n  %1 = fcmp nnan ult float %b, %a\n  %2 = fptosi float %a to i8\n  %3 = fptosi float %b to i8\n  %4 = select i1 %1, i8 %3, i8 %2\n  ret i8 %4\n}\n"
+        },
+        {
+          "test_name": "t11",
+          "test_body": "define i8 @t11(float %a, float %b) {\n  %1 = fcmp fast ult float %b, %a\n  %2 = fptosi float %a to i8\n  %3 = fptosi float %b to i8\n  %4 = select i1 %1, i8 %3, i8 %2\n  ret i8 %4\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/unordered-fcmp-select.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "select_min_ugt",
+          "test_body": "define float @select_min_ugt(float %a, float %b) {\n  %cmp = fcmp fast ugt float %a, %b\n  %sel = select reassoc i1 %cmp, float %b, float %a\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "select_min_ult",
+          "test_body": "define float @select_min_ult(float %a, float %b) {\n  %cmp = fcmp nnan nsz ult float %a, %b\n  %sel = select fast i1 %cmp, float %a, float %b\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "select_max_ule",
+          "test_body": "define float @select_max_ule(float %a, float %b) {\n  %cmp = fcmp fast ule float %a, %b\n  %sel = select nsz i1 %cmp, float %b, float %a\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "select_min_uge",
+          "test_body": "define float @select_min_uge(float %a, float %b) {\n  %cmp = fcmp nnan nsz uge float %a, %b\n  %sel = select fast i1 %cmp, float %b, float %a\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "select_max_ugt_2_use_cmp",
+          "test_body": "declare void @foo(i1)\n\ndefine float @select_max_ugt_2_use_cmp(float %a, float %b) {\n  %cmp = fcmp reassoc nnan ugt float %a, %b\n  call void @foo(i1 %cmp)\n  %sel = select fast i1 %cmp, float %a, float %b\n  ret float %sel\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "The problem I ran into is a few vectorizer tests regressed. Those need to be taught to directly vectorize compare and select "
+    },
+    {
+      "author": "nikic",
+      "body": "See also https://reviews.llvm.org/D62158 and https://reviews.llvm.org/D62414 for historical context."
+    },
+    {
+      "author": "valadaptive",
+      "body": "I've loosened the precondition a bit (the nnan flag only needs to be present on the comparison), and reworded the comments.\r\n\r\nI wouldn't be at all opposed to just removing this transform entirely, considering the enormous subtlety involved in `minnum`/`maxnum`, the opportunity for pessimization if not carefully handled, and the potentially limited applicability (fast-math flags are hard to use properly, and I don't think many projects enable them)."
+    },
+    {
+      "author": "SergeyShch01",
+      "body": "Hello @valadaptive,\r\n\r\nThis commit caused a performance regression of the benchmarks we are tracking. Could you please have a look?\r\nThe reproducer is as follows (should be compiled w/ -O3 --target=aarch64-unknown-linux-gnu -mcpu=neoverse-v2):\r\n\r\n```\r\n__attribute__((aligned(64))) double a[32000];\r\n__attribute__((aligned(64))) double b[32000];\r\n__attribute__((aligned(64))) double c[32000];\r\n__attribute__((aligned(64))) double d[32000];\r\n\r\n__attribute__((noinline))\r\nvoid dummy(double* a, double* b, double* c, double* d, double chksum)\r\n{\r\n    asm volatile(\"\" : : \"r\"(a), \"r\"(b), \"r\"(c), \"r\"(d), \"r\"(chksum) : \"memory\");\r\n}\r\n\r\n__attribute__((noinline))\r\nvoid kernel(int iterations)\r\n{\r\n    double x, chksum;\r\n    int index;\r\n    for (int nl = 0; nl < iterations; nl++) {\r\n        x = a[0];\r\n        index = 0;\r\n        for (int i = 0; i < 32000; ++i) {\r\n            if (a[i] > x) {\r\n                x = a[i];\r\n                index = i;\r\n            }\r\n        }\r\n        chksum = x + (double)index;\r\n        dummy(a, b, c, d, chksum);\r\n    }\r\n}\r\n```\r\n\r\nBefore the commit this was compiled into a sequence of if statements; after the commit they were replaced with select instructions.\r\n"
+    },
+    {
+      "author": "valadaptive",
+      "body": "@SergeyShch01 Can you elaborate? I tried creating a repro on Compiler Explorer but [Clang 21 and trunk seem to compile it identically](https://llvm.godbolt.org/z/Tvfj5997j).\r\n\r\nThe code path I modified (converting a compare+select into a minnum/maxnum) shouldn't be taken unless the compiler can prove that the input is never zero or NaN, or it doesn't care because fast-math flags are enabled. I don't believe `-O3` enables any fast-math flags.\r\n\r\nIf I use `-Ofast`, [Clang trunk *does* optimize this to `fmaxnm`+`csel`](https://llvm.godbolt.org/z/5PvPfqMYe), because it enables fast-math flags. Those allow the compiler to assume that the sign of zero does not matter, and that no inputs are NaN so it can ignore the intricacies of NaN propagation. This code looks much more compact and contains significantly fewer branches, so I'd be surprised if it turns out to be slower.\r\n\r\nDo you have any fast-math flags enabled that you did not list in the compiler flags you gave here?"
+    },
+    {
+      "author": "SergeyShch01",
+      "body": "@valadaptive,\r\n\r\nSorry, I was imprecise - Ofast should be used instead of O3.  The correct repro is here:  https://llvm.godbolt.org/z/rGWsj3f6f\r\n\r\nThe version w/ branches is faster as the version w/ selects contains recurrences formed by those selects and fmaxnm instructions which block parallel execution of iteration tail which is possible if a[i] <= x.\r\n\r\nFrom other side branches can be mispredicted, so it can be unclear which version is better. But usually introduction of  new recurrences which are bigger than already existing recurrences is more harmful performance-wise.\r\n"
+    },
+    {
+      "author": "valadaptive",
+      "body": "That's... weird. As far as I can tell, being able to turn `a < b ? a : b` into `min(a, b)` is the entire point of this optimization.\r\n\r\nI'm not sure why this wouldn't have been happening before. This PR changes the optimization pass to check for some fast-math flags on the comparison instead of the `select`. If that's what's allowing the optimization to kick in *now*, that would imply it was never actually being applied before. Unless the fast-math flags on `select`s generated from if-else statements vary depending on where those `select`s come from?\r\n\r\nIf this entire optimization is actually a pessimization in practice, it should simply be removed outright. "
+    },
+    {
+      "author": "sjoerdmeijer",
+      "body": "From a very quick look, I believe this is the old story of conditional moves vs. branches, [this](https://discourse.llvm.org/t/rfc-cmov-vs-branch-optimization/6040) post has a good summary of the problem. \r\nThis is extremely difficult to get right, that's why this is a recurring problem. So this may not always be profitable:\r\n\r\n> As far as I can tell, being able to turn a < b ? a : b into min(a, b) is the entire point of this optimization.\r\n\r\nBecause I haven't spent much time on this, there are a lot of things unclear to me with that TSVC example, especially the interaction between different things. But yeah, since this patch is not doing anything new, I am not sure there's anything to do here. \r\n\r\n\r\n"
+    },
+    {
+      "author": "nikic",
+      "body": "I guess the unrolling here could probably be done better by performing parallel maxnm reductions. @fhahn recently added support doing that for add reductions."
+    },
+    {
+      "author": "fhahn",
+      "body": "Yes, with fast-math we can unroll this and introduce parallel reductions. See the code added in https://github.com/llvm/llvm-project/pull/149470  & https://github.com/llvm/llvm-project/pull/166630. Extending for min/max reductions should be fairly straigth-forward "
+    },
+    {
+      "author": "SergeyShch01",
+      "body": "> From a very quick look, I believe this is the old story of conditional moves vs. branches\r\n\r\nNot exactly.  This commit transforms an instuction which can be lowered to branches to instruction which can't. So we've reduced the spectrum of transformations which can be applied and potentially lost the optimization opprortunity w/o a heuristic decision regarding profitability of such conversion.\r\n\r\nThe solutoin could be to support maxnum expansion to branches in select-optimize pass similarly to selects.\r\n\r\nDon't want to fight in 'br-vs-select' holy war, but usually if new big recurrences are created by selects then branches are better - this is quite simple and strightforward heuristics to check.\r\n\r\n"
+    },
+    {
+      "author": "valadaptive",
+      "body": "> Not exactly. This commit transforms an instuction which can be lowered to branches to instruction which can't.\r\n\r\nHuh? The entire purpose of this PR was the exact opposite: to only lower a compare+select to a min/max if we can preserve the requisite fast-math flags to invert the transformation."
+    },
+    {
+      "author": "SergeyShch01",
+      "body": "> Huh? The entire purpose of this PR was the exact opposite: to only lower a compare+select to a min/max if we can preserve the requisite fast-math flags to invert the transformation.\r\n\r\nWhy then have we lost the opportunity to convert the instruction to branch?"
+    },
+    {
+      "author": "valadaptive",
+      "body": "> Why then have we lost the opportunity to convert the instruction to branch?\r\n\r\nAs far as I can tell, we haven't. We're just not doing it because the compiler thinks branches are slower."
+    },
+    {
+      "author": "SergeyShch01",
+      "body": "> As far as I can tell, we haven't. We're just not doing it because the compiler thinks branches are slower.\r\n\r\nselect-optimize pass which converts selects to branches doesn't work w/ maxnum. Then the compiler doesn't try branches if we substitute select by maxnum and we lose the optimization opportunity."
+    },
+    {
+      "author": "nikic",
+      "body": "The shared snippet is missing the initialization code for the arrays. Does it really benchmark a maximum reduction over zero-initialized arrays? If so, the benchmark is completely useless.\r\n\r\nIf someone wants to work on improving unrolled FP min/max reductions (that sounds fairly sensible) or on supporting maxnum in SelectOptimize (I'd question the value of this more, but at least the pass already handles various other patterns that get converted to selects, like extension ops), I'd say feel free. But otherwise, a TSVC benchmark is likely not worth spending time on.\r\n\r\nI don't think that this patch itself is doing anything problematic in itself."
+    },
+    {
+      "author": "sjoerdmeijer",
+      "body": "\r\n> The shared snippet is missing the initialization code for the arrays. Does it really benchmark a maximum reduction over zero-initialized arrays? If so, the benchmark is completely useless.\r\n> \r\n> If someone wants to work on improving unrolled FP min/max reductions (that sounds fairly sensible) or on supporting maxnum in SelectOptimize (I'd question the value of this more, but at least the pass already handles various other patterns that get converted to selects, like extension ops), I'd say feel free. But otherwise, a TSVC benchmark is likely not worth spending time on.\r\n> \r\n> I don't think that this patch itself is doing anything problematic in itself.\r\n\r\nAgreed. \r\n\r\nJust a quick note on TSVC: it's a completely useless and artificial benchmark, so optimising it is not a goal in itself,  but it's only used to capture codegen differences. It's nice and convenient to capture this in a small benchmark, but then needs further assessment. I guess the identified opportunity for unrolling FP min/max reductions is a good outcome of this, it looks general, and potentially an useful improvement. "
+    }
+  ],
+  "knowledge_cutoff": "2026-01-25T04:10:50Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        4357,
+        4363
+      ],
+      [
+        4366,
+        4373
+      ],
+      [
+        4376,
+        4383
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fcmp-fadd-select.ll": [
+      [
+        6,
+        16
+      ],
+      [
+        19,
+        29
+      ],
+      [
+        32,
+        42
+      ],
+      [
+        45,
+        55
+      ],
+      [
+        58,
+        68
+      ],
+      [
+        74,
+        84
+      ],
+      [
+        87,
+        97
+      ],
+      [
+        100,
+        110
+      ],
+      [
+        113,
+        123
+      ],
+      [
+        126,
+        136
+      ],
+      [
+        142,
+        152
+      ],
+      [
+        155,
+        165
+      ],
+      [
+        168,
+        178
+      ],
+      [
+        181,
+        191
+      ],
+      [
+        194,
+        204
+      ],
+      [
+        210,
+        220
+      ],
+      [
+        223,
+        233
+      ],
+      [
+        236,
+        246
+      ],
+      [
+        249,
+        259
+      ],
+      [
+        262,
+        272
+      ],
+      [
+        278,
+        288
+      ],
+      [
+        291,
+        301
+      ],
+      [
+        304,
+        314
+      ],
+      [
+        317,
+        327
+      ],
+      [
+        330,
+        340
+      ],
+      [
+        346,
+        356
+      ],
+      [
+        359,
+        369
+      ],
+      [
+        372,
+        382
+      ],
+      [
+        385,
+        395
+      ],
+      [
+        398,
+        408
+      ],
+      [
+        414,
+        424
+      ],
+      [
+        427,
+        437
+      ],
+      [
+        440,
+        450
+      ],
+      [
+        453,
+        463
+      ],
+      [
+        466,
+        476
+      ],
+      [
+        482,
+        492
+      ],
+      [
+        495,
+        505
+      ],
+      [
+        508,
+        518
+      ],
+      [
+        521,
+        531
+      ],
+      [
+        534,
+        544
+      ],
+      [
+        551,
+        577
+      ],
+      [
+        581,
+        592
+      ],
+      [
+        596,
+        602
+      ],
+      [
+        604,
+        610
+      ],
+      [
+        617,
+        627
+      ],
+      [
+        630,
+        640
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fcmp-select.ll": [
+      [
+        219,
+        232
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fneg.ll": [
+      [
+        1100,
+        1110
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minmax-fp.ll": [
+      [
+        160,
+        166
+      ],
+      [
+        174,
+        180
+      ],
+      [
+        322,
+        342
+      ],
+      [
+        364,
+        375
+      ],
+      [
+        386,
+        416
+      ],
+      [
+        438,
+        449
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/unordered-fcmp-select.ll": [
+      [
+        36,
+        45
+      ],
+      [
+        67,
+        76
+      ],
+      [
+        112,
+        123
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::visitSelectInst"
+    ],
+    "llvm/test/Transforms/InstCombine/fcmp-fadd-select.ll": [
+      "float",
+      "test_fcmp_multiple_uses",
+      "test_fcmp_oge_fadd_select_constant_swapped",
+      "test_fcmp_oge_fadd_select_neg_constant",
+      "test_fcmp_ogt_fadd_select_neg_constant",
+      "test_fcmp_ogt_fadd_select_rewrite_flags2",
+      "test_fcmp_ole_fadd_select_constant_swapped",
+      "test_fcmp_ole_fadd_select_neg_constant",
+      "test_fcmp_olt_fadd_select_constant_swapped",
+      "test_fcmp_olt_fadd_select_neg_constant",
+      "test_fcmp_uge_fadd_select_constant_swapped",
+      "test_fcmp_uge_fadd_select_neg_constant",
+      "test_fcmp_ugt_fadd_select_constant_swapped",
+      "test_fcmp_ugt_fadd_select_neg_constant",
+      "test_fcmp_ule_fadd_select_constant_swapped",
+      "test_fcmp_ule_fadd_select_neg_constant",
+      "test_fcmp_ult_fadd_select_constant_swapped",
+      "test_fcmp_ult_fadd_select_neg_constant"
+    ],
+    "llvm/test/Transforms/InstCombine/fcmp-select.ll": [
+      "oeq",
+      "test_fcmp_select_const_const_multiuse",
+      "test_fcmp_select_var_const_fmf"
+    ]
+  }
+}

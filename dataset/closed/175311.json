@@ -1,0 +1,140 @@
+{
+  "pr_id": 175311,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175311",
+  "state": "closed",
+  "title": "[VectorCombine] Consolidate fragmented loads into wide loads",
+  "author": "ParkHanbum",
+  "base_commit": "3920bc61ca5d35009a34673fb2f4914cc1d2205d",
+  "fix_commit": "3dc25d2109fea78f22e26da39c693f3609c159ef",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 3e06f74fa5c65..8a0841c094d89 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -143,6 +143,7 @@ class VectorCombine {\n   bool foldShufflesOfLengthChangingShuffles(Instruction &I);\n   bool foldShuffleOfIntrinsics(Instruction &I);\n   bool foldShuffleToIdentity(Instruction &I);\n+  bool foldFragmentedLoads(Instruction &I);\n   bool foldShuffleFromReductions(Instruction &I);\n   bool foldShuffleChainsToReduce(Instruction &I);\n   bool foldCastFromReductions(Instruction &I);\n@@ -3606,6 +3607,111 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {\n   return true;\n }\n \n+struct LaneOrigin {\n+  LoadInst *LI = nullptr;\n+  int64_t Offset = 0;\n+  Value *BasePtr = nullptr;\n+};\n+\n+bool VectorCombine::foldFragmentedLoads(Instruction &I) {\n+  auto *VT = dyn_cast<FixedVectorType>(I.getType());\n+  if (!VT || I.use_empty())\n+    return false;\n+\n+  unsigned ElementSize = VT->getElementType()->getPrimitiveSizeInBits();\n+  if (!ElementSize)\n+    return false;\n+\n+  unsigned NumElts = VT->getNumElements();\n+  unsigned VTySize = ElementSize * NumElts;\n+  unsigned MaxVectorSize =\n+      TTI.getRegisterBitWidth(TargetTransformInfo::RGK_FixedWidthVector);\n+  unsigned MaxVectorEltNum = MaxVectorSize / ElementSize;\n+  if (NumElts > MaxVectorEltNum)\n+    return false;\n+\n+  Type *EltTy = VT->getElementType();\n+  SmallVector<LaneOrigin, 4> Origins(NumElts);\n+  for (unsigned Lane = 0; Lane < NumElts; ++Lane) {\n+    InstLane IL = lookThroughShuffles(&*I.use_begin(), Lane);\n+    if (!IL.first)\n+      return false;\n+\n+    auto *LI = dyn_cast<LoadInst>(IL.first->get());\n+    if (!canWidenLoad(LI, TTI))\n+      return false;\n+\n+    if (auto *LIVTy = dyn_cast<FixedVectorType>(LI->getType());\n+        !LIVTy || LIVTy->getElementType() != EltTy ||\n+        LIVTy->getNumElements() >= MaxVectorEltNum)\n+      return false;\n+\n+    int64_t ConstantOffset = 0;\n+    Value *Base = GetPointerBaseWithConstantOffset(LI->getPointerOperand(),\n+                                                   ConstantOffset, *DL);\n+\n+    Origins[Lane].LI = LI;\n+    Origins[Lane].BasePtr = Base;\n+    int64_t Offset = ConstantOffset * 8 + (IL.second * ElementSize);\n+    if (Offset < 0 || Offset >= VTySize || Offset % ElementSize)\n+      return false;\n+\n+    Origins[Lane].Offset = Offset;\n+  }\n+\n+  SmallPtrSet<LoadInst *, 4> Loads;\n+  SmallVector<Value *, 2> Bases;\n+  LoadInst *FirstLI = nullptr;\n+  Align Align = Origins[0].LI->getAlign();\n+  for (const auto &O : Origins) {\n+    Align = commonAlignment(O.LI->getAlign(), Align.value());\n+    Loads.insert(O.LI);\n+    if (!is_contained(Bases, O.BasePtr))\n+      Bases.push_back(O.BasePtr);\n+    if (!FirstLI || O.LI->comesBefore(FirstLI))\n+      FirstLI = O.LI;\n+  }\n+\n+  if (Bases.size() > 2 || Loads.size() <= Bases.size()) {\n+    LLVM_DEBUG(dbgs() << \"No load reduction: \" << Loads.size() << \" loads -> \"\n+                      << Bases.size() << \" wide loads..\\n\");\n+    return false;\n+  }\n+\n+  for (Value *Base : Bases) {\n+    MemoryLocation Loc(Base, LocationSize::precise(VTySize / 8));\n+    if (isMemModifiedBetween(FirstLI->getIterator(), I.getIterator(), Loc,\n+                             AA)) {\n+      LLVM_DEBUG(dbgs() << \"Optimization aborted: Memory modification detected \"\n+                           \"for base: \";\n+                 Base->dump());\n+      return false;\n+    }\n+  }\n+\n+  Type *WideVecTy = VT;\n+  Value *WideL0 = Builder.CreateAlignedLoad(WideVecTy, Bases[0], Align);\n+  Value *WideL1 = Bases.size() > 1\n+                      ? Builder.CreateAlignedLoad(WideVecTy, Bases[1], Align)\n+                      : WideL0;\n+\n+  SmallVector<int, 4> NewMask;\n+  for (const auto &O : Origins) {\n+    int WideIdx = O.Offset / ElementSize;\n+    if (O.BasePtr == Bases[0])\n+      NewMask.push_back(WideIdx);\n+    else\n+      NewMask.push_back(WideIdx + NumElts);\n+  }\n+\n+  LLVM_DEBUG(dbgs() << \"VC: Folding \" << Loads.size() << \" loads with \"\n+                    << Bases.size() << \" widening bases..\" << \"\\n\");\n+\n+  Value *NewSVI = Builder.CreateShuffleVector(WideL0, WideL1, NewMask);\n+  replaceValue(I, *NewSVI);\n+  return true;\n+}\n+\n /// Given a commutative reduction, the order of the input lanes does not alter\n /// the results. We can use this to remove certain shuffles feeding the\n /// reduction, removing the need to shuffle at all.\n@@ -5032,6 +5138,8 @@ bool VectorCombine::run() {\n           return true;\n         if (foldSelectShuffle(I))\n           return true;\n+        if (foldFragmentedLoads(I))\n+          return true;\n         if (foldShuffleToIdentity(I))\n           return true;\n         break;\n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "LLVM currently maintains multiple narrow loads (e.g., <2 x double>\r\nor scalars) from adjacent memory addresses when they are combined\r\ninto a single larger vector (e.g., <4 x double>) through a sequence\r\nof nested shufflevector instructions. These fragmented loads and the\r\nassociated shuffle tree remain as separate operations in the IR.\r\n\r\nThis patch introduces foldFragmentedLoads to identify these\r\nfragmented load patterns within shuffle chains and consolidate them\r\ninto one or two wide loads that fit within the target's maximum\r\nvector register width. The entire shuffle tree is folded into a\r\nsingle shufflevector operation using the newly created wide load(s)\r\nas operands.\r\n\r\nProof: https://alive2.llvm.org/ce/z/eZXjhM\r\nFixed: https://github.com/llvm/llvm-project/issues/140234\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/shuffle-of-fragment-loads.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=sse2",
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=avx2"
+      ],
+      "tests": [
+        {
+          "test_name": "test_i32_3_to_1",
+          "test_body": "define <4 x i32> @test_i32_3_to_1(ptr %p) {\n  %L0 = load <2 x i32>, ptr %p, align 8\n  %p1 = getelementptr i8, ptr %p, i64 4\n  %L1 = load <2 x i32>, ptr %p1, align 4\n  %p2 = getelementptr i8, ptr %p, i64 8\n  %L2 = load <2 x i32>, ptr %p2, align 8\n  %v1 = shufflevector <2 x i32> %L0, <2 x i32> %L1, <2 x i32> <i32 0, i32 3>\n  %res = shufflevector <2 x i32> %v1, <2 x i32> %L2, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_i16_4_to_2",
+          "test_body": "define <8 x i16> @test_i16_4_to_2(ptr %x, ptr %y) {\n  %x0 = load <2 x i16>, ptr %x, align 4\n  %xa = getelementptr i8, ptr %x, i64 4\n  %x1 = load <2 x i16>, ptr %xa, align 4\n  %y0 = load <2 x i16>, ptr %y, align 4\n  %ya = getelementptr i8, ptr %y, i64 4\n  %y1 = load <2 x i16>, ptr %ya, align 4\n  %vx = shufflevector <2 x i16> %x0, <2 x i16> %x1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %vy = shufflevector <2 x i16> %y0, <2 x i16> %y1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %res = shufflevector <4 x i16> %vx, <4 x i16> %vy, <8 x i32> <i32 0, i32 4, i32 1, i32 5, i32 2, i32 6, i32 3, i32 7>\n  ret <8 x i16> %res\n}\n"
+        },
+        {
+          "test_name": "test_i64_3_to_1_success",
+          "test_body": "define <4 x i64> @test_i64_3_to_1_success(ptr %p) {\n  %L0 = load <2 x i64>, ptr %p, align 16\n  %pa = getelementptr i8, ptr %p, i64 8\n  %L1 = load <2 x i64>, ptr %pa, align 8\n  %pb = getelementptr i8, ptr %p, i64 16\n  %L2 = load <2 x i64>, ptr %pb, align 16\n  %v1 = shufflevector <2 x i64> %L0, <2 x i64> %L1, <2 x i32> <i32 1, i32 2>\n  %res = shufflevector <2 x i64> %v1, <2 x i64> %L2, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  ret <4 x i64> %res\n}\n"
+        },
+        {
+          "test_name": "test_i32_4_to_2_success",
+          "test_body": "define <4 x i32> @test_i32_4_to_2_success(ptr %x, ptr %y) {\n  %x0 = load <2 x i32>, ptr %x, align 8\n  %xa = getelementptr i8, ptr %x, i64 8\n  %x1 = load <2 x i32>, ptr %xa, align 8\n  %y0 = load <2 x i32>, ptr %y, align 8\n  %ya = getelementptr i8, ptr %y, i64 8\n  %y1 = load <2 x i32>, ptr %ya, align 8\n  %vx = shufflevector <2 x i32> %x0, <2 x i32> %x1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %vy = shufflevector <2 x i32> %y0, <2 x i32> %y1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %res = shufflevector <4 x i32> %vx, <4 x i32> %vy, <4 x i32> <i32 1, i32 3, i32 5, i32 7>\n  ret <4 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_neg_not_a_load",
+          "test_body": "define <4 x float> @test_neg_not_a_load(ptr %x) {\n  %x0 = load <2 x float>, ptr %x, align 8\n  %v_add = fadd <2 x float> %x0, splat (float 1.000000e+00)\n  %xa = getelementptr i8, ptr %x, i64 8\n  %x1 = load <2 x float>, ptr %xa, align 8\n  %res = shufflevector <2 x float> %v_add, <2 x float> %x1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x float> %res\n}\n"
+        },
+        {
+          "test_name": "test_alias_fail_mod_at_end_avx",
+          "test_body": "define <8 x i32> @test_alias_fail_mod_at_end_avx(ptr dereferenceable(32) %p) {\n  %L0 = load <4 x i32>, ptr %p, align 16\n  %p1 = getelementptr i8, ptr %p, i64 16\n  %L1 = load <4 x i32>, ptr %p1, align 16\n  store i32 77, ptr %p, align 4\n  %res = shufflevector <4 x i32> %L0, <4 x i32> %L1, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_neg_multi_use",
+          "test_body": "declare void @use(<2 x i32>)\n\ndefine <4 x i32> @test_neg_multi_use(ptr %x, ptr %y) {\n  %x0 = load <2 x i32>, ptr %x, align 8\n  call void @use(<2 x i32> %x0)\n  %xa = getelementptr i8, ptr %x, i64 8\n  %x1 = load <2 x i32>, ptr %xa, align 8\n  %y0 = load <2 x i32>, ptr %y, align 8\n  %ya = getelementptr i8, ptr %y, i64 8\n  %y1 = load <2 x i32>, ptr %ya, align 8\n  %vx = shufflevector <2 x i32> %x0, <2 x i32> %x1, <4 x i32> <i32 0, i32 2, i32 1, i32 3>\n  %vy = shufflevector <2 x i32> %y0, <2 x i32> %y1, <4 x i32> <i32 0, i32 2, i32 1, i32 3>\n  %res = shufflevector <4 x i32> %vx, <4 x i32> %vy, <4 x i32> <i32 0, i32 1, i32 4, i32 5>\n  ret <4 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_i64_4_to_2",
+          "test_body": "define <4 x i64> @test_i64_4_to_2(ptr %x, ptr %y) {\n  %x0 = load <2 x i64>, ptr %x, align 16\n  %xa = getelementptr i8, ptr %x, i64 16\n  %x1 = load <2 x i64>, ptr %xa, align 16\n  %y0 = load <2 x i64>, ptr %y, align 16\n  %ya = getelementptr i8, ptr %y, i64 16\n  %y1 = load <2 x i64>, ptr %ya, align 16\n  %vx = shufflevector <2 x i64> %x0, <2 x i64> %x1, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %vy = shufflevector <2 x i64> %y0, <2 x i64> %y1, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %res = shufflevector <4 x i64> %vx, <4 x i64> %vy, <4 x i32> <i32 1, i32 3, i32 5, i32 7>\n  ret <4 x i64> %res\n}\n"
+        },
+        {
+          "test_name": "test_alias_fail_mod_avx",
+          "test_body": "define <8 x i32> @test_alias_fail_mod_avx(ptr dereferenceable(32) %p) {\n  %L0 = load <4 x i32>, ptr %p, align 16\n  %bad_ptr = getelementptr i8, ptr %p, i64 20\n  store i32 99, ptr %bad_ptr, align 4\n  %p1 = getelementptr i8, ptr %p, i64 16\n  %L1 = load <4 x i32>, ptr %p1, align 16\n  %res = shufflevector <4 x i32> %L0, <4 x i32> %L1, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_float_4_to_2",
+          "test_body": "define <8 x float> @test_float_4_to_2(ptr %x, ptr %y) {\n  %x0 = load <2 x float>, ptr %x, align 8\n  %x_off = getelementptr i8, ptr %x, i64 8\n  %x1 = load <2 x float>, ptr %x_off, align 8\n  %y0 = load <2 x float>, ptr %y, align 8\n  %y_off = getelementptr i8, ptr %y, i64 8\n  %y1 = load <2 x float>, ptr %y_off, align 8\n  %v1 = shufflevector <2 x float> %x0, <2 x float> %x1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %v2 = shufflevector <2 x float> %y0, <2 x float> %y1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %v1w = shufflevector <4 x float> %v1, <4 x float> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 poison, i32 poison, i32 poison, i32 poison>\n  %v2w = shufflevector <4 x float> %v2, <4 x float> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 poison, i32 poison, i32 poison, i32 poison>\n  %res = shufflevector <8 x float> %v1w, <8 x float> %v2w, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 8, i32 9, i32 10, i32 11>\n  ret <8 x float> %res\n}\n"
+        },
+        {
+          "test_name": "test_i16_3_to_1",
+          "test_body": "define <8 x i16> @test_i16_3_to_1(ptr %p) {\n  %L0 = load <2 x i16>, ptr %p, align 4\n  %p1 = getelementptr i8, ptr %p, i64 4\n  %L1 = load <2 x i16>, ptr %p1, align 4\n  %p2 = getelementptr i8, ptr %p, i64 8\n  %L2 = load <4 x i16>, ptr %p2, align 8\n  %v1 = shufflevector <2 x i16> %L0, <2 x i16> %L1, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %res = shufflevector <4 x i16> %v1, <4 x i16> %L2, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 5, i32 4, i32 7, i32 6>\n  ret <8 x i16> %res\n}\n"
+        },
+        {
+          "test_name": "test_neg_trunc_mismatch",
+          "test_body": "define <4 x i32> @test_neg_trunc_mismatch(ptr %p) {\n  %L0 = load <2 x i64>, ptr %p, align 16\n  %T0 = trunc <2 x i64> %L0 to <2 x i32>\n  %p1 = getelementptr i8, ptr %p, i64 16\n  %L1 = load <2 x i32>, ptr %p1, align 8\n  %v1 = shufflevector <2 x i32> %T0, <2 x i32> %L1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x i32> %v1\n}\n"
+        },
+        {
+          "test_name": "test_neg_out_of_range",
+          "test_body": "define <4 x i32> @test_neg_out_of_range(ptr %x) {\n  %x0 = load <2 x i32>, ptr %x, align 8\n  %xa = getelementptr i8, ptr %x, i64 16\n  %x1 = load <2 x i32>, ptr %xa, align 8\n  %res = shufflevector <2 x i32> %x0, <2 x i32> %x1, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  ret <4 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_neg_misaligned",
+          "test_body": "define <4 x i32> @test_neg_misaligned(ptr %x) {\n  %x0 = load <2 x i32>, ptr %x, align 8\n  %xa = getelementptr i8, ptr %x, i64 2\n  %x1 = load <2 x i32>, ptr %xa, align 1\n  %res = shufflevector <2 x i32> %x0, <2 x i32> %x1, <4 x i32> <i32 1, i32 0, i32 2, i32 3>\n  ret <4 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_double_3_to_1",
+          "test_body": "define <4 x double> @test_double_3_to_1(ptr %p) {\n  %L1 = load <2 x double>, ptr %p, align 16\n  %p_plus_8 = getelementptr i8, ptr %p, i64 8\n  %L2 = load <2 x double>, ptr %p_plus_8, align 8\n  %p_plus_16 = getelementptr i8, ptr %p, i64 16\n  %L3 = load <2 x double>, ptr %p_plus_16, align 16\n  %v1 = shufflevector <2 x double> %L1, <2 x double> %L2, <2 x i32> <i32 0, i32 3>\n  %res = shufflevector <2 x double> %v1, <2 x double> %L3, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x double> %res\n}\n"
+        },
+        {
+          "test_name": "test_neg_too_many_bases",
+          "test_body": "define <4 x i32> @test_neg_too_many_bases(ptr %x, ptr %y, ptr %z) {\n  %lx = load <2 x i32>, ptr %x, align 8\n  %ly = load <2 x i32>, ptr %y, align 8\n  %lz = load <2 x i32>, ptr %z, align 8\n  %v_xy = shufflevector <2 x i32> %lx, <2 x i32> %ly, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %v_z = shufflevector <2 x i32> %lz, <2 x i32> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>\n  %res = shufflevector <4 x i32> %v_xy, <4 x i32> %v_z, <4 x i32> <i32 0, i32 2, i32 4, i32 1>\n  ret <4 x i32> %res\n}\n"
+        },
+        {
+          "test_name": "test_double_4_to_2",
+          "test_body": "define <4 x double> @test_double_4_to_2(ptr %x, ptr %y) {\n  %x0 = load <2 x double>, ptr %x, align 16\n  %x_off = getelementptr i8, ptr %x, i64 16\n  %x1 = load <2 x double>, ptr %x_off, align 16\n  %y0 = load <2 x double>, ptr %y, align 16\n  %y_off = getelementptr i8, ptr %y, i64 16\n  %y1 = load <2 x double>, ptr %y_off, align 16\n  %v1 = shufflevector <2 x double> %x0, <2 x double> %x1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %v2 = shufflevector <2 x double> %y0, <2 x double> %y1, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %res = shufflevector <4 x double> %v1, <4 x double> %v2, <4 x i32> <i32 0, i32 2, i32 4, i32 6>\n  ret <4 x double> %res\n}\n"
+        },
+        {
+          "test_name": "test_float_3_to_1",
+          "test_body": "define <4 x float> @test_float_3_to_1(ptr %p) {\n  %L0 = load <2 x float>, ptr %p, align 8\n  %p1 = getelementptr i8, ptr %p, i64 4\n  %L1 = load <2 x float>, ptr %p1, align 4\n  %p2 = getelementptr i8, ptr %p, i64 8\n  %L2 = load <2 x float>, ptr %p2, align 4\n  %v1 = shufflevector <2 x float> %L0, <2 x float> %L1, <2 x i32> <i32 0, i32 3>\n  %res = shufflevector <2 x float> %v1, <2 x float> %L2, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x float> %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "ParkHanbum",
+      "body": "Got it. So instead of extending load, I should create a separate extended vector by combining load. "
+    },
+    {
+      "author": "ParkHanbum",
+      "body": "This PR will be closed as the implementation approach has changed.\r\n\r\n@dtcxzyw thanks for review"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-10T15:03:26Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        143,
+        148
+      ],
+      [
+        3606,
+        3611
+      ],
+      [
+        5032,
+        5037
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::foldShuffleFromReductions",
+      "VectorCombine::foldShuffleToIdentity",
+      "VectorCombine::run"
+    ]
+  }
+}

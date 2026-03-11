@@ -1,0 +1,122 @@
+{
+  "pr_id": 176436,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176436",
+  "state": "closed",
+  "title": "[MemCpyOpt] support offset slices for performStackMoveOptzn and processMemCpy",
+  "author": "vtjnash",
+  "base_commit": "dc9c08e6e0081ae0799597ba5f95ca5a6eddeac0",
+  "fix_commit": "6c8676ee8cdd5cb21a0fa402d67f6870b00ac3e5",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Scalar/MemCpyOptimizer.h b/llvm/include/llvm/Transforms/Scalar/MemCpyOptimizer.h\nindex 496d2958fc2d0..b87ea0b9d243f 100644\n--- a/llvm/include/llvm/Transforms/Scalar/MemCpyOptimizer.h\n+++ b/llvm/include/llvm/Transforms/Scalar/MemCpyOptimizer.h\n@@ -16,6 +16,7 @@\n \n #include \"llvm/IR/BasicBlock.h\"\n #include \"llvm/IR/PassManager.h\"\n+#include \"llvm/Support/Compiler.h\"\n \n namespace llvm {\n \n@@ -54,12 +55,12 @@ class MemCpyOptPass : public PassInfoMixin<MemCpyOptPass> {\n public:\n   MemCpyOptPass() = default;\n \n-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);\n+  LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);\n \n   // Glue for the old PM.\n-  bool runImpl(Function &F, TargetLibraryInfo *TLI, AAResults *AA,\n-               AssumptionCache *AC, DominatorTree *DT, PostDominatorTree *PDT,\n-               MemorySSA *MSSA);\n+  LLVM_ABI bool runImpl(Function &F, TargetLibraryInfo *TLI, AAResults *AA,\n+                        AssumptionCache *AC, DominatorTree *DT,\n+                        PostDominatorTree *PDT, MemorySSA *MSSA);\n \n private:\n   // Helper functions\n@@ -85,8 +86,8 @@ class MemCpyOptPass : public PassInfoMixin<MemCpyOptPass> {\n                                     Value *ByteVal);\n   bool moveUp(StoreInst *SI, Instruction *P, const LoadInst *LI);\n   bool performStackMoveOptzn(Instruction *Load, Instruction *Store,\n-                             AllocaInst *DestAlloca, AllocaInst *SrcAlloca,\n-                             TypeSize Size, BatchAAResults &BAA);\n+                             Value *DestPtr, Value *SrcPtr, TypeSize Size,\n+                             BatchAAResults &BAA);\n   bool isMemMoveMemSetDependency(MemMoveInst *M);\n \n   void eraseInstruction(Instruction *I);\ndiff --git a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\nindex 5de3dfa148314..d8d784f2ff774 100644\n--- a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n+++ b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n@@ -726,18 +726,15 @@ bool MemCpyOptPass::processStoreOfLoad(StoreInst *SI, LoadInst *LI,\n   // If this is a load-store pair from a stack slot to a stack slot, we\n   // might be able to perform the stack-move optimization just as we do for\n   // memcpys from an alloca to an alloca.\n-  if (auto *DestAlloca = dyn_cast<AllocaInst>(SI->getPointerOperand())) {\n-    if (auto *SrcAlloca = dyn_cast<AllocaInst>(LI->getPointerOperand())) {\n-      if (performStackMoveOptzn(LI, SI, DestAlloca, SrcAlloca,\n-                                DL.getTypeStoreSize(T), BAA)) {\n-        // Avoid invalidating the iterator.\n-        BBI = SI->getNextNode()->getIterator();\n-        eraseInstruction(SI);\n-        eraseInstruction(LI);\n-        ++NumMemCpyInstr;\n-        return true;\n-      }\n-    }\n+  if (performStackMoveOptzn(LI, SI, SI->getPointerOperand(),\n+                            LI->getPointerOperand(), DL.getTypeStoreSize(T),\n+                            BAA)) {\n+    // Avoid invalidating the iterator.\n+    BBI = SI->getNextNode()->getIterator();\n+    eraseInstruction(SI);\n+    eraseInstruction(LI);\n+    ++NumMemCpyInstr;\n+    return true;\n   }\n \n   return false;\n@@ -1497,20 +1494,47 @@ bool MemCpyOptPass::performMemCpyToMemSetOptzn(MemCpyInst *MemCpy,\n // transformation only because we restrict the scope of this optimization to\n // allocas that aren't captured.\n bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n-                                          AllocaInst *DestAlloca,\n-                                          AllocaInst *SrcAlloca, TypeSize Size,\n-                                          BatchAAResults &BAA) {\n+                                          Value *DestPtr, Value *SrcPtr,\n+                                          TypeSize Size, BatchAAResults &BAA) {\n   LLVM_DEBUG(dbgs() << \"Stack Move: Attempting to optimize:\\n\"\n                     << *Store << \"\\n\");\n \n+  AllocaInst *DestAlloca = dyn_cast<AllocaInst>(getUnderlyingObject(DestPtr));\n+  if (!DestAlloca)\n+    return false;\n+\n+  AllocaInst *SrcAlloca = dyn_cast<AllocaInst>(getUnderlyingObject(SrcPtr));\n+  if (!SrcAlloca)\n+    return false;\n+\n+  // Explicitly don't handle degenerate case of a partial copy within one\n+  // alloca. It would always fail the dominator check later anyways, and\n+  // possibly the modref checks also.\n+  if (SrcAlloca == DestAlloca)\n+    return false;\n+\n   // Make sure the two allocas are in the same address space.\n   if (SrcAlloca->getAddressSpace() != DestAlloca->getAddressSpace()) {\n     LLVM_DEBUG(dbgs() << \"Stack Move: Address space mismatch\\n\");\n     return false;\n   }\n \n+  if (!SrcAlloca->isStaticAlloca() || !DestAlloca->isStaticAlloca())\n+    return false;\n+\n   // Check that copy is full with static size.\n   const DataLayout &DL = DestAlloca->getDataLayout();\n+\n+  auto DestOffset = DestPtr->getPointerOffsetFrom(DestAlloca, DL);\n+  if (!DestOffset)\n+    return false;\n+\n+  auto SrcOffset = SrcPtr->getPointerOffsetFrom(SrcAlloca, DL);\n+  if (!SrcOffset || *SrcOffset < *DestOffset || *SrcOffset < 0)\n+    return false;\n+  // Offset difference must preserve dest alloca's alignment.\n+  if ((*SrcOffset - *DestOffset) % DestAlloca->getAlign().value() != 0)\n+    return false;\n   std::optional<TypeSize> SrcSize = SrcAlloca->getAllocationSize(DL);\n   std::optional<TypeSize> DestSize = DestAlloca->getAllocationSize(DL);\n   if (!SrcSize || !DestSize)\n@@ -1518,14 +1542,12 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n   if (*SrcSize != *DestSize)\n     if (!SrcSize->isFixed() || !DestSize->isFixed())\n       return false;\n-  if (Size != *DestSize) {\n+  // Check that copy covers entirety of dest alloca.\n+  if (Size != *DestSize || *DestOffset != 0) {\n     LLVM_DEBUG(dbgs() << \"Stack Move: Destination alloca size mismatch\\n\");\n     return false;\n   }\n \n-  if (!SrcAlloca->isStaticAlloca() || !DestAlloca->isStaticAlloca())\n-    return false;\n-\n   // Check if it will be legal to combine allocas without breaking dominator.\n   bool MoveSrc = !DT->dominates(SrcAlloca, DestAlloca);\n   if (MoveSrc) {\n@@ -1689,7 +1711,13 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n   }\n \n   // Merge the two allocas.\n-  DestAlloca->replaceAllUsesWith(SrcAlloca);\n+  Value *NewDestPtr = SrcAlloca;\n+  if (*SrcOffset != *DestOffset) {\n+    IRBuilder<> Builder(DestAlloca);\n+    NewDestPtr = Builder.CreateInBoundsPtrAdd(\n+        SrcAlloca, Builder.getInt64(*SrcOffset - *DestOffset));\n+  }\n+  DestAlloca->replaceAllUsesWith(NewDestPtr);\n   eraseInstruction(DestAlloca);\n \n   // Drop metadata on the source alloca.\n@@ -1760,7 +1788,7 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {\n     return false;\n \n   // If copying from a constant, try to turn the memcpy into a memset.\n-  if (auto *GV = dyn_cast<GlobalVariable>(M->getSource()))\n+  if (auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(M->getSource())))\n     if (GV->isConstant() && GV->hasDefinitiveInitializer())\n       if (Value *ByteVal = isBytewiseValue(GV->getInitializer(),\n                                            M->getDataLayout())) {\n@@ -1846,16 +1874,10 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {\n   // If the transfer is from a stack slot to a stack slot, then we may be able\n   // to perform the stack-move optimization. See the comments in\n   // performStackMoveOptzn() for more details.\n-  auto *DestAlloca = dyn_cast<AllocaInst>(M->getDest());\n-  if (!DestAlloca)\n-    return false;\n-  auto *SrcAlloca = dyn_cast<AllocaInst>(M->getSource());\n-  if (!SrcAlloca)\n-    return false;\n   ConstantInt *Len = dyn_cast<ConstantInt>(M->getLength());\n   if (Len == nullptr)\n     return false;\n-  if (performStackMoveOptzn(M, M, DestAlloca, SrcAlloca,\n+  if (performStackMoveOptzn(M, M, M->getDest(), M->getSource(),\n                             TypeSize::getFixed(Len->getZExtValue()), BAA)) {\n     // Avoid invalidating the iterator.\n     BBI = M->getNextNode()->getIterator();\n",
+  "components": [
+    "MemCpyOptimizer"
+  ],
+  "description": "In particular, support offset of src, since offset of dest will be a followup change when dest is allowed to be not full-sized with copy.\r\n\r\nExtracted from https://github.com/llvm/llvm-project/pull/150792",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/MemCpyOpt/stack-move-offset.ll",
+      "commands": [
+        "opt < %s -passes=memcpyopt -verify-memoryssa -S"
+      ],
+      "tests": [
+        {
+          "test_name": "memcpy_src_gep_to_dest_alloca",
+          "test_body": "; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare void @use_nocapture(ptr nocapture)\n\ndefine void @memcpy_src_gep_to_dest_alloca() {\n  %src = alloca [16 x i8], align 4\n  %dest = alloca [8 x i8], align 8\n  call void @llvm.lifetime.start.p0(ptr %src)\n  call void @llvm.lifetime.start.p0(ptr %dest)\n  %src.gep = getelementptr inbounds i8, ptr %src, i64 8\n  store i64 42, ptr %src.gep, align 4\n  call void @use_nocapture(ptr nocapture %src.gep)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %dest, ptr align 8 %src.gep, i64 8, i1 false)\n  call void @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr %src)\n  call void @llvm.lifetime.end.p0(ptr %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "no_optimize_dest_has_offset",
+          "test_body": "; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare void @use_nocapture(ptr nocapture)\n\ndefine void @no_optimize_dest_has_offset() {\n  %src = alloca [16 x i8], align 4\n  %dest = alloca [16 x i8], align 8\n  call void @llvm.lifetime.start.p0(ptr %src)\n  call void @llvm.lifetime.start.p0(ptr %dest)\n  %src.gep = getelementptr inbounds i8, ptr %src, i64 8\n  %dest.gep = getelementptr inbounds i8, ptr %dest, i64 8\n  store i64 42, ptr %src.gep, align 4\n  call void @use_nocapture(ptr nocapture %src.gep)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest.gep, ptr align 4 %src.gep, i64 8, i1 false)\n  call void @use_nocapture(ptr nocapture %dest.gep)\n  call void @llvm.lifetime.end.p0(ptr %src)\n  call void @llvm.lifetime.end.p0(ptr %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "load_store_src_gep_to_dest_alloca",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #0\n\ndeclare void @use_nocapture(ptr nocapture)\n\ndefine void @load_store_src_gep_to_dest_alloca() {\n  %src = alloca [8 x i8], align 4\n  %dest = alloca [4 x i8], align 4\n  call void @llvm.lifetime.start.p0(ptr %src)\n  call void @llvm.lifetime.start.p0(ptr %dest)\n  %src.gep = getelementptr inbounds i8, ptr %src, i64 4\n  store i32 42, ptr %src.gep, align 4\n  call void @use_nocapture(ptr nocapture %src.gep)\n  %val = load i32, ptr %src.gep, align 4\n  store i32 %val, ptr %dest, align 4\n  call void @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr %src)\n  call void @llvm.lifetime.end.p0(ptr %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "memcpy_src_gep_offset4_to_dest_alloca",
+          "test_body": "; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare void @use_nocapture(ptr nocapture)\n\ndefine void @memcpy_src_gep_offset4_to_dest_alloca() {\n  %src = alloca [12 x i8], align 4\n  %dest = alloca [8 x i8], align 4\n  call void @llvm.lifetime.start.p0(ptr %src)\n  call void @llvm.lifetime.start.p0(ptr %dest)\n  %src.gep = getelementptr inbounds i8, ptr %src, i64 4\n  store i64 42, ptr %src.gep, align 4\n  call void @use_nocapture(ptr nocapture %src.gep)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src.gep, i64 8, i1 false)\n  call void @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr %src)\n  call void @llvm.lifetime.end.p0(ptr %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "no_optimize_alignment_mismatch",
+          "test_body": "; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare void @use_nocapture(ptr nocapture)\n\ndefine void @no_optimize_alignment_mismatch() {\n  %src = alloca [12 x i8], align 4\n  %dest = alloca [8 x i8], align 8\n  call void @llvm.lifetime.start.p0(ptr %src)\n  call void @llvm.lifetime.start.p0(ptr %dest)\n  %src.gep = getelementptr inbounds i8, ptr %src, i64 4\n  store i64 42, ptr %src.gep, align 4\n  call void @use_nocapture(ptr nocapture %src.gep)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %dest, ptr align 4 %src.gep, i64 8, i1 false)\n  call void @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr %src)\n  call void @llvm.lifetime.end.p0(ptr %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "memcpy_both_direct_allocas",
+          "test_body": "; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare void @use_nocapture(ptr nocapture)\n\ndefine void @memcpy_both_direct_allocas() {\n  %src = alloca [8 x i8], align 4\n  %dest = alloca [8 x i8], align 8\n  call void @llvm.lifetime.start.p0(ptr %src)\n  call void @llvm.lifetime.start.p0(ptr %dest)\n  store i64 42, ptr %src, align 4\n  call void @use_nocapture(ptr nocapture %src)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %dest, ptr align 4 %src, i64 8, i1 false)\n  call void @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr %src)\n  call void @llvm.lifetime.end.p0(ptr %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "no_optimize_partial_dest_copy",
+          "test_body": "; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare void @use_nocapture(ptr nocapture)\n\ndefine void @no_optimize_partial_dest_copy() {\n  %src = alloca [12 x i8], align 4\n  %dest = alloca [16 x i8], align 4\n  call void @llvm.lifetime.start.p0(ptr %src)\n  call void @llvm.lifetime.start.p0(ptr %dest)\n  %src.gep = getelementptr inbounds i8, ptr %src, i64 4\n  store i64 42, ptr %src.gep, align 4\n  call void @use_nocapture(ptr nocapture %src.gep)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src.gep, i64 8, i1 false)\n  call void @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr %src)\n  call void @llvm.lifetime.end.p0(ptr %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "chapuni",
+      "body": "Seems this broke selfhosting (in my private builders). Investigating."
+    },
+    {
+      "author": "aeubanks",
+      "body": "I also see a miscompile with this PR, reproducible on x86-64 linux with a stage 2 build of LLVM, running `build/stage2/bin/llvm-mca llvm/test/tools/llvm-mca/X86/cpus.s -mtriple=x86_64-unknown-unknown -mcpu=x86-64 -resource-pressure=false -instruction-info=false`. I had to use the sysroot from https://commondatastorage.googleapis.com/chrome-linux-sysroot/dec7a3a0fc5b83b909cba1b6d119077e0429a138eadef6bf5a0f2e03b1904631 for some reason"
+    },
+    {
+      "author": "vtjnash",
+      "body": "@aeubanks is there any other details you can provide about what was miscompiled about that command? downloading a random sysroot to reproduce feels like a bit large of a step to take. Is that by chance an older c++ stdlib? (the other report of miscompile also only occurred with old stdlibs)\r\n\r\nEDIT: I see that is Debian Bullseye, circa 2021-2024"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-16T17:28:41Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Scalar/MemCpyOptimizer.h": [
+      [
+        16,
+        21
+      ],
+      [
+        54,
+        65
+      ],
+      [
+        85,
+        92
+      ]
+    ],
+    "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+      [
+        726,
+        743
+      ],
+      [
+        1497,
+        1516
+      ],
+      [
+        1518,
+        1531
+      ],
+      [
+        1689,
+        1695
+      ],
+      [
+        1760,
+        1766
+      ],
+      [
+        1846,
+        1861
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Transforms/Scalar/MemCpyOptimizer.h": [
+      "MemCpyOptPass"
+    ],
+    "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+      "MemCpyOptPass::performStackMoveOptzn",
+      "MemCpyOptPass::processMemCpy",
+      "MemCpyOptPass::processStoreOfLoad"
+    ]
+  }
+}

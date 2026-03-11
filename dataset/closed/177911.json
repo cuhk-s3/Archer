@@ -1,0 +1,87 @@
+{
+  "pr_id": 177911,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177911",
+  "state": "closed",
+  "title": "[VPlan] Create SCEV before any VPIRInstructions to check for overflow",
+  "author": "tclin914",
+  "base_commit": "55d4c694a9c6cf1091026b1c71c4acab791b1029",
+  "fix_commit": "71ef25a9789db03f6e4b0b7eed7a7120db23eb98",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex 1f8243d5f6c72..bc3fce1191824 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -1040,6 +1040,8 @@ void VPlanTransforms::addMinimumIterationCheck(\n       // an overflow to zero when updating induction variables and so an\n       // additional overflow check is required before entering the vector loop.\n \n+      VPValue *StepVPV = Builder.createExpandSCEV(Step);\n+\n       // Get the maximum unsigned value for the type.\n       VPValue *MaxUIntTripCount =\n           Plan.getConstantInt(cast<IntegerType>(TripCountTy)->getMask());\n@@ -1050,8 +1052,8 @@ void VPlanTransforms::addMinimumIterationCheck(\n       // Don't execute the vector loop if (UMax - n) < (VF * UF).\n       // FIXME: Should only check VF * UF, but currently checks Step=max(VF*UF,\n       // minProfitableTripCount).\n-      TripCountCheck = Builder.createICmp(ICmpInst::ICMP_ULT, DistanceToMax,\n-                                          Builder.createExpandSCEV(Step), DL);\n+      TripCountCheck =\n+          Builder.createICmp(ICmpInst::ICMP_ULT, DistanceToMax, StepVPV, DL);\n     } else {\n       // TripCountCheck = false, folding tail implies positive vector trip\n       // count.\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex a39b171ab4cd6..fa34de81bd001 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -4861,7 +4861,7 @@ VPlanTransforms::expandSCEVs(VPlan &Plan, ScalarEvolution &SE) {\n   }\n   assert(none_of(*Entry, IsaPred<VPExpandSCEVRecipe>) &&\n          \"VPExpandSCEVRecipes must be at the beginning of the entry block, \"\n-         \"after any VPIRInstructions\");\n+         \"before any VPIRInstructions\");\n   // Add IR instructions in the entry basic block but not in the VPIRBasicBlock\n   // to the VPIRBasicBlock.\n   auto EI = Entry->begin();\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "This PR tried to fix the assertion fail at VPlanTransforms.cpp:4862 since SCEV was created after VPIRInstructions.\r\n\r\nThe tripcount in scalable-predication.ll was changed from constant value 256 to non-constant value %n to avoid VPIRInstructions optimized out, which cannot trigger the assertion fail.\r\n\r\nThe orders in ir-bb<entry> from:\r\n\r\nir-bb<entry>:\r\n  EMIT vp<%2> = EXPAND SCEV (1 umax %n)\r\n  EMIT vp<%3> = sub ir<-1>, vp<%2>\r\n  EMIT vp<%4> = EXPAND SCEV (4 * vscale)<nuw>\r\n  EMIT vp<%5> = icmp ult vp<%3>, vp<%4>\r\n  EMIT branch-on-cond vp<%5>\r\nSuccessor(s): scalar.ph, vector.ph\r\n\r\nto:\r\n\r\nir-bb<entry>:\r\n  EMIT vp<%2> = EXPAND SCEV (1 umax %n)\r\n  EMIT vp<%3> = EXPAND SCEV (4 * vscale)<nuw>\r\n  EMIT vp<%4> = sub ir<-1>, vp<%2>\r\n  EMIT vp<%5> = icmp ult vp<%4>, vp<%3>\r\n  EMIT branch-on-cond vp<%5>\r\nSuccessor(s): scalar.ph, vector.ph",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/scalable-predication.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-tail-folding-style=data -prefer-predicate-over-epilogue=predicate-dont-vectorize -force-target-supports-scalable-vectors -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "foo2",
+          "test_body": "define void @foo2(i32 %val, ptr dereferenceable(1024) %ptr, i64 %n) {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  %ld1 = load i32, ptr %gep, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, %n\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\n!0 = distinct !{!0, !1, !2, !3, !4}\n!1 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n!3 = !{!\"llvm.loop.interleave.count\", i32 1}\n!4 = !{!\"llvm.loop.vectorize.width\", i32 4}\n"
+        },
+        {
+          "test_name": "foo",
+          "test_body": "define void @foo(i32 %val, ptr dereferenceable(1024) %ptr) {\nentry:\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %entry\n  %index = phi i64 [ %index.next, %while.body ], [ 0, %entry ]\n  %gep = getelementptr i32, ptr %ptr, i64 %index\n  %ld1 = load i32, ptr %gep, align 4\n  %index.next = add nsw i64 %index, 1\n  %cmp10 = icmp ult i64 %index.next, 256\n  br i1 %cmp10, label %while.body, label %while.end.loopexit, !llvm.loop !0\n\nwhile.end.loopexit:                               ; preds = %while.body\n  ret void\n}\n\n!0 = distinct !{!0, !1, !2, !3, !4}\n!1 = !{!\"llvm.loop.vectorize.predicate.enable\", i1 true}\n!2 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}\n!3 = !{!\"llvm.loop.interleave.count\", i32 1}\n!4 = !{!\"llvm.loop.vectorize.width\", i32 4}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "tclin914",
+      "body": "> Could you also add a test where this causes a crash?\r\n\r\nThe trip count in scalable-predication.ll was changed from a constant to a variable, which would cause a crash without the changes in this PR."
+    },
+    {
+      "author": "tclin914",
+      "body": "> I see, could you just add a new function to test non-constant trip counts?\r\n\r\nDone. Thanks."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-26T08:57:09Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        1040,
+        1045
+      ],
+      [
+        1050,
+        1057
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        4861,
+        4867
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/scalable-predication.ll": [
+      [
+        5,
+        10
+      ],
+      [
+        54,
+        59
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "VPlanTransforms::addMinimumIterationCheck"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::expandSCEVs"
+    ]
+  }
+}

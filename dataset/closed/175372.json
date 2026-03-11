@@ -1,0 +1,1898 @@
+{
+  "pr_id": 175372,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175372",
+  "state": "closed",
+  "title": "ValueTracking: Account for undef in adjustKnownFPClassForSelectArm",
+  "author": "arsenm",
+  "base_commit": "d52c7da0863f0c777382de37b22960f824ac7f48",
+  "fix_commit": "4c11e6028f7d634bf5b7eda8d54e79117067a648",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex 81ac93374b475..e2b0d20c790a9 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -137,11 +137,21 @@ struct KnownFPClass {\n     return isKnownNever(fcPositive) && isKnownNeverLogicalNegZero(Mode);\n   }\n \n-  KnownFPClass intersectWith(const KnownFPClass &RHS) {\n-    return KnownFPClass(~(~KnownFPClasses & ~RHS.KnownFPClasses),\n+  KnownFPClass intersectWith(const KnownFPClass &RHS) const {\n+    return KnownFPClass(KnownFPClasses | RHS.KnownFPClasses,\n                         SignBit == RHS.SignBit ? SignBit : std::nullopt);\n   }\n \n+  KnownFPClass unionWith(const KnownFPClass &RHS) const {\n+    std::optional<bool> MergedSignBit;\n+    if (SignBit && !RHS.SignBit)\n+      MergedSignBit = SignBit;\n+    else if (!SignBit && RHS.SignBit)\n+      MergedSignBit = RHS.SignBit;\n+\n+    return KnownFPClass(KnownFPClasses & RHS.KnownFPClasses, MergedSignBit);\n+  }\n+\n   KnownFPClass &operator|=(const KnownFPClass &RHS) {\n     KnownFPClasses = KnownFPClasses | RHS.KnownFPClasses;\n \ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex ab64156e2d173..3dc321b28a060 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -4885,11 +4885,17 @@ void llvm::adjustKnownFPClassForSelectArm(KnownFPClass &Known, Value *Cond,\n                                           Value *Arm, bool Invert,\n                                           const SimplifyQuery &SQ,\n                                           unsigned Depth) {\n+\n+  KnownFPClass KnownSrc;\n   computeKnownFPClassFromCond(Arm, Cond,\n-                              /*CondIsTrue=*/!Invert, SQ.CxtI, Known,\n+                              /*CondIsTrue=*/!Invert, SQ.CxtI, KnownSrc,\n                               Depth + 1);\n-  // TODO: Do we need to check isGuaranteedNotToBeUndef, like the KnownBits\n-  // case?\n+  KnownSrc = KnownSrc.unionWith(Known);\n+  if (KnownSrc.isUnknown())\n+    return;\n+\n+  if (isGuaranteedNotToBeUndef(Arm, SQ.AC, SQ.CxtI, SQ.DT, Depth + 1))\n+    Known = KnownSrc;\n }\n \n void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "This needs to consider undef like the KnownBits case does.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass-implied-by-fcmp.ll",
+      "commands": [
+        "opt -S -passes=attributor -attributor-manifest-internal < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_assumed_ogt_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ogt_neg1(float noundef %arg) {\n  %ogt.neg1 = fcmp ogt float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %ogt.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_fabs_ueq_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_ueq_smallest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ueq.smallest.normal = fcmp ueq float %fabs.arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.ueq.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_ueq_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_ueq_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %ueq.1 = fcmp ueq float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %ueq.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_ole_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_ole_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %ole.1 = fcmp olt float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %ole.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_ule_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_ule_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ule.1 = fcmp ule float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.ule.1, float %arg, float %copysign\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_ult_1_to_0",
+          "test_body": "define float @clamp_is_ult_1_to_0(float noundef %arg) {\n  %is.ult.1 = fcmp olt float %arg, 1.000000e+00\n  %select = select i1 %is.ult.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_ult_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ult_1(float noundef %arg) {\n  %ult.1 = fcmp ult float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %ult.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_olt_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_olt_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %olt.1 = fcmp olt float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %olt.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_ule_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ule_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ule.neg1 = fcmp ule float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.ule.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_oeq_smallest_normal_known_pos",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_oeq_smallest_normal_known_pos(float nofpclass(ninf nzero nsub nnorm) %arg) {\n  %is.oeq.smallest.normal = fcmp oeq float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.oeq.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_ole_largest_denormal_0.0",
+          "test_body": "define float @clamp_ole_largest_denormal_0.0(float noundef %arg) {\n  %is.ole.largest.denormal = fcmp ole float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.ole.largest.denormal, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_une_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_une_1(float noundef %arg) {\n  %une.1 = fcmp une float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %une.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_uge_largest_denormal_0.0",
+          "test_body": "define float @clamp_uge_largest_denormal_0.0(float noundef %arg) {\n  %is.uge.largest.denormal = fcmp uge float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.uge.largest.denormal, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_uge_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_uge_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %uge.1 = fcmp ugt float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %uge.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_ogt_largest_denormal_0.0",
+          "test_body": "define float @clamp_ogt_largest_denormal_0.0(float noundef %arg) {\n  %is.ogt.largest.denormal = fcmp ogt float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.ogt.largest.denormal, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_one_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_one_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %one.1 = fcmp one float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %one.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_uge_1_to_1",
+          "test_body": "define float @clamp_is_uge_1_to_1(float noundef %arg) {\n  %is.ugt.1 = fcmp uge float %arg, 1.000000e+00\n  %select = select i1 %is.ugt.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_olt_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_olt_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.olt.smallest.normal = fcmp olt float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.olt.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_ugt_largest_denormal_0.0",
+          "test_body": "define float @clamp_ugt_largest_denormal_0.0(float noundef %arg) {\n  %is.ugt.largest.denormal = fcmp ugt float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.ugt.largest.denormal, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_true_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_true_ninf(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_oeq_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_oeq_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %oeq.1 = fcmp oeq float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %oeq.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_oeq_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_oeq_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.oeq.neg1 = fcmp oeq float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.oeq.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_oeq_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_oeq_neg1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %oeq.neg1 = fcmp oeq float %arg.fabs, -1.000000e+00\n  call void @llvm.assume(i1 %oeq.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ugt_neg1_to_0",
+          "test_body": "define float @clamp_is_ugt_neg1_to_0(float noundef %arg) {\n  %is.ugt.neg1 = fcmp ugt float %arg, -1.000000e+00\n  %select = select i1 %is.ugt.neg1, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_oeq_1_else_1",
+          "test_body": "define float @fcmp_oeq_1_else_1(float noundef %arg) {\n  %is.oeq.1 = fcmp oeq float %arg, 1.000000e+00\n  %select = select i1 %is.oeq.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_fabs_one_1_arg_else_0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_one_1_arg_else_0(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.one.1 = fcmp one float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.one.1, float %arg, float 0.000000e+00\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_uge_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_uge_1(float noundef %arg) {\n  %uge.1 = fcmp uge float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %uge.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_olt_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_olt_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.olt.neg1 = fcmp olt float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.olt.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_ole_1_to_0",
+          "test_body": "define float @clamp_is_ole_1_to_0(float noundef %arg) {\n  %is.ole.1 = fcmp ole float %arg, 1.000000e+00\n  %select = select i1 %is.ole.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_is_ugt_neg1_to_neg1",
+          "test_body": "define float @clamp_is_ugt_neg1_to_neg1(float noundef %arg) {\n  %is.ugt.neg1 = fcmp ugt float %arg, -1.000000e+00\n  %select = select i1 %is.ugt.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_false_n0",
+          "test_body": "define float @clamp_false_n0(float noundef %arg) {\n  %fcmp = fcmp false float %arg, -0.000000e+00\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "if_fcmp_one_0_arg_else_1",
+          "test_body": "define float @if_fcmp_one_0_arg_else_1(float noundef %arg) {\n  %is.one.0 = fcmp one float %arg, 0.000000e+00\n  %select = select i1 %is.one.0, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_oeq_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_oeq_1(float noundef %arg) {\n  %oeq.1 = fcmp oeq float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %oeq.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ult_neg1_to_neg1_commute",
+          "test_body": "define float @clamp_is_ult_neg1_to_neg1_commute(float noundef %arg) {\n  %is.oge.neg1 = fcmp oge float %arg, -1.000000e+00\n  %select = select i1 %is.oge.neg1, float %arg, float -1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_true_p0",
+          "test_body": "define float @clamp_true_p0(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0.000000e+00\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_uge_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_uge_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.uge.neg1 = fcmp uge float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.uge.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_one_1_1_else_arg",
+          "test_body": "define float @fcmp_one_1_1_else_arg(float noundef %arg) {\n  %is.one.1 = fcmp one float %arg, 1.000000e+00\n  %select = select i1 %is.one.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_one_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_one_1(float noundef %arg) {\n  %one.1 = fcmp one float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %one.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_true_n0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_true_n0(float noundef %arg) {\n  %fcmp = fcmp true float %arg, -0.000000e+00\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_ueq_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ueq_1(float noundef %arg) {\n  %ueq.1 = fcmp ueq float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %ueq.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_is_is_olt_smallest_normal_to_0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_is_is_olt_smallest_normal_to_0(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.olt.smallest.normal = fcmp olt float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.olt.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_oge_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_oge_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.oge.smallest.normal = fcmp oge float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.oge.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_fabs_une_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_une_smallest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.une.smallest.normal = fcmp une float %fabs.arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.une.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "if_fcmp_oeq_0_1_else_arg",
+          "test_body": "define float @if_fcmp_oeq_0_1_else_arg(float noundef %arg) {\n  %is.oeq.0 = fcmp oeq float %arg, 0.000000e+00\n  %select = select i1 %is.oeq.0, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_one_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_one_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.one.smallest.normal = fcmp one float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.one.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_false_nan",
+          "test_body": "define float @clamp_false_nan(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0x7FF8000000000000\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_is_olt_neg1_to_neg1",
+          "test_body": "define float @clamp_is_olt_neg1_to_neg1(float noundef %arg) {\n  %is.olt.neg1 = fcmp olt float %arg, -1.000000e+00\n  %select = select i1 %is.olt.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_fabs_oeq_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_oeq_smallest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.oeq.smallest.normal = fcmp oeq float %fabs.arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.oeq.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_false_p0",
+          "test_body": "define float @clamp_false_p0(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0.000000e+00\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_fabs_false_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_false_pinf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp false float %fabs, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_ueq_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_ueq_smallest_normal(float noundef %arg) {\n  %is.ueq.smallest.normal = fcmp ueq float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.ueq.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_ole_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ole_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ole.smallest.normal = fcmp ole float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.ole.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_olt_neg1_to_neg1_commute",
+          "test_body": "define float @clamp_is_olt_neg1_to_neg1_commute(float noundef %arg) {\n  %is.uge.neg1 = fcmp uge float %arg, -1.000000e+00\n  %select = select i1 %is.uge.neg1, float %arg, float -1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_ugt_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ugt_neg1(float noundef %arg) {\n  %ugt.neg1 = fcmp ugt float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %ugt.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_une_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_une_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %une.1 = fcmp one float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %une.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_true_pinf_0.0",
+          "test_body": "define float @clamp_true_pinf_0.0(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0x7FF0000000000000\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_oge_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_oge_1(float noundef %arg) {\n  %oge.1 = fcmp ogt float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %oge.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ogt_neg1_to_neg1",
+          "test_body": "define float @clamp_is_ogt_neg1_to_neg1(float noundef %arg) {\n  %is.ogt.neg1 = fcmp ogt float %arg, -1.000000e+00\n  %select = select i1 %is.ogt.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_oge_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_oge_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.oge.1 = fcmp oge float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.oge.1, float %copysign, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_olt_largest_denormal_0.0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_olt_largest_denormal_0.0(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.fabs.olt.largest.denormal = fcmp olt float %fabs.arg, 0x380FFFFFC0000000\n  %select = select i1 %is.fabs.olt.largest.denormal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_une_1_1_else_arg",
+          "test_body": "define float @fcmp_une_1_1_else_arg(float noundef %arg) {\n  %is.une.1 = fcmp une float %arg, 1.000000e+00\n  %select = select i1 %is.une.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_ord_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_ord_smallest_normal(float noundef %arg) {\n  %is.ord.smallest.normal = fcmp ord float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.ord.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_ult_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_ult_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ult.1 = fcmp ult float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.ult.1, float %arg, float %copysign\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "if_fcmp_one_0_1_else_arg",
+          "test_body": "define float @if_fcmp_one_0_1_else_arg(float noundef %arg) {\n  %is.one.0 = fcmp one float %arg, 0.000000e+00\n  %select = select i1 %is.one.0, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_fabs_ole_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_ole_ninf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp ole float %fabs, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_ogt_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_ogt_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ogt.1 = fcmp ogt float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.ogt.1, float %copysign, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_is_ogt_largest_normal_to_largest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_is_ogt_largest_normal_to_largest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ogt.largest.normal = fcmp ogt float %fabs.arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.ogt.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_fabs_ord_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_ord_smallest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ord.smallest.normal = fcmp ord float %fabs.arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.ord.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_ole_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_ole_ninf(float noundef %arg) {\n  %fcmp = fcmp ole float %arg, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_is_is_ole_smallest_normal_to_0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_is_is_ole_smallest_normal_to_0(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ole.smallest.normal = fcmp ole float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.ole.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_one_neg1_else_neg1",
+          "test_body": "define float @fcmp_one_neg1_else_neg1(float noundef %arg) {\n  %is.one.neg1 = fcmp one float %arg, -1.000000e+00\n  %select = select i1 %is.one.neg1, float %arg, float -1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "if_fcmp_oeq_1_0_else_arg",
+          "test_body": "define float @if_fcmp_oeq_1_0_else_arg(float noundef %arg) {\n  %is.oeq.1 = fcmp oeq float %arg, 1.000000e+00\n  %select = select i1 %is.oeq.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_ole_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_ole_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ole.1 = fcmp ole float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.ole.1, float %arg, float %copysign\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_uge_largest_normal_to_largest_normal",
+          "test_body": "define float @clamp_is_uge_largest_normal_to_largest_normal(float noundef %arg) {\n  %is.uge.largest.normal = fcmp uge float %arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.uge.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_one_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_one_neg1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %one.neg1 = fcmp one float %arg.fabs, -1.000000e+00\n  call void @llvm.assume(i1 %one.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_ole_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ole_neg1(float noundef %arg) {\n  %ole.neg1 = fcmp ole float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %ole.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "fcmp_fabs_oeq_1_else_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_oeq_1_else_1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.oeq.1 = fcmp oeq float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.oeq.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_oge_largest_normal_to_largest_normal",
+          "test_body": "define float @clamp_is_oge_largest_normal_to_largest_normal(float noundef %arg) {\n  %is.oge.largest.normal = fcmp oge float %arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.oge.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_false_n0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_false_n0(float noundef %arg) {\n  %fcmp = fcmp false float %arg, -0.000000e+00\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_ogt_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ogt_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ogt.smallest.normal = fcmp ogt float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.ogt.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_ole_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ole_1(float noundef %arg) {\n  %ole.1 = fcmp ole float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %ole.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_ule_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ule_1(float noundef %arg) {\n  %ule.1 = fcmp ule float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %ule.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_false_pinf_0.0",
+          "test_body": "define float @clamp_false_pinf_0.0(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0x7FF0000000000000\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_true_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_true_pinf(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_ugt_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_ugt_pinf(float noundef %arg) {\n  %fcmp = fcmp ugt float %arg, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_oge_largest_denormal_0.0",
+          "test_body": "define float @clamp_oge_largest_denormal_0.0(float noundef %arg) {\n  %is.oge.largest.denormal = fcmp oge float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.oge.largest.denormal, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_une_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_une_neg1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %une.neg1 = fcmp une float %arg.fabs, -1.000000e+00\n  call void @llvm.assume(i1 %une.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_ogt_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_ogt_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %ogt.1 = fcmp ogt float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %ogt.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ugt_1_to_1_commute",
+          "test_body": "define float @clamp_is_ugt_1_to_1_commute(float noundef %arg) {\n  %is.ole.1 = fcmp ole float %arg, 1.000000e+00\n  %select = select i1 %is.ole.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_ugt_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ugt_1(float noundef %arg) {\n  %ugt.1 = fcmp ugt float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %ugt.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_une_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_une_neg1(float noundef %arg) {\n  %une.neg1 = fcmp une float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %une.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_fabs_true_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_true_ninf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp true float %fabs, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_fabs_one_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_one_smallest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.one.smallest.normal = fcmp one float %fabs.arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.one.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ogt_1_to_1_commute",
+          "test_body": "define float @clamp_is_ogt_1_to_1_commute(float noundef %arg) {\n  %is.ule.1 = fcmp ule float %arg, 1.000000e+00\n  %select = select i1 %is.ule.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_oeq_1_else_0",
+          "test_body": "define float @fcmp_oeq_1_else_0(float noundef %arg) {\n  %is.oeq.1 = fcmp oeq float %arg, 1.000000e+00\n  %select = select i1 %is.oeq.1, float 1.000000e+00, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_oeq_neg1_else_neg1",
+          "test_body": "define float @fcmp_oeq_neg1_else_neg1(float noundef %arg) {\n  %is.oeq.neg1 = fcmp oeq float %arg, -1.000000e+00\n  %select = select i1 %is.oeq.neg1, float %arg, float -1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_is_ult_1_to_1_commute",
+          "test_body": "define float @clamp_is_ult_1_to_1_commute(float noundef %arg) {\n  %is.oge.1 = fcmp oge float %arg, 1.000000e+00\n  %select = select i1 %is.oge.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_is_ule_1_to_1",
+          "test_body": "define float @clamp_is_ule_1_to_1(float noundef %arg) {\n  %is.ule.1 = fcmp ule float %arg, 1.000000e+00\n  %select = select i1 %is.ule.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "if_fcmp_une_0_arg_else_1",
+          "test_body": "define float @if_fcmp_une_0_arg_else_1(float noundef %arg) {\n  %is.une.0 = fcmp une float %arg, 0.000000e+00\n  %select = select i1 %is.une.0, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_ult_largest_denormal_0.0",
+          "test_body": "define float @clamp_ult_largest_denormal_0.0(float noundef %arg) {\n  %is.ult.largest.denormal = fcmp ult float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.ult.largest.denormal, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_is_ole_1_to_1",
+          "test_body": "define float @clamp_is_ole_1_to_1(float noundef %arg) {\n  %is.ole.1 = fcmp ole float %arg, 1.000000e+00\n  %select = select i1 %is.ole.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_fabs_ueq_1_0_else_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_ueq_1_0_else_arg(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ueq.1 = fcmp ueq float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.ueq.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_une_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_une_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.une.neg1 = fcmp une float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.une.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_une_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_une_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.une.smallest.normal = fcmp une float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.une.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_fabs_oeq_1_0_else_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_oeq_1_0_else_arg(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.oeq.1 = fcmp oeq float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.oeq.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_false_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_false_smallest_normal(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_ule_largest_denormal_0.0",
+          "test_body": "define float @clamp_ule_largest_denormal_0.0(float noundef %arg) {\n  %is.ule.largest.denormal = fcmp ule float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.ule.largest.denormal, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_ult_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ult_neg1(float noundef %arg) {\n  %ult.neg1 = fcmp ult float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %ult.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_olt_1_to_0",
+          "test_body": "define float @clamp_is_olt_1_to_0(float noundef %arg) {\n  %is.olt.1 = fcmp olt float %arg, 1.000000e+00\n  %select = select i1 %is.olt.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_oeq_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_oeq_smallest_normal(float noundef %arg) {\n  %is.oeq.smallest.normal = fcmp oeq float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.oeq.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_true_smallest_normal_0.0",
+          "test_body": "define float @clamp_true_smallest_normal_0.0(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0x3810000000000000\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_true_p0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_true_p0(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_ueq_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ueq_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ueq.smallest.normal = fcmp ueq float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.ueq.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_oeq_largest_denormal_arg_else_0.0",
+          "test_body": "define float @fcmp_oeq_largest_denormal_arg_else_0.0(float noundef %arg) {\n  %is.oeq.largest.denormal = fcmp oeq float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.oeq.largest.denormal, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_oge_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_oge_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.oge.neg1 = fcmp oge float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.oge.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_ole_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ole_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ole.neg1 = fcmp ole float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.ole.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_one_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_one_neg1(float noundef %arg) {\n  %one.neg1 = fcmp one float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %one.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_oge_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_oge_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %oge.1 = fcmp oge float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %oge.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_oge_1_to_1_commute",
+          "test_body": "define float @clamp_is_oge_1_to_1_commute(float %arg) {\n  %is.ult.1 = fcmp ult float %arg, 1.000000e+00\n  %select = select i1 %is.ult.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_ueq_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ueq_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ueq.neg1 = fcmp ueq float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.ueq.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_fabs_one_1_neg2_else_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_one_1_neg2_else_arg(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.one.1 = fcmp one float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.one.1, float -2.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_une_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_une_smallest_normal(float noundef %arg) {\n  %is.une.smallest.normal = fcmp une float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.une.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_fabs_ole_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_ole_pinf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp ole float %fabs, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "fcmp_fabs_one_1_0_else_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_one_1_0_else_arg(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.one.1 = fcmp one float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.one.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_uge_known_negative",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_uge_known_negative(float %arg, float %unknown) {\n  %known.positive = call float @llvm.fabs.f32(float %unknown)\n  %known.negative = fneg float %known.positive\n  %uge.known.negative = fcmp uge float %arg, %known.negative\n  call void @llvm.assume(i1 %uge.known.negative)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ogt_1_to_1",
+          "test_body": "define float @clamp_is_ogt_1_to_1(float noundef %arg) {\n  %is.ogt.1 = fcmp ogt float %arg, 1.000000e+00\n  %select = select i1 %is.ogt.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_ugt_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_ugt_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ugt.1 = fcmp ugt float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.ugt.1, float %copysign, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_ogt_largest_normal_to_largest_normal",
+          "test_body": "define float @clamp_is_ogt_largest_normal_to_largest_normal(float noundef %arg) {\n  %is.ogt.largest.normal = fcmp ogt float %arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.ogt.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_fabs_uno_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_uno_smallest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.uno.smallest.normal = fcmp uno float %fabs.arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.uno.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_ogt_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ogt_1(float noundef %arg) {\n  %ogt.1 = fcmp ogt float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %ogt.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_olt_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_olt_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.olt.1 = fcmp olt float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.olt.1, float %arg, float %copysign\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_is_uge_largest_normal_to_largest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_is_uge_largest_normal_to_largest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ugt.largest.normal = fcmp uge float %fabs.arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.ugt.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_false_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_false_pinf(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_true_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_true_smallest_normal(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_olt_1_to_1",
+          "test_body": "define float @clamp_is_olt_1_to_1(float noundef %arg) {\n  %is.olt.1 = fcmp olt float %arg, 1.000000e+00\n  %select = select i1 %is.olt.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_is_olt_1_to_1_commute",
+          "test_body": "define float @clamp_is_olt_1_to_1_commute(float noundef %arg) {\n  %is.uge.1 = fcmp uge float %arg, 1.000000e+00\n  %select = select i1 %is.uge.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_ule_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_ule_neg1(float noundef %arg) {\n  %ule.neg1 = fcmp ule float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %ule.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ult_1_to_1",
+          "test_body": "define float @clamp_is_ult_1_to_1(float noundef %arg) {\n  %is.ult.1 = fcmp ult float %arg, 1.000000e+00\n  %select = select i1 %is.ult.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_ule_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_ule_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %ule.1 = fcmp ule float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %ule.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_ole_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_ole_pinf(float noundef %arg) {\n  %fcmp = fcmp ole float %arg, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_false_smallest_normal_0.0",
+          "test_body": "define float @clamp_false_smallest_normal_0.0(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0x3810000000000000\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_false_ninf_0.0",
+          "test_body": "define float @clamp_false_ninf_0.0(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0xFFF0000000000000\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_is_ugt_largest_normal_to_largest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_is_ugt_largest_normal_to_largest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.ugt.largest.normal = fcmp ugt float %fabs.arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.ugt.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_false_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_false_ninf(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_oge_1_to_1",
+          "test_body": "define float @clamp_is_oge_1_to_1(float noundef %arg) {\n  %is.oge.1 = fcmp oge float %arg, 1.000000e+00\n  %select = select i1 %is.oge.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_assumed_olt_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_olt_neg1(float noundef %arg) {\n  %olt.neg1 = fcmp olt float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %olt.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_false_p0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_false_p0(float noundef %arg) {\n  %fcmp = fcmp false float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ole_1_to_0_commute",
+          "test_body": "define float @clamp_is_ole_1_to_0_commute(float noundef %arg) {\n  %is.ugt.1 = fcmp ugt float %arg, 1.000000e+00\n  %select = select i1 %is.ugt.1, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_ult_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ult_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ult.neg1 = fcmp ult float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.ult.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_olt_largest_denormal_0.0",
+          "test_body": "define float @clamp_olt_largest_denormal_0.0(float noundef %arg) {\n  %is.olt.largest.denormal = fcmp olt float %arg, 0x380FFFFFC0000000\n  %select = select i1 %is.olt.largest.denormal, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_ole_largest_denormal_0.0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ole_largest_denormal_0.0(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.fabs.ole.largest.denormal = fcmp ole float %fabs.arg, 0x380FFFFFC0000000\n  %select = select i1 %is.fabs.ole.largest.denormal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_ogt_neg1_to_0",
+          "test_body": "define float @clamp_is_ogt_neg1_to_0(float noundef %arg) {\n  %is.ogt.neg1 = fcmp ogt float %arg, -1.000000e+00\n  %select = select i1 %is.ogt.neg1, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_ueq_1_else_0",
+          "test_body": "define float @fcmp_ueq_1_else_0(float noundef %arg) {\n  %is.ueq.1 = fcmp ueq float %arg, 1.000000e+00\n  %select = select i1 %is.ueq.1, float 1.000000e+00, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_true_n0",
+          "test_body": "define float @clamp_true_n0(float noundef %arg) {\n  %fcmp = fcmp true float %arg, -0.000000e+00\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_one_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_one_smallest_normal(float noundef %arg) {\n  %is.one.smallest.normal = fcmp one float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.one.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_ugt_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_ugt_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %ugt.1 = fcmp ugt float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %ugt.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ugt_largest_normal_to_largest_normal",
+          "test_body": "define float @clamp_is_ugt_largest_normal_to_largest_normal(float noundef %arg) {\n  %is.ugt.largest.normal = fcmp ugt float %arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.ugt.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_value_uge_1_to_1_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_fabs_value_uge_1_to_1_copysign(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.uge.1 = fcmp ugt float %fabs.arg, 1.000000e+00\n  %copysign = call float @llvm.copysign.f32(float 1.000000e+00, float %arg)\n  %select = select i1 %fabs.is.uge.1, float %copysign, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_ugt_1_to_1",
+          "test_body": "define float @clamp_is_ugt_1_to_1(float noundef %arg) {\n  %is.ugt.1 = fcmp ugt float %arg, 1.000000e+00\n  %select = select i1 %is.ugt.1, float 1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_fabs_une_1_0_else_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_une_1_0_else_arg(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.une.1 = fcmp une float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.une.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_uge_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_uge_neg1(float noundef %arg) {\n  %uge.neg1 = fcmp uge float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %uge.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_ogt_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ogt_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ogt.neg1 = fcmp ogt float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.ogt.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_true_ninf_0.0",
+          "test_body": "define float @clamp_true_ninf_0.0(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0xFFF0000000000000\n  %select = select i1 %fcmp, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_fabs_ugt_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_ugt_ninf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp ugt float %fabs, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_fabs_ugt_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_ugt_pinf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp ugt float %fabs, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_is_oge_largest_normal_to_largest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_is_oge_largest_normal_to_largest_normal(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %is.oge.largest.normal = fcmp oge float %fabs.arg, 0x47EFFFFFE0000000\n  %select = select i1 %is.oge.largest.normal, float 0x47EFFFFFE0000000, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_ult_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_ult_1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %ult.1 = fcmp ult float %arg.fabs, 1.000000e+00\n  call void @llvm.assume(i1 %ult.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_is_ult_neg1_to_neg1",
+          "test_body": "define float @clamp_is_ult_neg1_to_neg1(float noundef %arg) {\n  %is.ult.neg1 = fcmp ult float %arg, -1.000000e+00\n  %select = select i1 %is.ult.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_fabs_true_pinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_true_pinf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp true float %fabs, 0x7FF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_fabs_ueq_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @ret_assumed_fabs_ueq_neg1(float noundef %arg) {\n  %arg.fabs = call float @llvm.fabs.f32(float %arg)\n  %ueq.neg1 = fcmp ueq float %arg.fabs, -1.000000e+00\n  call void @llvm.assume(i1 %ueq.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_true_nan",
+          "test_body": "define float @clamp_true_nan(float noundef %arg) {\n  %fcmp = fcmp true float %arg, 0x7FF8000000000000\n  %select = select i1 %fcmp, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "fcmp_fabs_une_1_arg_else_0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fcmp_fabs_une_1_arg_else_0(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.une.1 = fcmp une float %fabs.arg, 1.000000e+00\n  %select = select i1 %fabs.is.une.1, float %arg, float 0.000000e+00\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_ule_1_to_0",
+          "test_body": "define float @clamp_is_ule_1_to_0(float noundef %arg) {\n  %is.ule.1 = fcmp ole float %arg, 1.000000e+00\n  %select = select i1 %is.ule.1, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_ugt_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_ugt_ninf(float noundef %arg) {\n  %fcmp = fcmp ugt float %arg, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_ugt_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_ugt_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.ugt.neg1 = fcmp ugt float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.ugt.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_fabs_false_ninf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\ndefine float @assume_fabs_false_ninf(float noundef %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %fcmp = fcmp false float %fabs, 0xFFF0000000000000\n  call void @llvm.assume(i1 %fcmp)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "if_fcmp_one_1_arg_else_0",
+          "test_body": "define float @if_fcmp_one_1_arg_else_0(float noundef %arg) {\n  %is.one.1 = fcmp one float %arg, 1.000000e+00\n  %select = select i1 %is.one.1, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_fabs_one_neg1_to_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_one_neg1_to_neg1(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float %arg)\n  %fabs.is.one.neg1 = fcmp one float %fabs.arg, -1.000000e+00\n  %select = select i1 %fabs.is.one.neg1, float -1.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_assumed_oge_neg1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_oge_neg1(float noundef %arg) {\n  %oge.neg1 = fcmp ogt float %arg, -1.000000e+00\n  call void @llvm.assume(i1 %oge.neg1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "ret_assumed_olt_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @ret_assumed_olt_1(float noundef %arg) {\n  %olt.1 = fcmp olt float %arg, 1.000000e+00\n  call void @llvm.assume(i1 %olt.1)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "clamp_fabs_oeq_smallest_normal_to_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_fabs_oeq_smallest_normal_to_zero(float noundef %arg) {\n  %fabs.arg = call float @llvm.fabs.f32(float noundef %arg)\n  %is.oeq.smallest.normal = fcmp oeq float %fabs.arg, 0x3810000000000000\n  %select = select i1 %is.oeq.smallest.normal, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_one_1_else_1",
+          "test_body": "define float @fcmp_one_1_else_1(float noundef %arg) {\n  %is.one.1 = fcmp one float %arg, 1.000000e+00\n  %select = select i1 %is.one.1, float %arg, float 1.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "assume_uno_smallest_normal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_uno_smallest_normal(float noundef %arg) {\n  %is.uno.smallest.normal = fcmp uno float %arg, 0x3810000000000000\n  call void @llvm.assume(i1 %is.uno.smallest.normal)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass-select.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "clamp_eq_pinf_to_pnormal",
+          "test_body": "define float @clamp_eq_pinf_to_pnormal(float %arg) {\n  %is.inf = fcmp oeq float %arg, 0x7FF0000000000000\n  %select = select i1 %is.inf, float 1.024000e+03, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_zero_to_inf",
+          "test_body": "define float @clamp_zero_to_inf(float %arg) {\n  %is.zero = fcmp oeq float %arg, 0.000000e+00\n  %select = select i1 %is.zero, float 0x7FF0000000000000, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_select_clamp_nan_to_zero_fpclass",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #0\n\ndefine float @ret_select_clamp_nan_to_zero_fpclass(float %arg) {\n  %is.nan = call i1 @llvm.is.fpclass.f32(float %arg, i32 3)\n  %select = select i1 %is.nan, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_eq_ninf_to_negnormal",
+          "test_body": "define float @clamp_eq_ninf_to_negnormal(float %arg) {\n  %is.inf = fcmp oeq float %arg, 0xFFF0000000000000\n  %select = select i1 %is.inf, float -1.024000e+03, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_select_clamp_nan_to_zero_ord",
+          "test_body": "define float @ret_select_clamp_nan_to_zero_ord(float %arg) {\n  %not.nan = fcmp ord float %arg, 0.000000e+00\n  %select = select i1 %not.nan, float %arg, float 0.000000e+00\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_select_clamp_nan_to_zero_uno",
+          "test_body": "define float @ret_select_clamp_nan_to_zero_uno(float noundef %arg) {\n  %is.nan = fcmp uno float %arg, 0.000000e+00\n  %select = select i1 %is.nan, float 0.000000e+00, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_denormal_to_poszero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_denormal_to_poszero(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.denorm.or.zero = fcmp olt float %fabs, 0x3810000000000000\n  %select = select i1 %is.denorm.or.zero, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_class_subnormal_or_inf_to_nan_swap",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #0\n\ndefine float @clamp_is_class_subnormal_or_inf_to_nan_swap(float %arg) {\n  %not.is.subnormal.or.inf = call i1 @llvm.is.fpclass.f32(float %arg, i32 363)\n  %select = select i1 %not.is.subnormal.or.inf, float %arg, float 0x7FF8000000000000\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_select_clamp_qnan_to_zero_fpclass",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #0\n\ndefine float @ret_select_clamp_qnan_to_zero_fpclass(float %arg) {\n  %is.nan = call i1 @llvm.is.fpclass.f32(float %arg, i32 2)\n  %select = select i1 %is.nan, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "isfinite_select_fabs_val_1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @isfinite_select_fabs_val_1(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %not.is.finite = fcmp uge float %fabs, 0x3810000000000000\n  %select = select i1 %not.is.finite, float 1.024000e+03, float %fabs\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_select_clamp_onlynans",
+          "test_body": "define float @ret_select_clamp_onlynans(float %arg) {\n  %not.nan = fcmp ord float %arg, 0.000000e+00\n  %select = select i1 %not.nan, float 0x7FF8000000000000, float %arg\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_eq_inf_to_pnormal",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_eq_inf_to_pnormal(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.inf = fcmp oeq float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.inf, float 1.024000e+03, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_is_class_subnormal_or_inf_to_nan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #0\n\ndefine float @clamp_is_class_subnormal_or_inf_to_nan(float %arg) {\n  %is.subnormal.or.inf = call i1 @llvm.is.fpclass.f32(float %arg, i32 660)\n  %select = select i1 %is.subnormal.or.inf, float 0x7FF8000000000000, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "isfinite_select_fabs_val_0",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @isfinite_select_fabs_val_0(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.finite = fcmp olt float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.finite, float %fabs, float 1.024000e+03\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_zero_to_only_inf",
+          "test_body": "define float @clamp_zero_to_only_inf(float %arg) {\n  %is.zero = fcmp oeq float %arg, 0.000000e+00\n  %select = select i1 %is.zero, float %arg, float 0x7FF0000000000000\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_only_denormal_or_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_only_denormal_or_zero(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.denorm.or.zero = fcmp olt float %fabs, 0x3810000000000000\n  %select = select i1 %is.denorm.or.zero, float %arg, float 0.000000e+00\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_select_nonan__noinf_nonan",
+          "test_body": "define float @ret_select_nonan__noinf_nonan(i1 %cond, float nofpclass(nan) %arg0, float nofpclass(nan inf) %arg1) {\n  %select = select i1 %cond, float %arg0, float %arg1\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_select_clamp_snan_to_zero_fpclass",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #0\n\ndefine float @ret_select_clamp_snan_to_zero_fpclass(float %arg) {\n  %is.nan = call i1 @llvm.is.fpclass.f32(float %arg, i32 1)\n  %select = select i1 %is.nan, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_denormal_to_negzero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_denormal_to_negzero(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.denorm.or.zero = fcmp olt float %fabs, 0x3810000000000000\n  %select = select i1 %is.denorm.or.zero, float -0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "not_clamp_inf_to_fabs",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @not_clamp_inf_to_fabs(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.inf = fcmp oeq float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.inf, float %arg, float %fabs\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_select_clamp_nan_to_zero_uno_returned_different_arg",
+          "test_body": "define float @ret_select_clamp_nan_to_zero_uno_returned_different_arg(float %arg0, float %arg1) {\n  %is.nan = fcmp uno float %arg0, 0.000000e+00\n  %select = select i1 %is.nan, float 0.000000e+00, float %arg1\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "clamp_denormal_to_zero_copysign",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.copysign.f32(float, float) #0\n\ndefine float @clamp_denormal_to_zero_copysign(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.denorm.or.zero = fcmp olt float %fabs, 0x3810000000000000\n  %zero = call float @llvm.copysign.f32(float 0.000000e+00, float %arg)\n  %select = select i1 %is.denorm.or.zero, float %zero, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_nonfinite_to_normal_olt",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_nonfinite_to_normal_olt(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.finite = fcmp olt float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.finite, float %arg, float 1.024000e+03\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_inf_to_fabs",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_inf_to_fabs(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.inf = fcmp oeq float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.inf, float %fabs, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_eq_inf_to_nan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_eq_inf_to_nan(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.inf = fcmp oeq float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.inf, float 0x7FF8000000000000, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "assume_returned_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_returned_arg(float noundef %arg) {\n  %ord = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %ord)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_select_condition_not_nan_commute",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_select_condition_not_nan_commute(float noundef %arg) {\n  %uno = fcmp uno float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %uno)\n  %select = select i1 %uno, float %arg, float 0.000000e+00\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_load",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_load(ptr %ptr) {\n  %val = load float, ptr %ptr, align 4\n  %ord = fcmp ord float %val, 0.000000e+00\n  call void @llvm.assume(i1 %ord)\n  ret float %val\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "assume_select_condition_not_nan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_select_condition_not_nan(float noundef %arg) {\n  %ord = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %ord)\n  %select = select i1 %ord, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero__output_only_is_dynamic",
+          "test_body": "define float @fadd_double_no_zero__output_only_is_dynamic(float noundef nofpclass(zero) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,ieee\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-fp.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fmax_fmax_zero_mismatch",
+          "test_body": "define float @fmax_fmax_zero_mismatch(float noundef %x) {\n  %cmp1 = fcmp ogt float %x, 0.000000e+00\n  %max1 = select i1 %cmp1, float %x, float -0.000000e+00\n  %cmp2 = fcmp ogt float 0.000000e+00, %max1\n  %max2 = select i1 %cmp2, float -0.000000e+00, float %max1\n  ret float %max2\n}\n"
+        },
+        {
+          "test_name": "fmin_fmin_zero_mismatch",
+          "test_body": "define float @fmin_fmin_zero_mismatch(float %x) {\n  %cmp1 = fcmp olt float %x, -0.000000e+00\n  %min1 = select i1 %cmp1, float %x, float 0.000000e+00\n  %cmp2 = fcmp olt float %min1, 0.000000e+00\n  %min2 = select i1 %cmp2, float %min1, float 0.000000e+00\n  ret float %min2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_nofpclass_nan_negatives__select_clamp_pos_to_zero__maybe_undef",
+          "test_body": "define nofpclass(nan ninf nzero nsub nnorm) float @ret_nofpclass_nan_negatives__select_clamp_pos_to_zero__maybe_undef(float %x) {\n  %is.gt.zero = fcmp ogt float %x, 0.000000e+00\n  %select = select i1 %is.gt.zero, float 0.000000e+00, float %x\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "ret_nofpclass_nan_negatives_zero__select_clamp_pos_to_zero",
+          "test_body": "define nofpclass(nan ninf zero nsub nnorm) float @ret_nofpclass_nan_negatives_zero__select_clamp_pos_to_zero(float %x) {\n  %is.gt.zero = fcmp ogt float %x, 0.000000e+00\n  %select = select i1 %is.gt.zero, float 0.000000e+00, float %x\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "exp_select_must_be_0",
+          "test_body": "define nofpclass(nan) float @exp_select_must_be_0(float noundef %arg, float nofpclass(inf sub norm) %zero.or.nan) {\n  %not.zero = fcmp one float %arg, 0.000000e+00\n  %select = select i1 %not.zero, float %zero.or.nan, float %arg\n  %exp = call float @llvm.exp.f32(float %select)\n  ret float %exp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.exp.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "exp_select_must_be_0_commute",
+          "test_body": "define nofpclass(nan) float @exp_select_must_be_0_commute(float noundef %arg, float nofpclass(inf sub norm) %zero.or.nan) {\n  %is.zero = fcmp oeq float %arg, 0.000000e+00\n  %select = select i1 %is.zero, float %arg, float %zero.or.nan\n  %exp = call float @llvm.exp.f32(float %select)\n  ret float %exp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.exp.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nofpclass_nan_negatives__select_clamp_pos_to_zero",
+          "test_body": "define nofpclass(nan ninf nzero nsub nnorm) float @ret_nofpclass_nan_negatives__select_clamp_pos_to_zero(float noundef %x) {\n  %is.gt.zero = fcmp ogt float %x, 0.000000e+00\n  %select = select i1 %is.gt.zero, float 0.000000e+00, float %x\n  ret float %select\n}\n"
+        },
+        {
+          "test_name": "partially_defined_0_splat_to_poison",
+          "test_body": "define nofpclass(zero) <3 x float> @partially_defined_0_splat_to_poison() {\n  ret <3 x float> <float 0.000000e+00, float 0.000000e+00, float poison>\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175974** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175974?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175382** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175382?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175381** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175381?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175380** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175380?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175372** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175372?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175372?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {undef deprecator}-->\n\n\n:warning: undef deprecator found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff -U0 --pickaxe-regex -S '([^a-zA-Z0-9#_-]undef([^a-zA-Z0-9_-]|$)|UndefValue::get)' 'HEAD~1' HEAD llvm/include/llvm/Support/KnownFPClass.h llvm/lib/Analysis/ValueTracking.cpp llvm/test/Transforms/Attributor/nofpclass-implied-by-fcmp.ll llvm/test/Transforms/Attributor/nofpclass-select.ll llvm/test/Transforms/Attributor/nofpclass.ll llvm/test/Transforms/InstCombine/minmax-fp.ll llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll\n``````````\n\n</details>\n\n\nThe following files introduce new uses of undef:\n - llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll\n\n[Undef](https://llvm.org/docs/LangRef.html#undefined-values) is now deprecated and should only be used in the rare cases where no replacement is possible. For example, a load of uninitialized memory yields `undef`. You should use `poison` values for placeholders instead.\n\nIn tests, avoid using `undef` and having tests that trigger undefined behavior. If you need an operand with some unimportant value, you can add a new argument to the function and use that instead.\n\nFor example, this is considered a bad practice:\n```llvm\ndefine void @fn() {\n  ...\n  br i1 undef, ...\n}\n```\n\nPlease use the following instead:\n```llvm\ndefine void @fn(i1 %cond) {\n  ...\n  br i1 %cond, ...\n}\n```\n\nPlease refer to the [Undefined Behavior Manual](https://llvm.org/docs/UndefinedBehavior.html) for more information.\n\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 188421 tests passed\n* 5001 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 129402 tests passed\n* 2863 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM IDS CHECK COMMENT-->\n\n:white_check_mark: With the latest revision this PR passed the LLVM ABI annotation checker."
+    },
+    {
+      "author": "arsenm",
+      "body": "> LGTM w/ test/warnings fixed\r\n\r\nThe warning was on existing code but that was already fixed "
+    },
+    {
+      "author": "arsenm",
+      "body": "Except floating-point-arithmetic.ll re-broke... "
+    }
+  ],
+  "knowledge_cutoff": "2026-01-10T17:52:14Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        137,
+        147
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        4885,
+        4895
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass-implied-by-fcmp.ll": [
+      [
+        10,
+        18
+      ],
+      [
+        22,
+        30
+      ],
+      [
+        35,
+        43
+      ],
+      [
+        48,
+        56
+      ],
+      [
+        61,
+        69
+      ],
+      [
+        74,
+        80
+      ],
+      [
+        86,
+        94
+      ],
+      [
+        99,
+        107
+      ],
+      [
+        112,
+        120
+      ],
+      [
+        125,
+        133
+      ],
+      [
+        138,
+        146
+      ],
+      [
+        151,
+        159
+      ],
+      [
+        164,
+        172
+      ],
+      [
+        177,
+        185
+      ],
+      [
+        190,
+        198
+      ],
+      [
+        203,
+        211
+      ],
+      [
+        216,
+        224
+      ],
+      [
+        229,
+        237
+      ],
+      [
+        242,
+        250
+      ],
+      [
+        255,
+        263
+      ],
+      [
+        268,
+        276
+      ],
+      [
+        281,
+        289
+      ],
+      [
+        294,
+        302
+      ],
+      [
+        307,
+        315
+      ],
+      [
+        320,
+        328
+      ],
+      [
+        333,
+        341
+      ],
+      [
+        350,
+        358
+      ],
+      [
+        363,
+        371
+      ],
+      [
+        376,
+        384
+      ],
+      [
+        389,
+        397
+      ],
+      [
+        402,
+        410
+      ],
+      [
+        415,
+        423
+      ],
+      [
+        427,
+        435
+      ],
+      [
+        439,
+        447
+      ],
+      [
+        451,
+        459
+      ],
+      [
+        463,
+        471
+      ],
+      [
+        475,
+        483
+      ],
+      [
+        487,
+        495
+      ],
+      [
+        499,
+        507
+      ],
+      [
+        511,
+        519
+      ],
+      [
+        523,
+        532
+      ],
+      [
+        537,
+        546
+      ],
+      [
+        551,
+        560
+      ],
+      [
+        565,
+        574
+      ],
+      [
+        579,
+        588
+      ],
+      [
+        593,
+        602
+      ],
+      [
+        607,
+        616
+      ],
+      [
+        621,
+        630
+      ],
+      [
+        639,
+        647
+      ],
+      [
+        651,
+        659
+      ],
+      [
+        663,
+        671
+      ],
+      [
+        675,
+        683
+      ],
+      [
+        687,
+        695
+      ],
+      [
+        699,
+        707
+      ],
+      [
+        711,
+        719
+      ],
+      [
+        723,
+        731
+      ],
+      [
+        735,
+        743
+      ],
+      [
+        747,
+        756
+      ],
+      [
+        761,
+        770
+      ],
+      [
+        780,
+        791
+      ],
+      [
+        797,
+        808
+      ],
+      [
+        814,
+        825
+      ],
+      [
+        831,
+        842
+      ],
+      [
+        848,
+        859
+      ],
+      [
+        865,
+        876
+      ],
+      [
+        882,
+        893
+      ],
+      [
+        899,
+        910
+      ],
+      [
+        920,
+        928
+      ],
+      [
+        933,
+        941
+      ],
+      [
+        946,
+        954
+      ],
+      [
+        959,
+        967
+      ],
+      [
+        972,
+        981
+      ],
+      [
+        987,
+        996
+      ],
+      [
+        1002,
+        1011
+      ],
+      [
+        1017,
+        1026
+      ],
+      [
+        1036,
+        1045
+      ],
+      [
+        1052,
+        1061
+      ],
+      [
+        1067,
+        1076
+      ],
+      [
+        1082,
+        1091
+      ],
+      [
+        1096,
+        1105
+      ],
+      [
+        1110,
+        1119
+      ],
+      [
+        1124,
+        1147
+      ],
+      [
+        1152,
+        1161
+      ],
+      [
+        1166,
+        1175
+      ],
+      [
+        1184,
+        1192
+      ],
+      [
+        1195,
+        1203
+      ],
+      [
+        1206,
+        1215
+      ],
+      [
+        1220,
+        1229
+      ],
+      [
+        1234,
+        1243
+      ],
+      [
+        1248,
+        1257
+      ],
+      [
+        1262,
+        1270
+      ],
+      [
+        1273,
+        1281
+      ],
+      [
+        1284,
+        1292
+      ],
+      [
+        1295,
+        1304
+      ],
+      [
+        1309,
+        1318
+      ],
+      [
+        1323,
+        1331
+      ],
+      [
+        1338,
+        1346
+      ],
+      [
+        1350,
+        1358
+      ],
+      [
+        1362,
+        1370
+      ],
+      [
+        1374,
+        1382
+      ],
+      [
+        1386,
+        1394
+      ],
+      [
+        1398,
+        1406
+      ],
+      [
+        1410,
+        1418
+      ],
+      [
+        1422,
+        1430
+      ],
+      [
+        1434,
+        1443
+      ],
+      [
+        1448,
+        1457
+      ],
+      [
+        1462,
+        1471
+      ],
+      [
+        1476,
+        1485
+      ],
+      [
+        1490,
+        1499
+      ],
+      [
+        1504,
+        1513
+      ],
+      [
+        1518,
+        1527
+      ],
+      [
+        1532,
+        1541
+      ],
+      [
+        1546,
+        1554
+      ],
+      [
+        1558,
+        1566
+      ],
+      [
+        1570,
+        1578
+      ],
+      [
+        1582,
+        1590
+      ],
+      [
+        1594,
+        1602
+      ],
+      [
+        1606,
+        1614
+      ],
+      [
+        1618,
+        1626
+      ],
+      [
+        1630,
+        1638
+      ],
+      [
+        1642,
+        1650
+      ],
+      [
+        1654,
+        1662
+      ],
+      [
+        1666,
+        1674
+      ],
+      [
+        1678,
+        1686
+      ],
+      [
+        1690,
+        1698
+      ],
+      [
+        1702,
+        1710
+      ],
+      [
+        1714,
+        1723
+      ],
+      [
+        1728,
+        1737
+      ],
+      [
+        1742,
+        1751
+      ],
+      [
+        1756,
+        1765
+      ],
+      [
+        1770,
+        1778
+      ],
+      [
+        1782,
+        1791
+      ],
+      [
+        1796,
+        1805
+      ],
+      [
+        1810,
+        1818
+      ],
+      [
+        2255,
+        2263
+      ],
+      [
+        2267,
+        2275
+      ],
+      [
+        2279,
+        2287
+      ],
+      [
+        2291,
+        2299
+      ],
+      [
+        2303,
+        2311
+      ],
+      [
+        2315,
+        2323
+      ],
+      [
+        2327,
+        2336
+      ],
+      [
+        2341,
+        2350
+      ],
+      [
+        2355,
+        2364
+      ],
+      [
+        2369,
+        2378
+      ],
+      [
+        2383,
+        2392
+      ],
+      [
+        2397,
+        2406
+      ],
+      [
+        2427,
+        2435
+      ],
+      [
+        2439,
+        2447
+      ],
+      [
+        2451,
+        2459
+      ],
+      [
+        2463,
+        2471
+      ],
+      [
+        2475,
+        2484
+      ],
+      [
+        2489,
+        2497
+      ],
+      [
+        2501,
+        2510
+      ],
+      [
+        2515,
+        2523
+      ],
+      [
+        2531,
+        2539
+      ],
+      [
+        2543,
+        2551
+      ],
+      [
+        2555,
+        2563
+      ],
+      [
+        2566,
+        2574
+      ],
+      [
+        2577,
+        2585
+      ],
+      [
+        2587,
+        2595
+      ],
+      [
+        2597,
+        2605
+      ],
+      [
+        2607,
+        2615
+      ],
+      [
+        2618,
+        2626
+      ],
+      [
+        2629,
+        2637
+      ],
+      [
+        2640,
+        2648
+      ],
+      [
+        2650,
+        2658
+      ],
+      [
+        2660,
+        2668
+      ],
+      [
+        2674,
+        2682
+      ],
+      [
+        2686,
+        2694
+      ],
+      [
+        2698,
+        2706
+      ],
+      [
+        2709,
+        2717
+      ],
+      [
+        2720,
+        2728
+      ],
+      [
+        2731,
+        2739
+      ],
+      [
+        2742,
+        2750
+      ],
+      [
+        2753,
+        2761
+      ],
+      [
+        2763,
+        2771
+      ],
+      [
+        2773,
+        2781
+      ],
+      [
+        2783,
+        2791
+      ],
+      [
+        2793,
+        2801
+      ],
+      [
+        2803,
+        2811
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass-select.ll": [
+      [
+        64,
+        72
+      ],
+      [
+        77,
+        83
+      ],
+      [
+        89,
+        95
+      ],
+      [
+        101,
+        107
+      ],
+      [
+        115,
+        121
+      ],
+      [
+        129,
+        135
+      ],
+      [
+        141,
+        147
+      ],
+      [
+        153,
+        159
+      ],
+      [
+        179,
+        185
+      ],
+      [
+        193,
+        199
+      ],
+      [
+        207,
+        213
+      ],
+      [
+        221,
+        227
+      ],
+      [
+        235,
+        241
+      ],
+      [
+        251,
+        257
+      ],
+      [
+        265,
+        271
+      ],
+      [
+        279,
+        285
+      ],
+      [
+        293,
+        299
+      ],
+      [
+        305,
+        311
+      ],
+      [
+        317,
+        323
+      ],
+      [
+        329,
+        335
+      ],
+      [
+        341,
+        347
+      ],
+      [
+        353,
+        359
+      ],
+      [
+        365,
+        371
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass.ll": [
+      [
+        3630,
+        3647
+      ],
+      [
+        3662,
+        3671
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minmax-fp.ll": [
+      [
+        118,
+        124
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll": [
+      [
+        1009,
+        1017
+      ],
+      [
+        1019,
+        1024
+      ],
+      [
+        1517,
+        1525
+      ],
+      [
+        1530,
+        1538
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "cannotBeOrderedGreaterEqZero",
+      "intersectWith",
+      "operator|="
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "llvm::adjustKnownFPClassForSelectArm"
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass-implied-by-fcmp.ll": [
+      "assume_fabs_false_ninf",
+      "assume_false_ninf",
+      "assume_false_pinf",
+      "assume_true_n0",
+      "assume_true_p0",
+      "assume_true_smallest_normal",
+      "fcmp_fabs_oeq_1_0_else_arg",
+      "fcmp_fabs_oeq_1_else_1",
+      "fcmp_fabs_one_1_0_else_arg",
+      "fcmp_fabs_one_1_arg_else_0",
+      "fcmp_fabs_one_1_neg2_else_arg",
+      "fcmp_fabs_ueq_1_0_else_arg",
+      "fcmp_fabs_une_1_0_else_arg",
+      "fcmp_fabs_une_1_arg_else_0",
+      "if_fcmp_one_1_arg_else_0"
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass-select.ll": [
+      "clamp_denormal_to_negzero",
+      "clamp_denormal_to_poszero",
+      "clamp_denormal_to_zero_copysign",
+      "clamp_eq_inf_to_nan",
+      "clamp_eq_inf_to_pnormal",
+      "clamp_eq_ninf_to_negnormal",
+      "clamp_eq_pinf_to_pnormal",
+      "clamp_is_class_subnormal_or_inf_to_nan_swap",
+      "clamp_nonfinite_to_normal_olt",
+      "clamp_only_denormal_or_zero",
+      "clamp_zero_to_inf",
+      "clamp_zero_to_only_inf",
+      "isfinite_select_fabs_val_0",
+      "isfinite_select_fabs_val_1",
+      "not_clamp_inf_to_fabs",
+      "ret_select_clamp_nan_to_zero_fpclass",
+      "ret_select_clamp_nan_to_zero_ord",
+      "ret_select_clamp_nan_to_zero_uno",
+      "ret_select_clamp_onlynans",
+      "ret_select_clamp_qnan_to_zero_fpclass",
+      "ret_select_clamp_snan_to_zero_fpclass"
+    ],
+    "llvm/test/Transforms/InstCombine/minmax-fp.ll": [
+      "fmax_fmax_zero_mismatch"
+    ]
+  }
+}

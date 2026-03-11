@@ -1,0 +1,358 @@
+{
+  "pr_id": 175194,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175194",
+  "state": "closed",
+  "title": "[VectorCombine] Fold vector sign-bit checks",
+  "author": "SavchenkoValeriy",
+  "base_commit": "a71ca9b27c675a6b37c64089f6d742206ad7e8d0",
+  "fix_commit": "2be0b54f5c556e8dfbb432407c77cfda05a6a2c8",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 708763a7eb982..a103b8ddaf608 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -147,6 +147,7 @@ class VectorCombine {\n   bool foldShuffleFromReductions(Instruction &I);\n   bool foldShuffleChainsToReduce(Instruction &I);\n   bool foldCastFromReductions(Instruction &I);\n+  bool foldSignBitReductionCmp(Instruction &I);\n   bool foldSelectShuffle(Instruction &I, bool FromReduction = false);\n   bool foldInterleaveIntrinsics(Instruction &I);\n   bool shrinkType(Instruction &I);\n@@ -4175,6 +4176,202 @@ bool VectorCombine::foldCastFromReductions(Instruction &I) {\n   return true;\n }\n \n+/// Fold:\n+///   icmp pred (reduce.{add,or,and,umax,umin}(signbit_extract(x))), C\n+/// into:\n+///   icmp sgt/slt (reduce.{or,umax,and,umin}(x)), -1/0\n+///\n+/// Sign-bit reductions produce values with known semantics:\n+///   - reduce.{or,umax}: 0 if no element is negative, 1 if any is\n+///   - reduce.{and,umin}: 1 if all elements are negative, 0 if any isn't\n+///   - reduce.add: count of negative elements (0 to NumElts)\n+///\n+/// We transform to a direct sign check on reduce.{or,umax} or\n+/// reduce.{and,umin} without explicit sign-bit extraction.\n+///\n+/// In spirit, it's similar to foldSignBitCheck in InstCombine.\n+bool VectorCombine::foldSignBitReductionCmp(Instruction &I) {\n+  CmpPredicate Pred;\n+  Value *ReduceOp;\n+  const APInt *CmpVal;\n+  if (!match(&I, m_ICmp(Pred, m_Value(ReduceOp), m_APInt(CmpVal))))\n+    return false;\n+\n+  auto *II = dyn_cast<IntrinsicInst>(ReduceOp);\n+  if (!II || !II->hasOneUse())\n+    return false;\n+\n+  Intrinsic::ID OrigIID = II->getIntrinsicID();\n+  switch (OrigIID) {\n+  case Intrinsic::vector_reduce_or:\n+  case Intrinsic::vector_reduce_umax:\n+  case Intrinsic::vector_reduce_and:\n+  case Intrinsic::vector_reduce_umin:\n+  case Intrinsic::vector_reduce_add:\n+    break;\n+  default:\n+    return false;\n+  }\n+\n+  Value *ReductionSrc = II->getArgOperand(0);\n+  if (!ReductionSrc->hasOneUse())\n+    return false;\n+\n+  auto *VecTy = dyn_cast<FixedVectorType>(ReductionSrc->getType());\n+  if (!VecTy)\n+    return false;\n+\n+  unsigned BitWidth = VecTy->getScalarSizeInBits();\n+  unsigned NumElts = VecTy->getNumElements();\n+\n+  // For reduce.add, the result is the count of negative elements\n+  // (0 to NumElts). This must fit in the scalar type without overflow.\n+  // Otherwise, reduce.add can wrap and identity doesn't hold.\n+  if (OrigIID == Intrinsic::vector_reduce_add && !isUIntN(BitWidth, NumElts))\n+    return false;\n+\n+  // Match sign-bit extraction: shr X, (bitwidth-1)\n+  Value *X;\n+  if (!match(ReductionSrc, m_Shr(m_Value(X), m_SpecificInt(BitWidth - 1))))\n+    return false;\n+\n+  // MaxVal: 1 for or/and/umax/umin, NumElts for add\n+  APInt MaxVal(CmpVal->getBitWidth(),\n+               OrigIID == Intrinsic::vector_reduce_add ? NumElts : 1);\n+\n+  // In addition to direct comparisons EQ 0, NE 0, EQ 1, NE 1, etc. we support\n+  // inequalities that can be interpreted as either EQ or NE considering a\n+  // rather narrow range of possible value of sign-bit reductions.\n+  bool IsEq;\n+  bool TestsHigh;\n+  if (ICmpInst::isEquality(Pred)) {\n+    // EQ/NE: comparison must be against 0 or MaxVal\n+    if (!CmpVal->isZero() && *CmpVal != MaxVal)\n+      return false;\n+    IsEq = Pred == ICmpInst::ICMP_EQ;\n+    TestsHigh = *CmpVal == MaxVal;\n+  } else if (ICmpInst::isLT(Pred) && *CmpVal == MaxVal) {\n+    // s/ult MaxVal -> ne MaxVal\n+    IsEq = false;\n+    TestsHigh = true;\n+  } else if (ICmpInst::isGT(Pred) && *CmpVal == MaxVal - 1) {\n+    // s/ugt MaxVal-1 -> eq MaxVal\n+    IsEq = true;\n+    TestsHigh = true;\n+  } else {\n+    return false;\n+  }\n+\n+  // For this fold we support four types of checks:\n+  //\n+  //   1. All lanes are negative - AllNeg\n+  //   2. All lanes are non-negative - AllNonNeg\n+  //   3. At least one negative lane - AnyNeg\n+  //   4. At least one non-negative lane - AnyNonNeg\n+  //\n+  // For each case, we can generate the following code:\n+  //\n+  //   1. AllNeg    - reduce.and/umin(X) < 0\n+  //   2. AllNonNeg -  reduce.or/umax(X) > -1\n+  //   3. AnyNeg    -  reduce.or/umax(X) < 0\n+  //   4. AnyNonNeg - reduce.and/umin(X) > -1\n+  //\n+  // The table below shows the aggregation of all supported cases\n+  // using these four cases.\n+  //\n+  //   Reduction   | == 0      | != 0      | == MAX    | != MAX\n+  //   ------------+-----------+-----------+-----------+-----------\n+  //   or/umax     | AllNonNeg | AnyNeg    | AnyNeg    | AllNonNeg\n+  //   and/umin    | AnyNonNeg | AllNeg    | AllNeg    | AnyNonNeg\n+  //   add         | AllNonNeg | AnyNeg    | AllNeg    | AnyNonNeg\n+  //\n+  // NOTE: MAX = 1 for or/and/umax/umin, and the vector size N for add\n+  //\n+  // For easier codegen and check inversion, we use the following encoding:\n+  //\n+  //   1. Bit-3 === requires or/umax (1) or and/umin (0) check\n+  //   2. Bit-2 === checks < 0 (1) or > -1 (0)\n+  //   3. Bit-1 === universal (1) or existential (0) check\n+  //\n+  //   AnyNeg    = 0b110: uses or/umax,  checks negative, any-check\n+  //   AllNonNeg = 0b101: uses or/umax,  checks non-neg,  all-check\n+  //   AnyNonNeg = 0b000: uses and/umin, checks non-neg,  any-check\n+  //   AllNeg    = 0b011: uses and/umin, checks negative, all-check\n+  //\n+  // XOR with 0b011 inverts the check (swaps all/any and neg/non-neg).\n+  //\n+  enum CheckKind : unsigned {\n+    AnyNonNeg = 0b000,\n+    AllNeg = 0b011,\n+    AllNonNeg = 0b101,\n+    AnyNeg = 0b110,\n+  };\n+  // Return true if we fold this check into or/umax and false for and/umin\n+  auto RequiresOr = [](CheckKind C) -> bool { return C & 0b100; };\n+  // Return true if we should check if result is negative and false otherwise\n+  auto IsNegativeCheck = [](CheckKind C) -> bool { return C & 0b010; };\n+  // Logically invert the check\n+  auto Invert = [](CheckKind C) { return CheckKind(C ^ 0b011); };\n+\n+  CheckKind Base;\n+  switch (OrigIID) {\n+  case Intrinsic::vector_reduce_or:\n+  case Intrinsic::vector_reduce_umax:\n+    Base = TestsHigh ? AnyNeg : AllNonNeg;\n+    break;\n+  case Intrinsic::vector_reduce_and:\n+  case Intrinsic::vector_reduce_umin:\n+    Base = TestsHigh ? AllNeg : AnyNonNeg;\n+    break;\n+  case Intrinsic::vector_reduce_add:\n+    Base = TestsHigh ? AllNeg : AllNonNeg;\n+    break;\n+  default:\n+    llvm_unreachable(\"Unexpected intrinsic\");\n+  }\n+\n+  CheckKind Check = IsEq ? Base : Invert(Base);\n+\n+  // Calculate old cost: shift + reduction\n+  InstructionCost OldCost =\n+      TTI.getInstructionCost(cast<Instruction>(ReductionSrc), CostKind);\n+  OldCost += TTI.getInstructionCost(II, CostKind);\n+\n+  auto PickCheaper = [&](Intrinsic::ID Arith, Intrinsic::ID MinMax) {\n+    InstructionCost ArithCost =\n+        TTI.getArithmeticReductionCost(getArithmeticReductionInstruction(Arith),\n+                                       VecTy, std::nullopt, CostKind);\n+    InstructionCost MinMaxCost =\n+        TTI.getMinMaxReductionCost(MinMax, VecTy, FastMathFlags(), CostKind);\n+    return ArithCost <= MinMaxCost ? std::make_pair(Arith, ArithCost)\n+                                   : std::make_pair(MinMax, MinMaxCost);\n+  };\n+\n+  // Choose output reduction based on encoding's MSB\n+  auto [NewIID, NewCost] = RequiresOr(Check)\n+                               ? PickCheaper(Intrinsic::vector_reduce_or,\n+                                             Intrinsic::vector_reduce_umax)\n+                               : PickCheaper(Intrinsic::vector_reduce_and,\n+                                             Intrinsic::vector_reduce_umin);\n+\n+  LLVM_DEBUG(dbgs() << \"Found sign-bit reduction cmp: \" << I << \"\\n  OldCost: \"\n+                    << OldCost << \" vs NewCost: \" << NewCost << \"\\n\");\n+\n+  if (NewCost > OldCost)\n+    return false;\n+\n+  // Generate comparison based on encoding's neg bit: slt 0 for neg, sgt -1 for\n+  // non-neg\n+  Builder.SetInsertPoint(&I);\n+  Type *ScalarTy = VecTy->getScalarType();\n+  Value *NewReduce = Builder.CreateIntrinsic(ScalarTy, NewIID, {X});\n+  Value *NewCmp = IsNegativeCheck(Check) ? Builder.CreateIsNeg(NewReduce)\n+                                         : Builder.CreateIsNotNeg(NewReduce);\n+\n+  replaceValue(I, *NewCmp);\n+  return true;\n+}\n+\n /// Returns true if this ShuffleVectorInst eventually feeds into a\n /// vector reduction intrinsic (e.g., vector_reduce_add) by only following\n /// chains of shuffles and binary operators (in any combination/order).\n@@ -5207,6 +5404,9 @@ bool VectorCombine::run() {\n           return true;\n         break;\n       case Instruction::ICmp:\n+        if (foldSignBitReductionCmp(I))\n+          return true;\n+        [[fallthrough]];\n       case Instruction::FCmp:\n         if (foldExtractExtract(I))\n           return true;\n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "Fold patterns that extract sign bits, reduce them, and compare against boundary values into direct sign checks on the reduced vector.\r\n\r\n```\r\nicmp pred (reduce.{add,or,and,umax,umin}(lshr X, BitWidth-1)), C\r\n    ->  icmp slt/sgt (reduce.{or,umax,and,umin}(X)), 0/-1\r\n```\r\n\r\nWhen the comparison is against 0 or MAX (1 for boolean reductions, NumElts for add), the pattern reduces to one of four quantified predicates:\r\n- \u2200x: x < 0 (AllNeg)\r\n- \u2200x: x \u2265 0 (AllNonNeg)\r\n- \u2203x: x < 0 (AnyNeg)\r\n- \u2203x: x \u2265 0 (AnyNonNeg)\r\n\r\nThe transform eliminates the shift and selects between reduce.or/reduce.umax or reduce.and/reduce.umin based on cost modeling.\r\n\r\n## The matrix of Alive2 proofs for every pair of {reduction, comparison}:\r\n\r\n| Reduction | == 0 | != 0 | == MAX | != MAX |\r\n|-----------|------|------|--------|--------|\r\n| or        | [proof](https://alive2.llvm.org/ce/z/_BWxJW) | [proof](https://alive2.llvm.org/ce/z/k3EiK6) | [proof](https://alive2.llvm.org/ce/z/a8cAjp) | [proof](https://alive2.llvm.org/ce/z/ci-HMt) |\r\n| umax      | [proof](https://alive2.llvm.org/ce/z/dWt28G) | [proof](https://alive2.llvm.org/ce/z/_MqxXC) | [proof](https://alive2.llvm.org/ce/z/KQebnF) | [proof](https://alive2.llvm.org/ce/z/mixEgN) |\r\n| and       | [proof](https://alive2.llvm.org/ce/z/JgYrLj) | [proof](https://alive2.llvm.org/ce/z/FZuPLy) | [proof](https://alive2.llvm.org/ce/z/bYCa8V) | [proof](https://alive2.llvm.org/ce/z/9fsLsN) |\r\n| umin      | [proof](https://alive2.llvm.org/ce/z/YnaSL-) | [proof](https://alive2.llvm.org/ce/z/rGrgoM) | [proof](https://alive2.llvm.org/ce/z/pb-ezQ) | [proof](https://alive2.llvm.org/ce/z/JkoqEi) |\r\n| add       | [proof](https://alive2.llvm.org/ce/z/d5w5CF) | [proof](https://alive2.llvm.org/ce/z/GUgQ2Z) | [proof](https://alive2.llvm.org/ce/z/HnstY8) | [proof](https://alive2.llvm.org/ce/z/j8z_3C) |\r\n\r\n### Other test cases\r\n\r\n| Test | Proof |\r\n|------|-------|\r\n| or_slt_1 (slt 1 \u2261 eq 0) | [proof](https://alive2.llvm.org/ce/z/Wdb_uN) |\r\n| umax_sgt_0 (sgt 0 \u2261 ne 0) | [proof](https://alive2.llvm.org/ce/z/nw6NZc) |\r\n| and_slt_max (slt 1 \u2261 ne 1) | [proof](https://alive2.llvm.org/ce/z/ZDMSXZ) |\r\n| umin_sgt_max_minus_1 (sgt 0 \u2261 eq 1) | [proof](https://alive2.llvm.org/ce/z/Uynf8P) |\r\n| add_ult_max (ult 4 \u2261 ne 4) | [proof](https://alive2.llvm.org/ce/z/pyDgTg) |\r\n| add_ugt_max_minus_1 (ugt 3 \u2261 eq 4) | [proof](https://alive2.llvm.org/ce/z/mHVXJk) |\r\n| ashr_add_eq_0 (ashr instead of lshr) | [proof](https://alive2.llvm.org/ce/z/oa9Kgo) |\r\n\r\n### or/umax and and/umin equivalence\r\n\r\n| Check | Equivalence | Proof |\r\n|-----------------|-------------|-------|\r\n| AnyNeg | or slt 0 \u2261 umax slt 0 | [proof](https://alive2.llvm.org/ce/z/Do2tNQ) |\r\n| AllNonNeg | or sgt -1 \u2261 umax sgt -1 | [proof](https://alive2.llvm.org/ce/z/N4kZ8Z) |\r\n| AllNeg | and slt 0 \u2261 umin slt 0 | [proof](https://alive2.llvm.org/ce/z/4mNpMk) |\r\n| AnyNonNeg | and sgt -1 \u2261 umin sgt -1 | [proof](https://alive2.llvm.org/ce/z/2pVnyg) |\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/VectorCombine/AArch64/fold-signbit-reduction-cmp.ll",
+      "commands": [
+        "opt -S -passes=vector-combine -mtriple=aarch64 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "or_eq_0_v8i16",
+          "test_body": "define i1 @or_eq_0_v8i16(<8 x i16> %x) {\n  %shr = lshr <8 x i16> %x, splat (i16 15)\n  %red = call i16 @llvm.vector.reduce.or.v8i16(<8 x i16> %shr)\n  %cmp = icmp eq i16 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.vector.reduce.or.v8i16(<8 x i16>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ashr_add_eq_0",
+          "test_body": "define i1 @ashr_add_eq_0(<4 x i32> %x) {\n  %shr = ashr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_eq_max_v2i64",
+          "test_body": "define i1 @and_eq_max_v2i64(<2 x i64> %x) {\n  %shr = lshr <2 x i64> %x, splat (i64 63)\n  %red = call i64 @llvm.vector.reduce.and.v2i64(<2 x i64> %shr)\n  %cmp = icmp eq i64 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.vector.reduce.and.v2i64(<2 x i64>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_multi_use_shift",
+          "test_body": "define i1 @negative_multi_use_shift(<4 x i32> %x, ptr %p) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  store <4 x i32> %shr, ptr %p, align 16\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_wrong_shift",
+          "test_body": "define i1 @negative_wrong_shift(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 30)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_sgt_wrong_const",
+          "test_body": "define i1 @negative_sgt_wrong_const(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp sgt i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_eq_0",
+          "test_body": "define i1 @and_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_ne_max",
+          "test_body": "define i1 @umax_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_eq_0",
+          "test_body": "define i1 @umax_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ne_0",
+          "test_body": "define i1 @add_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_slt_wrong_const",
+          "test_body": "define i1 @negative_slt_wrong_const(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp slt i32 %red, 2\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_eq_0",
+          "test_body": "define i1 @or_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_ne_0",
+          "test_body": "define i1 @umax_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_ne_max",
+          "test_body": "define i1 @or_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_ne_max",
+          "test_body": "define i1 @and_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_eq_0",
+          "test_body": "define i1 @umin_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_ne_max",
+          "test_body": "define i1 @umin_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_eq_max",
+          "test_body": "define i1 @and_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_eq_0",
+          "test_body": "define i1 @add_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ult_max",
+          "test_body": "define i1 @add_ult_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ult i32 %red, 4\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_ne_0",
+          "test_body": "define i1 @and_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_ne_0",
+          "test_body": "define i1 @umin_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_eq_max",
+          "test_body": "define i1 @or_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_ne_0",
+          "test_body": "define i1 @or_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_add_numelts_overflow",
+          "test_body": "define i1 @negative_add_numelts_overflow(<8 x i2> %x) {\n  %shr = lshr <8 x i2> %x, splat (i2 1)\n  %red = call i2 @llvm.vector.reduce.add.v8i2(<8 x i2> %shr)\n  %cmp = icmp eq i2 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i2 @llvm.vector.reduce.add.v8i2(<8 x i2>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_eq_max",
+          "test_body": "define i1 @umin_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ugt_max_minus_1",
+          "test_body": "define i1 @add_ugt_max_minus_1(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ugt i32 %red, 3\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_eq_max",
+          "test_body": "define i1 @umax_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_wrong_cmp_const",
+          "test_body": "define i1 @negative_wrong_cmp_const(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 2\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ne_max",
+          "test_body": "define i1 @add_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 4\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_eq_max",
+          "test_body": "define i1 @add_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 4\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/fold-signbit-reduction-cmp.ll",
+      "commands": [
+        "opt -S -passes=vector-combine -mtriple=x86_64-- < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "or_eq_0_v8i16",
+          "test_body": "define i1 @or_eq_0_v8i16(<8 x i16> %x) {\n  %shr = lshr <8 x i16> %x, splat (i16 15)\n  %red = call i16 @llvm.vector.reduce.or.v8i16(<8 x i16> %shr)\n  %cmp = icmp eq i16 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.vector.reduce.or.v8i16(<8 x i16>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ashr_add_eq_0",
+          "test_body": "define i1 @ashr_add_eq_0(<4 x i32> %x) {\n  %shr = ashr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_eq_max_v2i64",
+          "test_body": "define i1 @and_eq_max_v2i64(<2 x i64> %x) {\n  %shr = lshr <2 x i64> %x, splat (i64 63)\n  %red = call i64 @llvm.vector.reduce.and.v2i64(<2 x i64> %shr)\n  %cmp = icmp eq i64 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.vector.reduce.and.v2i64(<2 x i64>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_multi_use_shift",
+          "test_body": "define i1 @negative_multi_use_shift(<4 x i32> %x, ptr %p) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  store <4 x i32> %shr, ptr %p, align 16\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_wrong_shift",
+          "test_body": "define i1 @negative_wrong_shift(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 30)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_sgt_wrong_const",
+          "test_body": "define i1 @negative_sgt_wrong_const(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp sgt i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_eq_0",
+          "test_body": "define i1 @and_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_ne_max",
+          "test_body": "define i1 @umax_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_eq_0",
+          "test_body": "define i1 @umax_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ne_0",
+          "test_body": "define i1 @add_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_slt_wrong_const",
+          "test_body": "define i1 @negative_slt_wrong_const(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp slt i32 %red, 2\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_eq_0",
+          "test_body": "define i1 @or_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_ne_0",
+          "test_body": "define i1 @umax_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_ne_max",
+          "test_body": "define i1 @or_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_ne_max",
+          "test_body": "define i1 @and_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_eq_0",
+          "test_body": "define i1 @umin_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_ne_max",
+          "test_body": "define i1 @umin_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_eq_max",
+          "test_body": "define i1 @and_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_eq_0",
+          "test_body": "define i1 @add_eq_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ult_max",
+          "test_body": "define i1 @add_ult_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ult i32 %red, 4\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "and_ne_0",
+          "test_body": "define i1 @and_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.and.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_ne_0",
+          "test_body": "define i1 @umin_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_eq_max",
+          "test_body": "define i1 @or_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "or_ne_0",
+          "test_body": "define i1 @or_ne_0(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.or.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.or.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_add_numelts_overflow",
+          "test_body": "define i1 @negative_add_numelts_overflow(<8 x i2> %x) {\n  %shr = lshr <8 x i2> %x, splat (i2 1)\n  %red = call i2 @llvm.vector.reduce.add.v8i2(<8 x i2> %shr)\n  %cmp = icmp eq i2 %red, 0\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i2 @llvm.vector.reduce.add.v8i2(<8 x i2>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_eq_max",
+          "test_body": "define i1 @umin_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umin.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ugt_max_minus_1",
+          "test_body": "define i1 @add_ugt_max_minus_1(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ugt i32 %red, 3\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_eq_max",
+          "test_body": "define i1 @umax_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 1\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "negative_wrong_cmp_const",
+          "test_body": "define i1 @negative_wrong_cmp_const(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 2\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_ne_max",
+          "test_body": "define i1 @add_ne_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp ne i32 %red, 4\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "add_eq_max",
+          "test_body": "define i1 @add_eq_max(<4 x i32> %x) {\n  %shr = lshr <4 x i32> %x, splat (i32 31)\n  %red = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %shr)\n  %cmp = icmp eq i32 %red, 4\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "SavchenkoValeriy",
+      "body": "@RKSimon do you mind taking another look here?"
+    },
+    {
+      "author": "RKSimon",
+      "body": "> @RKSimon do you mind taking another look here?\r\n\r\ndon't forget to use the \"re-request-review\" icon by the reviewer, otherwise I don't usually see it (and I often miss CC mentions)"
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "@RKSimon I can't re-request the review on this PR, but do you mind checking it? I split the test case between X86 and AArch64 targets as you asked."
+    },
+    {
+      "author": "preames",
+      "body": "High level comment.  I think this transform can be split into several sub-transforms.  I am not expressing an opinion as to whether this change should land before or after such a split, and will leave that up to area reviewers.\r\n\r\nYour proposed transform of\r\n```\r\n icmp pred (reduce.{add,or,and,umax,umin}(lshr X, BitWidth-1)), C\r\n    ->  icmp slt/sgt (reduce.{or,umax,and,umin}(X)), 0/-1\r\n```\r\n\r\nPossible splits:\r\n\r\n(1)\r\n`reduce.{or,and,umax,umin}(lshr X, BitWidth-1)) -> lshr (reduce.{or,and,umax,umin} X), BitWidth-1`\r\n\r\n(This generalizes for any logical op.  Note that we should already be canonicalizing smin/smax to umin/umax; if not that's another to play with.)\r\n\r\n(2) Your inequality handling is just a transform to convert the inequality form to the equality form (of the source).  \r\n\r\nI believe that (1) generalizes for any single bit extract (i.e. and X, 2).  \r\n"
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "> (1) `reduce.{or,and,umax,umin}(lshr X, BitWidth-1)) -> lshr (reduce.{or,and,umax,umin} X), BitWidth-1`\r\n> \r\n> (This generalizes for any logical op. Note that we should already be canonicalizing smin/smax to umin/umax; if not that's another to play with.)\r\n\r\nThis doesn't work for the original motivating issue: https://github.com/llvm/llvm-project/pull/175194#discussion_r2679545284 But I agree (1) should simplify the implementation.\r\n"
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "> High level comment. I think this transform can be split into several sub-transforms. I am not expressing an opinion as to whether this change should land before or after such a split, and will leave that up to area reviewers.\r\n> \r\n\r\nThanks for the comment, I always strive to split desired folds into smaller more general folds (as actually the case here as well).\r\n\r\n> Your proposed transform of\r\n> \r\n> ```\r\n>  icmp pred (reduce.{add,or,and,umax,umin}(lshr X, BitWidth-1)), C\r\n>     ->  icmp slt/sgt (reduce.{or,umax,and,umin}(X)), 0/-1\r\n> ```\r\n> \r\n> Possible splits:\r\n> \r\n> (1) `reduce.{or,and,umax,umin}(lshr X, BitWidth-1)) -> lshr (reduce.{or,and,umax,umin} X), BitWidth-1`\r\n> \r\n> (This generalizes for any logical op. Note that we should already be canonicalizing smin/smax to umin/umax; if not that's another to play with.)\r\n> \r\n> (2) Your inequality handling is just a transform to convert the inequality form to the equality form (of the source).\r\n> \r\n> I believe that (1) generalizes for any single bit extract (i.e. and X, 2).\r\n\r\nI don't oppose it, but it actually doesn't help with the motivation example that is about reduce.add` that I generalized to this transformation. And I don't quite see how implementation would be simpler because we'll be matching shift of a reduction as opposed to reduction of a shift. All the rest is the same. The only benefit that I see is that we would support \"shift of a reduction\" cases in addition to what I propose in this patch. However, `reduce.add` should still check for \"reduction of a shift\", which will make implementation more cumbersome.\r\n\r\nMaybe that can be a follow up work?\r\n\r\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "@RKSimon @dtcxzyw hey folks, is there anything else I can do in this PR? Mind taking a quick look?"
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "@RKSimon sorry for continuously bugging you about it, but do you mind taking another look if this change is good to go?"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189159 tests passed\n* 5018 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130113 tests passed\n* 2880 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "@RKSimon the new commit fixes the failure"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-09T16:13:48Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        147,
+        152
+      ],
+      [
+        4175,
+        4180
+      ],
+      [
+        5207,
+        5212
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::foldCastFromReductions",
+      "VectorCombine::run"
+    ]
+  }
+}

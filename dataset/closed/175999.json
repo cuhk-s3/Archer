@@ -1,0 +1,116 @@
+{
+  "pr_id": 175999,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175999",
+  "state": "closed",
+  "title": "ValueTracking: Improve nan tracking for fma square special case",
+  "author": "arsenm",
+  "base_commit": "35efc168dd2f01babfb16cb6cba7af5c7f2e14ad",
+  "fix_commit": "a87e99cc6d84dff95a2920731761c766be7b259d",
+  "patch": "diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 8641ab6f28e33..7b39f1633a5e4 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5146,6 +5146,16 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n         DenormalMode Mode =\n             F ? F->getDenormalMode(FltSem) : DenormalMode::getDynamic();\n \n+        if (KnownNotFromFlags & fcNan) {\n+          KnownSrc.knownNot(fcNan);\n+          KnownAddend.knownNot(fcNan);\n+        }\n+\n+        if (KnownNotFromFlags & fcInf) {\n+          KnownSrc.knownNot(fcInf);\n+          KnownAddend.knownNot(fcInf);\n+        }\n+\n         Known = KnownFPClass::fma_square(KnownSrc, KnownAddend, Mode);\n         break;\n       }\n@@ -5156,6 +5166,11 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n                             InterestedClasses, KnownSrc[I], Q, Depth + 1);\n         if (KnownSrc[I].isUnknown())\n           return;\n+\n+        if (KnownNotFromFlags & fcNan)\n+          KnownSrc[I].knownNot(fcNan);\n+        if (KnownNotFromFlags & fcInf)\n+          KnownSrc[I].knownNot(fcInf);\n       }\n \n       const Function *F = II->getFunction();\n@@ -5623,6 +5638,10 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n                           Q, Depth + 1);\n     }\n \n+    // TODO: Improve accuracy in unfused FMA pattern. We can prove an additional\n+    // not-nan if the addend is known-not negative infinity if the multiply is\n+    // known-not infinity.\n+\n     computeKnownFPClass(Op->getOperand(0), DemandedElts, fcAllFlags, KnownLHS,\n                         Q, Depth + 1);\n \ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex 4b1d7367f103d..ceaf6f8a92bb1 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -375,7 +375,19 @@ KnownFPClass KnownFPClass::fma(const KnownFPClass &KnownLHS,\n KnownFPClass KnownFPClass::fma_square(const KnownFPClass &KnownSquared,\n                                       const KnownFPClass &KnownAddend,\n                                       DenormalMode Mode) {\n-  return fadd_impl(square(KnownSquared, Mode), KnownAddend, Mode);\n+  KnownFPClass Squared = square(KnownSquared, Mode);\n+  KnownFPClass Known = fadd_impl(Squared, KnownAddend, Mode);\n+\n+  // Since we know the squared input must be positive, the add of opposite sign\n+  // infinities nan hazard only applies for negative inf.\n+  //\n+  // TODO: Alternatively to proving addend is not -inf, we could know Squared is\n+  // not pinf. Other than the degenerate always-subnormal input case, we can't\n+  // prove that without a known range.\n+  if (KnownAddend.isKnownNever(fcNegInf | fcNan) && Squared.isKnownNever(fcNan))\n+    Known.knownNot(fcNan);\n+\n+  return Known;\n }\n \n KnownFPClass KnownFPClass::exp(const KnownFPClass &KnownSrc) {\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "In the square multiply case, we can infer if the add of opposite\nsign infinities can occur.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass-fma.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_fma_ninf__no_nan_inputs",
+          "test_body": "define half @ret_fma_ninf__no_nan_inputs(half nofpclass(nan) %arg0, half nofpclass(nan) %arg1, half nofpclass(nan) %arg2) {\n  %call = call ninf half @llvm.fma.f16(half %arg0, half %arg1, half %arg2)\n  ret half %call\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fma.f16(half, half, half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_noinf_fma_square__no_nan__no_nan",
+          "test_body": "define nofpclass(inf) half @ret_noinf_fma_square__no_nan__no_nan(half noundef nofpclass(nan) %arg0, half nofpclass(nan) %arg1) {\n  %call = call half @llvm.fma.f16(half %arg0, half %arg0, half %arg1)\n  ret half %call\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fma.f16(half, half, half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_fma_ninf_square__no_nan__no_nan",
+          "test_body": "define half @ret_fma_ninf_square__no_nan__no_nan(half noundef nofpclass(nan) %arg0, half nofpclass(nan) %arg1) {\n  %call = call ninf half @llvm.fma.f16(half %arg0, half %arg0, half %arg1)\n  ret half %call\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fma.f16(half, half, half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_fma_square__no_nan_no_inf_no_zero__no_nan_no_ninf",
+          "test_body": "define half @ret_fma_square__no_nan_no_inf_no_zero__no_nan_no_ninf(half noundef nofpclass(nan inf zero) %arg0, half nofpclass(nan ninf) %arg1) {\n  %call = call half @llvm.fma.f16(half %arg0, half %arg0, half %arg1)\n  ret half %call\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fma.f16(half, half, half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nonan_fma_square__no_nan__no_nan",
+          "test_body": "define nofpclass(nan) half @ret_nonan_fma_square__no_nan__no_nan(half noundef nofpclass(nan) %arg0, half nofpclass(nan) %arg1) {\n  %call = call half @llvm.fma.f16(half %arg0, half %arg0, half %arg1)\n  ret half %call\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fma.f16(half, half, half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_fma_square__no_nan_no_inf__no_nan_no_ninf",
+          "test_body": "define half @ret_fma_square__no_nan_no_inf__no_nan_no_ninf(half noundef nofpclass(nan inf) %arg0, half nofpclass(nan ninf) %arg1) {\n  %call = call half @llvm.fma.f16(half %arg0, half %arg0, half %arg1)\n  ret half %call\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fma.f16(half, half, half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_fma_square__no_nan_no_inf__no_nan_no_pinf",
+          "test_body": "define half @ret_fma_square__no_nan_no_inf__no_nan_no_pinf(half noundef nofpclass(nan inf) %arg0, half nofpclass(nan pinf) %arg1) {\n  %call = call half @llvm.fma.f16(half %arg0, half %arg0, half %arg1)\n  ret half %call\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fma.f16(half, half, half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms",
+    "llvm:adt"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175999** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175999?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175999?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#175614** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175614?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>: 1 other dependent PR ([#175615](https://github.com/llvm/llvm-project/pull/175615) <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175615?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>)\n* **#175613** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175613?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174853** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174853?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174852** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174852?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189173 tests passed\n* 5019 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130137 tests passed\n* 2881 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-14T17:30:10Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5146,
+        5151
+      ],
+      [
+        5156,
+        5161
+      ],
+      [
+        5623,
+        5628
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        375,
+        381
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass-fma.ll": [
+      [
+        444,
+        452
+      ],
+      [
+        454,
+        466
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::exp",
+      "KnownFPClass::fma_square"
+    ]
+  }
+}

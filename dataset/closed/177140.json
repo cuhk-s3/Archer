@@ -1,0 +1,455 @@
+{
+  "pr_id": 177140,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177140",
+  "state": "closed",
+  "title": "IR: Add !nofpclass metadata",
+  "author": "arsenm",
+  "base_commit": "7dfd963812cd6b68986eeaacccf8ff39fece9a06",
+  "fix_commit": "0d49b98ce6e08db345ab30464cee28deeca1cc9d",
+  "patch": "diff --git a/llvm/docs/LangRef.rst b/llvm/docs/LangRef.rst\nindex 7c212097286ac..c117743dbfd39 100644\n--- a/llvm/docs/LangRef.rst\n+++ b/llvm/docs/LangRef.rst\n@@ -7448,6 +7448,38 @@ Examples:\n     !2 = !{ i8 0, i8 2, i8 3, i8 6 }\n     !3 = !{ i8 -2, i8 0, i8 3, i8 6 }\n \n+\n+.. _nofpclass-metadata:\n+\n+'``nofpclass``' Metadata\n+^^^^^^^^^^^^^^^^^^^^^^^^\n+\n+``nofpclass`` metadata may be attached only to ``load``\n+instructions. It asserts floating-point value classes which will not\n+be loaded. The representation is an i32 constant integer encoding a\n+10-bit bitmask, with the same meaning and format as the\n+:ref:`nofpclass <nofpclass>` attribute. If the loaded value is one of\n+the specified floating-point classes, a poison value is returned. The\n+interpretation does not depend on the floating-point environment. A\n+zero value would be meaningless and is invalid.\n+\n+Examples:\n+\n+.. code-block:: llvm\n+\n+  %not.nan = load float, ptr %p, align 4, !nofpclass !0\n+  %not.inf = load <2 x float>, ptr %p, align 4, !nofpclass !1\n+  %only.normal = load double, ptr %p, align 8, !nofpclass !2\n+  %always.poison = load double, ptr %p, align 8, !nofpclass !3\n+  %not.nan.array = load [2 x <2 x float>], ptr %p, !nofpclass !1\n+  %not.nan.struct = load { 2 x float }, ptr %p, align 8, !nofpclass !1\n+  ...\n+  !0 = !{ i32 3 }\n+  !1 = !{ i32 516 }\n+  !2 = !{ i32 759 }\n+  !3 = !{ i32 1023 }\n+\n+\n '``absolute_symbol``' Metadata\n ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n \ndiff --git a/llvm/include/llvm/IR/FixedMetadataKinds.def b/llvm/include/llvm/IR/FixedMetadataKinds.def\nindex 01d22bdd7c996..98129985714b2 100644\n--- a/llvm/include/llvm/IR/FixedMetadataKinds.def\n+++ b/llvm/include/llvm/IR/FixedMetadataKinds.def\n@@ -58,3 +58,4 @@ LLVM_FIXED_MD_KIND(MD_nofree, \"nofree\", 43)\n LLVM_FIXED_MD_KIND(MD_captures, \"captures\", 44)\n LLVM_FIXED_MD_KIND(MD_alloc_token, \"alloc_token\", 45)\n LLVM_FIXED_MD_KIND(MD_implicit_ref, \"implicit.ref\", 46)\n+LLVM_FIXED_MD_KIND(MD_nofpclass, \"nofpclass\", 47)\ndiff --git a/llvm/include/llvm/IR/Metadata.h b/llvm/include/llvm/IR/Metadata.h\nindex 85a7f8fd373c0..441bee3e5bf48 100644\n--- a/llvm/include/llvm/IR/Metadata.h\n+++ b/llvm/include/llvm/IR/Metadata.h\n@@ -144,7 +144,8 @@ class Metadata {\n \n   /// Metadata IDs that may generate poison.\n   constexpr static const unsigned PoisonGeneratingIDs[] = {\n-      LLVMContext::MD_range, LLVMContext::MD_nonnull, LLVMContext::MD_align};\n+      LLVMContext::MD_range, LLVMContext::MD_nonnull, LLVMContext::MD_align,\n+      LLVMContext::MD_nofpclass};\n };\n \n // Create wrappers for C Binding types (see CBindingWrapping.h).\n@@ -1472,6 +1473,7 @@ class MDNode : public Metadata {\n   LLVM_ABI static MDNode *getMostGenericAliasScope(MDNode *A, MDNode *B);\n   LLVM_ABI static MDNode *getMostGenericAlignmentOrDereferenceable(MDNode *A,\n                                                                    MDNode *B);\n+  LLVM_ABI static MDNode *getMostGenericNoFPClass(MDNode *A, MDNode *B);\n   /// Merge !prof metadata from two instructions.\n   /// Currently only implemented with direct callsites with branch weights.\n   LLVM_ABI static MDNode *getMergedProfMetadata(MDNode *A, MDNode *B,\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 171952120fc40..d6fc0889c3efd 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5098,6 +5098,17 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n             .intersectWith(ComputeForArm(Op->getOperand(2), /*Invert=*/true));\n     break;\n   }\n+  case Instruction::Load: {\n+    const MDNode *NoFPClass =\n+        cast<LoadInst>(Op)->getMetadata(LLVMContext::MD_nofpclass);\n+    if (!NoFPClass)\n+      break;\n+\n+    ConstantInt *MaskVal =\n+        mdconst::extract<ConstantInt>(NoFPClass->getOperand(0));\n+    Known.knownNot(static_cast<FPClassTest>(MaskVal->getZExtValue()));\n+    break;\n+  }\n   case Instruction::Call: {\n     const CallInst *II = cast<CallInst>(Op);\n     const Intrinsic::ID IID = II->getIntrinsicID();\ndiff --git a/llvm/lib/IR/Attributes.cpp b/llvm/lib/IR/Attributes.cpp\nindex 14a289c3471bd..409e4a18fefa2 100644\n--- a/llvm/lib/IR/Attributes.cpp\n+++ b/llvm/lib/IR/Attributes.cpp\n@@ -2337,6 +2337,11 @@ AttrBuilder &AttrBuilder::addFromEquivalentMetadata(const Instruction &I) {\n   if (const MDNode *Range = I.getMetadata(LLVMContext::MD_range))\n     addRangeAttr(getConstantRangeFromMetadata(*Range));\n \n+  if (const MDNode *NoFPClass = I.getMetadata(LLVMContext::MD_nofpclass)) {\n+    ConstantInt *CI = mdconst::extract<ConstantInt>(NoFPClass->getOperand(0));\n+    addNoFPClassAttr(static_cast<FPClassTest>(CI->getZExtValue()));\n+  }\n+\n   return *this;\n }\n \ndiff --git a/llvm/lib/IR/Metadata.cpp b/llvm/lib/IR/Metadata.cpp\nindex 326abd87ddae9..0410796b24fad 100644\n--- a/llvm/lib/IR/Metadata.cpp\n+++ b/llvm/lib/IR/Metadata.cpp\n@@ -1397,6 +1397,23 @@ MDNode *MDNode::getMostGenericRange(MDNode *A, MDNode *B) {\n   return MDNode::get(A->getContext(), MDs);\n }\n \n+MDNode *MDNode::getMostGenericNoFPClass(MDNode *A, MDNode *B) {\n+  if (!A || !B)\n+    return nullptr;\n+\n+  if (A == B)\n+    return A;\n+\n+  ConstantInt *AVal = mdconst::extract<ConstantInt>(A->getOperand(0));\n+  ConstantInt *BVal = mdconst::extract<ConstantInt>(B->getOperand(0));\n+  unsigned Intersect = AVal->getZExtValue() & BVal->getZExtValue();\n+  if (Intersect == 0)\n+    return nullptr;\n+\n+  return MDNode::get(A->getContext(), ConstantAsMetadata::get(ConstantInt::get(\n+                                          AVal->getType(), Intersect)));\n+}\n+\n MDNode *MDNode::getMostGenericNoaliasAddrspace(MDNode *A, MDNode *B) {\n   if (!A || !B)\n     return nullptr;\ndiff --git a/llvm/lib/IR/Verifier.cpp b/llvm/lib/IR/Verifier.cpp\nindex 055b5852dcce7..c098e9e0f200d 100644\n--- a/llvm/lib/IR/Verifier.cpp\n+++ b/llvm/lib/IR/Verifier.cpp\n@@ -529,6 +529,7 @@ class Verifier : public InstVisitor<Verifier>, VerifierSupport {\n   void verifyRangeLikeMetadata(const Value &V, const MDNode *Range, Type *Ty,\n                                RangeLikeMetadataKind Kind);\n   void visitRangeMetadata(Instruction &I, MDNode *Range, Type *Ty);\n+  void visitNoFPClassMetadata(Instruction &I, MDNode *Range, Type *Ty);\n   void visitNoaliasAddrspaceMetadata(Instruction &I, MDNode *Range, Type *Ty);\n   void visitDereferenceableMetadata(Instruction &I, MDNode *MD);\n   void visitNofreeMetadata(Instruction &I, MDNode *MD);\n@@ -4570,6 +4571,25 @@ void Verifier::visitRangeMetadata(Instruction &I, MDNode *Range, Type *Ty) {\n   verifyRangeLikeMetadata(I, Range, Ty, RangeLikeMetadataKind::Range);\n }\n \n+void Verifier::visitNoFPClassMetadata(Instruction &I, MDNode *NoFPClass,\n+                                      Type *Ty) {\n+  Check(AttributeFuncs::isNoFPClassCompatibleType(Ty),\n+        \"nofpclass only applies to floating-point typed loads\", I);\n+\n+  Check(NoFPClass->getNumOperands() == 1,\n+        \"nofpclass must have exactly one entry\", NoFPClass);\n+  ConstantInt *MaskVal =\n+      mdconst::dyn_extract<ConstantInt>(NoFPClass->getOperand(0));\n+  Check(MaskVal && MaskVal->getType()->isIntegerTy(32),\n+        \"nofpclass entry must be a constant i32\", NoFPClass);\n+  uint32_t Val = MaskVal->getZExtValue();\n+  Check(Val != 0, \"'nofpclass' must have at least one test bit set\", NoFPClass,\n+        I);\n+\n+  Check((Val & ~static_cast<unsigned>(fcAllFlags)) == 0,\n+        \"Invalid value for 'nofpclass' test mask\", NoFPClass, I);\n+}\n+\n void Verifier::visitNoaliasAddrspaceMetadata(Instruction &I, MDNode *Range,\n                                              Type *Ty) {\n   assert(Range && Range == I.getMetadata(LLVMContext::MD_noalias_addrspace) &&\n@@ -5692,6 +5712,11 @@ void Verifier::visitInstruction(Instruction &I) {\n     visitRangeMetadata(I, Range, I.getType());\n   }\n \n+  if (MDNode *MD = I.getMetadata(LLVMContext::MD_nofpclass)) {\n+    Check(isa<LoadInst>(I), \"nofpclass is only for loads\", &I);\n+    visitNoFPClassMetadata(I, MD, I.getType());\n+  }\n+\n   if (MDNode *Range = I.getMetadata(LLVMContext::MD_noalias_addrspace)) {\n     Check(isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicRMWInst>(I) ||\n               isa<AtomicCmpXchgInst>(I) || isa<CallInst>(I),\ndiff --git a/llvm/lib/Transforms/Scalar/GVN.cpp b/llvm/lib/Transforms/Scalar/GVN.cpp\nindex 72e1131a54a86..4a9dcb5e2effd 100644\n--- a/llvm/lib/Transforms/Scalar/GVN.cpp\n+++ b/llvm/lib/Transforms/Scalar/GVN.cpp\n@@ -1594,6 +1594,9 @@ void GVNPass::eliminatePartiallyRedundantLoad(\n       NewLoad->setMetadata(LLVMContext::MD_invariant_group, InvGroupMD);\n     if (auto *RangeMD = Load->getMetadata(LLVMContext::MD_range))\n       NewLoad->setMetadata(LLVMContext::MD_range, RangeMD);\n+    if (auto *NoFPClassMD = Load->getMetadata(LLVMContext::MD_nofpclass))\n+      NewLoad->setMetadata(LLVMContext::MD_nofpclass, NoFPClassMD);\n+\n     if (auto *AccessMD = Load->getMetadata(LLVMContext::MD_access_group))\n       if (LI->getLoopFor(Load->getParent()) == LI->getLoopFor(UnavailableBlock))\n         NewLoad->setMetadata(LLVMContext::MD_access_group, AccessMD);\ndiff --git a/llvm/lib/Transforms/Utils/Local.cpp b/llvm/lib/Transforms/Utils/Local.cpp\nindex f7842a235b20d..ebb00cc5ff9e5 100644\n--- a/llvm/lib/Transforms/Utils/Local.cpp\n+++ b/llvm/lib/Transforms/Utils/Local.cpp\n@@ -2961,6 +2961,10 @@ static void combineMetadata(Instruction *K, const Instruction *J,\n         if (!AAOnly && (DoesKMove || !K->hasMetadata(LLVMContext::MD_noundef)))\n           K->setMetadata(Kind, MDNode::getMostGenericRange(JMD, KMD));\n         break;\n+      case LLVMContext::MD_nofpclass:\n+        if (!AAOnly && (DoesKMove || !K->hasMetadata(LLVMContext::MD_noundef)))\n+          K->setMetadata(Kind, MDNode::getMostGenericNoFPClass(JMD, KMD));\n+        break;\n       case LLVMContext::MD_fpmath:\n         if (!AAOnly)\n           K->setMetadata(Kind, MDNode::getMostGenericFPMath(JMD, KMD));\n@@ -3149,6 +3153,14 @@ void llvm::copyMetadataForLoad(LoadInst &Dest, const LoadInst &Source) {\n     case LLVMContext::MD_range:\n       copyRangeMetadata(DL, Source, N, Dest);\n       break;\n+\n+    case LLVMContext::MD_nofpclass:\n+      // This only applies if the floating-point type interpretation. This\n+      // should handle degenerate cases like casting between a scalar and single\n+      // element vector.\n+      if (NewType->getScalarType() == Source.getType()->getScalarType())\n+        Dest.setMetadata(ID, N);\n+      break;\n     }\n   }\n }\n",
+  "components": [
+    "GVN",
+    "IR",
+    "Local",
+    "ValueTracking"
+  ],
+  "description": "This adds the analogous metadata to the nofpclass attribute\r\nto assert values are not a certain set of floating-point classes.\r\nThis allows the same information to be expressed if a function\r\nargument is passed indirectly. This matches the bitmask encoding\r\nof nofpclass.\r\n\r\nI also think this should be allowed for stores to symmetrically handle\r\nsret, but leave that for later.\r\n\r\nAlternatively we could add a more expressive !fprange metadata,\r\nbut that would be much more complex. It's useful to match the attribute,\r\nand more annotations can always be added.\r\n\r\nFixes #133560",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/ArgumentPromotion/metadata.ll",
+      "commands": [
+        "opt < %s -passes=argpromotion -S"
+      ],
+      "tests": [
+        {
+          "test_name": "caller",
+          "test_body": "declare hidden void @callee(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)\n\ndefine void @caller(ptr %p1, ptr %p2, ptr %p3, ptr %p4, ptr %p5, ptr %p6, ptr %p7, ptr %p8, ptr %p9, ptr %p10, ptr %p11) {\n  call void @callee(ptr %p1, ptr %p2, ptr %p3, ptr %p4, ptr %p5, ptr %p6, ptr %p7, ptr %p8, ptr %p9, ptr %p10, ptr %p11)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "callee",
+          "test_body": "declare void @use.i32(i32)\n\ndeclare void @use.p32(ptr)\n\ndeclare void @use.f32(float)\n\ndefine hidden void @callee(ptr %p1, ptr %p2, ptr %p3, ptr %p4, ptr %p5, ptr %p6, ptr %p7, ptr %p8, ptr %p9, ptr %p10, ptr %p11) {\n  %v1 = load i32, ptr %p1, align 4, !range !0\n  %v2 = load i32, ptr %p2, align 4, !range !0, !noundef !1\n  %v3 = load ptr, ptr %p3, align 8, !nonnull !1\n  %v4 = load ptr, ptr %p4, align 8, !nonnull !1, !noundef !1\n  %v5 = load ptr, ptr %p5, align 8, !dereferenceable !2\n  %v6 = load ptr, ptr %p6, align 8, !dereferenceable_or_null !2\n  %v7 = load ptr, ptr %p7, align 8, !align !3\n  %v8 = load ptr, ptr %p8, align 8, !align !3, !noundef !1\n  %v9 = load ptr, ptr %p9, align 8, !noundef !1\n  %v10 = load ptr, ptr %p10, align 8, !nontemporal !4\n  %v11 = load float, ptr %p11, align 4, !nofpclass !5\n  call void @use.i32(i32 %v1)\n  call void @use.i32(i32 %v2)\n  call void @use.p32(ptr %v3)\n  call void @use.p32(ptr %v4)\n  call void @use.p32(ptr %v5)\n  call void @use.p32(ptr %v6)\n  call void @use.p32(ptr %v7)\n  call void @use.p32(ptr %v8)\n  call void @use.p32(ptr %v9)\n  call void @use.p32(ptr %v10)\n  call void @use.f32(float %v11)\n  ret void\n}\n\n!0 = !{i32 0, i32 4}\n!1 = !{}\n!2 = !{i64 8}\n!3 = !{i64 4}\n!4 = !{i32 1}\n!5 = !{i32 3}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "infer_return_from_load_nofpclass_md_v2f32",
+          "test_body": "define <2 x float> @infer_return_from_load_nofpclass_md_v2f32(ptr %ptr) {\n  %load = load <2 x float>, ptr %ptr, align 8, !nofpclass !0\n  ret <2 x float> %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "infer_return_from_load_nofpclass_md_f32_1",
+          "test_body": "define float @infer_return_from_load_nofpclass_md_f32_1(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{i32 512}\n"
+        },
+        {
+          "test_name": "infer_return_from_load_nofpclass_md_f32_0",
+          "test_body": "define float @infer_return_from_load_nofpclass_md_f32_0(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "infer_return_from_load_nofpclass_md_array",
+          "test_body": "define [4 x float] @infer_return_from_load_nofpclass_md_array(ptr %ptr) {\n  %load = load [4 x float], ptr %ptr, align 4, !nofpclass !0\n  ret [4 x float] %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "infer_return_from_load_nofpclass_md_struct",
+          "test_body": "define { float, float } @infer_return_from_load_nofpclass_md_struct(ptr %ptr) {\n  %load = load { float, float }, ptr %ptr, align 4, !nofpclass !0\n  ret { float, float } %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero_or_sub__output_only_is_ftpz",
+          "test_body": "define float @fadd_double_no_zero_or_sub__output_only_is_ftpz(float noundef nofpclass(zero sub) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"positive-zero,ieee\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/load-metadata.ll",
+      "commands": [
+        "opt -S -passes=gvn < %s",
+        "opt -S -passes='gvn<memoryssa>' < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "nofpclass",
+          "test_body": "define float @nofpclass(ptr %p, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  store float 0.000000e+00, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %PRE = load float, ptr %p, align 4, !nofpclass !0\n  ret float %PRE\n}\n\n!0 = !{i32 3}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/merge-nofpclass.ll",
+      "commands": [
+        "opt -passes=gvn -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "merge_nofpclass_noundef",
+          "test_body": "define float @merge_nofpclass_noundef(ptr %arg, float %arg1) {\nbb:\n  %not.inf = load float, ptr %arg, align 4, !noundef !0, !nofpclass !1\n  %not.nan = load float, ptr %arg, align 4, !nofpclass !2\n  %add = fadd float %not.nan, %not.inf\n  ret float %add\n}\n\n!0 = !{}\n!1 = !{i32 519}\n!2 = !{i32 3}\n"
+        },
+        {
+          "test_name": "merge_nofpclass",
+          "test_body": "define float @merge_nofpclass(ptr %arg, float %arg1) {\nbb:\n  %not.inf = load float, ptr %arg, align 4, !nofpclass !0\n  %not.nan = load float, ptr %arg, align 4, !nofpclass !1\n  %add = fadd float %not.nan, %not.inf\n  ret float %add\n}\n\n!0 = !{i32 519}\n!1 = !{i32 3}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVNHoist/hoist-md.ll",
+      "commands": [
+        "opt -S -passes=gvn-hoist < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "nofpclass_md",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine float @nofpclass_md(i1 %b, ptr %y) {\nentry:\n  br i1 %b, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  %not.nan = load float, ptr %y, align 4, !nofpclass !0\n  br label %return\n\nif.end:                                           ; preds = %entry\n  %not.inf = load float, ptr %y, align 4, !nofpclass !1\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval.0 = phi float [ %not.nan, %if.then ], [ %not.inf, %if.end ]\n  ret float %retval.0\n}\n\n!0 = !{i32 547}\n!1 = !{i32 519}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fold-phi-load-metadata.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "phi_load_nofpclass_metadata",
+          "test_body": "%struct.S1 = type { i32, float }\n\ndefine float @phi_load_nofpclass_metadata(ptr %s1, ptr %s2, i32 %c) {\nentry:\n  %tobool = icmp eq i32 %c, 0\n  br i1 %tobool, label %if.end, label %if.then\n\nif.then:                                          ; preds = %entry\n  %i = getelementptr inbounds %struct.S1, ptr %s2, i64 0, i32 1\n  %val = load float, ptr %i, align 4, !nofpclass !0\n  br label %return\n\nif.end:                                           ; preds = %entry\n  %val2 = load float, ptr %s1, align 4, !nofpclass !1\n  br label %return\n\nreturn:                                           ; preds = %if.end, %if.then\n  %retval = phi float [ %val, %if.then ], [ %val2, %if.end ]\n  ret float %retval\n}\n\n!0 = !{i32 3}\n!1 = !{i32 519}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/loadstore-metadata.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_load_cast_combine_nofpclass_fpvec",
+          "test_body": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine <2 x half> @test_load_cast_combine_nofpclass_fpvec(ptr %ptr) {\nentry:\n  %l = load float, ptr %ptr, align 4, !nofpclass !0\n  %c = bitcast float %l to <2 x half>\n  ret <2 x half> %c\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "preserve_load_metadata_after_select_transform_nofpclass",
+          "test_body": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine float @preserve_load_metadata_after_select_transform_nofpclass(i1 %c, ptr dereferenceable(8) %a, ptr dereferenceable(8) %b) {\nentry:\n  %ptr.sel = select i1 %c, ptr %b, ptr %a\n  %l.sel = load float, ptr %ptr.sel, align 1, !nofpclass !0\n  ret float %l.sel\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "test_load_cast_combine_nofpclass_int",
+          "test_body": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i32 @test_load_cast_combine_nofpclass_int(ptr %ptr) {\nentry:\n  %l = load float, ptr %ptr, align 4, !nofpclass !0\n  %c = bitcast float %l to i32\n  ret i32 %c\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "test_load_cast_combine_nofpclass_scalar_to_1xvec",
+          "test_body": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine <1 x float> @test_load_cast_combine_nofpclass_scalar_to_1xvec(ptr %ptr) {\nentry:\n  %l = load float, ptr %ptr, align 4, !nofpclass !0\n  %c = bitcast float %l to <1 x float>\n  ret <1 x float> %c\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "test_load_cast_combine_nofpclass_1xvec_to_scalar",
+          "test_body": "target datalayout = \"e-m:e-p:64:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine float @test_load_cast_combine_nofpclass_1xvec_to_scalar(ptr %ptr) {\nentry:\n  %l = load <1 x float>, ptr %ptr, align 4, !nofpclass !0\n  %c = bitcast <1 x float> %l to float\n  ret float %c\n}\n\n!0 = !{i32 3}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SROA/preserve-metadata.ll",
+      "commands": [
+        "opt < %s -passes='sroa<preserve-cfg>' -S",
+        "opt < %s -passes='sroa<modify-cfg>' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "propagate_nofpclass",
+          "test_body": "define float @propagate_nofpclass(float %v) {\nentry:\n  %a = alloca [2 x float], align 4\n  %a.gep1 = getelementptr [2 x float], ptr %a, i32 0, i32 1\n  store float %v, ptr %a.gep1, align 4\n  store float 0.000000e+00, ptr %a, align 4\n  %load = load volatile float, ptr %a.gep1, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "load_i128_to_load_ptr",
+          "test_body": "define i128 @load_i128_to_load_ptr() {\n  %a = alloca i128, align 8\n  store ptr null, ptr %a, align 8\n  %v = load i128, ptr %a, align 4, !range !0\n  ret i128 %v\n}\n\n!0 = !{i128 1, i128 0}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SimplifyCFG/hoist-with-metadata.ll",
+      "commands": [
+        "opt < %s -passes=simplifycfg -simplifycfg-require-and-preserve-domtree=1 -hoist-common-insts=true -S"
+      ],
+      "tests": [
+        {
+          "test_name": "hoist_nofpclass_intersect",
+          "test_body": "define void @hoist_nofpclass_intersect(i1 %c, ptr %p) {\nif:\n  br i1 %c, label %then, label %else\n\nthen:                                             ; preds = %if\n  %t = load float, ptr %p, align 4, !nofpclass !0\n  br label %out\n\nelse:                                             ; preds = %if\n  %e = load float, ptr %p, align 4, !nofpclass !1\n  br label %out\n\nout:                                              ; preds = %else, %then\n  ret void\n}\n\n!0 = !{i32 3}\n!1 = !{i32 519}\n"
+        },
+        {
+          "test_name": "hoist_nofpclass_drop",
+          "test_body": "define void @hoist_nofpclass_drop(i1 %c, ptr %p) {\nif:\n  br i1 %c, label %then, label %else\n\nthen:                                             ; preds = %if\n  %t = load float, ptr %p, align 4, !nofpclass !0\n  br label %out\n\nelse:                                             ; preds = %if\n  %e = load float, ptr %p, align 4, !nofpclass !1\n  br label %out\n\nout:                                              ; preds = %else, %then\n  ret void\n}\n\n!0 = !{i32 3}\n!1 = !{i32 512}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Verifier/nofpclass-metadata.ll",
+      "commands": [
+        "not llvm-as -disable-output %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "not_load",
+          "test_body": "declare float @func()\n\ndefine float @not_load(ptr %ptr) {\n  %result = call float @func(), !nofpclass !0\n  ret float %result\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "load_hetero_struct",
+          "test_body": "%struct = type { i32, float }\n\ndefine %struct @load_hetero_struct(ptr %ptr) {\n  %load = load %struct, ptr %ptr, align 4, !nofpclass !0\n  ret %struct %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "md_is_float",
+          "test_body": "define float @md_is_float(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{float 1.000000e+00}\n"
+        },
+        {
+          "test_name": "load_int_vec",
+          "test_body": "define <2 x i32> @load_int_vec(ptr %ptr) {\n  %load = load <2 x i32>, ptr %ptr, align 8, !nofpclass !0\n  ret <2 x i32> %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "md_is_string",
+          "test_body": "define float @md_is_string(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{!\"foo\"}\n"
+        },
+        {
+          "test_name": "md_is_zero_val",
+          "test_body": "define float @md_is_zero_val(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{i32 0}\n"
+        },
+        {
+          "test_name": "md_is_i64",
+          "test_body": "define float @md_is_i64(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{i64 1}\n"
+        },
+        {
+          "test_name": "load_int",
+          "test_body": "define i32 @load_int(ptr %ptr) {\n  %load = load i32, ptr %ptr, align 4, !nofpclass !0\n  ret i32 %load\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "md_missing_value",
+          "test_body": "define float @md_missing_value(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{}\n"
+        },
+        {
+          "test_name": "md_is_ptr",
+          "test_body": "define float @md_is_ptr(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{ptr @md_is_ptr}\n"
+        },
+        {
+          "test_name": "md_is_out_of_bounds",
+          "test_body": "define float @md_is_out_of_bounds(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{i32 1024}\n"
+        },
+        {
+          "test_name": "md_too_many_entries",
+          "test_body": "define float @md_too_many_entries(ptr %ptr) {\n  %load = load float, ptr %ptr, align 4, !nofpclass !0\n  ret float %load\n}\n\n!0 = !{i32 1, i32 2}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/tools/llvm-reduce/reduce-operands-to-args-metadata-to-attributes.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "use_noundef_range",
+          "test_body": "define void @use_noundef_range() {\n  %load = load i32, ptr null, align 4, !range !0, !noundef !1\n  %load_vec = load <2 x i32>, ptr null, align 8, !range !0, !noundef !1\n  store i32 %load, ptr null, align 4\n  store <2 x i32> %load_vec, ptr null, align 8\n  ret void\n}\n\n!0 = !{i32 8, i32 25}\n!1 = !{}\n"
+        },
+        {
+          "test_name": "use_nofpclass",
+          "test_body": "define void @use_nofpclass() {\n  %load = load float, ptr null, align 4, !nofpclass !0\n  %load_vec = load <2 x float>, ptr null, align 8, !nofpclass !1\n  store float %load, ptr null, align 4\n  store <2 x float> %load_vec, ptr null, align 8\n  ret void\n}\n\n!0 = !{i32 3}\n!1 = !{i32 516}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:ir",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#177140** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/177140?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/177140?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "I guess we can leverage this metadata to infer nnan/ninf for phi nodes in SROA.\r\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-21T10:46:01Z",
+  "patch_location_lineno": {
+    "llvm/docs/LangRef.rst": [
+      [
+        7448,
+        7453
+      ]
+    ],
+    "llvm/include/llvm/IR/FixedMetadataKinds.def": [
+      [
+        58,
+        60
+      ]
+    ],
+    "llvm/include/llvm/IR/Metadata.h": [
+      [
+        144,
+        150
+      ],
+      [
+        1472,
+        1477
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5098,
+        5103
+      ]
+    ],
+    "llvm/lib/IR/Attributes.cpp": [
+      [
+        2337,
+        2342
+      ]
+    ],
+    "llvm/lib/IR/Metadata.cpp": [
+      [
+        1397,
+        1402
+      ]
+    ],
+    "llvm/lib/IR/Verifier.cpp": [
+      [
+        529,
+        534
+      ],
+      [
+        4570,
+        4575
+      ],
+      [
+        5692,
+        5697
+      ]
+    ],
+    "llvm/lib/Transforms/Scalar/GVN.cpp": [
+      [
+        1594,
+        1599
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/Local.cpp": [
+      [
+        2961,
+        2966
+      ],
+      [
+        3149,
+        3154
+      ]
+    ],
+    "llvm/test/Transforms/ArgumentPromotion/metadata.ll": [
+      [
+        3,
+        12
+      ],
+      [
+        19,
+        24
+      ],
+      [
+        31,
+        36
+      ],
+      [
+        41,
+        66
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass.ll": [
+      [
+        3734,
+        3739
+      ],
+      [
+        3748,
+        3753
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/load-metadata.ll": [
+      [
+        45,
+        59
+      ]
+    ],
+    "llvm/test/Transforms/GVNHoist/hoist-md.ll": [
+      [
+        157,
+        162
+      ],
+      [
+        171,
+        174
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fold-phi-load-metadata.ll": [
+      [
+        35,
+        40
+      ],
+      [
+        45,
+        50
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/loadstore-metadata.ll": [
+      [
+        327,
+        332
+      ],
+      [
+        362,
+        365
+      ]
+    ],
+    "llvm/test/Transforms/SROA/preserve-metadata.ll": [
+      [
+        146,
+        151
+      ]
+    ],
+    "llvm/test/Transforms/SimplifyCFG/hoist-with-metadata.ll": [
+      [
+        592,
+        597
+      ],
+      [
+        616,
+        619
+      ]
+    ],
+    "llvm/test/tools/llvm-reduce/reduce-operands-to-args-metadata-to-attributes.ll": [
+      [
+        66,
+        72
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ],
+    "llvm/lib/IR/Attributes.cpp": [
+      "AttrBuilder::addFromEquivalentMetadata",
+      "AttrBuilder::merge"
+    ],
+    "llvm/lib/IR/Metadata.cpp": [
+      "MDNode::getMostGenericNoaliasAddrspace",
+      "MDNode::getMostGenericRange"
+    ],
+    "llvm/lib/IR/Verifier.cpp": [
+      "Verifier::visitInstruction",
+      "Verifier::visitNoaliasAddrspaceMetadata",
+      "Verifier::visitRangeMetadata"
+    ],
+    "llvm/lib/Transforms/Scalar/GVN.cpp": [
+      "GVNPass::eliminatePartiallyRedundantLoad"
+    ],
+    "llvm/lib/Transforms/Utils/Local.cpp": [
+      "combineMetadata",
+      "llvm::copyMetadataForLoad"
+    ]
+  }
+}

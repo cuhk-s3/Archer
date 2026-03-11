@@ -1,0 +1,188 @@
+{
+  "pr_id": 175974,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175974",
+  "state": "closed",
+  "title": "InstCombine: Handle multiple uses for min/max in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "196433eb270390820bb50c243a66fc78a1757b41",
+  "fix_commit": "05135bcbff03648aaa49d999c820002d067010a9",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 6275d5624197e..358fac1ec07d7 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2033,6 +2033,101 @@ static Constant *getFPClassConstant(Type *Ty, FPClassTest Mask,\n   }\n }\n \n+static Value *\n+simplifyDemandedFPClassMinMax(KnownFPClass &Known, Intrinsic::ID IID,\n+                              const CallInst *CI, FPClassTest DemandedMask,\n+                              KnownFPClass KnownLHS, KnownFPClass KnownRHS,\n+                              const Function &F, bool NSZ) {\n+  const bool PropagateNaN =\n+      IID == Intrinsic::maximum || IID == Intrinsic::minimum;\n+\n+  /// Propagate nnan-ness to simplify edge case checks.\n+  if (PropagateNaN && (DemandedMask & fcNan) == fcNone) {\n+    KnownLHS.knownNot(fcNan);\n+    KnownRHS.knownNot(fcNan);\n+  }\n+\n+  bool OrderedZeroSign = !NSZ;\n+\n+  KnownFPClass::MinMaxKind OpKind;\n+  switch (IID) {\n+  case Intrinsic::maximum: {\n+    OpKind = KnownFPClass::MinMaxKind::maximum;\n+\n+    // If one operand is known greater than the other, it must be that\n+    // operand unless the other is a nan.\n+    if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n+                                KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownRHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(0);\n+\n+    if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n+                                   KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownLHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(1);\n+\n+    break;\n+  }\n+  case Intrinsic::minimum: {\n+    OpKind = KnownFPClass::MinMaxKind::minimum;\n+\n+    // If one operand is known less than the other, it must be that operand\n+    // unless the other is a nan.\n+    if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n+                                   KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownRHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(0);\n+\n+    if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n+                                KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownLHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(1);\n+\n+    break;\n+  }\n+  case Intrinsic::maximumnum: {\n+    OpKind = KnownFPClass::MinMaxKind::maximumnum;\n+\n+    if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n+                                KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownLHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(0);\n+\n+    if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n+                                   KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownRHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(1);\n+\n+    break;\n+  }\n+  case Intrinsic::minimumnum: {\n+    OpKind = KnownFPClass::MinMaxKind::minimumnum;\n+\n+    if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n+                                   KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownLHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(0);\n+\n+    if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n+                                KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n+        KnownRHS.isKnownNever(fcNan))\n+      return CI->getArgOperand(1);\n+\n+    break;\n+  }\n+  default:\n+    llvm_unreachable(\"not a min/max intrinsic\");\n+  }\n+\n+  Type *EltTy = CI->getType()->getScalarType();\n+  DenormalMode Mode = F.getDenormalMode(EltTy->getFltSemantics());\n+  Known = KnownFPClass::minMaxLike(KnownLHS, KnownRHS, OpKind, Mode);\n+\n+  FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n+  return getFPClassConstant(CI->getType(), ValidResults,\n+                            /*IsCanonicalizing=*/true);\n+}\n+\n /// Try to set an inferred no-nans or no-infs in \\p FMF. \\p\n /// ValidResults is a mask of known valid results for the operator\n /// (already computed from the result, and the known operand inputs,\n@@ -2447,101 +2542,16 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n           SimplifyDemandedFPClass(CI, 0, SrcDemandedMask, KnownLHS, Depth + 1))\n         return I;\n \n-      /// Propagate nnan-ness to simplify edge case checks.\n-      if (PropagateNaN && (DemandedMask & fcNan) == fcNone) {\n-        KnownLHS.knownNot(fcNan);\n-        KnownRHS.knownNot(fcNan);\n-      }\n-\n-      bool OrderedZeroSign = !FMF.noSignedZeros();\n-\n-      KnownFPClass::MinMaxKind OpKind;\n-      switch (IID) {\n-      case Intrinsic::maximum: {\n-        OpKind = KnownFPClass::MinMaxKind::maximum;\n-\n-        // If one operand is known greater than the other, it must be that\n-        // operand unless the other is a nan.\n-        if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n-                                    KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n-            KnownRHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(0);\n-\n-        if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n-                                       KnownRHS.KnownFPClasses,\n-                                       OrderedZeroSign) &&\n-            KnownLHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(1);\n-\n-        break;\n-      }\n-      case Intrinsic::minimum: {\n-        OpKind = KnownFPClass::MinMaxKind::minimum;\n-\n-        // If one operand is known less than the other, it must be that operand\n-        // unless the other is a nan.\n-        if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n-                                       KnownRHS.KnownFPClasses,\n-                                       OrderedZeroSign) &&\n-            KnownRHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(0);\n-\n-        if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n-                                    KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n-            KnownLHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(1);\n-\n-        break;\n-      }\n-      case Intrinsic::maximumnum: {\n-        OpKind = KnownFPClass::MinMaxKind::maximumnum;\n-\n-        if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n-                                    KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n-            KnownLHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(0);\n-\n-        if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n-                                       KnownRHS.KnownFPClasses,\n-                                       OrderedZeroSign) &&\n-            KnownRHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(1);\n-\n-        break;\n-      }\n-      case Intrinsic::minimumnum: {\n-        OpKind = KnownFPClass::MinMaxKind::minimumnum;\n-\n-        if (cannotOrderStrictlyGreater(KnownLHS.KnownFPClasses,\n-                                       KnownRHS.KnownFPClasses,\n-                                       OrderedZeroSign) &&\n-            KnownLHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(0);\n-\n-        if (cannotOrderStrictlyLess(KnownLHS.KnownFPClasses,\n-                                    KnownRHS.KnownFPClasses, OrderedZeroSign) &&\n-            KnownRHS.isKnownNever(fcNan))\n-          return CI->getArgOperand(1);\n-\n-        break;\n-      }\n-      default:\n-        llvm_unreachable(\"not a min/max intrinsic\");\n-      }\n-\n-      Type *EltTy = VTy->getScalarType();\n-      DenormalMode Mode = F.getDenormalMode(EltTy->getFltSemantics());\n-      Known = KnownFPClass::minMaxLike(KnownLHS, KnownRHS, OpKind, Mode);\n-\n-      FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n-\n-      if (Constant *SingleVal =\n-              getFPClassConstant(VTy, ValidResults, /*IsCanonicalizing=*/true))\n-        return SingleVal;\n+      Value *Simplified =\n+          simplifyDemandedFPClassMinMax(Known, IID, CI, DemandedMask, KnownLHS,\n+                                        KnownRHS, F, FMF.noSignedZeros());\n+      if (Simplified)\n+        return Simplified;\n \n       auto *FPOp = cast<FPMathOperator>(CI);\n \n       bool ChangedFlags = false;\n+      FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n \n       // TODO: Add NSZ flag if we know the result will not be sensitive on the\n       // sign of 0.\n@@ -2950,6 +2960,32 @@ Value *InstCombinerImpl::SimplifyMultipleUseDemandedFPClass(\n     Known = KnownLHS.intersectWith(KnownRHS);\n     break;\n   }\n+  case Instruction::Call: {\n+    const CallInst *CI = cast<CallInst>(I);\n+    const Intrinsic::ID IID = CI->getIntrinsicID();\n+    switch (IID) {\n+    case Intrinsic::maximum:\n+    case Intrinsic::minimum:\n+    case Intrinsic::maximumnum:\n+    case Intrinsic::minimumnum: {\n+      KnownFPClass KnownRHS = computeKnownFPClass(\n+          CI->getArgOperand(1), DemandedMask, CxtI, Depth + 1);\n+      if (KnownRHS.isUnknown())\n+        return nullptr;\n+\n+      KnownFPClass KnownLHS = computeKnownFPClass(\n+          CI->getArgOperand(0), DemandedMask, CxtI, Depth + 1);\n+\n+      return simplifyDemandedFPClassMinMax(\n+          Known, IID, CI, DemandedMask, KnownLHS, KnownRHS, F,\n+          cast<FPMathOperator>(CI)->hasNoSignedZeros());\n+    }\n+    default:\n+      break;\n+    }\n+\n+    [[fallthrough]];\n+  }\n   default:\n     Known = computeKnownFPClass(I, DemandedMask, CxtI, Depth + 1);\n     break;\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-maximum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "simplify_multiple_use_maximum_commute",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive()\n\ndeclare nofpclass(nan pinf pzero psub pnorm) float @returns_negative()\n\ndefine nofpclass(snan) float @simplify_multiple_use_maximum_commute(ptr %ptr) {\n  %positive = call float @returns_positive()\n  %negative = call float @returns_negative()\n  %max = call float @llvm.maximum.f32(float %negative, float %positive)\n  store float %max, ptr %ptr, align 4\n  ret float %max\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "simplify_multiple_use_maximum",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive()\n\ndeclare nofpclass(nan pinf pzero psub pnorm) float @returns_negative()\n\ndefine nofpclass(snan) float @simplify_multiple_use_maximum(ptr %ptr) {\n  %positive = call float @returns_positive()\n  %negative = call float @returns_negative()\n  %max = call float @llvm.maximum.f32(float %positive, float %negative)\n  store float %max, ptr %ptr, align 4\n  ret float %max\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-maximumnum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "simplify_multiple_use_maximumnum_commute",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive()\n\ndeclare nofpclass(pinf pzero psub pnorm) float @returns_negative_or_nan()\n\ndefine nofpclass(snan) float @simplify_multiple_use_maximumnum_commute(ptr %ptr) {\n  %positive = call float @returns_positive()\n  %negative.or.nan = call float @returns_negative_or_nan()\n  %max = call float @llvm.maximumnum.f32(float %negative.or.nan, float %positive)\n  store float %max, ptr %ptr, align 4\n  ret float %max\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "simplify_multiple_use_maximumnum",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive()\n\ndeclare nofpclass(pinf pzero psub pnorm) float @returns_negative_or_nan()\n\ndefine nofpclass(snan) float @simplify_multiple_use_maximumnum(ptr %ptr) {\n  %positive = call float @returns_positive()\n  %negative.or.nan = call float @returns_negative_or_nan()\n  %max = call float @llvm.maximumnum.f32(float %positive, float %negative.or.nan)\n  store float %max, ptr %ptr, align 4\n  ret float %max\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-minimum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "simplify_multiple_use_minimum",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive()\n\ndeclare nofpclass(nan pinf pzero psub pnorm) float @returns_negative()\n\ndefine nofpclass(snan) float @simplify_multiple_use_minimum(ptr %ptr) {\n  %positive = call float @returns_positive()\n  %negative = call float @returns_negative()\n  %min = call float @llvm.minimum.f32(float %positive, float %negative)\n  store float %min, ptr %ptr, align 4\n  ret float %min\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "simplify_multiple_use_minimum_commute",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive()\n\ndeclare nofpclass(nan pinf pzero psub pnorm) float @returns_negative()\n\ndefine nofpclass(snan) float @simplify_multiple_use_minimum_commute(ptr %ptr) {\n  %positive = call float @returns_positive()\n  %negative = call float @returns_negative()\n  %min = call float @llvm.minimum.f32(float %negative, float %positive)\n  store float %min, ptr %ptr, align 4\n  ret float %min\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-minimumnum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "simplify_multiple_use_minimumnum_commute",
+          "test_body": "declare nofpclass(ninf nzero nsub nnorm) float @returns_positive_or_nan()\n\ndeclare nofpclass(nan pinf pzero psub pnorm) float @returns_negative()\n\ndefine nofpclass(snan) float @simplify_multiple_use_minimumnum_commute(ptr %ptr) {\n  %positive.or.nan = call float @returns_positive_or_nan()\n  %negative = call float @returns_negative()\n  %min = call float @llvm.minimumnum.f32(float %negative, float %positive.or.nan)\n  store float %min, ptr %ptr, align 4\n  ret float %min\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "simplify_multiple_use_minimumnum",
+          "test_body": "declare nofpclass(ninf nzero nsub nnorm) float @returns_positive_or_nan()\n\ndeclare nofpclass(nan pinf pzero psub pnorm) float @returns_negative()\n\ndefine nofpclass(snan) float @simplify_multiple_use_minimumnum(ptr %ptr) {\n  %positive.or.nan = call float @returns_positive_or_nan()\n  %negative = call float @returns_negative()\n  %min = call float @llvm.minimumnum.f32(float %positive.or.nan, float %negative)\n  store float %min, ptr %ptr, align 4\n  ret float %min\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175974** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175974?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175974?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#175382** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175382?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175381** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175381?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175380** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175380?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175372** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175372?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-14T15:59:27Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2033,
+        2038
+      ],
+      [
+        2447,
+        2547
+      ],
+      [
+        2950,
+        2955
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-maximum.ll": [
+      [
+        2071,
+        2077
+      ],
+      [
+        2087,
+        2093
+      ],
+      [
+        2103,
+        2109
+      ],
+      [
+        2119,
+        2125
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-maximumnum.ll": [
+      [
+        2076,
+        2082
+      ],
+      [
+        2092,
+        2098
+      ],
+      [
+        2108,
+        2114
+      ],
+      [
+        2124,
+        2130
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-minimum.ll": [
+      [
+        2059,
+        2065
+      ],
+      [
+        2075,
+        2081
+      ],
+      [
+        2091,
+        2097
+      ],
+      [
+        2107,
+        2113
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-minimumnum.ll": [
+      [
+        2067,
+        2073
+      ],
+      [
+        2083,
+        2089
+      ],
+      [
+        2099,
+        2105
+      ],
+      [
+        2115,
+        2121
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass",
+      "InstCombinerImpl::SimplifyMultipleUseDemandedFPClass",
+      "getFPClassConstant"
+    ]
+  }
+}

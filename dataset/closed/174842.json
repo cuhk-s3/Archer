@@ -1,0 +1,689 @@
+{
+  "pr_id": 174842,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174842",
+  "state": "closed",
+  "title": "InstCombine: Handle rounding intrinsics in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "8821654715dcebf45ffd1e467b0ce2daf6946195",
+  "fix_commit": "1da1e7a3d5e5a865ad9bb30d49abc4687bd7da74",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex 5a3ed677bd762..193a3511b9f8e 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -299,6 +299,13 @@ struct KnownFPClass {\n                                      const fltSemantics &DstTy,\n                                      const fltSemantics &SrcTy);\n \n+  /// Propagate known class for rounding intrinsics (trunc, floor, ceil, rint,\n+  /// nearbyint, round, roundeven). This is trunc if \\p IsTrunc. \\p\n+  /// IsMultiUnitFPType if this is for a multi-unit floating-point type.\n+  static LLVM_ABI KnownFPClass roundToIntegral(const KnownFPClass &Src,\n+                                               bool IsTrunc,\n+                                               bool IsMultiUnitFPType);\n+\n   void resetAll() { *this = KnownFPClass(); }\n };\n \ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 5340d41dd3683..4c123aa0bd054 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5228,26 +5228,9 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n       computeKnownFPClass(II->getArgOperand(0), DemandedElts, InterestedSrcs,\n                           KnownSrc, Q, Depth + 1);\n \n-      // Integer results cannot be subnormal.\n-      Known.knownNot(fcSubnormal);\n-\n-      Known.propagateNaN(KnownSrc, true);\n-\n-      // Pass through infinities, except PPC_FP128 is a special case for\n-      // intrinsics other than trunc.\n-      if (IID == Intrinsic::trunc || !V->getType()->isMultiUnitFPType()) {\n-        if (KnownSrc.isKnownNeverPosInfinity())\n-          Known.knownNot(fcPosInf);\n-        if (KnownSrc.isKnownNeverNegInfinity())\n-          Known.knownNot(fcNegInf);\n-      }\n-\n-      // Negative round ups to 0 produce -0\n-      if (KnownSrc.isKnownNever(fcPosFinite))\n-        Known.knownNot(fcPosFinite);\n-      if (KnownSrc.isKnownNever(fcNegFinite))\n-        Known.knownNot(fcNegFinite);\n-\n+      Known = KnownFPClass::roundToIntegral(\n+          KnownSrc, IID == Intrinsic::trunc,\n+          V->getType()->getScalarType()->isMultiUnitFPType());\n       break;\n     }\n     case Intrinsic::exp:\ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex e14fca918bb5c..2e43469245563 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -376,3 +376,31 @@ KnownFPClass KnownFPClass::fpext(const KnownFPClass &KnownSrc,\n \n   return Known;\n }\n+\n+KnownFPClass KnownFPClass::roundToIntegral(const KnownFPClass &KnownSrc,\n+                                           bool IsTrunc,\n+                                           bool IsMultiUnitFPType) {\n+  KnownFPClass Known;\n+\n+  // Integer results cannot be subnormal.\n+  Known.knownNot(fcSubnormal);\n+\n+  Known.propagateNaN(KnownSrc, true);\n+\n+  // Pass through infinities, except PPC_FP128 is a special case for\n+  // intrinsics other than trunc.\n+  if (IsTrunc || !IsMultiUnitFPType) {\n+    if (KnownSrc.isKnownNeverPosInfinity())\n+      Known.knownNot(fcPosInf);\n+    if (KnownSrc.isKnownNeverNegInfinity())\n+      Known.knownNot(fcNegInf);\n+  }\n+\n+  // Negative round ups to 0 produce -0\n+  if (KnownSrc.isKnownNever(fcPosFinite))\n+    Known.knownNot(fcPosFinite);\n+  if (KnownSrc.isKnownNever(fcNegFinite))\n+    Known.knownNot(fcNegFinite);\n+\n+  return Known;\n+}\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 9382f5b536d87..19e0eafc9c8b2 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2638,6 +2638,73 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n \n       return getFPClassConstant(VTy, ValidResults, /*IsCanonicalizing=*/true);\n     }\n+    case Intrinsic::trunc:\n+    case Intrinsic::floor:\n+    case Intrinsic::ceil:\n+    case Intrinsic::rint:\n+    case Intrinsic::nearbyint:\n+    case Intrinsic::round:\n+    case Intrinsic::roundeven: {\n+      FPClassTest DemandedSrcMask = DemandedMask;\n+\n+      // Zero results imply valid subnormal sources.\n+      if (DemandedMask & fcNegZero)\n+        DemandedSrcMask |= fcNegSubnormal | fcNegNormal;\n+\n+      if (DemandedMask & fcPosZero)\n+        DemandedSrcMask |= fcPosSubnormal | fcPosNormal;\n+\n+      KnownFPClass KnownSrc;\n+      if (SimplifyDemandedFPClass(CI, 0, DemandedSrcMask, KnownSrc, Depth + 1))\n+        return I;\n+\n+      // Note: Possibly dropping snan quiet.\n+      if (KnownSrc.isKnownAlways(fcInf | fcNan | fcZero))\n+        return CI->getArgOperand(0);\n+\n+      // Propagate nnan-ness to source to simplify source checks.\n+      if ((DemandedMask & fcNan) == fcNone)\n+        KnownSrc.knownNot(fcNan);\n+\n+      bool IsRoundNearestOrTrunc =\n+          IID == Intrinsic::round || IID == Intrinsic::roundeven ||\n+          IID == Intrinsic::nearbyint || IID == Intrinsic::rint ||\n+          IID == Intrinsic::trunc;\n+\n+      // Ignore denormals-as-zero, as canonicalization is not mandated.\n+      if ((IID == Intrinsic::floor || IsRoundNearestOrTrunc) &&\n+          KnownSrc.isKnownAlways(fcPosZero | fcPosSubnormal))\n+        return ConstantFP::getZero(VTy);\n+\n+      if ((IID == Intrinsic::ceil || IsRoundNearestOrTrunc) &&\n+          KnownSrc.isKnownAlways(fcNegZero | fcNegSubnormal))\n+        return ConstantFP::getZero(VTy, true);\n+\n+      if (IID == Intrinsic::floor && KnownSrc.isKnownAlways(fcNegSubnormal))\n+        return ConstantFP::get(VTy, -1.0);\n+\n+      if (IID == Intrinsic::ceil && KnownSrc.isKnownAlways(fcPosSubnormal))\n+        return ConstantFP::get(VTy, 1.0);\n+\n+      Known = KnownFPClass::roundToIntegral(\n+          KnownSrc, IID == Intrinsic::trunc,\n+          VTy->getScalarType()->isMultiUnitFPType());\n+\n+      FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n+      if (Constant *SingleVal =\n+              getFPClassConstant(VTy, ValidResults, /*IsCanonicalizing=*/true))\n+        return SingleVal;\n+\n+      if ((IID == Intrinsic::trunc || IsRoundNearestOrTrunc) &&\n+          KnownSrc.isKnownAlways(fcZero | fcSubnormal)) {\n+        Value *Copysign = Builder.CreateCopySign(ConstantFP::getZero(VTy),\n+                                                 CI->getArgOperand(0));\n+        Copysign->takeName(CI);\n+        return Copysign;\n+      }\n+\n+      return nullptr;\n+    }\n     case Intrinsic::canonicalize: {\n       Type *EltTy = VTy->getScalarType();\n \n",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-rounding-intrinsics.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_only_nan__floor_vec",
+          "test_body": "define nofpclass(inf zero sub norm) <2 x float> @ret_only_nan__floor_vec(<2 x float> %x) {\n  %result = call <2 x float> @llvm.floor.v2f32(<2 x float> %x)\n  ret <2 x float> %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x float> @llvm.floor.v2f32(<2 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf_or_nan__floor",
+          "test_body": "define nofpclass(snan) float @source_known_inf_or_nan__floor(float nofpclass(zero sub norm) %inf.or.nan) {\n  %result = call float @llvm.floor.f32(float %inf.or.nan)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans__simplify_select_nan__nearbyint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans__simplify_select_nan__nearbyint(i1 %cond, float nofpclass(inf zero sub norm) %is.nan, float %unknown) {\n  %select = select i1 %cond, float %is.nan, float %unknown\n  %result = call float @llvm.nearbyint.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.nearbyint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf_or_nan_or_zero_or_sub__floor",
+          "test_body": "define nofpclass(snan) float @source_known_inf_or_nan_or_zero_or_sub__floor(float nofpclass(norm) %inf.or.nan.or.zero.or.sub) {\n  %result = call float @llvm.floor.f32(float %inf.or.nan.or.zero.or.sub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_inf_no_nan__simplify_select_inf_or_nan__floor",
+          "test_body": "define nofpclass(nan inf) float @ret_no_inf_no_nan__simplify_select_inf_or_nan__floor(i1 %cond, float nofpclass(zero sub norm) %is.inf.or.nan, float %unknown) {\n  %select = select i1 %cond, float %is.inf.or.nan, float %unknown\n  %result = call float @llvm.floor.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub_or_nzero__ceil",
+          "test_body": "define nofpclass(snan) float @source_known_nsub_or_nzero__ceil(float nofpclass(nan inf pzero psub norm) %nsub.or.nzero) {\n  %result = call float @llvm.ceil.f32(float %nsub.or.nzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.ceil.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub_or_nzero_or_nan__floor",
+          "test_body": "define nofpclass(snan) float @source_known_nsub_or_nzero_or_nan__floor(float nofpclass(inf pzero psub norm) %nsub.or.nzero.or.nan) {\n  %result = call float @llvm.floor.f32(float %nsub.or.nzero.or.nan)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_nsub_or_zero_or_nan__roundeven",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_nsub_or_zero_or_nan__roundeven(float nofpclass(inf psub norm) %nsub.or.zero) {\n  %result = call float @llvm.roundeven.f32(float %nsub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.roundeven.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_nsub_or_zero_or_nan__nearbyint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_nsub_or_zero_or_nan__nearbyint(float nofpclass(inf psub norm) %nsub.or.zero) {\n  %result = call float @llvm.nearbyint.f32(float %nsub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.nearbyint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub__floor",
+          "test_body": "define nofpclass(snan) float @source_known_psub__floor(float nofpclass(nan inf zero nsub norm) %psub) {\n  %result = call float @llvm.floor.f32(float %psub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub_or_zero__roundeven",
+          "test_body": "define nofpclass(snan) float @source_known_sub_or_zero__roundeven(float nofpclass(nan inf norm) %sub.or.zero) {\n  %result = call float @llvm.roundeven.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.roundeven.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_nsub_or_zero_or_nan__round",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_nsub_or_zero_or_nan__round(float nofpclass(inf psub norm) %nsub.or.zero) {\n  %result = call float @llvm.round.f32(float %nsub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_sub_or_zero_or_nan__rint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_sub_or_zero_or_nan__rint(float nofpclass(inf norm) %sub.or.zero) {\n  %result = call float @llvm.rint.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.rint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_nsub__trunc(float nofpclass(nan inf zero psub norm) %nsub) {\n  %result = call float @llvm.trunc.f32(float %nsub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans__simplify_select_nan__trunc",
+          "test_body": "define nofpclass(nan) float @ret_no_nans__simplify_select_nan__trunc(i1 %cond, float nofpclass(inf zero sub norm) %is.nan, float %unknown) {\n  %select = select i1 %cond, float %is.nan, float %unknown\n  %result = call float @llvm.trunc.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf_or_nan_or_zero_or_sub__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_inf_or_nan_or_zero_or_sub__trunc(float nofpclass(norm) %inf.or.nan.or.zero.or.sub) {\n  %result = call float @llvm.trunc.f32(float %inf.or.nan.or.zero.or.sub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub_or_pzero__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_psub_or_pzero__trunc(float nofpclass(nan inf nzero nsub norm) %psub.or.pzero) {\n  %result = call float @llvm.trunc.f32(float %psub.or.pzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_only_psub__floor",
+          "test_body": "define nofpclass(snan) float @ret_only_only_psub__floor(float nofpclass(nan inf zero nsub norm) %only.psub) {\n  %result = call float @llvm.floor.f32(float %only.psub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub__floor",
+          "test_body": "define nofpclass(snan) float @source_known_sub__floor(float nofpclass(nan inf zero norm) %sub) {\n  %result = call float @llvm.floor.f32(float %sub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans__simplify_select_nan__round",
+          "test_body": "define nofpclass(nan) float @ret_no_nans__simplify_select_nan__round(i1 %cond, float nofpclass(inf zero sub norm) %is.nan, float %unknown) {\n  %select = select i1 %cond, float %is.nan, float %unknown\n  %result = call float @llvm.round.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub_or_zero__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_sub_or_zero__trunc(float nofpclass(nan inf norm) %sub.or.zero) {\n  %result = call float @llvm.trunc.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_only_nsub__ceil",
+          "test_body": "define nofpclass(snan) float @ret_only_only_nsub__ceil(float nofpclass(nan inf zero psub norm) %only.nsub) {\n  %result = call float @llvm.ceil.f32(float %only.nsub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.ceil.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans__simplify_select_nan__ceil",
+          "test_body": "define nofpclass(nan) float @ret_no_nans__simplify_select_nan__ceil(i1 %cond, float nofpclass(inf zero sub norm) %is.nan, float %unknown) {\n  %select = select i1 %cond, float %is.nan, float %unknown\n  %result = call float @llvm.ceil.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.ceil.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_sub__trunc(float nofpclass(nan inf zero norm) %sub) {\n  %result = call float @llvm.trunc.f32(float %sub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub_or_pzero__nearbyint",
+          "test_body": "define nofpclass(snan) float @source_known_psub_or_pzero__nearbyint(float nofpclass(nan inf nzero nsub norm) %psub.or.pzero) {\n  %result = call float @llvm.nearbyint.f32(float %psub.or.pzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.nearbyint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub_or_pzero__round",
+          "test_body": "define nofpclass(snan) float @source_known_psub_or_pzero__round(float nofpclass(nan inf nzero nsub norm) %psub.or.pzero) {\n  %result = call float @llvm.round.f32(float %psub.or.pzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_sub_or_zero_or_nan__roundeven",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_sub_or_zero_or_nan__roundeven(float nofpclass(inf norm) %sub.or.zero) {\n  %result = call float @llvm.roundeven.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.roundeven.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_nan__floor",
+          "test_body": "define nofpclass(inf zero sub norm) float @ret_only_nan__floor(float %x) {\n  %result = call float @llvm.floor.f32(float %x)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf__floor",
+          "test_body": "define nofpclass(snan) float @source_known_inf__floor(float nofpclass(nan zero sub norm) %inf) {\n  %result = call float @llvm.floor.f32(float %inf)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_pinf__floor",
+          "test_body": "define nofpclass(snan) float @source_known_pinf__floor(float nofpclass(nan ninf zero sub norm) %pinf) {\n  %result = call float @llvm.floor.f32(float %pinf)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub_or_nzero__roundeven",
+          "test_body": "define nofpclass(snan) float @source_known_nsub_or_nzero__roundeven(float nofpclass(nan inf pzero psub norm) %nsub.or.nzero) {\n  %result = call float @llvm.roundeven.f32(float %nsub.or.nzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.roundeven.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_nsub_or_zero_or_nan__rint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_nsub_or_zero_or_nan__rint(float nofpclass(inf psub norm) %nsub.or.zero) {\n  %result = call float @llvm.rint.f32(float %nsub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.rint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans__simplify_select_nan__roundeven",
+          "test_body": "define nofpclass(nan) float @ret_no_nans__simplify_select_nan__roundeven(i1 %cond, float nofpclass(inf zero sub norm) %is.nan, float %unknown) {\n  %select = select i1 %cond, float %is.nan, float %unknown\n  %result = call float @llvm.roundeven.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.roundeven.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf_or_nan_or_zero__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_inf_or_nan_or_zero__trunc(float nofpclass(sub norm) %inf.or.nan.or.zero) {\n  %result = call float @llvm.trunc.f32(float %inf.or.nan.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf_or_zero__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_inf_or_zero__trunc(float nofpclass(nan sub norm) %inf.or.zero) {\n  %result = call float @llvm.trunc.f32(float %inf.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub_or_zero__rint",
+          "test_body": "define nofpclass(snan) float @source_known_sub_or_zero__rint(float nofpclass(nan inf norm) %sub.or.zero) {\n  %result = call float @llvm.rint.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.rint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_psub_or_zero_or_nan__trunc",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_psub_or_zero_or_nan__trunc(float nofpclass(inf nsub norm) %psub.or.zero) {\n  %result = call float @llvm.trunc.f32(float %psub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf_or_zero__floor",
+          "test_body": "define nofpclass(snan) float @source_known_inf_or_zero__floor(float nofpclass(nan sub norm) %inf.or.zero) {\n  %result = call float @llvm.floor.f32(float %inf.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_only_nsub__floor",
+          "test_body": "define nofpclass(snan) float @ret_only_only_nsub__floor(float nofpclass(nan inf zero psub norm) %only.nsub) {\n  %result = call float @llvm.floor.f32(float %only.nsub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub_or_nzero__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_nsub_or_nzero__trunc(float nofpclass(nan inf pzero psub norm) %nsub.or.nzero) {\n  %result = call float @llvm.trunc.f32(float %nsub.or.nzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_pinf_or_nan__floor",
+          "test_body": "define nofpclass(snan) float @source_known_pinf_or_nan__floor(float nofpclass(ninf zero sub norm) %pinf.or.nan) {\n  %result = call float @llvm.floor.f32(float %pinf.or.nan)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_only_nsub__round",
+          "test_body": "define nofpclass(snan) float @ret_only_only_nsub__round(float nofpclass(nan inf zero psub norm) %only.nsub) {\n  %result = call float @llvm.round.f32(float %only.nsub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_inf_or_nan_or_zero__floor",
+          "test_body": "define nofpclass(snan) float @source_known_inf_or_nan_or_zero__floor(float nofpclass(sub norm) %inf.or.nan.or.zero) {\n  %result = call float @llvm.floor.f32(float %inf.or.nan.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans__simplify_select_nan__rint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans__simplify_select_nan__rint(i1 %cond, float nofpclass(inf zero sub norm) %is.nan, float %unknown) {\n  %select = select i1 %cond, float %is.nan, float %unknown\n  %result = call float @llvm.rint.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.rint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_infs__simplify_select_inf__floor",
+          "test_body": "define nofpclass(inf) float @ret_no_infs__simplify_select_inf__floor(i1 %cond, float nofpclass(nan zero sub norm) %is.inf, float %unknown) {\n  %select = select i1 %cond, float %is.inf, float %unknown\n  %result = call float @llvm.floor.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub_or_nzero__rint",
+          "test_body": "define nofpclass(snan) float @source_known_nsub_or_nzero__rint(float nofpclass(nan inf pzero psub norm) %nsub.or.nzero) {\n  %result = call float @llvm.rint.f32(float %nsub.or.nzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.rint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub_or_zero__nearbyint",
+          "test_body": "define nofpclass(snan) float @source_known_sub_or_zero__nearbyint(float nofpclass(nan inf norm) %sub.or.zero) {\n  %result = call float @llvm.nearbyint.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.nearbyint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub_or_pzero__floor",
+          "test_body": "define nofpclass(snan) float @source_known_psub_or_pzero__floor(float nofpclass(nan inf nzero nsub norm) %psub.or.pzero) {\n  %result = call float @llvm.floor.f32(float %psub.or.pzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_psub_or_zero_or_nan__rint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_psub_or_zero_or_nan__rint(float nofpclass(inf nsub norm) %psub.or.zero) {\n  %result = call float @llvm.rint.f32(float %psub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.rint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub_or_pzero__rint",
+          "test_body": "define nofpclass(snan) float @source_known_psub_or_pzero__rint(float nofpclass(nan inf nzero nsub norm) %psub.or.pzero) {\n  %result = call float @llvm.rint.f32(float %psub.or.pzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.rint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub_or_nzero__nearbyint",
+          "test_body": "define nofpclass(snan) float @source_known_nsub_or_nzero__nearbyint(float nofpclass(nan inf pzero psub norm) %nsub.or.nzero) {\n  %result = call float @llvm.nearbyint.f32(float %nsub.or.nzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.nearbyint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_psub_or_zero_or_nan__round",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_psub_or_zero_or_nan__round(float nofpclass(inf nsub norm) %psub.or.zero) {\n  %result = call float @llvm.round.f32(float %psub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub_or_pzero__ceil",
+          "test_body": "define nofpclass(snan) float @source_known_psub_or_pzero__ceil(float nofpclass(nan inf nzero nsub norm) %psub.or.pzero) {\n  %result = call float @llvm.ceil.f32(float %psub.or.pzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.ceil.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_nsub_or_zero_or_nan__trunc",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_nsub_or_zero_or_nan__trunc(float nofpclass(inf psub norm) %nsub.or.zero) {\n  %result = call float @llvm.trunc.f32(float %nsub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_sub_or_zero_or_nan__nearbyint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_sub_or_zero_or_nan__nearbyint(float nofpclass(inf norm) %sub.or.zero) {\n  %result = call float @llvm.nearbyint.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.nearbyint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_sub_or_zero_or_nan__round",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_sub_or_zero_or_nan__round(float nofpclass(inf norm) %sub.or.zero) {\n  %result = call float @llvm.round.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_not_ninf__floor_ppcf128",
+          "test_body": "define nofpclass(snan) ppc_fp128 @source_known_not_ninf__floor_ppcf128(ppc_fp128 nofpclass(ninf) %not.ninf) {\n  %result = call ppc_fp128 @llvm.floor.ppcf128(ppc_fp128 %not.ninf)\n  ret ppc_fp128 %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare ppc_fp128 @llvm.floor.ppcf128(ppc_fp128) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub__trunc",
+          "test_body": "define nofpclass(snan) float @source_known_psub__trunc(float nofpclass(nan inf zero nsub norm) %psub) {\n  %result = call float @llvm.trunc.f32(float %psub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_psub_or_zero_or_nan__nearbyint",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_psub_or_zero_or_nan__nearbyint(float nofpclass(inf nsub norm) %psub.or.zero) {\n  %result = call float @llvm.nearbyint.f32(float %psub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.nearbyint.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_psub_or_zero_or_nan__roundeven",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_psub_or_zero_or_nan__roundeven(float nofpclass(inf nsub norm) %psub.or.zero) {\n  %result = call float @llvm.roundeven.f32(float %psub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.roundeven.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub_or_nzero__round",
+          "test_body": "define nofpclass(snan) float @source_known_nsub_or_nzero__round(float nofpclass(nan inf pzero psub norm) %nsub.or.nzero) {\n  %result = call float @llvm.round.f32(float %nsub.or.nzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_only_psub__round",
+          "test_body": "define nofpclass(snan) float @ret_only_only_psub__round(float nofpclass(nan inf zero nsub norm) %only.psub) {\n  %result = call float @llvm.round.f32(float %only.psub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans__simplify_select_nan__floor",
+          "test_body": "define nofpclass(nan) float @ret_no_nans__simplify_select_nan__floor(i1 %cond, float nofpclass(inf zero sub norm) %is.nan, float %unknown) {\n  %select = select i1 %cond, float %is.nan, float %unknown\n  %result = call float @llvm.floor.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_snan__floor_no_snan",
+          "test_body": "define nofpclass(snan) float @ret_no_snan__floor_no_snan(float nofpclass(nan) %x) {\n  %result = call float @llvm.floor.f32(float %x)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "nzero_demands_pnorm_input__round",
+          "test_body": "define nofpclass(nan pzero sub norm) float @nzero_demands_pnorm_input__round(i1 %cond, float %unknown, float nofpclass(nan inf zero sub pnorm) %only.nnorm) {\n  %select = select i1 %cond, float %unknown, float %only.nnorm\n  %result = call float @llvm.round.f32(float %select)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_nsub__floor",
+          "test_body": "define nofpclass(snan) float @source_known_nsub__floor(float nofpclass(nan inf zero psub norm) %nsub) {\n  %result = call float @llvm.floor.f32(float %nsub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_only_psub__ceil",
+          "test_body": "define nofpclass(snan) float @ret_only_only_psub__ceil(float nofpclass(nan inf zero nsub norm) %only.psub) {\n  %result = call float @llvm.ceil.f32(float %only.psub)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.ceil.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_nsub_or_zero_or_nan__ceil",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_nsub_or_zero_or_nan__ceil(float nofpclass(inf psub norm) %nsub.or.zero) {\n  %result = call float @llvm.ceil.f32(float %nsub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.ceil.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_ninf_or_nan__floor",
+          "test_body": "define nofpclass(snan) float @source_known_ninf_or_nan__floor(float nofpclass(pinf zero sub norm) %ninf.or.nan) {\n  %result = call float @llvm.floor.f32(float %ninf.or.nan)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_no_infs__floor",
+          "test_body": "define nofpclass(nan inf) float @ret_no_nans_no_infs__floor(float %x) {\n  %result = call float @llvm.floor.f32(float %x)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub_or_zero_or_nan__floor_vec",
+          "test_body": "define nofpclass(snan) <2 x float> @source_known_sub_or_zero_or_nan__floor_vec(<2 x float> nofpclass(inf norm) %sub.or.zero.or.nan) {\n  %result = call <2 x float> @llvm.floor.v2f32(<2 x float> %sub.or.zero.or.nan)\n  ret <2 x float> %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x float> @llvm.floor.v2f32(<2 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_ninf__floor",
+          "test_body": "define nofpclass(snan) float @source_known_ninf__floor(float nofpclass(nan pinf zero sub norm) %ninf) {\n  %result = call float @llvm.floor.f32(float %ninf)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.floor.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nans_source_known_sub_or_zero_or_nan__trunc",
+          "test_body": "define nofpclass(nan) float @ret_no_nans_source_known_sub_or_zero_or_nan__trunc(float nofpclass(inf norm) %sub.or.zero) {\n  %result = call float @llvm.trunc.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.trunc.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_sub_or_zero__round",
+          "test_body": "define nofpclass(snan) float @source_known_sub_or_zero__round(float nofpclass(nan inf norm) %sub.or.zero) {\n  %result = call float @llvm.round.f32(float %sub.or.zero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.round.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "source_known_psub_or_pzero__roundeven",
+          "test_body": "define nofpclass(snan) float @source_known_psub_or_pzero__roundeven(float nofpclass(nan inf nzero nsub norm) %psub.or.pzero) {\n  %result = call float @llvm.roundeven.f32(float %psub.or.pzero)\n  ret float %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.roundeven.f32(float) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms",
+    "llvm:adt"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#174842** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174842?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174842?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#174841** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174841?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#173883** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/173883?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>: 1 other dependent PR ([#174846](https://github.com/llvm/llvm-project/pull/174846) <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174846?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>)\n* **#173882** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/173882?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#173881** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/173881?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#173880** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/173880?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#173872** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/173872?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>: 2 other dependent PRs ([#173896](https://github.com/llvm/llvm-project/pull/173896) <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/173896?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>, [#174023](https://github.com/llvm/llvm-project/pull/174023) <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174023?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>)\n* **#173871** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/173871?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 188326 tests passed\n* 4997 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-07T19:15:06Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        299,
+        304
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5228,
+        5253
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        376,
+        378
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2638,
+        2643
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-rounding-intrinsics.ll": [
+      [
+        14,
+        21
+      ],
+      [
+        24,
+        31
+      ],
+      [
+        140,
+        147
+      ],
+      [
+        152,
+        159
+      ],
+      [
+        164,
+        171
+      ],
+      [
+        228,
+        235
+      ],
+      [
+        268,
+        275
+      ],
+      [
+        278,
+        285
+      ],
+      [
+        288,
+        295
+      ],
+      [
+        308,
+        315
+      ],
+      [
+        328,
+        335
+      ],
+      [
+        338,
+        345
+      ],
+      [
+        357,
+        364
+      ],
+      [
+        376,
+        383
+      ],
+      [
+        436,
+        443
+      ],
+      [
+        448,
+        455
+      ],
+      [
+        460,
+        467
+      ],
+      [
+        472,
+        479
+      ],
+      [
+        484,
+        491
+      ],
+      [
+        496,
+        503
+      ],
+      [
+        508,
+        514
+      ],
+      [
+        518,
+        525
+      ],
+      [
+        528,
+        535
+      ],
+      [
+        538,
+        545
+      ],
+      [
+        558,
+        565
+      ],
+      [
+        568,
+        574
+      ],
+      [
+        578,
+        585
+      ],
+      [
+        588,
+        595
+      ],
+      [
+        618,
+        625
+      ],
+      [
+        628,
+        634
+      ],
+      [
+        638,
+        645
+      ],
+      [
+        648,
+        655
+      ],
+      [
+        658,
+        664
+      ],
+      [
+        668,
+        675
+      ],
+      [
+        678,
+        685
+      ],
+      [
+        688,
+        694
+      ],
+      [
+        698,
+        705
+      ],
+      [
+        708,
+        715
+      ],
+      [
+        718,
+        724
+      ],
+      [
+        728,
+        735
+      ],
+      [
+        738,
+        745
+      ],
+      [
+        778,
+        784
+      ],
+      [
+        788,
+        794
+      ],
+      [
+        798,
+        804
+      ],
+      [
+        838,
+        844
+      ],
+      [
+        848,
+        854
+      ],
+      [
+        858,
+        864
+      ],
+      [
+        868,
+        874
+      ],
+      [
+        878,
+        884
+      ],
+      [
+        888,
+        894
+      ],
+      [
+        898,
+        904
+      ],
+      [
+        908,
+        914
+      ],
+      [
+        918,
+        924
+      ],
+      [
+        928,
+        934
+      ],
+      [
+        938,
+        944
+      ],
+      [
+        948,
+        954
+      ],
+      [
+        1219,
+        1226
+      ],
+      [
+        1229,
+        1236
+      ],
+      [
+        1239,
+        1246
+      ],
+      [
+        1249,
+        1256
+      ],
+      [
+        1259,
+        1266
+      ],
+      [
+        1269,
+        1276
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "operator|",
+      "resetAll"
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::fpext"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-rounding-intrinsics.ll": [
+      "ret_no_nans_source_known_nsub_or_zero_or_nan__nearbyint",
+      "ret_no_nans_source_known_nsub_or_zero_or_nan__rint",
+      "ret_no_nans_source_known_nsub_or_zero_or_nan__roundeven",
+      "ret_no_nans_source_known_nsub_or_zero_or_nan__trunc",
+      "ret_no_nans_source_known_psub_or_zero_or_nan__nearbyint",
+      "ret_no_nans_source_known_psub_or_zero_or_nan__rint",
+      "ret_no_nans_source_known_psub_or_zero_or_nan__roundeven",
+      "ret_no_nans_source_known_psub_or_zero_or_nan__trunc",
+      "ret_no_nans_source_known_sub_or_zero_or_nan__nearbyint",
+      "ret_no_nans_source_known_sub_or_zero_or_nan__rint",
+      "ret_no_nans_source_known_sub_or_zero_or_nan__roundeven",
+      "ret_no_nans_source_known_sub_or_zero_or_nan__trunc",
+      "ret_only_nan__floor_vec",
+      "ret_only_only_nsub__ceil",
+      "ret_only_only_nsub__floor",
+      "ret_only_only_nsub__round",
+      "ret_only_only_psub__ceil",
+      "ret_only_only_psub__floor",
+      "ret_only_only_psub__round",
+      "source_known_inf__floor",
+      "source_known_inf_or_nan__floor",
+      "source_known_inf_or_nan_or_zero__floor",
+      "source_known_inf_or_nan_or_zero__trunc",
+      "source_known_inf_or_zero__floor",
+      "source_known_inf_or_zero__trunc",
+      "source_known_ninf_or_nan__floor",
+      "source_known_not_ninf__floor_ppcf128",
+      "source_known_not_pinf__floor__ppcf128",
+      "source_known_nsub__floor",
+      "source_known_nsub__trunc",
+      "source_known_nsub_or_nzero__ceil",
+      "source_known_nsub_or_nzero__nearbyint",
+      "source_known_nsub_or_nzero__rint",
+      "source_known_nsub_or_nzero__roundeven",
+      "source_known_nsub_or_nzero__trunc",
+      "source_known_pinf_or_nan__floor",
+      "source_known_psub__floor",
+      "source_known_psub__trunc",
+      "source_known_psub_or_pzero__floor",
+      "source_known_psub_or_pzero__nearbyint",
+      "source_known_psub_or_pzero__rint",
+      "source_known_psub_or_pzero__roundeven",
+      "source_known_psub_or_pzero__trunc",
+      "source_known_sub__trunc",
+      "source_known_sub_or_zero__nearbyint",
+      "source_known_sub_or_zero__rint",
+      "source_known_sub_or_zero__roundeven",
+      "source_known_sub_or_zero__trunc"
+    ]
+  }
+}

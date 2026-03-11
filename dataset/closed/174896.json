@@ -1,0 +1,136 @@
+{
+  "pr_id": 174896,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174896",
+  "state": "closed",
+  "title": "[profcheck] Fix encoding of 0 loopEstimatedTrip count",
+  "author": "mtrofin",
+  "base_commit": "84cc15344ff804e010d16ee9ac0b2b180ea88701",
+  "fix_commit": "92480a5243ff5e93737b2cb6167914837330c04a",
+  "patch": "diff --git a/llvm/lib/Transforms/Utils/LoopUtils.cpp b/llvm/lib/Transforms/Utils/LoopUtils.cpp\nindex 749ff98ad0066..d7d421e1a4142 100644\n--- a/llvm/lib/Transforms/Utils/LoopUtils.cpp\n+++ b/llvm/lib/Transforms/Utils/LoopUtils.cpp\n@@ -54,6 +54,9 @@ using namespace llvm::PatternMatch;\n \n static const char *LLVMLoopDisableNonforced = \"llvm.loop.disable_nonforced\";\n static const char *LLVMLoopDisableLICM = \"llvm.licm.disable\";\n+namespace llvm {\n+extern cl::opt<bool> ProfcheckDisableMetadataFixes;\n+} // namespace llvm\n \n bool llvm::formDedicatedExitBlocks(Loop *L, DominatorTree *DT, LoopInfo *LI,\n                                    MemorySSAUpdater *MSSAU,\n@@ -967,7 +970,7 @@ bool llvm::setLoopEstimatedTripCount(\n     return true;\n \n   // Calculate taken and exit weights.\n-  unsigned LatchExitWeight = 0;\n+  unsigned LatchExitWeight = ProfcheckDisableMetadataFixes ? 0 : 1;\n   unsigned BackedgeTakenWeight = 0;\n \n   if (EstimatedTripCount != 0) {\ndiff --git a/llvm/unittests/Transforms/Utils/LoopUtilsTest.cpp b/llvm/unittests/Transforms/Utils/LoopUtilsTest.cpp\nindex 9fc9fb5b5a97e..a839d75cd6235 100644\n--- a/llvm/unittests/Transforms/Utils/LoopUtilsTest.cpp\n+++ b/llvm/unittests/Transforms/Utils/LoopUtilsTest.cpp\n@@ -239,7 +239,7 @@ TEST(LoopUtils, zeroEstimatedTripCount) {\n           SmallVector<uint32_t, 2> Weights;\n           EXPECT_EQ(extractBranchWeights(LatchBranch, Weights), true);\n           EXPECT_EQ(Weights[0], 0u);\n-          EXPECT_EQ(Weights[1], 0u);\n+          EXPECT_EQ(Weights[1], 1u);\n           EXPECT_EQ(getOptionalIntLoopAttribute(L, \"foo\"), Foo);\n           EXPECT_EQ(getOptionalIntLoopAttribute(L, LLVMLoopEstimatedTripCount),\n                     0);\n",
+  "components": [
+    "LoopUtils"
+  ],
+  "description": "We currently encode an estimated trip count of 0 as the latch having branch probabilities 0-0. That's an invalid pair of weights. The probability of a branch is computed as a fraction of its corresponding weight and the sum of the weights. In fact, `BranchProbabilityInfo::calcMetadataWeights` will convert this to a 1-1, meaning 50% - 50%, which isn't quite what we want. To indicate the loop is never taken, we just need to initialize the exit probability to non-zero (hence, 1)\n\nRelated: https://reviews.llvm.org/D67905\n\nIssue #147390",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/check-prof-info.ll",
+      "commands": [],
+      "tests": [
+        {
+          "test_name": "foo_i8",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n@a = external global [1024 x i32], align 16\n@b = external global [1024 x i32], align 16\n\ndefine void @foo_i8(i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds [1024 x i8], ptr @b, i64 0, i64 %iv\n  %load = load i8, ptr %arrayidx, align 1\n  %arrayidx2 = getelementptr inbounds [1024 x i8], ptr @a, i64 0, i64 %iv\n  store i8 %load, ptr %arrayidx2, align 1\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, %n\n  br i1 %exitcond, label %for.cond.cleanup, label %for.body, !prof !0\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n}\n\n!0 = !{!\"branch_weights\", i32 1, i32 1023}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/branch-weights.ll",
+      "commands": [
+        "-epilogue-vectorization-force-VF=4",
+        "-epilogue-vectorization-force-VF=4"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ndefine void @f0(i8 %n, i32 %len, ptr %p) !prof !0 {\n; MAINVF4IC1_EPI4-LABEL: define void @f0(\n; MAINVF4IC1_EPI4-SAME: i8 [[N:%.*]], i32 [[LEN:%.*]], ptr [[P:%.*]]) !prof [[PROF0:![0-9]+]] {\n; MAINVF4IC1_EPI4:  [[ENTRY:.*:]]\n; MAINVF4IC1_EPI4:    [[CMP_ENTRY:%.*]] = icmp sgt i32 [[LEN]], 0\n; MAINVF4IC1_EPI4:    br i1 [[CMP_ENTRY]], label %[[ITER_CHECK:.*]], label %[[EXIT:.*]], !prof [[PROF1:![0-9]+]]\n; MAINVF4IC1_EPI4:  [[ITER_CHECK]]:\n; MAINVF4IC1_EPI4:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i32 [[TMP0:%.*]], 4\n; MAINVF4IC1_EPI4:    br i1 [[MIN_ITERS_CHECK]], label %[[VEC_EPILOG_SCALAR_PH:.*]], label %[[VECTOR_SCEVCHECK:.*]], !prof [[PROF2:![0-9]+]]\n; MAINVF4IC1_EPI4:  [[VECTOR_SCEVCHECK]]:\n; MAINVF4IC1_EPI4:    [[TMP2:%.*]] = icmp slt i8 [[TMP1:%.*]], 0\n; MAINVF4IC1_EPI4:    [[TMP3:%.*]] = icmp ugt i32 [[LEN]], 255\n; MAINVF4IC1_EPI4:    br i1 [[TMP4:%.*]], label %[[VEC_EPILOG_SCALAR_PH]], label %[[VECTOR_MAIN_LOOP_ITER_CHECK:.*]], !prof [[PROF2]]\n; MAINVF4IC1_EPI4:  [[VECTOR_MAIN_LOOP_ITER_CHECK]]:\n; MAINVF4IC1_EPI4:    [[MIN_ITERS_CHECK1:%.*]] = icmp ult i32 [[TMP0]], 4\n; MAINVF4IC1_EPI4:    br i1 [[MIN_ITERS_CHECK1]], label %[[VEC_EPILOG_PH:.*]], label %[[VECTOR_PH:.*]], !prof [[PROF2]]\n; MAINVF4IC1_EPI4:  [[VECTOR_PH]]:\n; MAINVF4IC1_EPI4:    br label %[[VECTOR_BODY:.*]]\n; MAINVF4IC1_EPI4:  [[VECTOR_BODY]]:\n; MAINVF4IC1_EPI4:    [[TMP8:%.*]] = icmp eq i32 [[INDEX_NEXT:%.*]], [[N_VEC:%.*]]\n; MAINVF4IC1_EPI4:    br i1 [[TMP8]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !prof [[PROF3:![0-9]+]], !llvm.loop [[LOOP4:![0-9]+]]\n; MAINVF4IC1_EPI4:  [[MIDDLE_BLOCK]]:\n; MAINVF4IC1_EPI4:    [[CMP_N:%.*]] = icmp eq i32 [[TMP0]], [[N_VEC]]\n; MAINVF4IC1_EPI4:    br i1 [[CMP_N]], label %[[EXIT_LOOPEXIT:.*]], label %[[VEC_EPILOG_ITER_CHECK:.*]], !prof [[PROF8:![0-9]+]]\n; MAINVF4IC1_EPI4:  [[VEC_EPILOG_ITER_CHECK]]:\n; MAINVF4IC1_EPI4:    [[MIN_EPILOG_ITERS_CHECK:%.*]] = icmp ult i32 [[N_VEC_REMAINING:%.*]], 4\n; MAINVF4IC1_EPI4:    br i1 [[MIN_EPILOG_ITERS_CHECK]], label %[[VEC_EPILOG_SCALAR_PH]], label %[[VEC_EPILOG_PH]], !prof [[PROF9:![0-9]+]]\n; MAINVF4IC1_EPI4:  [[VEC_EPILOG_PH]]:\n; MAINVF4IC1_EPI4:    br label %[[VEC_EPILOG_VECTOR_BODY:.*]]\n; MAINVF4IC1_EPI4:  [[VEC_EPILOG_VECTOR_BODY]]:\n; MAINVF4IC1_EPI4:    [[TMP12:%.*]] = icmp eq i32 [[INDEX_NEXT6:%.*]], [[N_VEC3:%.*]]\n; MAINVF4IC1_EPI4:    br i1 [[TMP12]], label %[[VEC_EPILOG_MIDDLE_BLOCK:.*]], label %[[VEC_EPILOG_VECTOR_BODY]], !prof [[PROF10:![0-9]+]], !llvm.loop [[LOOP11:![0-9]+]]\n; MAINVF4IC1_EPI4:  [[VEC_EPILOG_MIDDLE_BLOCK]]:\n; MAINVF4IC1_EPI4:    [[CMP_N8:%.*]] = icmp eq i32 [[TMP0]], [[N_VEC3]]\n; MAINVF4IC1_EPI4:    br i1 [[CMP_N8]], label %[[EXIT_LOOPEXIT]], label %[[VEC_EPILOG_SCALAR_PH]], !prof [[PROF8]]\n; MAINVF4IC1_EPI4:  [[VEC_EPILOG_SCALAR_PH]]:\n; MAINVF4IC1_EPI4:    br label %[[LOOP:.*]]\n; MAINVF4IC1_EPI4:  [[LOOP]]:\n; MAINVF4IC1_EPI4:    [[CMP_LOOP:%.*]] = icmp ult i32 [[I32:%.*]], [[LEN]]\n; MAINVF4IC1_EPI4:    br i1 [[CMP_LOOP]], label %[[LOOP]], label %[[EXIT_LOOPEXIT]], !prof [[PROF13:![0-9]+]], !llvm.loop [[LOOP14:![0-9]+]]\n; MAINVF4IC1_EPI4:  [[EXIT_LOOPEXIT]]:\n; MAINVF4IC1_EPI4:    br label %[[EXIT]]\n; MAINVF4IC1_EPI4:  [[EXIT]]:\n;\n; MAINVF4IC2_EPI4-LABEL: define void @f0(\n; MAINVF4IC2_EPI4-SAME: i8 [[N:%.*]], i32 [[LEN:%.*]], ptr [[P:%.*]]) !prof [[PROF0:![0-9]+]] {\n; MAINVF4IC2_EPI4:  [[ENTRY:.*:]]\n; MAINVF4IC2_EPI4:    [[CMP_ENTRY:%.*]] = icmp sgt i32 [[LEN]], 0\n; MAINVF4IC2_EPI4:    br i1 [[CMP_ENTRY]], label %[[ITER_CHECK:.*]], label %[[EXIT:.*]], !prof [[PROF1:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[ITER_CHECK]]:\n; MAINVF4IC2_EPI4:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i32 [[TMP0:%.*]], 4\n; MAINVF4IC2_EPI4:    br i1 [[MIN_ITERS_CHECK]], label %[[VEC_EPILOG_SCALAR_PH:.*]], label %[[VECTOR_SCEVCHECK:.*]], !prof [[PROF2:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[VECTOR_SCEVCHECK]]:\n; MAINVF4IC2_EPI4:    [[TMP2:%.*]] = icmp slt i8 [[TMP1:%.*]], 0\n; MAINVF4IC2_EPI4:    [[TMP3:%.*]] = icmp ugt i32 [[LEN]], 255\n; MAINVF4IC2_EPI4:    br i1 [[TMP4:%.*]], label %[[VEC_EPILOG_SCALAR_PH]], label %[[VECTOR_MAIN_LOOP_ITER_CHECK:.*]], !prof [[PROF2]]\n; MAINVF4IC2_EPI4:  [[VECTOR_MAIN_LOOP_ITER_CHECK]]:\n; MAINVF4IC2_EPI4:    [[MIN_ITERS_CHECK1:%.*]] = icmp ult i32 [[TMP0]], 8\n; MAINVF4IC2_EPI4:    br i1 [[MIN_ITERS_CHECK1]], label %[[VEC_EPILOG_PH:.*]], label %[[VECTOR_PH:.*]], !prof [[PROF2]]\n; MAINVF4IC2_EPI4:  [[VECTOR_PH]]:\n; MAINVF4IC2_EPI4:    br label %[[VECTOR_BODY:.*]]\n; MAINVF4IC2_EPI4:  [[VECTOR_BODY]]:\n; MAINVF4IC2_EPI4:    [[TMP9:%.*]] = icmp eq i32 [[INDEX_NEXT:%.*]], [[N_VEC:%.*]]\n; MAINVF4IC2_EPI4:    br i1 [[TMP9]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !prof [[PROF3:![0-9]+]], !llvm.loop [[LOOP4:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[MIDDLE_BLOCK]]:\n; MAINVF4IC2_EPI4:    [[CMP_N:%.*]] = icmp eq i32 [[TMP0]], [[N_VEC]]\n; MAINVF4IC2_EPI4:    br i1 [[CMP_N]], label %[[EXIT_LOOPEXIT:.*]], label %[[VEC_EPILOG_ITER_CHECK:.*]], !prof [[PROF8:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[VEC_EPILOG_ITER_CHECK]]:\n; MAINVF4IC2_EPI4:    [[MIN_EPILOG_ITERS_CHECK:%.*]] = icmp ult i32 [[N_VEC_REMAINING:%.*]], 4\n; MAINVF4IC2_EPI4:    br i1 [[MIN_EPILOG_ITERS_CHECK]], label %[[VEC_EPILOG_SCALAR_PH]], label %[[VEC_EPILOG_PH]], !prof [[PROF9:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[VEC_EPILOG_PH]]:\n; MAINVF4IC2_EPI4:    br label %[[VEC_EPILOG_VECTOR_BODY:.*]]\n; MAINVF4IC2_EPI4:  [[VEC_EPILOG_VECTOR_BODY]]:\n; MAINVF4IC2_EPI4:    [[TMP13:%.*]] = icmp eq i32 [[INDEX_NEXT6:%.*]], [[N_VEC3:%.*]]\n; MAINVF4IC2_EPI4:    br i1 [[TMP13]], label %[[VEC_EPILOG_MIDDLE_BLOCK:.*]], label %[[VEC_EPILOG_VECTOR_BODY]], !prof [[PROF10:![0-9]+]], !llvm.loop [[LOOP11:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[VEC_EPILOG_MIDDLE_BLOCK]]:\n; MAINVF4IC2_EPI4:    [[CMP_N8:%.*]] = icmp eq i32 [[TMP0]], [[N_VEC3]]\n; MAINVF4IC2_EPI4:    br i1 [[CMP_N8]], label %[[EXIT_LOOPEXIT]], label %[[VEC_EPILOG_SCALAR_PH]], !prof [[PROF13:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[VEC_EPILOG_SCALAR_PH]]:\n; MAINVF4IC2_EPI4:    br label %[[LOOP:.*]]\n; MAINVF4IC2_EPI4:  [[LOOP]]:\n; MAINVF4IC2_EPI4:    [[CMP_LOOP:%.*]] = icmp ult i32 [[I32:%.*]], [[LEN]]\n; MAINVF4IC2_EPI4:    br i1 [[CMP_LOOP]], label %[[LOOP]], label %[[EXIT_LOOPEXIT]], !prof [[PROF14:![0-9]+]], !llvm.loop [[LOOP15:![0-9]+]]\n; MAINVF4IC2_EPI4:  [[EXIT_LOOPEXIT]]:\n; MAINVF4IC2_EPI4:    br label %[[EXIT]]\n; MAINVF4IC2_EPI4:  [[EXIT]]:\n;\nentry:\n  %cmp.entry = icmp sgt i32 %len, 0\n  br i1 %cmp.entry, label %loop, label %exit, !prof !1\n\nloop:\n  %i8 = phi i8 [0, %entry], [%i8.inc, %loop]\n  %i32 = phi i32 [0, %entry], [%i32.inc, %loop]\n\n  %ptr = getelementptr inbounds i32, ptr %p, i8 %i8\n  store i32 %i32, ptr %ptr\n\n  %i8.inc = add i8 %i8, 1\n  %i32.inc = add i32 %i32, 1\n\n  %cmp.loop = icmp ult i32 %i32, %len\n  br i1 %cmp.loop, label %loop, label %exit, !prof !2\n\nexit:\n  ret void\n}\n\n!0 = !{!\"function_entry_count\", i64 13}\n!1 = !{!\"branch_weights\", i32 12, i32 1}\n!2 = !{!\"branch_weights\", i32 1234, i32 1}\n;.\n; MAINVF4IC1_EPI4: [[PROF0]] = !{!\"function_entry_count\", i64 13}\n; MAINVF4IC1_EPI4: [[PROF1]] = !{!\"branch_weights\", i32 12, i32 1}\n; MAINVF4IC1_EPI4: [[PROF2]] = !{!\"branch_weights\", i32 1, i32 127}\n; MAINVF4IC1_EPI4: [[PROF3]] = !{!\"branch_weights\", i32 1, i32 307}\n; MAINVF4IC1_EPI4: [[LOOP4]] = distinct !{[[LOOP4]], [[META5:![0-9]+]], [[META6:![0-9]+]], [[META7:![0-9]+]]}\n; MAINVF4IC1_EPI4: [[META5]] = !{!\"llvm.loop.isvectorized\", i32 1}\n; MAINVF4IC1_EPI4: [[META6]] = !{!\"llvm.loop.unroll.runtime.disable\"}\n; MAINVF4IC1_EPI4: [[META7]] = !{!\"llvm.loop.estimated_trip_count\", i32 308}\n; MAINVF4IC1_EPI4: [[PROF8]] = !{!\"branch_weights\", i32 1, i32 3}\n; MAINVF4IC1_EPI4: [[PROF9]] = !{!\"branch_weights\", i32 4, i32 0}\n; MAINVF4IC1_EPI4: [[PROF10]] = !{!\"branch_weights\", i32 1, i32 0}\n; MAINVF4IC1_EPI4: [[LOOP11]] = distinct !{[[LOOP11]], [[META5]], [[META6]], [[META12:![0-9]+]]}\n; MAINVF4IC1_EPI4: [[META12]] = !{!\"llvm.loop.estimated_trip_count\", i32 0}\n; MAINVF4IC1_EPI4: [[PROF13]] = !{!\"branch_weights\", i32 2, i32 1}\n; MAINVF4IC1_EPI4: [[LOOP14]] = distinct !{[[LOOP14]], [[META5]], [[META15:![0-9]+]]}\n; MAINVF4IC1_EPI4: [[META15]] = !{!\"llvm.loop.estimated_trip_count\", i32 3}\n;.\n; MAINVF4IC2_EPI4: [[PROF0]] = !{!\"function_entry_count\", i64 13}\n; MAINVF4IC2_EPI4: [[PROF1]] = !{!\"branch_weights\", i32 12, i32 1}\n; MAINVF4IC2_EPI4: [[PROF2]] = !{!\"branch_weights\", i32 1, i32 127}\n; MAINVF4IC2_EPI4: [[PROF3]] = !{!\"branch_weights\", i32 1, i32 153}\n; MAINVF4IC2_EPI4: [[LOOP4]] = distinct !{[[LOOP4]], [[META5:![0-9]+]], [[META6:![0-9]+]], [[META7:![0-9]+]]}\n; MAINVF4IC2_EPI4: [[META5]] = !{!\"llvm.loop.isvectorized\", i32 1}\n; MAINVF4IC2_EPI4: [[META6]] = !{!\"llvm.loop.unroll.runtime.disable\"}\n; MAINVF4IC2_EPI4: [[META7]] = !{!\"llvm.loop.estimated_trip_count\", i32 154}\n; MAINVF4IC2_EPI4: [[PROF8]] = !{!\"branch_weights\", i32 1, i32 7}\n; MAINVF4IC2_EPI4: [[PROF9]] = !{!\"branch_weights\", i32 4, i32 4}\n; MAINVF4IC2_EPI4: [[PROF10]] = !{!\"branch_weights\", i32 1, i32 0}\n; MAINVF4IC2_EPI4: [[LOOP11]] = distinct !{[[LOOP11]], [[META5]], [[META6]], [[META12:![0-9]+]]}\n; MAINVF4IC2_EPI4: [[META12]] = !{!\"llvm.loop.estimated_trip_count\", i32 0}\n; MAINVF4IC2_EPI4: [[PROF13]] = !{!\"branch_weights\", i32 1, i32 3}\n; MAINVF4IC2_EPI4: [[PROF14]] = !{!\"branch_weights\", i32 2, i32 1}\n; MAINVF4IC2_EPI4: [[LOOP15]] = distinct !{[[LOOP15]], [[META5]], [[META16:![0-9]+]]}\n; MAINVF4IC2_EPI4: [[META16]] = !{!\"llvm.loop.estimated_trip_count\", i32 3}\n;."
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "mtrofin",
+      "body": "* **#175096** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175096?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175095** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175095?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174896** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174896?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174896?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "mtrofin",
+      "body": "### Merge activity\n\n* **Jan 13, 1:10 AM UTC**: A user started a stack merge that includes this pull request via [Graphite](https://app.graphite.com/github/pr/llvm/llvm-project/174896).\n* **Jan 13, 1:12 AM UTC**: @mtrofin merged this pull request with [Graphite](https://app.graphite.com/github/pr/llvm/llvm-project/174896).\n"
+    },
+    {
+      "author": "jdenny-ornl",
+      "body": "> To indicate the loop is never taken, we just need to initialize the exit probability to non-zero (hence, 1)\r\n\r\nA latch exit weight of non-zero with a backedge weight of zero means 1 iteration.  Any time the latch has been reached, at least 1 iteration has already executed.  After this PR, we cannot distinguish 1 and 0.\r\n\r\nBefore this PR, an estimated trip count of 0 was encoded as zeroed branch weights because, indeed, there are no valid branch weights that encode that case.  See [our recent discussion](https://github.com/llvm/llvm-project/pull/175096#discussion_r2696109097)."
+    },
+    {
+      "author": "mtrofin",
+      "body": "> > To indicate the loop is never taken, we just need to initialize the exit probability to non-zero (hence, 1)\r\n> \r\n> A latch exit weight of non-zero with a backedge weight of zero means 1 iteration. Any time the latch has been reached, at least 1 iteration has already executed. After this PR, we cannot distinguish 1 and 0.\r\n> \r\n> Before this PR, an estimated trip count of 0 was encoded as zeroed branch weights because, indeed, there are no valid branch weights that encode that case. See [our recent discussion](https://github.com/llvm/llvm-project/pull/175096#discussion_r2696109097).\r\n\r\nIIUC the presence of `llvm.loop.estimated_trip_count` shouldn't require relying on the 0-0 branch weights, correct? The problem with the 0-0 branch weights is that they could lead to really off BFI info (see the examples in [this](https://github.com/llvm/llvm-project/pull/175096) commit message). I think this highlights even more why we want `llvm.loop.estimated_trip_count` in the first place, no?"
+    },
+    {
+      "author": "jdenny-ornl",
+      "body": "> IIUC the presence of `llvm.loop.estimated_trip_count` shouldn't require relying on the 0-0 branch weights, correct?  The problem with the 0-0 branch weights is that they could lead to really off BFI info (see the examples in [this](https://github.com/llvm/llvm-project/pull/175096) commit message). I think this highlights even more why we want `llvm.loop.estimated_trip_count` in the first place, no?\r\n\r\nGood point.  And eventually the weight parameter of `{set,get}LoopEstimatedTripCount` should go away anyway.\r\n\r\nTo make it easier to keep all this straight in the meantime, would you please update `setLoopEstimatedTripCount` comments in `LoopUtils.h` not to claim it zeroes branch weights?  Please point out that it is intentionally setting the branch weights to indicate a count of 1 as there are no valid branch weights that indicate 0.\r\n\r\n"
+    },
+    {
+      "author": "mtrofin",
+      "body": "> > IIUC the presence of `llvm.loop.estimated_trip_count` shouldn't require relying on the 0-0 branch weights, correct?  The problem with the 0-0 branch weights is that they could lead to really off BFI info (see the examples in [this](https://github.com/llvm/llvm-project/pull/175096) commit message). I think this highlights even more why we want `llvm.loop.estimated_trip_count` in the first place, no?\r\n> \r\n> Good point. And eventually the weight parameter of `{set,get}LoopEstimatedTripCount` should go away anyway.\r\n> \r\n> To make it easier to keep all this straight in the meantime, would you please update `setLoopEstimatedTripCount` comments in `LoopUtils.h` not to claim it zeroes branch weights? Please point out that it is intentionally setting the branch weights to indicate a count of 1 as there are no valid branch weights that indicate 0.\r\n\r\nAck, and to clarify: `setLoopEstimatedTripCount` assumes rotated form, right?"
+    },
+    {
+      "author": "jdenny-ornl",
+      "body": "> to clarify: `setLoopEstimatedTripCount` assumes rotated form, right?\r\n\r\nIt bails if `getExpectedExitLoopLatchBranch` returns `nullptr`, so it wants the loop to have a single latch, and it wants that latch to be able to exit.  I believe that qualifies, but correct me if I missed something.\r\n\r\n"
+    },
+    {
+      "author": "mtrofin",
+      "body": "...and the latch to have 2 successors, so yes."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-08T01:08:20Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Utils/LoopUtils.cpp": [
+      [
+        54,
+        59
+      ],
+      [
+        967,
+        973
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/check-prof-info.ll": [
+      [
+        184,
+        190
+      ],
+      [
+        346,
+        352
+      ],
+      [
+        369,
+        375
+      ],
+      [
+        388,
+        394
+      ],
+      [
+        412,
+        418
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/branch-weights.ll": [
+      [
+        126,
+        132
+      ],
+      [
+        143,
+        149
+      ]
+    ],
+    "llvm/unittests/Transforms/Utils/LoopUtilsTest.cpp": [
+      [
+        239,
+        245
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Utils/LoopUtils.cpp": [
+      "llvm::formDedicatedExitBlocks",
+      "llvm::setLoopEstimatedTripCount"
+    ],
+    "llvm/unittests/Transforms/Utils/LoopUtilsTest.cpp": [
+      "TEST"
+    ]
+  }
+}

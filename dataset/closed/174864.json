@@ -1,0 +1,389 @@
+{
+  "pr_id": 174864,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174864",
+  "state": "closed",
+  "title": "[LV] Vectorize early exit loops with multiple exits.",
+  "author": "fhahn",
+  "base_commit": "0b887beebe7818cf545d0a784e1ff09675b5d6fb",
+  "fix_commit": "ce57ca378b123b0f755f0f424f3d8d27ff24d12c",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\nindex 0b8796f646ae3..54bb073eb4f81 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n@@ -233,6 +233,12 @@ class VPBuilder {\n     return createNaryOp(VPInstruction::LogicalAnd, {LHS, RHS}, DL, Name);\n   }\n \n+  VPInstruction *createLogicalOr(VPValue *LHS, VPValue *RHS,\n+                                 DebugLoc DL = DebugLoc::getUnknown(),\n+                                 const Twine &Name = \"\") {\n+    return createNaryOp(VPInstruction::LogicalOr, {LHS, RHS}, DL, Name);\n+  }\n+\n   VPInstruction *createSelect(VPValue *Cond, VPValue *TrueVal,\n                               VPValue *FalseVal,\n                               DebugLoc DL = DebugLoc::getUnknown(),\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 5c3049b54c2de..499c5a31421ed 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -9509,15 +9509,6 @@ bool LoopVectorizePass::processLoop(Loop *L) {\n                                  \"UncountableEarlyExitLoopsDisabled\", ORE, L);\n       return false;\n     }\n-    SmallVector<BasicBlock *, 8> ExitingBlocks;\n-    L->getExitingBlocks(ExitingBlocks);\n-    // TODO: Support multiple uncountable early exits.\n-    if (ExitingBlocks.size() - LVL.getCountableExitingBlocks().size() > 1) {\n-      reportVectorizationFailure(\"Auto-vectorization of loops with multiple \"\n-                                 \"uncountable early exits is not yet supported\",\n-                                 \"MultipleUncountableEarlyExits\", ORE, L);\n-      return false;\n-    }\n   }\n \n   if (!LVL.getPotentiallyFaultingLoads().empty()) {\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex 68ff4e6a037f5..07b6c306fa980 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -1211,6 +1211,7 @@ class LLVM_ABI_FOR_TEST VPInstruction : public VPRecipeWithIRFlags,\n     // during unrolling.\n     ExtractPenultimateElement,\n     LogicalAnd, // Non-poison propagating logical And.\n+    LogicalOr,  // Non-poison propagating logical Or.\n     // Add an offset in bytes (second operand) to a base pointer (first\n     // operand). Only generates scalar values (either for the first lane only or\n     // for all lanes, depending on its uses).\n@@ -1520,6 +1521,9 @@ class VPPhiAccessors {\n   /// Returns the incoming block with index \\p Idx.\n   const VPBasicBlock *getIncomingBlock(unsigned Idx) const;\n \n+  /// Returns the incoming value for \\p VPBB. \\p VPBB must be an incoming block.\n+  VPValue *getIncomingValueForBlock(const VPBasicBlock *VPBB) const;\n+\n   /// Returns the number of incoming values, also number of incoming blocks.\n   virtual unsigned getNumIncoming() const {\n     return getAsRecipe()->getNumOperands();\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\nindex 5bd4f6b8026b8..35f4f7c1a48ec 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n@@ -124,9 +124,10 @@ Type *VPTypeAnalysis::inferScalarTypeForRecipe(const VPInstruction *R) {\n   case VPInstruction::LastActiveLane:\n     return Type::getIntNTy(Ctx, 64);\n   case VPInstruction::LogicalAnd:\n+  case VPInstruction::LogicalOr:\n     assert(inferScalarType(R->getOperand(0))->isIntegerTy(1) &&\n            inferScalarType(R->getOperand(1))->isIntegerTy(1) &&\n-           \"LogicalAnd operands should be bool\");\n+           \"LogicalAnd/Or operands should be bool\");\n     return IntegerType::get(Ctx, 1);\n   case VPInstruction::BranchOnCond:\n   case VPInstruction::BranchOnTwoConds:\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex 9b4ae56e7f175..da1035847020a 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -903,33 +903,27 @@ void VPlanTransforms::handleEarlyExits(VPlan &Plan,\n   auto *LatchVPBB = cast<VPBasicBlock>(MiddleVPBB->getSinglePredecessor());\n   VPBlockBase *HeaderVPB = cast<VPBasicBlock>(LatchVPBB->getSuccessors()[1]);\n \n-  // Disconnect all early exits from the loop leaving it with a single exit from\n-  // the latch. Early exits that are countable are left for a scalar epilog. The\n-  // condition of uncountable early exits (currently at most one is supported)\n-  // is fused into the latch exit, and used to branch from middle block to the\n-  // early exit destination.\n-  [[maybe_unused]] bool HandledUncountableEarlyExit = false;\n+  if (HasUncountableEarlyExit) {\n+    handleUncountableEarlyExits(Plan, cast<VPBasicBlock>(HeaderVPB), LatchVPBB,\n+                                MiddleVPBB);\n+    return;\n+  }\n+\n+  // Disconnect countable early exits from the loop, leaving it with a single\n+  // exit from the latch. Countable early exits are left for a scalar epilog.\n   for (VPIRBasicBlock *EB : Plan.getExitBlocks()) {\n     for (VPBlockBase *Pred : to_vector(EB->getPredecessors())) {\n       if (Pred == MiddleVPBB)\n         continue;\n-      if (HasUncountableEarlyExit) {\n-        assert(!HandledUncountableEarlyExit &&\n-               \"can handle exactly one uncountable early exit\");\n-        handleUncountableEarlyExit(cast<VPBasicBlock>(Pred), EB, Plan,\n-                                   cast<VPBasicBlock>(HeaderVPB), LatchVPBB);\n-        HandledUncountableEarlyExit = true;\n-      } else {\n-        for (VPRecipeBase &R : EB->phis())\n-          cast<VPIRPhi>(&R)->removeIncomingValueFor(Pred);\n-      }\n-      cast<VPBasicBlock>(Pred)->getTerminator()->eraseFromParent();\n+\n+      // Remove phi operands for the early exiting block.\n+      for (VPRecipeBase &R : EB->phis())\n+        cast<VPIRPhi>(&R)->removeIncomingValueFor(Pred);\n+      auto *EarlyExitingVPBB = cast<VPBasicBlock>(Pred);\n+      EarlyExitingVPBB->getTerminator()->eraseFromParent();\n       VPBlockUtils::disconnectBlocks(Pred, EB);\n     }\n   }\n-\n-  assert((!HasUncountableEarlyExit || HandledUncountableEarlyExit) &&\n-         \"missed an uncountable exit that must be handled\");\n }\n \n void VPlanTransforms::addMiddleCheck(VPlan &Plan,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\nindex 34cb5a8b48f78..5154e0e607eb4 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n@@ -833,9 +833,10 @@ inline auto m_c_LogicalAnd(const Op0_t &Op0, const Op1_t &Op1) {\n }\n \n template <typename Op0_t, typename Op1_t>\n-inline AllRecipe_match<Instruction::Select, Op0_t, specific_intval<1>, Op1_t>\n-m_LogicalOr(const Op0_t &Op0, const Op1_t &Op1) {\n-  return m_Select(Op0, m_True(), Op1);\n+inline auto m_LogicalOr(const Op0_t &Op0, const Op1_t &Op1) {\n+  return m_CombineOr(\n+      m_c_VPInstruction<VPInstruction::LogicalOr, Op0_t, Op1_t>(Op0, Op1),\n+      m_Select(Op0, m_True(), Op1));\n }\n \n template <typename Op0_t, typename Op1_t>\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 89a270d1219e7..389331fd958d2 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -468,6 +468,7 @@ unsigned VPInstruction::getNumOperandsForOpcode() const {\n   case VPInstruction::ExitingIVValue:\n   case VPInstruction::FirstOrderRecurrenceSplice:\n   case VPInstruction::LogicalAnd:\n+  case VPInstruction::LogicalOr:\n   case VPInstruction::PtrAdd:\n   case VPInstruction::WidePtrAdd:\n   case VPInstruction::WideIVStep:\n@@ -813,6 +814,11 @@ Value *VPInstruction::generate(VPTransformState &State) {\n     Value *B = State.get(getOperand(1));\n     return Builder.CreateLogicalAnd(A, B, Name);\n   }\n+  case VPInstruction::LogicalOr: {\n+    Value *A = State.get(getOperand(0));\n+    Value *B = State.get(getOperand(1));\n+    return Builder.CreateLogicalOr(A, B, Name);\n+  }\n   case VPInstruction::PtrAdd: {\n     assert((State.VF.isScalar() || vputils::onlyFirstLaneUsed(this)) &&\n            \"can only generate first lane for PtrAdd\");\n@@ -1339,6 +1345,7 @@ bool VPInstruction::opcodeMayReadOrWriteFromMemory() const {\n   case VPInstruction::ExtractLastActive:\n   case VPInstruction::FirstOrderRecurrenceSplice:\n   case VPInstruction::LogicalAnd:\n+  case VPInstruction::LogicalOr:\n   case VPInstruction::Not:\n   case VPInstruction::PtrAdd:\n   case VPInstruction::WideIVStep:\n@@ -1506,6 +1513,9 @@ void VPInstruction::printRecipe(raw_ostream &O, const Twine &Indent,\n   case VPInstruction::LogicalAnd:\n     O << \"logical-and\";\n     break;\n+  case VPInstruction::LogicalOr:\n+    O << \"logical-or\";\n+    break;\n   case VPInstruction::PtrAdd:\n     O << \"ptradd\";\n     break;\n@@ -1705,6 +1715,14 @@ void VPPhiAccessors::removeIncomingValueFor(VPBlockBase *IncomingBlock) const {\n   R->removeOperand(Position);\n }\n \n+VPValue *\n+VPPhiAccessors::getIncomingValueForBlock(const VPBasicBlock *VPBB) const {\n+  for (unsigned Idx = 0; Idx != getNumIncoming(); ++Idx)\n+    if (getIncomingBlock(Idx) == VPBB)\n+      return getIncomingValue(Idx);\n+  llvm_unreachable(\"VPBB is not an incoming block\");\n+}\n+\n #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)\n void VPPhiAccessors::printPhiOperands(raw_ostream &O,\n                                       VPSlotTracker &SlotTracker) const {\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex b05d8adff8a2e..da3afe7ce6d03 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -4036,75 +4036,211 @@ void VPlanTransforms::convertToConcreteRecipes(VPlan &Plan) {\n     R->eraseFromParent();\n }\n \n-void VPlanTransforms::handleUncountableEarlyExit(VPBasicBlock *EarlyExitingVPBB,\n-                                                 VPBasicBlock *EarlyExitVPBB,\n-                                                 VPlan &Plan,\n-                                                 VPBasicBlock *HeaderVPBB,\n-                                                 VPBasicBlock *LatchVPBB) {\n-  auto *MiddleVPBB = cast<VPBasicBlock>(LatchVPBB->getSuccessors()[0]);\n-  if (!EarlyExitVPBB->getSinglePredecessor() &&\n-      EarlyExitVPBB->getPredecessors()[1] == MiddleVPBB) {\n-    assert(EarlyExitVPBB->getNumPredecessors() == 2 &&\n-           EarlyExitVPBB->getPredecessors()[0] == EarlyExitingVPBB &&\n-           \"unsupported early exit VPBB\");\n-    // Early exit operand should always be last phi operand. If EarlyExitVPBB\n-    // has two predecessors and EarlyExitingVPBB is the first, swap the operands\n-    // of the phis.\n-    for (VPRecipeBase &R : EarlyExitVPBB->phis())\n-      cast<VPIRPhi>(&R)->swapOperands();\n-  }\n+void VPlanTransforms::handleUncountableEarlyExits(VPlan &Plan,\n+                                                  VPBasicBlock *HeaderVPBB,\n+                                                  VPBasicBlock *LatchVPBB,\n+                                                  VPBasicBlock *MiddleVPBB) {\n+  struct EarlyExitInfo {\n+    VPBasicBlock *EarlyExitingVPBB;\n+    VPIRBasicBlock *EarlyExitVPBB;\n+    VPValue *CondToExit;\n+  };\n \n+  VPDominatorTree VPDT(Plan);\n   VPBuilder Builder(LatchVPBB->getTerminator());\n-  VPBlockBase *TrueSucc = EarlyExitingVPBB->getSuccessors()[0];\n-  assert(match(EarlyExitingVPBB->getTerminator(), m_BranchOnCond()) &&\n-         \"Terminator must be be BranchOnCond\");\n-  VPValue *CondOfEarlyExitingVPBB =\n-      EarlyExitingVPBB->getTerminator()->getOperand(0);\n-  auto *CondToEarlyExit = TrueSucc == EarlyExitVPBB\n-                              ? CondOfEarlyExitingVPBB\n-                              : Builder.createNot(CondOfEarlyExitingVPBB);\n-\n-  // Create a BranchOnTwoConds in the latch that branches to:\n-  // [0] vector.early.exit, [1] middle block, [2] header (continue looping).\n-  VPValue *IsEarlyExitTaken =\n-      Builder.createNaryOp(VPInstruction::AnyOf, {CondToEarlyExit});\n-  VPBasicBlock *VectorEarlyExitVPBB =\n-      Plan.createVPBasicBlock(\"vector.early.exit\");\n-  VectorEarlyExitVPBB->setParent(EarlyExitVPBB->getParent());\n-\n-  VPBlockUtils::connectBlocks(VectorEarlyExitVPBB, EarlyExitVPBB);\n-\n-  // Update the exit phis in the early exit block.\n-  VPBuilder MiddleBuilder(MiddleVPBB);\n-  VPBuilder EarlyExitB(VectorEarlyExitVPBB);\n-  for (VPRecipeBase &R : EarlyExitVPBB->phis()) {\n-    auto *ExitIRI = cast<VPIRPhi>(&R);\n-    // Early exit operand should always be last, i.e., 0 if EarlyExitVPBB has\n-    // a single predecessor and 1 if it has two.\n-    unsigned EarlyExitIdx = ExitIRI->getNumOperands() - 1;\n-    if (ExitIRI->getNumOperands() != 1) {\n-      // The first of two operands corresponds to the latch exit, via MiddleVPBB\n-      // predecessor. Extract its final lane.\n-      ExitIRI->extractLastLaneOfLastPartOfFirstOperand(MiddleBuilder);\n+  SmallVector<EarlyExitInfo> Exits;\n+  for (VPIRBasicBlock *ExitBlock : Plan.getExitBlocks()) {\n+    for (VPBlockBase *Pred : to_vector(ExitBlock->getPredecessors())) {\n+      if (Pred == MiddleVPBB)\n+        continue;\n+      // Collect condition for this early exit.\n+      auto *EarlyExitingVPBB = cast<VPBasicBlock>(Pred);\n+      VPBlockBase *TrueSucc = EarlyExitingVPBB->getSuccessors()[0];\n+      VPValue *CondOfEarlyExitingVPBB;\n+      [[maybe_unused]] bool Matched =\n+          match(EarlyExitingVPBB->getTerminator(),\n+                m_BranchOnCond(m_VPValue(CondOfEarlyExitingVPBB)));\n+      assert(Matched && \"Terminator must be BranchOnCond\");\n+      auto *CondToEarlyExit = TrueSucc == ExitBlock\n+                                  ? CondOfEarlyExitingVPBB\n+                                  : Builder.createNot(CondOfEarlyExitingVPBB);\n+      assert((isa<VPIRValue>(CondOfEarlyExitingVPBB) ||\n+              VPDT.properlyDominates(\n+                  CondOfEarlyExitingVPBB->getDefiningRecipe()->getParent(),\n+                  LatchVPBB)) &&\n+             \"exit condition must dominate the latch\");\n+      Exits.push_back({\n+          EarlyExitingVPBB,\n+          ExitBlock,\n+          CondToEarlyExit,\n+      });\n+    }\n+  }\n+\n+  assert(!Exits.empty() && \"must have at least one early exit\");\n+  // Sort exits by dominance to get the correct program order.\n+  llvm::sort(Exits, [&VPDT](const EarlyExitInfo &A, const EarlyExitInfo &B) {\n+    return VPDT.dominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB);\n+  });\n+\n+  // Build the AnyOf condition for the latch terminator using logical OR\n+  // to avoid poison propagation from later exit conditions when an earlier\n+  // exit is taken.\n+  VPValue *Combined = Exits[0].CondToExit;\n+  for (const EarlyExitInfo &Info : drop_begin(Exits))\n+    Combined = Builder.createLogicalOr(Combined, Info.CondToExit);\n+\n+  VPValue *IsAnyExitTaken =\n+      Builder.createNaryOp(VPInstruction::AnyOf, {Combined});\n+\n+  // Create the vector.early.exit blocks.\n+  SmallVector<VPBasicBlock *> VectorEarlyExitVPBBs(Exits.size());\n+  for (unsigned Idx = 0; Idx != Exits.size(); ++Idx) {\n+    Twine BlockSuffix = Exits.size() == 1 ? \"\" : Twine(\".\") + Twine(Idx);\n+    VPBasicBlock *VectorEarlyExitVPBB =\n+        Plan.createVPBasicBlock(\"vector.early.exit\" + BlockSuffix);\n+    VectorEarlyExitVPBBs[Idx] = VectorEarlyExitVPBB;\n+  }\n+\n+  // Create the dispatch block (or reuse the single exit block if only one\n+  // exit). The dispatch block computes the first active lane of the combined\n+  // condition and, for multiple exits, chains through conditions to determine\n+  // which exit to take.\n+  VPBasicBlock *DispatchVPBB =\n+      Exits.size() == 1 ? VectorEarlyExitVPBBs[0]\n+                        : Plan.createVPBasicBlock(\"vector.early.exit.check\");\n+  VPBuilder DispatchBuilder(DispatchVPBB, DispatchVPBB->begin());\n+  VPValue *FirstActiveLane =\n+      DispatchBuilder.createNaryOp(VPInstruction::FirstActiveLane, {Combined},\n+                                   DebugLoc::getUnknown(), \"first.active.lane\");\n+\n+  // For each early exit, disconnect the original exiting block\n+  // (early.exiting.I) from the exit block (ir-bb<exit.I>) and route through a\n+  // new vector.early.exit block. Update ir-bb<exit.I>'s phis to extract their\n+  // values at the first active lane:\n+  //\n+  // Input:\n+  //  early.exiting.I:\n+  //     ...\n+  //    EMIT branch-on-cond vp<%cond.I>\n+  //  Successor(s): in.loop.succ, ir-bb<exit.I>\n+  //\n+  //  ir-bb<exit.I>:\n+  //    IR %phi = phi [ vp<%incoming.I>, early.exiting.I ], ...\n+  //\n+  // Output:\n+  //  early.exiting.I:\n+  //    ...\n+  //  Successor(s): in.loop.succ\n+  //\n+  //  vector.early.exit.I:\n+  //    EMIT vp<%exit.val> = extract-lane vp<%first.lane>, vp<%incoming.I>\n+  //  Successor(s): ir-bb<exit.I>\n+  //\n+  //  ir-bb<exit.I>:\n+  //    IR %phi = phi ... (extra operand: vp<%exit.val> from\n+  //                                      vector.early.exit.I)\n+  //\n+  for (auto [Exit, VectorEarlyExitVPBB] :\n+       zip_equal(Exits, VectorEarlyExitVPBBs)) {\n+    auto &[EarlyExitingVPBB, EarlyExitVPBB, _] = Exit;\n+    // Adjust the phi nodes in EarlyExitVPBB.\n+    //   1. remove incoming values from EarlyExitingVPBB,\n+    //   2. extract the incoming value at FirstActiveLane\n+    //   3. add back the extracts as last operands for the phis\n+    // Then adjust the CFG, removing the edge between EarlyExitingVPBB and\n+    // EarlyExitVPBB and adding a new edge between VectorEarlyExitVPBB and\n+    // EarlyExitVPBB. The extracts at FirstActiveLane are now the incoming\n+    // values from VectorEarlyExitVPBB.\n+    for (VPRecipeBase &R : EarlyExitVPBB->phis()) {\n+      auto *ExitIRI = cast<VPIRPhi>(&R);\n+      VPValue *IncomingVal =\n+          ExitIRI->getIncomingValueForBlock(EarlyExitingVPBB);\n+      VPValue *NewIncoming = IncomingVal;\n+      if (!isa<VPIRValue>(IncomingVal)) {\n+        VPBuilder EarlyExitBuilder(VectorEarlyExitVPBB);\n+        NewIncoming = EarlyExitBuilder.createNaryOp(\n+            VPInstruction::ExtractLane, {FirstActiveLane, IncomingVal},\n+            DebugLoc::getUnknown(), \"early.exit.value\");\n+      }\n+      ExitIRI->removeIncomingValueFor(EarlyExitingVPBB);\n+      ExitIRI->addOperand(NewIncoming);\n     }\n \n-    VPValue *IncomingFromEarlyExit = ExitIRI->getOperand(EarlyExitIdx);\n-    if (!isa<VPIRValue>(IncomingFromEarlyExit)) {\n-      // Update the incoming value from the early exit.\n-      VPValue *FirstActiveLane = EarlyExitB.createNaryOp(\n-          VPInstruction::FirstActiveLane, {CondToEarlyExit},\n-          DebugLoc::getUnknown(), \"first.active.lane\");\n-      IncomingFromEarlyExit = EarlyExitB.createNaryOp(\n-          VPInstruction::ExtractLane, {FirstActiveLane, IncomingFromEarlyExit},\n-          DebugLoc::getUnknown(), \"early.exit.value\");\n-      ExitIRI->setOperand(EarlyExitIdx, IncomingFromEarlyExit);\n+    EarlyExitingVPBB->getTerminator()->eraseFromParent();\n+    VPBlockUtils::disconnectBlocks(EarlyExitingVPBB, EarlyExitVPBB);\n+    VPBlockUtils::connectBlocks(VectorEarlyExitVPBB, EarlyExitVPBB);\n+  }\n+\n+  // For exit blocks that also have the middle block as predecessor (latch\n+  // exits to the same block as an early exit), extract the last lane of the\n+  // first operand for the middle block's incoming value.\n+  VPBuilder MiddleBuilder(MiddleVPBB);\n+  VPBasicBlock *MiddleSuccVPBB =\n+      cast<VPIRBasicBlock>(MiddleVPBB->getSuccessors()[0]);\n+  if (MiddleSuccVPBB->getNumPredecessors() > 1) {\n+    assert(all_of(MiddleSuccVPBB->getPredecessors(),\n+                  [&](VPBlockBase *Pred) {\n+                    return Pred == MiddleVPBB ||\n+                           is_contained(VectorEarlyExitVPBBs, Pred);\n+                  }) &&\n+           \"All predecessors must be either the middle block or early exit \"\n+           \"blocks\");\n+\n+    for (VPRecipeBase &R : MiddleSuccVPBB->phis()) {\n+      auto *ExitIRI = cast<VPIRPhi>(&R);\n+      assert(ExitIRI->getIncomingValueForBlock(MiddleVPBB) ==\n+                 ExitIRI->getOperand(0) &&\n+             \"First operand must come from middle block\");\n+      ExitIRI->extractLastLaneOfLastPartOfFirstOperand(MiddleBuilder);\n     }\n   }\n \n-  // Replace the conditional branch controlling the latch exit from the vector\n-  // loop with a multi-conditional branch exiting to vector early exit if the\n-  // early exit has been taken, exiting to middle block if the original\n-  // condition of the vector latch is true, otherwise continuing back to header.\n+  // Chain through exits: for each exit, check if its condition is true at\n+  // the first active lane. If so, take that exit; otherwise, try the next.\n+  // The last exit needs no check since it must be taken if all others fail.\n+  //\n+  // For 3 exits (cond.0, cond.1, cond.2), this creates:\n+  //\n+  // latch:\n+  //   ...\n+  //   EMIT vp<%combined> = logical-or vp<%cond.0>, vp<%cond.1>, vp<%cond.2>\n+  //   ...\n+  //\n+  // vector.early.exit.check:\n+  //   EMIT vp<%first.lane> = first-active-lane vp<%combined>\n+  //   EMIT vp<%at.cond.0> = extract-lane vp<%first.lane>, vp<%cond.0>\n+  //   EMIT branch-on-cond vp<%at.cond.0>\n+  // Successor(s): vector.early.exit.0, vector.early.exit.check.0\n+  //\n+  // vector.early.exit.check.0:\n+  //   EMIT vp<%at.cond.1> = extract-lane vp<%first.lane>, vp<%cond.1>\n+  //   EMIT branch-on-cond vp<%at.cond.1>\n+  // Successor(s): vector.early.exit.1, vector.early.exit.2\n+  VPBasicBlock *CurrentBB = DispatchVPBB;\n+  for (auto [I, Exit] : enumerate(ArrayRef(Exits).drop_back())) {\n+    VPValue *LaneVal = DispatchBuilder.createNaryOp(\n+        VPInstruction::ExtractLane, {FirstActiveLane, Exit.CondToExit},\n+        DebugLoc::getUnknown(), \"exit.cond.at.lane\");\n+\n+    // For the last dispatch, branch directly to the last exit on false;\n+    // otherwise, create a new check block.\n+    bool IsLastDispatch = (I + 2 == Exits.size());\n+    VPBasicBlock *FalseBB =\n+        IsLastDispatch ? VectorEarlyExitVPBBs.back()\n+                       : Plan.createVPBasicBlock(\n+                             Twine(\"vector.early.exit.check.\") + Twine(I));\n+\n+    DispatchBuilder.createNaryOp(VPInstruction::BranchOnCond, {LaneVal});\n+    CurrentBB->setSuccessors({VectorEarlyExitVPBBs[I], FalseBB});\n+    VectorEarlyExitVPBBs[I]->setPredecessors({CurrentBB});\n+    FalseBB->setPredecessors({CurrentBB});\n+\n+    CurrentBB = FalseBB;\n+    DispatchBuilder.setInsertPoint(CurrentBB);\n+  }\n+\n+  // Replace the latch terminator with the new branching logic.\n   auto *LatchExitingBranch = cast<VPInstruction>(LatchVPBB->getTerminator());\n   assert(LatchExitingBranch->getOpcode() == VPInstruction::BranchOnCount &&\n          \"Unexpected terminator\");\n@@ -4114,13 +4250,12 @@ void VPlanTransforms::handleUncountableEarlyExit(VPBasicBlock *EarlyExitingVPBB,\n \n   DebugLoc LatchDL = LatchExitingBranch->getDebugLoc();\n   LatchExitingBranch->eraseFromParent();\n-\n   Builder.setInsertPoint(LatchVPBB);\n   Builder.createNaryOp(VPInstruction::BranchOnTwoConds,\n-                       {IsEarlyExitTaken, IsLatchExitTaken}, LatchDL);\n+                       {IsAnyExitTaken, IsLatchExitTaken}, LatchDL);\n   LatchVPBB->clearSuccessors();\n-  LatchVPBB->setSuccessors({VectorEarlyExitVPBB, MiddleVPBB, HeaderVPBB});\n-  VectorEarlyExitVPBB->setPredecessors({LatchVPBB});\n+  LatchVPBB->setSuccessors({DispatchVPBB, MiddleVPBB, HeaderVPBB});\n+  DispatchVPBB->setPredecessors({LatchVPBB});\n }\n \n /// This function tries convert extended in-loop reductions to\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\nindex edf21115e2bab..5fc68c2df145f 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.h\n@@ -311,14 +311,13 @@ struct VPlanTransforms {\n   /// Remove dead recipes from \\p Plan.\n   static void removeDeadRecipes(VPlan &Plan);\n \n-  /// Update \\p Plan to account for the uncountable early exit from \\p\n-  /// EarlyExitingVPBB to \\p EarlyExitVPBB by introducing a BranchOnTwoConds\n-  /// terminator in the latch that handles the early exit and the latch exit\n-  /// condition.\n-  static void handleUncountableEarlyExit(VPBasicBlock *EarlyExitingVPBB,\n-                                         VPBasicBlock *EarlyExitVPBB,\n-                                         VPlan &Plan, VPBasicBlock *HeaderVPBB,\n-                                         VPBasicBlock *LatchVPBB);\n+  /// Update \\p Plan to account for uncountable early exits by introducing\n+  /// appropriate branching logic in the latch that handles early exits and the\n+  /// latch exit condition. Multiple exits are handled with a dispatch block\n+  /// that determines which exit to take based on lane-by-lane semantics.\n+  static void handleUncountableEarlyExits(VPlan &Plan, VPBasicBlock *HeaderVPBB,\n+                                          VPBasicBlock *LatchVPBB,\n+                                          VPBasicBlock *MiddleVPBB);\n \n   /// Replaces the exit condition from\n   ///   (branch-on-cond eq CanonicalIVInc, VectorTripCount)\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Building on top of the recent changes to introduce BranchOnTwoConds,\r\nthis patch adds support for vectorizing loops with multiple early exits,\r\nall dominating a countable latch. The early exits must form a\r\ndominance chain, so we can simply check which early exit has been taken\r\nin dominance order.\r\n\r\nCurrently LoopVectorizationLegality ensures that all exits other than\r\nthe latch must be uncountable. handleUncountableEarlyExits now collects\r\nthose uncountable exits and processes each exit.\r\n\r\nIn the vector region, we compute if any exit has been taken, by taking\r\nthe OR of all early exit conditions (EarlyExitConds) and checking if there's\r\nany active lane.\r\n\r\nIf the early exit is taken, we exit the loop and compute which early exit\r\nhas been taken. The first taken early exit is the one where its exit\r\ncondition is true in the first active lane of EarlyExitConds.\r\n\r\nWe create a chain of dispatch blocks outside the loop to check this for\r\nthe early exit blocks ordered by dominance.\r\n\r\nDepends on https://github.com/llvm/llvm-project/pull/174016 (included in PR)",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/VPlan/uncountable-early-exit-vplan.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -S -debug %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "two_early_exits_same_exit_with_constant_live_outs",
+          "test_body": "declare void @init(ptr)\n\ndefine i64 @two_early_exits_same_exit_with_constant_live_outs() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init(ptr %A, i64 1024)\n  call void @init(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %cmp1 = icmp eq i8 %ld.A, 42\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp2 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp2, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 67\n  br i1 %ec, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ 100, %early.exit.0 ], [ 43, %loop.latch ]\n  ret i64 %retval\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/early_exit_legality.ll",
+      "commands": [
+        "opt -S < %s -p loop-vectorize -debug-only=loop-vectorize -force-vector-width=4 -disable-output 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "multiple_uncountable_exits",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @multiple_uncountable_exits() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %search1\n\nsearch1:                                          ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp1 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp1, label %loop.end, label %search2\n\nsearch2:                                          ; preds = %search1\n  %cmp2 = icmp ult i8 %ld1, 34\n  br i1 %cmp2, label %loop.end, label %loop.inc\n\nloop.inc:                                         ; preds = %search2\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %search1, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %search2, %search1\n  %retval = phi i64 [ %index, %search1 ], [ 100, %search2 ], [ 43, %loop.inc ]\n  ret i64 %retval\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/multi_early_exit.ll",
+      "commands": [
+        "opt -S < %s -p loop-vectorize"
+      ],
+      "tests": [
+        {
+          "test_name": "early_exit_with_live_in_condition",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @early_exit_with_live_in_condition(i1 %cond) {\nentry:\n  %p = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %latch, %entry\n  %iv = phi i64 [ %inc, %latch ], [ 0, %entry ]\n  br i1 %cond, label %loop.end, label %search\n\nsearch:                                           ; preds = %loop\n  %arrayidx = getelementptr inbounds i8, ptr %p, i64 %iv\n  %ld = load i8, ptr %arrayidx, align 1\n  %cmp = icmp eq i8 %ld, 0\n  br i1 %cmp, label %loop.end, label %latch\n\nlatch:                                            ; preds = %search\n  %inc = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %inc, 1024\n  br i1 %exitcond, label %loop.end, label %loop\n\nloop.end:                                         ; preds = %latch, %search, %loop\n  %retval = phi i64 [ 0, %loop ], [ 1, %search ], [ 2, %latch ]\n  ret i64 %retval\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/multiple-early-exits.ll",
+      "commands": [
+        "opt -S < %s -p loop-vectorize -force-vector-width=4 -force-vector-interleave=1"
+      ],
+      "tests": [
+        {
+          "test_name": "two_early_exits_same_exit",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @two_early_exits_same_exit() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %cmp1 = icmp eq i8 %ld.A, 42\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp2 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp2, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 67\n  br i1 %ec, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ 100, %early.exit.0 ], [ 43, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "four_early_exits_same_exit",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @four_early_exits_same_exit() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  %C = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  call void @init_mem(ptr %C, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 3, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %cmp1 = icmp eq i8 %ld.A, 42\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp2 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp2, label %exit, label %early.exit.1\n\nearly.exit.1:                                     ; preds = %early.exit.0\n  %gep.C = getelementptr inbounds i8, ptr %C, i64 %iv\n  %ld.C = load i8, ptr %gep.C, align 1\n  %cmp3 = icmp eq i8 %ld.B, %ld.C\n  br i1 %cmp3, label %exit, label %early.exit.2\n\nearly.exit.2:                                     ; preds = %early.exit.1\n  %cmp4 = icmp ugt i8 %ld.C, 100\n  br i1 %cmp4, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.2\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 67\n  br i1 %ec, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %early.exit.2, %early.exit.1, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ 100, %early.exit.0 ], [ 200, %early.exit.1 ], [ 300, %early.exit.2 ], [ 43, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "two_early_exits_with_live_out_values",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @two_early_exits_with_live_out_values() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 3, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %sum = add i8 %ld.A, %ld.B\n  %cmp2 = icmp ult i8 %sum, 34\n  br i1 %cmp2, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 67\n  br i1 %ec, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ %iv, %early.exit.0 ], [ 99, %loop.latch ]\n  %retval2 = phi i8 [ 0, %loop.header ], [ %sum, %early.exit.0 ], [ 0, %loop.latch ]\n  %ext = zext i8 %retval2 to i64\n  %ret = add i64 %retval, %ext\n  ret i64 %ret\n}\n"
+        },
+        {
+          "test_name": "three_early_exits_iv_and_load_live_out",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @three_early_exits_iv_and_load_live_out() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %cmp2 = icmp ult i8 %ld.A, 34\n  br i1 %cmp2, label %exit, label %early.exit.1\n\nearly.exit.1:                                     ; preds = %early.exit.0\n  %cmp3 = icmp ugt i8 %ld.B, 100\n  br i1 %cmp3, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.1\n  %iv.next = add nuw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 128\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %early.exit.1, %early.exit.0, %loop.header\n  %retval.iv = phi i64 [ %iv, %loop.header ], [ %iv, %early.exit.0 ], [ %iv, %early.exit.1 ], [ 128, %loop.latch ]\n  %retval.ld = phi i8 [ %ld.A, %loop.header ], [ %ld.A, %early.exit.0 ], [ %ld.B, %early.exit.1 ], [ 0, %loop.latch ]\n  %ext = zext i8 %retval.ld to i64\n  %ret = add i64 %retval.iv, %ext\n  ret i64 %ret\n}\n"
+        },
+        {
+          "test_name": "three_early_exits_three_exit_blocks",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @three_early_exits_three_exit_blocks() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 3, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp1, label %exit1, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %cmp2 = icmp ult i8 %ld.A, 34\n  br i1 %cmp2, label %exit2, label %early.exit.1\n\nearly.exit.1:                                     ; preds = %early.exit.0\n  %cmp3 = icmp ugt i8 %ld.B, 100\n  br i1 %cmp3, label %exit3, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.1\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 99\n  br i1 %ec, label %loop.header, label %exit\n\nexit1:                                            ; preds = %loop.header\n  %ret1 = phi i64 [ %iv, %loop.header ]\n  ret i64 %ret1\n\nexit2:                                            ; preds = %early.exit.0\n  %ret2 = phi i64 [ 100, %early.exit.0 ]\n  ret i64 %ret2\n\nexit3:                                            ; preds = %early.exit.1\n  %ret3 = phi i64 [ 200, %early.exit.1 ]\n  ret i64 %ret3\n\nexit:                                             ; preds = %loop.latch\n  ret i64 43\n}\n"
+        },
+        {
+          "test_name": "two_early_exits_iv_live_out",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @two_early_exits_iv_live_out() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %cmp2 = icmp ult i8 %ld.A, 34\n  br i1 %cmp2, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add nuw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 128\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ %iv, %early.exit.0 ], [ 128, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "four_early_exits_with_conditional_loads",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine { i64, i8 } @four_early_exits_with_conditional_loads() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  %C = alloca [1024 x i8], align 1\n  %D = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  call void @init_mem(ptr %C, i64 1024)\n  call void @init_mem(ptr %D, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %cmp1 = icmp eq i8 %ld.A, 10\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp2 = icmp eq i8 %ld.B, 20\n  br i1 %cmp2, label %exit, label %early.exit.1\n\nearly.exit.1:                                     ; preds = %early.exit.0\n  %gep.C = getelementptr inbounds i8, ptr %C, i64 %iv\n  %ld.C = load i8, ptr %gep.C, align 1\n  %cmp3 = icmp eq i8 %ld.C, 30\n  br i1 %cmp3, label %exit, label %early.exit.2\n\nearly.exit.2:                                     ; preds = %early.exit.1\n  %gep.D = getelementptr inbounds i8, ptr %D, i64 %iv\n  %ld.D = load i8, ptr %gep.D, align 1\n  %cmp4 = icmp eq i8 %ld.D, 40\n  br i1 %cmp4, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.2\n  %iv.next = add nuw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 128\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %early.exit.2, %early.exit.1, %early.exit.0, %loop.header\n  %retval.iv = phi i64 [ %iv, %loop.header ], [ %iv, %early.exit.0 ], [ %iv, %early.exit.1 ], [ %iv, %early.exit.2 ], [ 128, %loop.latch ]\n  %retval.val = phi i8 [ %ld.A, %loop.header ], [ %ld.B, %early.exit.0 ], [ %ld.C, %early.exit.1 ], [ %ld.D, %early.exit.2 ], [ 0, %loop.latch ]\n  %r1 = insertvalue { i64, i8 } undef, i64 %retval.iv, 0\n  %r2 = insertvalue { i64, i8 } %r1, i8 %retval.val, 1\n  ret { i64, i8 } %r2\n}\n"
+        },
+        {
+          "test_name": "three_early_exits_same_exit",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @three_early_exits_same_exit() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 3, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %cmp1 = icmp eq i8 %ld.A, 42\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp2 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp2, label %exit, label %early.exit.1\n\nearly.exit.1:                                     ; preds = %early.exit.0\n  %cmp3 = icmp ugt i8 %ld.B, 100\n  br i1 %cmp3, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.1\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 67\n  br i1 %ec, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %early.exit.1, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ 100, %early.exit.0 ], [ 200, %early.exit.1 ], [ 43, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "two_early_exits_iv_diff_incoming",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @two_early_exits_iv_diff_incoming() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %iv.plus1 = add i64 %iv, 1\n  %cmp2 = icmp ult i8 %ld.A, 34\n  br i1 %cmp2, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add nuw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 128\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ %iv.plus1, %early.exit.0 ], [ 200, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "three_early_exits_loads_in_different_blocks",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @three_early_exits_loads_in_different_blocks() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  %C = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  call void @init_mem(ptr %C, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %cmp1 = icmp eq i8 %ld.A, 42\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp2 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp2, label %exit, label %early.exit.1\n\nearly.exit.1:                                     ; preds = %early.exit.0\n  %gep.C = getelementptr inbounds i8, ptr %C, i64 %iv\n  %ld.C = load i8, ptr %gep.C, align 1\n  %cmp3 = icmp eq i8 %ld.B, %ld.C\n  br i1 %cmp3, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.1\n  %iv.next = add nuw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 128\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %early.exit.1, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ %iv, %early.exit.0 ], [ %iv, %early.exit.1 ], [ 128, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "two_early_exits_different_exits",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @two_early_exits_different_exits() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp1, label %exit1, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %cmp2 = icmp ult i8 %ld.A, 34\n  br i1 %cmp2, label %exit2, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 67\n  br i1 %ec, label %loop.header, label %exit\n\nexit1:                                            ; preds = %loop.header\n  %ret1 = phi i64 [ %iv, %loop.header ]\n  ret i64 %ret1\n\nexit2:                                            ; preds = %early.exit.0\n  %ret2 = phi i64 [ 100, %early.exit.0 ]\n  ret i64 %ret2\n\nexit:                                             ; preds = %loop.latch\n  ret i64 43\n}\n"
+        },
+        {
+          "test_name": "three_early_exits_multiple_live_outs",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine { i64, i64 } @three_early_exits_multiple_live_outs() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %sum = add i8 %ld.A, %ld.B\n  %cmp2 = icmp ult i8 %sum, 34\n  br i1 %cmp2, label %exit, label %early.exit.1\n\nearly.exit.1:                                     ; preds = %early.exit.0\n  %diff = sub i8 %ld.A, %ld.B\n  %cmp3 = icmp ugt i8 %diff, 100\n  br i1 %cmp3, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.1\n  %iv.next = add nuw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 128\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %early.exit.1, %early.exit.0, %loop.header\n  %retval.iv = phi i64 [ %iv, %loop.header ], [ %iv, %early.exit.0 ], [ %iv, %early.exit.1 ], [ 128, %loop.latch ]\n  %retval.val = phi i8 [ %ld.A, %loop.header ], [ %sum, %early.exit.0 ], [ %diff, %early.exit.1 ], [ 0, %loop.latch ]\n  %ext = zext i8 %retval.val to i64\n  %r1 = insertvalue { i64, i64 } undef, i64 %retval.iv, 0\n  %r2 = insertvalue { i64, i64 } %r1, i64 %ext, 1\n  ret { i64, i64 } %r2\n}\n"
+        },
+        {
+          "test_name": "two_early_exits_load_in_early_exit_block",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @two_early_exits_load_in_early_exit_block() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %cmp1 = icmp eq i8 %ld.A, 42\n  br i1 %cmp1, label %exit, label %early.exit.0\n\nearly.exit.0:                                     ; preds = %loop.header\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp2 = icmp eq i8 %ld.A, %ld.B\n  br i1 %cmp2, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add nuw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 128\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ %iv, %early.exit.0 ], [ 128, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "two_early_exits_negated_condition",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @two_early_exits_negated_condition() {\nentry:\n  %A = alloca [1024 x i8], align 1\n  %B = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %A, i64 1024)\n  call void @init_mem(ptr %B, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 3, %entry ]\n  %gep.A = getelementptr inbounds i8, ptr %A, i64 %iv\n  %ld.A = load i8, ptr %gep.A, align 1\n  %gep.B = getelementptr inbounds i8, ptr %B, i64 %iv\n  %ld.B = load i8, ptr %gep.B, align 1\n  %cmp1 = icmp ne i8 %ld.A, %ld.B\n  br i1 %cmp1, label %early.exit.0, label %exit\n\nearly.exit.0:                                     ; preds = %loop.header\n  %cmp2 = icmp uge i8 %ld.A, 34\n  br i1 %cmp2, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %early.exit.0\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ne i64 %iv.next, 128\n  br i1 %ec, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch, %early.exit.0, %loop.header\n  %retval = phi i64 [ %iv, %loop.header ], [ 100, %early.exit.0 ], [ 43, %loop.latch ]\n  ret i64 %retval\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/unsupported_early_exit.ll",
+      "commands": [
+        "opt -S < %s -p loop-vectorize  -force-vector-width=4"
+      ],
+      "tests": [
+        {
+          "test_name": "multi_exit_load_in_nonexiting_block",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @multi_exit_load_in_nonexiting_block(ptr %src) {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %index = phi i64 [ %index.next, %loop.latch ], [ 0, %entry ]\n  %gep1 = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %gep1, align 1\n  %cmp1 = icmp eq i8 %ld1, 42\n  br i1 %cmp1, label %loop.end, label %middle.block\n\nmiddle.block:                                     ; preds = %loop.header\n  %gep.src = getelementptr inbounds i64, ptr %src, i64 %index\n  %ld.out = load i64, ptr %gep.src, align 4\n  br label %early.exit.2\n\nearly.exit.2:                                     ; preds = %middle.block\n  %gep2 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %gep2, align 1\n  %cmp2 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp2, label %loop.end, label %loop.latch\n\nloop.latch:                                       ; preds = %early.exit.2\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop.header, label %loop.end\n\nloop.end:                                         ; preds = %loop.latch, %early.exit.2, %loop.header\n  %retval = phi i64 [ %index, %loop.header ], [ %ld.out, %early.exit.2 ], [ 67, %loop.latch ]\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "uncountable_exit_infinite_loop",
+          "test_body": "declare void @init_mem(ptr, i64)\n\ndefine i64 @uncountable_exit_infinite_loop() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %exitcond = icmp ne i64 %index.next, 67\n  br label %loop\n\nloop.end:                                         ; preds = %loop\n  %retval = phi i64 [ %index, %loop ]\n  ret i64 %retval\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189994 tests passed\n* 5073 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "fhahn",
+      "body": "Updated after landing legality checks separately. I also added https://github.com/llvm/llvm-test-suite/pull/325 to add dedicated runtime tests for multiple early exits to llvm-test-suite"
+    },
+    {
+      "author": "fhahn",
+      "body": "ping"
+    },
+    {
+      "author": "david-arm",
+      "body": "> ping\r\n\r\nAre you planning to land this first - https://github.com/llvm/llvm-test-suite/pull/325?"
+    },
+    {
+      "author": "fhahn",
+      "body": "ping"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "androm3da",
+      "body": "I'm moving my comment from the commit over here to the PR, gives better context I think.\r\n\r\nI see this failure from libstdc++ with `_GLIBCXX_DEBUG` enabled and I suspect it came from the commit from this PR.\r\n\r\n```\r\n In function:                                                                                         \r\n      void std::sort(_RandomAccessIterator, _RandomAccessIterator, _Compare)                           \r\n      [_RandomAccessIterator = EarlyExitInfo *, _Compare = (lambda at                                  \r\n      /local/mnt/workspace/bcain-20260213_180548/llvm-project/llvm/lib/Transforms/Vectorize/VPlanTrans \r\n  forms.c                                                                                              \r\n  pp:4082:21)]                                                                                         \r\n                                                                                                       \r\n  Error: comparison doesn't meet irreflexive requirements, assert(!(a < a)).                           \r\n                                                                                                       \r\n  Objects involved in the operation:                                                                   \r\n      instance \"functor\" @ 0x7ffc58648430 {                                                            \r\n      }                                                                                                \r\n      iterator::value_type \"ordered type\"  {                                                           \r\n      }                  \r\n```\r\n\r\nHere's a possible fix to make the comparator pass the irreflexive requirement?\r\n\r\n```\r\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp                                                    \r\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\r\n@@ -4080,7 +4080,8 @@ void VPlanTransforms::handleUncountableEarlyExits(VPlan &Plan,                       \r\n   assert(!Exits.empty() && \"must have at least one early exit\");                                          \r\n   // Sort exits by dominance to get the correct program order.                                            \r\n   llvm::sort(Exits, [&VPDT](const EarlyExitInfo &A, const EarlyExitInfo &B) {                             \r\n-    return VPDT.dominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB);                                        \r\n+    return A.EarlyExitingVPBB != B.EarlyExitingVPBB &&                                                    \r\n+           VPDT.dominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB);                                        \r\n   });                                                                                                     \r\n\r\n```\r\n\r\n... I'll follow up w/a reproducer when my batch run is over ~tonight or tomorrow."
+    },
+    {
+      "author": "lukel97",
+      "body": "> I'm moving my comment from the commit over here to the PR, gives better context I think.\r\n> \r\n> I see this failure from libstdc++ with `_GLIBCXX_DEBUG` enabled and I suspect it came from the commit from this PR.\r\n> \r\n> ```\r\n>  In function:                                                                                         \r\n>       void std::sort(_RandomAccessIterator, _RandomAccessIterator, _Compare)                           \r\n>       [_RandomAccessIterator = EarlyExitInfo *, _Compare = (lambda at                                  \r\n>       /local/mnt/workspace/bcain-20260213_180548/llvm-project/llvm/lib/Transforms/Vectorize/VPlanTrans \r\n>   forms.c                                                                                              \r\n>   pp:4082:21)]                                                                                         \r\n>                                                                                                        \r\n>   Error: comparison doesn't meet irreflexive requirements, assert(!(a < a)).                           \r\n>                                                                                                        \r\n>   Objects involved in the operation:                                                                   \r\n>       instance \"functor\" @ 0x7ffc58648430 {                                                            \r\n>       }                                                                                                \r\n>       iterator::value_type \"ordered type\"  {                                                           \r\n>       }                  \r\n> ```\r\n> \r\n> Here's a possible fix to make the comparator pass the irreflexive requirement?\r\n> \r\n> ```\r\n> --- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp                                                    \r\n> +++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\r\n> @@ -4080,7 +4080,8 @@ void VPlanTransforms::handleUncountableEarlyExits(VPlan &Plan,                       \r\n>    assert(!Exits.empty() && \"must have at least one early exit\");                                          \r\n>    // Sort exits by dominance to get the correct program order.                                            \r\n>    llvm::sort(Exits, [&VPDT](const EarlyExitInfo &A, const EarlyExitInfo &B) {                             \r\n> -    return VPDT.dominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB);                                        \r\n> +    return A.EarlyExitingVPBB != B.EarlyExitingVPBB &&                                                    \r\n> +           VPDT.dominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB);                                        \r\n>    });                                                                                                     \r\n> ```\r\n> \r\n> ... I'll follow up w/a reproducer when my batch run is over ~tonight or tomorrow.\r\n\r\nI think we can use VPDT.properlyDominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB) too to meet the irreflexive requirement"
+    },
+    {
+      "author": "androm3da",
+      "body": "> I think we can use VPDT.properlyDominates(A.EarlyExitingVPBB, B.EarlyExitingVPBB) too to meet the irreflexive requirement\r\n\r\nok opened #181462"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-07T21:31:34Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+      [
+        233,
+        238
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        9509,
+        9523
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      [
+        1211,
+        1216
+      ],
+      [
+        1520,
+        1525
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      [
+        124,
+        132
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        903,
+        935
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      [
+        833,
+        841
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        468,
+        473
+      ],
+      [
+        813,
+        818
+      ],
+      [
+        1339,
+        1344
+      ],
+      [
+        1506,
+        1511
+      ],
+      [
+        1705,
+        1710
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        4036,
+        4110
+      ],
+      [
+        4114,
+        4126
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.h": [
+      [
+        311,
+        324
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/VPlan/uncountable-early-exit-vplan.ll": [
+      [
+        251,
+        257
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/early_exit_legality.ll": [
+      [
+        346,
+        357
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/multi_early_exit.ll": [
+      [
+        120,
+        122
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/multiple-early-exits.ll": [
+      [
+        7,
+        35
+      ],
+      [
+        64,
+        95
+      ],
+      [
+        200,
+        231
+      ],
+      [
+        264,
+        302
+      ],
+      [
+        343,
+        373
+      ],
+      [
+        408,
+        436
+      ],
+      [
+        466,
+        504
+      ],
+      [
+        573,
+        579
+      ],
+      [
+        616,
+        647
+      ],
+      [
+        763,
+        792
+      ],
+      [
+        822,
+        856
+      ],
+      [
+        899,
+        927
+      ],
+      [
+        956,
+        991
+      ],
+      [
+        1028,
+        1034
+      ],
+      [
+        1037,
+        1071
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/unsupported_early_exit.ll": [
+      [
+        57,
+        121
+      ],
+      [
+        709,
+        714
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+      "createLogicalAnd",
+      "createSelect"
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizePass::processLoop"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      "getNumIncoming"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      "VPTypeAnalysis::inferScalarTypeForRecipe"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "VPlanTransforms::addMiddleCheck",
+      "VPlanTransforms::handleEarlyExits"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      "m_LogicalOr",
+      "m_c_LogicalOr"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPInstruction::generate",
+      "VPInstruction::getNumOperandsForOpcode",
+      "VPInstruction::opcodeMayReadOrWriteFromMemory",
+      "VPInstruction::printRecipe",
+      "VPPhiAccessors::printPhiOperands",
+      "VPPhiAccessors::removeIncomingValueFor"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::convertToConcreteRecipes",
+      "VPlanTransforms::handleUncountableEarlyExit"
+    ],
+    "llvm/test/Transforms/LoopVectorize/multiple-early-exits.ll": [
+      "three_early_exits_three_exit_blocks",
+      "two_early_exits_different_live_outs",
+      "two_early_exits_iv_live_out",
+      "two_early_exits_load_in_early_exit_block"
+    ],
+    "llvm/test/Transforms/LoopVectorize/unsupported_early_exit.ll": [
+      "early_exit_on_last_block"
+    ]
+  }
+}

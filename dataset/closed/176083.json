@@ -1,0 +1,59 @@
+{
+  "pr_id": 176083,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176083",
+  "state": "closed",
+  "title": "[MemProf] Handle weak alias and aliasee prevailing in different modules",
+  "author": "teresajohnson",
+  "base_commit": "a975d2c71152200e1f8070967d5a0bf905b7080c",
+  "fix_commit": "c3c142d7d3de12e76488eab11a9c84058d441a68",
+  "patch": "diff --git a/llvm/lib/Transforms/IPO/MemProfContextDisambiguation.cpp b/llvm/lib/Transforms/IPO/MemProfContextDisambiguation.cpp\nindex a595ab002189f..488be32a652fd 100644\n--- a/llvm/lib/Transforms/IPO/MemProfContextDisambiguation.cpp\n+++ b/llvm/lib/Transforms/IPO/MemProfContextDisambiguation.cpp\n@@ -111,6 +111,8 @@ STATISTIC(NumImportantContextIds, \"Number of important context ids\");\n STATISTIC(NumFixupEdgeIdsInserted, \"Number of fixup edge ids inserted\");\n STATISTIC(NumFixupEdgesAdded, \"Number of fixup edges added\");\n STATISTIC(NumFixedContexts, \"Number of contexts with fixed edges\");\n+STATISTIC(AliaseesPrevailingInDiffModuleFromAlias,\n+          \"Number of aliasees prevailing in a different module than its alias\");\n \n static cl::opt<std::string> DotFilePathPrefix(\n     \"memprof-dot-file-path-prefix\", cl::init(\"\"), cl::Hidden,\n@@ -1083,6 +1085,7 @@ class IndexCallsiteContextGraph\n                            unsigned CloneNo);\n   std::string getLabel(const FunctionSummary *Func, const IndexCall &Call,\n                        unsigned CloneNo) const;\n+  DenseSet<GlobalValue::GUID> findAliaseeGUIDsPrevailingInDifferentModule();\n \n   // Saves mapping from function summaries containing memprof records back to\n   // its VI, for use in checking and debugging.\n@@ -2467,17 +2470,61 @@ ModuleCallsiteContextGraph::ModuleCallsiteContextGraph(\n       Call.call()->setMetadata(LLVMContext::MD_callsite, nullptr);\n }\n \n+// Finds the set of GUIDs for weak aliasees that are prevailing in different\n+// modules than any of their aliases. We need to handle these specially.\n+DenseSet<GlobalValue::GUID>\n+IndexCallsiteContextGraph::findAliaseeGUIDsPrevailingInDifferentModule() {\n+  DenseSet<GlobalValue::GUID> AliaseeGUIDs;\n+  for (auto &I : Index) {\n+    auto VI = Index.getValueInfo(I);\n+    for (auto &S : VI.getSummaryList()) {\n+      // We only care about aliases to functions.\n+      auto *AS = dyn_cast<AliasSummary>(S.get());\n+      if (!AS)\n+        continue;\n+      auto *AliaseeSummary = &AS->getAliasee();\n+      auto *AliaseeFS = dyn_cast<FunctionSummary>(AliaseeSummary);\n+      if (!AliaseeFS)\n+        continue;\n+      // Skip this summary if it is not for the prevailing symbol for this GUID.\n+      // The linker doesn't resolve local linkage values so don't check whether\n+      // those are prevailing.\n+      if (!GlobalValue::isLocalLinkage(S->linkage()) &&\n+          !isPrevailing(VI.getGUID(), S.get()))\n+        continue;\n+      // Prevailing aliasee could be in a different module only if it is weak.\n+      if (!GlobalValue::isWeakForLinker(AliaseeSummary->linkage()))\n+        continue;\n+      auto AliaseeGUID = AS->getAliaseeGUID();\n+      // If the aliasee copy in this module is not prevailing, record it.\n+      if (!isPrevailing(AliaseeGUID, AliaseeSummary))\n+        AliaseeGUIDs.insert(AliaseeGUID);\n+    }\n+  }\n+  AliaseesPrevailingInDiffModuleFromAlias += AliaseeGUIDs.size();\n+  return AliaseeGUIDs;\n+}\n+\n IndexCallsiteContextGraph::IndexCallsiteContextGraph(\n     ModuleSummaryIndex &Index,\n     llvm::function_ref<bool(GlobalValue::GUID, const GlobalValueSummary *)>\n         isPrevailing)\n     : Index(Index), isPrevailing(isPrevailing) {\n+  // Since we use the aliasee summary info to create the necessary clones for\n+  // its aliases, conservatively skip recording the aliasee function's callsites\n+  // in the CCG for any that are prevailing in a different module than one of\n+  // its aliases. We could record the necessary information to do this in the\n+  // summary, but this case should not be common.\n+  DenseSet<GlobalValue::GUID> GUIDsToSkip =\n+      findAliaseeGUIDsPrevailingInDifferentModule();\n   // Map for keeping track of the largest cold contexts up to the number given\n   // by MemProfTopNImportant. Must be a std::map (not DenseMap) because keys\n   // must be sorted.\n   std::map<uint64_t, uint32_t> TotalSizeToContextIdTopNCold;\n   for (auto &I : Index) {\n     auto VI = Index.getValueInfo(I);\n+    if (GUIDsToSkip.contains(VI.getGUID()))\n+      continue;\n     for (auto &S : VI.getSummaryList()) {\n       // We should only add the prevailing nodes. Otherwise we may try to clone\n       // in a weak copy that won't be linked (and may be different than the\n",
+  "components": [
+    "MemProfContextDisambiguation"
+  ],
+  "description": "For ThinLTO we only have the cloning information in the FunctionSummary,\nso for aliases we create as many clones as there are aliasee clones in\nthe LTO backend. However, that information is only in the prevailing\nsymbol's summary, as we don't keep the memprof summary information for\nother copies (to reduce memory and compile time).\n\nIn the case of weak aliases, it is possible that the prevailing copy\nof the alias may be in a different module than the prevailing copy of\nthe aliasee (e.g. when a module with a weak_odr aliasee definition does\nnot have a def of the weak_odr alias and is listed first on the link\nline). In that case, we were not creating the expected clones of the\nalias.\n\nRather than a more complex solution that adds additional summary\ninformation, detect this case and simply don't add the callsites in the\naliasee function to the callsite context graph. This will result in\nconservativeness (because we can't clone through that function), but\nthis should be a corner case.\n",
+  "tests": [
+    {
+      "file": "llvm/test/ThinLTO/X86/memprof-weak-alias.ll",
+      "commands": [
+        "src1.o -S 2>&1",
+        "src2.o -S 2>&1",
+        "src1.o -S 2>&1",
+        "src2.o -S 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": ";; Test handling of memprof ThinLTO when the call to update is a weak alias\n;; where the prevailing weak aliasee is defined in a different module.\n\n;; -stats requires asserts\n; REQUIRES: asserts\n\n;; Preparation steps to generate the bitcode and perform the thin link.\n\n;; First run the case where aliases (_Z8fooAliasv and _Z8fooAliasv2) and\n;; aliasees (_Z3foov and _Z3foov2, respectively) are prevailing in the same\n;; module.\n\n;; Run ThinLTO backends. We should be able to clone correctly.\n\n;; Now try where the aliasees are prevailing in the first module instead,\n;; which only has the alias declarations.\n\n;; We should have detected both aliasees and handle them conservatively.\n; STATS: 2 memprof-context-disambiguation - Number of aliasees prevailing in a different module than its alias\n\n;; Run ThinLTO backends. We should conservatively disable cloning.\n\n;--- src1.ll\nsource_filename = \"memprof-distrib-alias.ll\"\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @main() #0 {\nentry:\n  ;; The first call to fooAlias does not allocate cold memory. It should call\n  ;; the original function alias, which calls the original allocation decorated\n  ;; with a \"notcold\" attribute.\n  ; IR-MOD1:   call {{.*}} @_Z8fooAliasv()\n  %call = call ptr @_Z8fooAliasv(), !callsite !0\n  ;; The second call to fooAlias allocates cold memory. It should call the\n  ;; cloned alias which calls a cloned allocation decorated with a \"cold\"\n  ;; attribute.\n  ; IR-MOD1:   call {{.*}} @_Z8fooAliasv.memprof.1()\n  %call1 = call ptr @_Z8fooAliasv(), !callsite !1\n  ;; The first call to fooAlias2 does not allocate cold memory. It should call\n  ;; the original function alias, which calls the original allocation decorated\n  ;; with a \"notcold\" attribute.\n  ; IR-MOD1:   call {{.*}} @_Z8fooAliasv2()\n  %call2 = call ptr @_Z8fooAliasv2(), !callsite !9\n  ;; The second call to fooAlias2 allocates cold memory. It should call the\n  ;; cloned alias which calls a cloned allocation decorated with a \"cold\"\n  ;; attribute.\n  ; IR-MOD1:   call {{.*}} @_Z8fooAliasv2.memprof.1()\n  %call3 = call ptr @_Z8fooAliasv2(), !callsite !10\n  ret i32 0\n}\n\n; IR-MOD1: declare {{.*}} @_Z8fooAliasv.memprof.1()\n; IR-MOD1: declare {{.*}} @_Z8fooAliasv2.memprof.1()\n\ndeclare ptr @_Znam(i64)\n\n;; In this module the alias symbols are declarations. They alias with\n;; weak_odr symbols _Z3foov and _Z3foov2 which are defined in both modules.\ndeclare ptr @_Z8fooAliasv()\ndeclare ptr @_Z8fooAliasv2()\n\ndefine weak_odr ptr @_Z3foov() #0 {\nentry:\n  %call = call ptr @_Znam(i64 0), !memprof !2, !callsite !7\n  ret ptr null\n}\n\ndefine weak_odr ptr @_Z3foov2() #0 {\nentry:\n  %call = call ptr @_Znam(i64 0), !memprof !11, !callsite !16\n  ret ptr null\n}\n\nattributes #0 = { noinline optnone }\n\n!0 = !{i64 8632435727821051414}\n!1 = !{i64 -3421689549917153178}\n!2 = !{!3, !5}\n!3 = !{!4, !\"notcold\"}\n!4 = !{i64 9086428284934609951, i64 8632435727821051414}\n!5 = !{!6, !\"cold\"}\n!6 = !{i64 9086428284934609951, i64 -3421689549917153178}\n!7 = !{i64 9086428284934609951}\n!9 = !{i64 123}\n!10 = !{i64 234}\n!11 = !{!12, !14}\n!12 = !{!13, !\"notcold\"}\n!13 = !{i64 345, i64 123}\n!14 = !{!15, !\"cold\"}\n!15 = !{i64 345, i64 234}\n!16 = !{i64 345}\n\n;--- src2.ll\nsource_filename = \"memprof-distrib-alias2.ll\"\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare ptr @_Znam(i64)\n\n;; In this module the alias symbols are weak_odr aliases to weak_odr aliasees.\n@_Z8fooAliasv = weak_odr alias ptr (...), ptr @_Z3foov\n@_Z8fooAliasv2 = weak_odr alias ptr (...), ptr @_Z3foov2\n\ndefine weak_odr ptr @_Z3foov() #0 {\nentry:\n  %call = call ptr @_Znam(i64 0), !memprof !2, !callsite !7\n  ret ptr null\n}\n\ndefine weak_odr ptr @_Z3foov2() #0 {\nentry:\n  %call = call ptr @_Znam(i64 0), !memprof !11, !callsite !16\n  ret ptr null\n}\n\n; IR-MOD2: define weak_odr {{.*}} @_Z3foov()\n; IR-MOD2:   call {{.*}} @_Znam(i64 0) #[[NOTCOLD:[0-9]+]]\n; IR-MOD2: define weak_odr {{.*}} @_Z3foov.memprof.1()\n; IR-MOD2:   call {{.*}} @_Znam(i64 0) #[[COLD:[0-9]+]]\n; IR-MOD2: attributes #[[NOTCOLD]] = { \"memprof\"=\"notcold\" }\n; IR-MOD2: attributes #[[COLD]] = { \"memprof\"=\"cold\" }\n\nattributes #0 = { noinline optnone }\n\n!2 = !{!3, !5}\n!3 = !{!4, !\"notcold\"}\n!4 = !{i64 9086428284934609951, i64 8632435727821051414}\n!5 = !{!6, !\"cold\"}\n!6 = !{i64 9086428284934609951, i64 -3421689549917153178}\n!7 = !{i64 9086428284934609951}\n!11 = !{!12, !14}\n!12 = !{!13, !\"notcold\"}\n!13 = !{i64 345, i64 123}\n!14 = !{!15, !\"cold\"}\n!15 = !{i64 345, i64 234}\n!16 = !{i64 345}"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "LTO",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-01-15T04:56:26Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/IPO/MemProfContextDisambiguation.cpp": [
+      [
+        111,
+        116
+      ],
+      [
+        1083,
+        1088
+      ],
+      [
+        2467,
+        2483
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/IPO/MemProfContextDisambiguation.cpp": [
+      "IndexCallsiteContextGraph::IndexCallsiteContextGraph",
+      "ModuleCallsiteContextGraph::ModuleCallsiteContextGraph"
+    ]
+  }
+}

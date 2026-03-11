@@ -1,0 +1,533 @@
+{
+  "pr_id": 175852,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175852",
+  "state": "closed",
+  "title": "InstCombine: Handle fsub in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "fa457302cb6ad12d7e75e078da22ace6bb4184e6",
+  "fix_commit": "f931d9abbf920bf07ca39d57f60a3da655286463",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex 3dd2cbad873d2..108bdf867a5f0 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -176,6 +176,12 @@ struct KnownFPClass {\n       SignBit = !*SignBit;\n   }\n \n+  static KnownFPClass fneg(const KnownFPClass &Src) {\n+    KnownFPClass Known = Src;\n+    Known.fneg();\n+    return Known;\n+  }\n+\n   void fabs() {\n     if (KnownFPClasses & fcNegZero)\n       KnownFPClasses |= fcPosZero;\n@@ -192,12 +198,6 @@ struct KnownFPClass {\n     signBitMustBeZero();\n   }\n \n-  static KnownFPClass fneg(const KnownFPClass &Src) {\n-    KnownFPClass Known = Src;\n-    Known.fneg();\n-    return Known;\n-  }\n-\n   static KnownFPClass fabs(const KnownFPClass &Src) {\n     KnownFPClass Known = Src;\n     Known.fabs();\n@@ -234,6 +234,11 @@ struct KnownFPClass {\n   fadd_self(const KnownFPClass &Src,\n             DenormalMode Mode = DenormalMode::getDynamic());\n \n+  /// Report known values for fsub\n+  LLVM_ABI static KnownFPClass\n+  fsub(const KnownFPClass &LHS, const KnownFPClass &RHS,\n+       DenormalMode Mode = DenormalMode::getDynamic());\n+\n   /// Report known values for fmul\n   LLVM_ABI static KnownFPClass\n   fmul(const KnownFPClass &LHS, const KnownFPClass &RHS,\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 171952120fc40..7e49639c5ff40 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5524,78 +5524,37 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n                         KnownRHS, Q, Depth + 1);\n \n     // Special case fadd x, x, which is the canonical form of fmul x, 2.\n-    bool SelfAdd = Op->getOperand(0) == Op->getOperand(1) &&\n-                   isGuaranteedNotToBeUndef(Op->getOperand(0), Q.AC, Q.CxtI,\n-                                            Q.DT, Depth + 1);\n-    if (SelfAdd)\n+    bool Self = Op->getOperand(0) == Op->getOperand(1) &&\n+                isGuaranteedNotToBeUndef(Op->getOperand(0), Q.AC, Q.CxtI, Q.DT,\n+                                         Depth + 1);\n+    if (Self)\n       KnownLHS = KnownRHS;\n \n     if ((WantNaN && KnownRHS.isKnownNeverNaN()) ||\n         (WantNegative && KnownRHS.cannotBeOrderedLessThanZero()) ||\n         WantNegZero || Opc == Instruction::FSub) {\n \n-      if (!SelfAdd) {\n-        // RHS is canonically cheaper to compute. Skip inspecting the LHS if\n-        // there's no point.\n-        computeKnownFPClass(Op->getOperand(0), DemandedElts, InterestedSrcs,\n-                            KnownLHS, Q, Depth + 1);\n-      }\n-\n-      // Adding positive and negative infinity produces NaN.\n-      // TODO: Check sign of infinities.\n-      if (KnownLHS.isKnownNeverNaN() && KnownRHS.isKnownNeverNaN() &&\n-          (KnownLHS.isKnownNeverInfinity() || KnownRHS.isKnownNeverInfinity()))\n-        Known.knownNot(fcNan);\n-\n       // FIXME: Context function should always be passed in separately\n       const Function *F = cast<Instruction>(Op)->getFunction();\n+      const fltSemantics &FltSem =\n+          Op->getType()->getScalarType()->getFltSemantics();\n+      DenormalMode Mode =\n+          F ? F->getDenormalMode(FltSem) : DenormalMode::getDynamic();\n \n-      if (Op->getOpcode() == Instruction::FAdd) {\n-        if (KnownLHS.cannotBeOrderedLessThanZero() &&\n-            KnownRHS.cannotBeOrderedLessThanZero())\n-          Known.knownNot(KnownFPClass::OrderedLessThanZeroMask);\n-        if (KnownLHS.cannotBeOrderedGreaterThanZero() &&\n-            KnownRHS.cannotBeOrderedGreaterThanZero())\n-          Known.knownNot(KnownFPClass::OrderedGreaterThanZeroMask);\n-\n-        if (!F)\n-          break;\n-\n-        const fltSemantics &FltSem =\n-            Op->getType()->getScalarType()->getFltSemantics();\n-        DenormalMode Mode = F->getDenormalMode(FltSem);\n-\n-        // Doubling 0 will give the same 0.\n-        if (SelfAdd && KnownRHS.isKnownNeverLogicalPosZero(Mode) &&\n-            (Mode.Output == DenormalMode::IEEE ||\n-             (Mode.Output == DenormalMode::PreserveSign &&\n-              KnownRHS.isKnownNeverPosSubnormal()) ||\n-             (Mode.Output == DenormalMode::PositiveZero &&\n-              KnownRHS.isKnownNeverSubnormal())))\n-          Known.knownNot(fcPosZero);\n-\n-        // (fadd x, 0.0) is guaranteed to return +0.0, not -0.0.\n-        if ((KnownLHS.isKnownNeverLogicalNegZero(Mode) ||\n-             KnownRHS.isKnownNeverLogicalNegZero(Mode)) &&\n-            // Make sure output negative denormal can't flush to -0\n-            (Mode.Output == DenormalMode::IEEE ||\n-             Mode.Output == DenormalMode::PositiveZero))\n-          Known.knownNot(fcNegZero);\n+      if (Self && Opc == Instruction::FAdd) {\n+        Known = KnownFPClass::fadd_self(KnownLHS, Mode);\n       } else {\n-        if (!F)\n-          break;\n+        // RHS is canonically cheaper to compute. Skip inspecting the LHS if\n+        // there's no point.\n \n-        const fltSemantics &FltSem =\n-            Op->getType()->getScalarType()->getFltSemantics();\n-        DenormalMode Mode = F->getDenormalMode(FltSem);\n-\n-        // Only fsub -0, +0 can return -0\n-        if ((KnownLHS.isKnownNeverLogicalNegZero(Mode) ||\n-             KnownRHS.isKnownNeverLogicalPosZero(Mode)) &&\n-            // Make sure output negative denormal can't flush to -0\n-            (Mode.Output == DenormalMode::IEEE ||\n-             Mode.Output == DenormalMode::PositiveZero))\n-          Known.knownNot(fcNegZero);\n+        if (!Self) {\n+          computeKnownFPClass(Op->getOperand(0), DemandedElts, InterestedSrcs,\n+                              KnownLHS, Q, Depth + 1);\n+        }\n+\n+        Known = Opc == Instruction::FAdd\n+                    ? KnownFPClass::fadd(KnownLHS, KnownRHS, Mode)\n+                    : KnownFPClass::fsub(KnownLHS, KnownRHS, Mode);\n       }\n     }\n \ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex ae8c4a9133897..2946c597aa286 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -279,6 +279,12 @@ KnownFPClass KnownFPClass::fadd_self(const KnownFPClass &KnownSrc,\n   return Known;\n }\n \n+KnownFPClass KnownFPClass::fsub(const KnownFPClass &KnownLHS,\n+                                const KnownFPClass &KnownRHS,\n+                                DenormalMode Mode) {\n+  return fadd(KnownLHS, fneg(KnownRHS), Mode);\n+}\n+\n KnownFPClass KnownFPClass::fmul(const KnownFPClass &KnownLHS,\n                                 const KnownFPClass &KnownRHS,\n                                 DenormalMode Mode) {\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex a0aa7c89a7744..4c5affb34bb11 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2211,11 +2211,13 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n     Known.fneg();\n     break;\n   }\n-  case Instruction::FAdd: {\n+  case Instruction::FAdd:\n+  case Instruction::FSub: {\n     KnownFPClass KnownLHS, KnownRHS;\n \n     // fadd x, x can be handled more aggressively.\n     if (I->getOperand(0) == I->getOperand(1) &&\n+        I->getOpcode() == Instruction::FAdd &&\n         isGuaranteedNotToBeUndef(I->getOperand(0), SQ.AC, CxtI, SQ.DT,\n                                  Depth + 1)) {\n       Type *EltTy = VTy->getScalarType();\n@@ -2269,7 +2271,10 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n \n       Type *EltTy = VTy->getScalarType();\n       DenormalMode Mode = F.getDenormalMode(EltTy->getFltSemantics());\n-      Known = KnownFPClass::fadd(KnownLHS, KnownRHS, Mode);\n+\n+      Known = I->getOpcode() == Instruction::FAdd\n+                  ? KnownFPClass::fadd(KnownLHS, KnownRHS, Mode)\n+                  : KnownFPClass::fsub(KnownLHS, KnownRHS, Mode);\n     }\n \n     FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n@@ -2285,11 +2290,12 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n     }\n \n     // With nnan: X + {+/-}Inf --> {+/-}Inf\n-    if (ResultNotNan && KnownRHS.isKnownAlways(fcInf | fcNan) &&\n-        KnownLHS.isKnownNever(fcNan))\n+    if (ResultNotNan && I->getOpcode() == Instruction::FAdd &&\n+        KnownRHS.isKnownAlways(fcInf | fcNan) && KnownLHS.isKnownNever(fcNan))\n       return I->getOperand(1);\n \n     // With nnan: {+/-}Inf + X --> {+/-}Inf\n+    // With nnan: {+/-}Inf - X --> {+/-}Inf\n     if (ResultNotNan && KnownLHS.isKnownAlways(fcInf | fcNan) &&\n         KnownRHS.isKnownNever(fcNan))\n       return I->getOperand(0);\n",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "description": "alive2 fails on some of the tests, but this is due to existing\nfolds in instsimplify and https://github.com/AliveToolkit/alive2/issues/1273",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fsub.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_nonan__unknown__fsub__nzero",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fsub__nzero(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fsub half %unknown, %nzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__fsub_self__nonan",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndefine nofpclass(nan) half @ret_nonan__fsub_self__nonan(i1 %cond, half noundef %unknown) {\n  %nan = call noundef half @returns_nan()\n  %select = select i1 %cond, half %nan, half %unknown\n  %add = fsub half %select, %select\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero_nsub__fsub__pzero__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero_nsub__fsub__pzero__daz(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %not.nzero.nsub, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "pzero__fsub_nsz__unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fsub_nsz__unknown(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fsub nsz half %pzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inferred_nan_output__noinfs_only_lhs",
+          "test_body": "define nofpclass(nzero) half @inferred_nan_output__noinfs_only_lhs(half nofpclass(nan inf) %x, half nofpclass(nan) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_only_snan",
+          "test_body": "define nofpclass(qnan inf zero sub norm) half @ret_only_snan(half %x, half %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_fabs_fsub_known_positive_sources",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) half @returns_positive()\n\ndefine nofpclass(nan) half @ret_nonan_fabs_fsub_known_positive_sources() {\n  %positive0 = call half @returns_positive()\n  %positive1 = call half @returns_positive()\n  %known.positive.add = fsub half %positive1, %positive1\n  %fabs = call half @llvm.fabs.f16(half %known.positive.add)\n  ret half %fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nonan__zero__fsub__unknown",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan) half @ret_nonan__zero__fsub__unknown(half %unknown) {\n  %zero = call half @returns_zero()\n  %add = fsub half %zero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_inf_input_lhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(inf sub norm) half @nan_result_demands_inf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(nan inf zero) %y) {\n  %pinf = call half @returns_pinf()\n  %x.or.inf = select i1 %cond, half %x, half %pinf\n  %add = fsub half %x.or.inf, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__inf_or_nan__fsub__unknown",
+          "test_body": "declare nofpclass(zero sub norm) half @returns_inf_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan__inf_or_nan__fsub__unknown(half %unknown) {\n  %inf.or.nan = call half @returns_inf_or_nan()\n  %add = fsub half %inf.or.nan, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_ninf_input_rhs",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) half @returns_ninf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_ninf_input_rhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %ninf = call half @returns_ninf()\n  %y.or.inf = select i1 %cond, half %y, half %ninf\n  %add = fsub half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_nans_inputs",
+          "test_body": "define nofpclass(snan) half @no_nans_inputs(half nofpclass(nan) %x, half nofpclass(nan) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero__fsub__pzero__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero__fsub__pzero__dynamic(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %not.nzero, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "no_infs_inputs",
+          "test_body": "define nofpclass(snan) half @no_infs_inputs(half nofpclass(inf) %x, half nofpclass(inf) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "unknown__fsub_nsz__pzero_or_nan",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @unknown__fsub_nsz__pzero_or_nan(half %unknown) {\n  %pzero.or.nan = call half @returns_pzero()\n  %add = fsub nsz half %unknown, %pzero.or.nan\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_inf_input_rhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(inf sub norm) half @nan_result_demands_inf_input_rhs(i1 %cond, half nofpclass(zero) %x, half %y) {\n  %pinf = call half @returns_pinf()\n  %y.or.inf = select i1 %cond, half %y, half %pinf\n  %add = fsub half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_only_inf",
+          "test_body": "define nofpclass(nan zero sub norm) half @ret_only_inf(half %x, half %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fsub__inf_or_nan",
+          "test_body": "declare nofpclass(zero sub norm) half @returns_inf_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fsub__inf_or_nan(half %unknown) {\n  %inf.or.nan = call half @returns_inf_or_nan()\n  %add = fsub half %unknown, %inf.or.nan\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "unknown__fsub_nsz__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @unknown__fsub_nsz__pzero(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fsub nsz half %unknown, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fsub__not_nzero_nsub__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fsub__not_nzero_nsub__daz(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %pzero, %not.nzero.nsub\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_only_nzero",
+          "test_body": "define nofpclass(nan inf pzero sub norm) half @ret_only_nzero(half %x, half %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "nzero__fsub__unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(snan) half @nzero__fsub__unknown(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fsub half %nzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fsub__unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fsub__unknown(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %pzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "unknown__fsub__nzero",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(snan) half @unknown__fsub__nzero(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fsub half %unknown, %nzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__inf__fsub__unknown",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan) half @ret_nonan__inf__fsub__unknown(half %unknown) {\n  %inf = call half @returns_inf()\n  %add = fsub half %inf, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero__fsub__pzero__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero__fsub__pzero__daz(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %not.nzero, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fsub__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fsub__pzero(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %unknown, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inferred_nan_output__noinfs_only_rhs",
+          "test_body": "define nofpclass(nzero) half @inferred_nan_output__noinfs_only_rhs(half nofpclass(nan) %x, half nofpclass(nan inf) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__pzero__fsub__unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(nan) half @ret_nonan__pzero__fsub__unknown(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %pzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_ninf_input_lhs",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) half @returns_ninf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_ninf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %ninf = call half @returns_ninf()\n  %x.or.inf = select i1 %cond, half %x, half %ninf\n  %add = fsub half %x.or.inf, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fsub__inf",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fsub__inf(half %unknown) {\n  %inf = call half @returns_inf()\n  %add = fsub half %unknown, %inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_nans_input_and_output",
+          "test_body": "define nofpclass(nan) half @no_nans_input_and_output(half nofpclass(nan) %x, half nofpclass(nan) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fsub__not_nzero_nsub__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fsub__not_nzero_nsub__dynamic(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %pzero, %not.nzero.nsub\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__nzero__fsub__unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(nan) half @ret_nonan__nzero__fsub__unknown(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fsub half %nzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_inf_input_rhs",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_inf_input_rhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %inf = call half @returns_inf()\n  %y.or.inf = select i1 %cond, half %y, half %inf\n  %add = fsub half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero__fsub__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero__fsub__pzero(half nofpclass(nzero) %not.nzero) {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %not.nzero, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fsub__not_nzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fsub__not_nzero(half nofpclass(nzero) %not.nzero) {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %pzero, %not.nzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_fneg_fabs_fsub_known_negative_or_nan_sources",
+          "test_body": "declare nofpclass(pinf pzero psub pnorm) half @returns_negative_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan_fneg_fabs_fsub_known_negative_or_nan_sources() {\n  %negative.or.nan0 = call half @returns_negative_or_nan()\n  %negative.or.nan1 = call half @returns_negative_or_nan()\n  %known.negative.sub = fsub half %negative.or.nan0, %negative.or.nan1\n  %fabs = call half @llvm.fabs.f16(half %known.negative.sub)\n  %neg.fabs = fneg half %fabs\n  ret half %neg.fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "no_nans_infs_inputs__noinfs_output",
+          "test_body": "define nofpclass(inf) half @no_nans_infs_inputs__noinfs_output(half nofpclass(nan inf) %x, half nofpclass(nan inf) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fsub__not_nzero__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fsub__not_nzero__daz(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %pzero, %not.nzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_only_nan",
+          "test_body": "define nofpclass(inf zero sub norm) half @ret_only_nan(half %x, half %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_only_zero",
+          "test_body": "define nofpclass(nan inf sub norm) half @ret_only_zero(half %x, half %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_fneg_fabs_fsub_known_negative_sources",
+          "test_body": "declare nofpclass(nan pinf pzero psub pnorm) half @returns_negative()\n\ndefine nofpclass(nan) half @ret_nonan_fneg_fabs_fsub_known_negative_sources() {\n  %negative0 = call half @returns_negative()\n  %negative1 = call half @returns_negative()\n  %known.negative.op = fsub half %negative0, %negative1\n  %fabs = call half @llvm.fabs.f16(half %known.negative.op)\n  %neg.fabs = fneg half %fabs\n  ret half %neg.fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "pzero__fsub__not_nzero__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fsub__not_nzero__dynamic(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %pzero, %not.nzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fsub__zero",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fsub__zero(half %unknown) {\n  %zero = call half @returns_zero()\n  %add = fsub half %unknown, %zero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "unknown__fsub__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @unknown__fsub__pzero(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %unknown, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero_nsub__fsub__pzero__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero_nsub__fsub__pzero__dynamic(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fsub half %not.nzero.nsub, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "inf_result_demands_pinf_input_rhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_pinf_input_rhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %pinf = call half @returns_pinf()\n  %y.or.inf = select i1 %cond, half %y, half %pinf\n  %add = fsub half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_nans_infs_inputs",
+          "test_body": "define nofpclass(snan) half @no_nans_infs_inputs(half nofpclass(nan inf) %x, half nofpclass(nan inf) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_pinf_input_lhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_pinf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %pinf = call half @returns_pinf()\n  %x.or.inf = select i1 %cond, half %x, half %pinf\n  %add = fsub half %x.or.inf, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_infs_inputs_and_outputs",
+          "test_body": "define nofpclass(inf) half @no_infs_inputs_and_outputs(half nofpclass(inf) %x, half nofpclass(inf) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_nans_infs_inputs__nonans_output",
+          "test_body": "define nofpclass(nan) half @no_nans_infs_inputs__nonans_output(half nofpclass(nan inf) %x, half nofpclass(nan inf) %y) {\n  %add = fsub half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_fabs_fsub_known_positive_or_nan_sources",
+          "test_body": "declare nofpclass(ninf nzero nsub nnorm) half @returns_positive_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan_fabs_fsub_known_positive_or_nan_sources() {\n  %positive.or.nan0 = call half @returns_positive_or_nan()\n  %positive.or.nan1 = call half @returns_positive_or_nan()\n  %known.positive.add = fsub half %positive.or.nan0, %positive.or.nan1\n  %fabs = call half @llvm.fabs.f16(half %known.positive.add)\n  ret half %fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "inf_result_demands_inf_input_lhs",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_inf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %inf = call half @returns_inf()\n  %x.or.inf = select i1 %cond, half %x, half %inf\n  %add = fsub half %x.or.inf, %y\n  ret half %add\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175852** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175852?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175852?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#175851** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175851?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189112 tests passed\n* 5013 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130077 tests passed\n* 2876 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-13T21:55:32Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        176,
+        181
+      ],
+      [
+        192,
+        203
+      ],
+      [
+        234,
+        239
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5524,
+        5601
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        279,
+        284
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2211,
+        2221
+      ],
+      [
+        2269,
+        2275
+      ],
+      [
+        2285,
+        2295
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fsub.ll": [
+      [
+        34,
+        41
+      ],
+      [
+        64,
+        70
+      ],
+      [
+        92,
+        98
+      ],
+      [
+        218,
+        226
+      ],
+      [
+        236,
+        242
+      ],
+      [
+        251,
+        257
+      ],
+      [
+        267,
+        273
+      ],
+      [
+        282,
+        288
+      ],
+      [
+        296,
+        303
+      ],
+      [
+        311,
+        318
+      ],
+      [
+        326,
+        333
+      ],
+      [
+        341,
+        348
+      ],
+      [
+        367,
+        373
+      ],
+      [
+        390,
+        396
+      ],
+      [
+        401,
+        407
+      ],
+      [
+        412,
+        418
+      ],
+      [
+        423,
+        429
+      ],
+      [
+        434,
+        440
+      ],
+      [
+        445,
+        451
+      ],
+      [
+        516,
+        522
+      ],
+      [
+        532,
+        540
+      ],
+      [
+        595,
+        601
+      ],
+      [
+        607,
+        614
+      ],
+      [
+        619,
+        625
+      ],
+      [
+        631,
+        638
+      ],
+      [
+        667,
+        673
+      ],
+      [
+        679,
+        685
+      ],
+      [
+        691,
+        698
+      ],
+      [
+        703,
+        709
+      ],
+      [
+        715,
+        722
+      ],
+      [
+        727,
+        733
+      ],
+      [
+        739,
+        745
+      ],
+      [
+        751,
+        757
+      ],
+      [
+        787,
+        793
+      ],
+      [
+        799,
+        805
+      ],
+      [
+        835,
+        842
+      ],
+      [
+        847,
+        853
+      ],
+      [
+        907,
+        914
+      ],
+      [
+        919,
+        925
+      ],
+      [
+        931,
+        938
+      ],
+      [
+        1031,
+        1038
+      ],
+      [
+        1043,
+        1049
+      ],
+      [
+        1055,
+        1062
+      ],
+      [
+        1067,
+        1073
+      ],
+      [
+        1079,
+        1086
+      ],
+      [
+        1091,
+        1097
+      ],
+      [
+        1103,
+        1110
+      ],
+      [
+        1115,
+        1121
+      ],
+      [
+        1127,
+        1135
+      ],
+      [
+        1141,
+        1147
+      ],
+      [
+        1158,
+        1164
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "fabs",
+      "fneg"
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::fadd_self",
+      "KnownFPClass::fmul"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fsub.ll": [
+      "pzero_or_nan__fsub__not_nzero",
+      "ret_nonan_fabs_fsub_known_positive_or_nan_sources",
+      "ret_nonan_fabs_fsub_known_positive_sources",
+      "ret_nonan_fneg_fabs_fsub_known_negative_sources"
+    ]
+  }
+}

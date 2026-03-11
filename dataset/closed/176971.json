@@ -1,0 +1,97 @@
+{
+  "pr_id": 176971,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176971",
+  "state": "closed",
+  "title": "[VPlan] Fix register usage of VPExpressionRecipe",
+  "author": "john-brawn-arm",
+  "base_commit": "d13119f26999533a3048db3db058e19ae02a76aa",
+  "fix_commit": "8dad11794a0a51523ddc6667c9fadf529f6ed3ae",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex 94a19beb75a8f..9ddc0a849654e 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -3215,6 +3215,8 @@ class VPExpressionRecipe : public VPSingleDefRecipe {\n     return PR ? PR->getVFScaleFactor() : 1;\n   }\n \n+  unsigned getMinVFScaleFactor() const;\n+\n   /// Method for generating code, must not be called as this recipe is abstract.\n   void execute(VPTransformState &State) override {\n     llvm_unreachable(\"recipe must be removed before execute\");\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\nindex 39e7a044dfff5..08917d72d018c 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n@@ -553,10 +553,16 @@ SmallVector<VPRegisterUsage, 8> llvm::calculateRegisterUsageForPlan(\n           // even in the scalar case.\n           RegUsage[ClassID] += 1;\n         } else {\n-          // The output from scaled phis and scaled reductions actually has\n-          // fewer lanes than the VF.\n-          unsigned ScaleFactor =\n-              vputils::getVFScaleFactor(VPV->getDefiningRecipe());\n+          unsigned ScaleFactor;\n+          auto *DefR = VPV->getDefiningRecipe();\n+          if (auto *ER = dyn_cast<VPExpressionRecipe>(DefR))\n+            // In an expression recipe we want the maximum register usage out of\n+            // its subexpressions, which means the minimum scaling factor.\n+            ScaleFactor = ER->getMinVFScaleFactor();\n+          else\n+            // The output from scaled phis and scaled reductions actually has\n+            // fewer lanes than the VF.\n+            ScaleFactor = vputils::getVFScaleFactor(DefR);\n           ElementCount VF = VFs[J];\n           if (ScaleFactor > 1) {\n             VF = VFs[J].divideCoefficientBy(ScaleFactor);\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 64890ac9e9b92..fa59a2741a581 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -2949,6 +2949,14 @@ void VPExpressionRecipe::decompose() {\n   ExpressionRecipes.clear();\n }\n \n+unsigned VPExpressionRecipe::getMinVFScaleFactor() const {\n+  unsigned Min = UINT_MAX;\n+  for (auto *R : ExpressionRecipes) {\n+    Min = std::min(Min, vputils::getVFScaleFactor(R));\n+  }\n+  return Min;\n+}\n+\n InstructionCost VPExpressionRecipe::computeCost(ElementCount VF,\n                                                 VPCostContext &Ctx) const {\n   Type *RedTy = Ctx.Types.inferScalarType(this);\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "In calculateRegisterUsageForPlan the VF is scaled when the recipe has a scaling factor. For VPExpressionRecipe this is based on the output of the recipe, but for calculating the register usage we're intrested in the largest VF used in all of the subexpressions, which means we should be using the minimum scaling factor from all of the subexpressions.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/reg-usage.ll",
+      "commands": [
+        "opt -mtriple arm64-linux -passes=loop-vectorize -mattr=+sve -debug-only=loop-vectorize,vplan -disable-output <%s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "dotp_unrolled",
+          "test_body": "define i32 @dotp_unrolled(i32 %num_out, i64 %num_in, ptr %a, ptr %b) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %accum3 = phi i32 [ 0, %entry ], [ %add.a3, %for.body ]\n  %accum2 = phi i32 [ 0, %entry ], [ %add.a2, %for.body ]\n  %accum1 = phi i32 [ 0, %entry ], [ %add.a1, %for.body ]\n  %accum0 = phi i32 [ 0, %entry ], [ %add.a0, %for.body ]\n  %gep.a0 = getelementptr inbounds i8, ptr %a, i64 %iv\n  %gep.b0 = getelementptr inbounds i8, ptr %b, i64 %iv\n  %offset.1 = or disjoint i64 %iv, 1\n  %gep.a1 = getelementptr inbounds i8, ptr %a, i64 %offset.1\n  %gep.b1 = getelementptr inbounds i8, ptr %b, i64 %offset.1\n  %offset.2 = or disjoint i64 %iv, 2\n  %gep.a2 = getelementptr inbounds i8, ptr %a, i64 %offset.2\n  %gep.b2 = getelementptr inbounds i8, ptr %b, i64 %offset.2\n  %offset.3 = or disjoint i64 %iv, 3\n  %gep.a3 = getelementptr inbounds i8, ptr %a, i64 %offset.3\n  %gep.b3 = getelementptr inbounds i8, ptr %b, i64 %offset.3\n  %load.a0 = load i8, ptr %gep.a0, align 1\n  %ext.a0 = sext i8 %load.a0 to i32\n  %load.b0 = load i8, ptr %gep.b0, align 1\n  %ext.b0 = sext i8 %load.b0 to i32\n  %mul.a0 = mul nsw i32 %ext.b0, %ext.a0\n  %add.a0 = add nsw i32 %mul.a0, %accum0\n  %load.a1 = load i8, ptr %gep.a1, align 1\n  %ext.a1 = sext i8 %load.a1 to i32\n  %load.b1 = load i8, ptr %gep.b1, align 1\n  %ext.b1 = sext i8 %load.b1 to i32\n  %mul.a1 = mul nsw i32 %ext.a1, %ext.b1\n  %add.a1 = add nsw i32 %mul.a1, %accum1\n  %load.a2 = load i8, ptr %gep.a2, align 1\n  %ext.a2 = sext i8 %load.a2 to i32\n  %load.b2 = load i8, ptr %gep.b2, align 1\n  %ext.b2 = sext i8 %load.b2 to i32\n  %mul.a2 = mul nsw i32 %ext.a2, %ext.b2\n  %add.a2 = add nsw i32 %mul.a2, %accum2\n  %load.a3 = load i8, ptr %gep.a3, align 1\n  %ext.a3 = sext i8 %load.a3 to i32\n  %load.b3 = load i8, ptr %gep.b3, align 1\n  %ext.b3 = sext i8 %load.b3 to i32\n  %mul.a3 = mul nsw i32 %ext.a3, %ext.b3\n  %add.a3 = add nsw i32 %mul.a3, %accum3\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, %num_in\n  br i1 %exitcond.not, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  %result0 = add nsw i32 %add.a0, %add.a1\n  %result1 = add nsw i32 %add.a2, %add.a3\n  %result = add nsw i32 %result0, %result1\n  ret i32 %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "john-brawn-arm",
+      "body": "For the function dotp_unrolled in reg-usage.ll the code we generate (using ``-force-vector-width=16 -force-vector-interleave=1`` so we select VF 16 with no interleaving) is\r\n```\r\n.LBB3_3:                                // %vector.body\r\n                                        // =>This Inner Loop Header: Depth=1\r\n        ldur    q4, [x9, #-1]\r\n        ldur    q5, [x10, #-1]\r\n        subs    x11, x11, #16\r\n        ldr     q6, [x9]\r\n        ldr     q7, [x10]\r\n        ldur    q16, [x9, #1]\r\n        ldur    q17, [x10, #1]\r\n        smull   v20.8h, v5.8b, v4.8b\r\n        smull2  v4.8h, v5.16b, v4.16b\r\n        ldur    q18, [x9, #2]\r\n        ldur    q19, [x10, #2]\r\n        smull   v21.8h, v6.8b, v7.8b\r\n        smull   v22.8h, v16.8b, v17.8b\r\n        smull2  v5.8h, v6.16b, v7.16b\r\n        smull2  v6.8h, v16.16b, v17.16b\r\n        smull   v23.8h, v18.8b, v19.8b\r\n        smull2  v7.8h, v18.16b, v19.16b\r\n        add     x9, x9, #16\r\n        saddw   v1.4s, v1.4s, v20.4h\r\n        add     x10, x10, #16\r\n        saddw   v2.4s, v2.4s, v21.4h\r\n        saddw   v3.4s, v3.4s, v22.4h\r\n        saddw   v0.4s, v0.4s, v23.4h\r\n        saddw2  v1.4s, v1.4s, v20.8h\r\n        saddw2  v2.4s, v2.4s, v21.8h\r\n        saddw2  v3.4s, v3.4s, v22.8h\r\n        saddw2  v0.4s, v0.4s, v23.8h\r\n        saddw   v1.4s, v1.4s, v4.4h\r\n        saddw   v2.4s, v2.4s, v5.4h\r\n        saddw   v3.4s, v3.4s, v6.4h\r\n        saddw   v0.4s, v0.4s, v7.4h\r\n        saddw2  v1.4s, v1.4s, v4.8h\r\n        saddw2  v2.4s, v2.4s, v5.8h\r\n        saddw2  v3.4s, v3.4s, v6.8h\r\n        saddw2  v0.4s, v0.4s, v7.8h\r\n        b.ne    .LBB3_3\r\n```\r\nThis uses 16 vector registers (v0-v7 and v16-v23), which is what we're now calculating the register usage as being."
+    },
+    {
+      "author": "john-brawn-arm",
+      "body": "Ping."
+    },
+    {
+      "author": "john-brawn-arm",
+      "body": "> > For the function dotp_unrolled in reg-usage.ll the code we generate (using -force-vector-width=16 -force-vector-interleave=1 so we select VF 16 with no interleaving) is\r\n> \r\n> What is the VPlan for the test case? The result should only have a scale factor, if we formed a partial reduction, and in that case, all recipes in the expression should be folded into the partial reduction IIRC.\r\n> \r\n> But from the assembly, it looks like we don't create a partial reduction. is it possible that we incorrectly formed a VPExpression recipe for a dot product that we then cannot lower to a dot product?\r\n\r\nThe vector loop in the vplan is\r\n```\r\n<x1> vector loop: {\r\n  vector.body:\r\n    EMIT vp<%7> = CANONICAL-INDUCTION ir<0>, vp<%index.next>\r\n    WIDEN-REDUCTION-PHI ir<%accum3> = phi vp<%3>, vp<%20> (VF scaled by 1/4)\r\n    WIDEN-REDUCTION-PHI ir<%accum2> = phi vp<%4>, vp<%17> (VF scaled by 1/4)\r\n    WIDEN-REDUCTION-PHI ir<%accum1> = phi vp<%5>, vp<%14> (VF scaled by 1/4)\r\n    WIDEN-REDUCTION-PHI ir<%accum0> = phi vp<%6>, vp<%11> (VF scaled by 1/4)\r\n    vp<%8> = SCALAR-STEPS vp<%7>, ir<1>, vp<%0>\r\n    CLONE ir<%gep.a0> = getelementptr inbounds ir<%a>, vp<%8>\r\n    CLONE ir<%gep.b0> = getelementptr inbounds ir<%b>, vp<%8>\r\n    CLONE ir<%offset.1> = or disjoint vp<%8>, ir<1>\r\n    CLONE ir<%gep.a1> = getelementptr inbounds ir<%a>, ir<%offset.1>\r\n    CLONE ir<%gep.b1> = getelementptr inbounds ir<%b>, ir<%offset.1>\r\n    CLONE ir<%offset.2> = or disjoint vp<%8>, ir<2>\r\n    CLONE ir<%gep.a2> = getelementptr inbounds ir<%a>, ir<%offset.2>\r\n    CLONE ir<%gep.b2> = getelementptr inbounds ir<%b>, ir<%offset.2>\r\n    CLONE ir<%offset.3> = or disjoint vp<%8>, ir<3>\r\n    CLONE ir<%gep.a3> = getelementptr inbounds ir<%a>, ir<%offset.3>\r\n    CLONE ir<%gep.b3> = getelementptr inbounds ir<%b>, ir<%offset.3>\r\n    vp<%9> = vector-pointer inbounds ir<%gep.a0>\r\n    WIDEN ir<%load.a0> = load vp<%9>\r\n    vp<%10> = vector-pointer inbounds ir<%gep.b0>\r\n    WIDEN ir<%load.b0> = load vp<%10>\r\n    EXPRESSION vp<%11> = ir<%accum0> + partial.reduce.add (mul nsw (ir<%load.b0> sext to i32), (ir<%load.a0> sext to i32))\r\n    vp<%12> = vector-pointer inbounds ir<%gep.a1>\r\n    WIDEN ir<%load.a1> = load vp<%12>\r\n    vp<%13> = vector-pointer inbounds ir<%gep.b1>\r\n    WIDEN ir<%load.b1> = load vp<%13>\r\n    EXPRESSION vp<%14> = ir<%accum1> + partial.reduce.add (mul nsw (ir<%load.a1> sext to i32), (ir<%load.b1> sext to i32))\r\n    vp<%15> = vector-pointer inbounds ir<%gep.a2>\r\n    WIDEN ir<%load.a2> = load vp<%15>\r\n    vp<%16> = vector-pointer inbounds ir<%gep.b2>\r\n    WIDEN ir<%load.b2> = load vp<%16>\r\n    EXPRESSION vp<%17> = ir<%accum2> + partial.reduce.add (mul nsw (ir<%load.a2> sext to i32), (ir<%load.b2> sext to i32))\r\n    vp<%18> = vector-pointer inbounds ir<%gep.a3>\r\n    WIDEN ir<%load.a3> = load vp<%18>\r\n    vp<%19> = vector-pointer inbounds ir<%gep.b3>\r\n    WIDEN ir<%load.b3> = load vp<%19>\r\n    EXPRESSION vp<%20> = ir<%accum3> + partial.reduce.add (mul nsw (ir<%load.a3> sext to i32), (ir<%load.b3> sext to i32))\r\n    EMIT vp<%index.next> = add nuw vp<%7>, vp<%1>\r\n    EMIT branch-on-count vp<%index.next>, vp<%2>\r\n  No successors\r\n}\r\n```\r\nThe IR output for this is\r\n```\r\nvector.body:                                      ; preds = %vector.body, %vector.ph\r\n  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]\r\n  %vec.phi = phi <4 x i32> [ zeroinitializer, %vector.ph ], [ %partial.reduce13, %vector.body ]\r\n  %vec.phi1 = phi <4 x i32> [ zeroinitializer, %vector.ph ], [ %partial.reduce10, %vector.body ]\r\n  %vec.phi2 = phi <4 x i32> [ zeroinitializer, %vector.ph ], [ %partial.reduce7, %vector.body ]\r\n  %vec.phi3 = phi <4 x i32> [ zeroinitializer, %vector.ph ], [ %partial.reduce, %vector.body ]\r\n  %0 = getelementptr inbounds i8, ptr %a, i64 %index\r\n  %1 = getelementptr inbounds i8, ptr %b, i64 %index\r\n  %2 = or disjoint i64 %index, 1\r\n  %3 = getelementptr inbounds i8, ptr %a, i64 %2\r\n  %4 = getelementptr inbounds i8, ptr %b, i64 %2\r\n  %5 = or disjoint i64 %index, 2\r\n  %6 = getelementptr inbounds i8, ptr %a, i64 %5\r\n  %7 = getelementptr inbounds i8, ptr %b, i64 %5\r\n  %8 = or disjoint i64 %index, 3\r\n  %9 = getelementptr inbounds i8, ptr %a, i64 %8\r\n  %10 = getelementptr inbounds i8, ptr %b, i64 %8\r\n  %wide.load = load <16 x i8>, ptr %0, align 1\r\n  %wide.load4 = load <16 x i8>, ptr %1, align 1\r\n  %11 = sext <16 x i8> %wide.load4 to <16 x i32>\r\n  %12 = sext <16 x i8> %wide.load to <16 x i32>\r\n  %13 = mul nsw <16 x i32> %11, %12\r\n  %partial.reduce = call <4 x i32> @llvm.vector.partial.reduce.add.v4i32.v16i32(<4 x i32> %vec.phi3, <16 x i32> %13)\r\n  %wide.load5 = load <16 x i8>, ptr %3, align 1\r\n  %wide.load6 = load <16 x i8>, ptr %4, align 1\r\n  %14 = sext <16 x i8> %wide.load5 to <16 x i32>\r\n  %15 = sext <16 x i8> %wide.load6 to <16 x i32>\r\n  %16 = mul nsw <16 x i32> %14, %15\r\n  %partial.reduce7 = call <4 x i32> @llvm.vector.partial.reduce.add.v4i32.v16i32(<4 x i32> %vec.phi2, <16 x i32> %16)\r\n  %wide.load8 = load <16 x i8>, ptr %6, align 1\r\n  %wide.load9 = load <16 x i8>, ptr %7, align 1\r\n  %17 = sext <16 x i8> %wide.load8 to <16 x i32>\r\n  %18 = sext <16 x i8> %wide.load9 to <16 x i32>\r\n  %19 = mul nsw <16 x i32> %17, %18\r\n  %partial.reduce10 = call <4 x i32> @llvm.vector.partial.reduce.add.v4i32.v16i32(<4 x i32> %vec.phi1, <16 x i32> %19)\r\n  %wide.load11 = load <16 x i8>, ptr %9, align 1\r\n  %wide.load12 = load <16 x i8>, ptr %10, align 1\r\n  %20 = sext <16 x i8> %wide.load11 to <16 x i32>\r\n  %21 = sext <16 x i8> %wide.load12 to <16 x i32>\r\n  %22 = mul nsw <16 x i32> %20, %21\r\n  %partial.reduce13 = call <4 x i32> @llvm.vector.partial.reduce.add.v4i32.v16i32(<4 x i32> %vec.phi, <16 x i32> %22)\r\n  %index.next = add nuw i64 %index, 16\r\n  %23 = icmp eq i64 %index.next, %n.vec\r\n  br i1 %23, label %middle.block, label %vector.body, !llvm.loop !13\r\n```\r\nThe important thing here for the register usage is the argument to the partial reduction. The ``mul nsw (ir<%load.b0> sext to i32), (ir<%load.a0> sext to i32)`` in the vplan becomes in IR\r\n```\r\n  %11 = sext <16 x i8> %wide.load4 to <16 x i32>\r\n  %12 = sext <16 x i8> %wide.load to <16 x i32>\r\n  %13 = mul nsw <16 x i32> %11, %12\r\n```\r\nThe 16 x i32 vectors get split up into four 4 x i32 vectors, so the register usage here is 4.\r\n\r\nThough actually, looking again at the generated assembly that's not exactly what ends up happening. The instructions corresponding to the first partial reduction expression are\r\n```\r\n        smull   v20.8h, v5.8b, v4.8b                                                                 \r\n        smull2  v4.8h, v5.16b, v4.16b   \r\n        saddw   v1.4s, v1.4s, v20.4h\r\n        saddw2  v1.4s, v1.4s, v20.8h                                                                 \r\n        saddw   v1.4s, v1.4s, v4.4h\r\n        saddw2  v1.4s, v1.4s, v4.8h\r\n```\r\nIt looks like during ISel an optimization has happened causing the multiply to be done using i16 values, meaning it uses half as many (i.e. 2 instead of 4) registers. This would result in a lower register usage, but instruction scheduling has transformed things so that more registers are used. Probably the best way to handle this would be for the VPlan to implement whatever ISel transformation is happening here. But regardless, the new register usage does match what's in the output IR."
+    },
+    {
+      "author": "john-brawn-arm",
+      "body": "> But from the assembly, it looks like we don't create a partial reduction. is it possible that we incorrectly formed a VPExpression recipe for a dot product that we then cannot lower to a dot product?\r\n\r\nIs the intention that VPExpressionRecipe should only be used if we can guarantee that the end result will be a single instruction? tryToMatchAndCreateMulAccumulateReduction doesn't exactly do that, it checks if the MulAccCost is less than the cost of the individual components, though I'm guessing that's unlikely to be true if it isn't expected to be combined into a single instruction. And from a quick look at Arch64TTIImpl::getPartialReductionCost it looks like it is calculating the cost assuming it can generate a single dot-product instruction.\r\n\r\nAnother example where we use a lot of registers due to a partial reduction that doesn't become a single instruction is in \r\nllvm/test/Transforms/LoopVectorize/AArch64/maxbandwidth-regpressure.ll, though it doesn't currently affect the result of the test (though I'm currently working on some changes around register pressure which mean it would be). There we have a partial reduction expression\r\n```\r\n    EXPRESSION vp<%8> = ir<%accum> + partial.reduce.add (sub (0, mul nuw nsw (ir<%load.b> zext to i32), (ir<%load.a> zext to i32)))\r\n```\r\nwhich becomes in IR\r\n```\r\n  %7 = zext <vscale x 16 x i8> %wide.load3 to <vscale x 16 x i32>\r\n  %8 = zext <vscale x 16 x i8> %wide.load to <vscale x 16 x i32>\r\n  %9 = mul nuw nsw <vscale x 16 x i32> %7, %8\r\n  %10 = sub <vscale x 16 x i32> zeroinitializer, %9\r\n  %partial.reduce = call <vscale x 4 x i32> @llvm.vector.partial.reduce.add.nxv4i32.nxv16i32(<vscale x 4 x i32> %vec.phi, <vscale x 16 x i32> %10)\r\n```\r\nwhich becomes (interspered with ld1b instructions which do the zext part of the above)\r\n```\r\n        mls     z0.s, p0/m, z4.s, z2.s\r\n        mls     z0.s, p0/m, z3.s, z6.s\r\n        mls     z0.s, p0/m, z3.s, z5.s\r\n        mls     z0.s, p0/m, z3.s, z6.s\r\n```\r\n"
+    },
+    {
+      "author": "john-brawn-arm",
+      "body": "I'm giving up on this and have raised https://github.com/llvm/llvm-project/issues/178703 in case some one else wants to figure out what the correct thing to do here is."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-20T17:14:45Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      [
+        3215,
+        3220
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      [
+        553,
+        562
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        2949,
+        2954
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/reg-usage.ll": [
+      [
+        192,
+        198
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      "execute",
+      "getVFScaleFactor"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      "llvm::calculateRegisterUsageForPlan"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPExpressionRecipe::computeCost",
+      "VPExpressionRecipe::decompose"
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/reg-usage.ll": [
+      "noalias"
+    ]
+  }
+}

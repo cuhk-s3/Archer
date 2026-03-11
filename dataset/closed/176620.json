@@ -1,0 +1,74 @@
+{
+  "pr_id": 176620,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176620",
+  "state": "closed",
+  "title": "[ControlFlowHub] Fix duplicate DomTree updates when branch successors are identical",
+  "author": "shiltian",
+  "base_commit": "c253b9f9caf0be95bb16e973f216489d894370e1",
+  "fix_commit": "abc33984b73594d71c9745d25029abff576fbc99",
+  "patch": "diff --git a/llvm/lib/Transforms/Utils/ControlFlowUtils.cpp b/llvm/lib/Transforms/Utils/ControlFlowUtils.cpp\nindex 287a177371c80..f728e9f18af57 100644\n--- a/llvm/lib/Transforms/Utils/ControlFlowUtils.cpp\n+++ b/llvm/lib/Transforms/Utils/ControlFlowUtils.cpp\n@@ -97,7 +97,7 @@ static void calcPredicateUsingInteger(ArrayRef<EdgeDescriptor> Branches,\n   for (auto [BB, Succ0, Succ1] : Branches) {\n     Value *Condition = redirectToHub(BB, Succ0, Succ1, FirstGuardBlock);\n     Value *IncomingId = nullptr;\n-    if (Succ0 && Succ1) {\n+    if (Succ0 && Succ1 && Succ0 != Succ1) {\n       auto Succ0Iter = find(Outgoing, Succ0);\n       auto Succ1Iter = find(Outgoing, Succ1);\n       Value *Id0 =\n@@ -107,7 +107,8 @@ static void calcPredicateUsingInteger(ArrayRef<EdgeDescriptor> Branches,\n       IncomingId = SelectInst::Create(Condition, Id0, Id1, \"target.bb.idx\",\n                                       BB->getTerminator()->getIterator());\n     } else {\n-      // Get the index of the non-null successor.\n+      // Get the index of the non-null successor, or when both successors\n+      // are the same block, use that block's index directly.\n       auto SuccIter = Succ0 ? find(Outgoing, Succ0) : find(Outgoing, Succ1);\n       IncomingId =\n           ConstantInt::get(Int32Ty, std::distance(Outgoing.begin(), SuccIter));\n@@ -166,9 +167,10 @@ static void calcPredicateUsingBooleans(\n       PHINode *Phi = cast<PHINode>(GuardPredicates[Out]);\n       if (Out != Succ0 && Out != Succ1) {\n         Phi->addIncoming(BoolFalse, BB);\n-      } else if (!Succ0 || !Succ1 || OneSuccessorDone) {\n+      } else if (!Succ0 || !Succ1 || Succ0 == Succ1 || OneSuccessorDone) {\n         // Optimization: When only one successor is an outgoing block,\n-        // the incoming predicate from `BB` is always true.\n+        // or both successors are the same block, the incoming predicate\n+        // from `BB` is always true.\n         Phi->addIncoming(BoolTrue, BB);\n       } else {\n         assert(Succ0 && Succ1);\n@@ -248,6 +250,11 @@ static void reconnectPhis(BasicBlock *Out, BasicBlock *GuardBlock,\n       Value *V = PoisonValue::get(Phi->getType());\n       if  (Phi->getBasicBlockIndex(BB) != -1) {\n         V = Phi->removeIncomingValue(BB, false);\n+        // When both successors are the same (Succ0 == Succ1), there are two\n+        // edges from BB to Out, so we need to remove the second PHI entry too.\n+        if (Succ0 && Succ1 && Succ0 == Succ1 &&\n+            Phi->getBasicBlockIndex(BB) != -1)\n+          Phi->removeIncomingValue(BB, false);\n         if (BB == Out) {\n           V = NewPhi;\n         }\n@@ -300,7 +307,8 @@ std::pair<BasicBlock *, bool> ControlFlowHub::finalize(\n     for (auto [BB, Succ0, Succ1] : Branches) {\n       if (Succ0)\n         Updates.push_back({DominatorTree::Delete, BB, Succ0});\n-      if (Succ1)\n+      // Only add Succ1 if it's different from Succ0 to avoid duplicate updates\n+      if (Succ1 && Succ1 != Succ0)\n         Updates.push_back({DominatorTree::Delete, BB, Succ1});\n     }\n   }\n",
+  "components": [
+    "ControlFlowUtils"
+  ],
+  "description": "When a conditional branch has both successors pointing to the same block (e.g., `br i1 %cond, label %bb, label %bb`), `ControlFlowHub::finalize` generates duplicate `Delete` updates for the same CFG edge. This can cause assertion in `fix-irreducible` pass.\n\nFixes #176553.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Util/control-flow-hub-finalize-same-succ-crash.ll",
+      "commands": [
+        "opt -S -passes=fix-irreducible %s"
+      ],
+      "tests": [
+        {
+          "test_name": "bar",
+          "test_body": "declare void @foo()\n\ndefine void @bar(i32 %0) {\nentry:\n  br label %bb.1\n\nbb.1:                                             ; preds = %entry\n  %v.0 = icmp slt i32 %0, 35\n  br i1 %v.0, label %bb.3, label %bb.2\n\nbb.2:                                             ; preds = %bb.1\n  %v.1 = icmp slt i32 %0, 47\n  br i1 %v.1, label %bb.5, label %bb.5\n\nbb.3:                                             ; preds = %bb.1\n  %v.2 = icmp eq i32 %0, 0\n  br i1 %v.2, label %bb.6, label %bb.4\n\nbb.4:                                             ; preds = %bb.6, %bb.3\n  br label %bb.5\n\nbb.5:                                             ; preds = %bb.4, %bb.2, %bb.2\n  %v.3 = phi i32 [ 0, %bb.4 ], [ 1, %bb.2 ], [ 1, %bb.2 ]\n  %v.4 = icmp eq i32 %v.3, 0\n  br i1 true, label %bb.6, label %bb.7\n\nbb.6:                                             ; preds = %bb.5, %bb.3\n  %v.5 = phi i32 [ %v.3, %bb.5 ], [ 0, %bb.3 ]\n  call void @foo()\n  br label %bb.4\n\nbb.7:                                             ; preds = %bb.5\n  ret void\n}\n"
+        },
+        {
+          "test_name": "baz",
+          "test_body": "define void @baz(i1 %v.0, i1 %v.1) {\nentry:\n  br i1 %v.0, label %bb.1, label %bb.2\n\nbb.1:                                             ; preds = %entry\n  br label %bb.4\n\nbb.2:                                             ; preds = %entry\n  br i1 %v.1, label %bb.3, label %bb.3\n\nbb.3:                                             ; preds = %bb.4, %bb.2, %bb.2\n  br label %bb.4\n\nbb.4:                                             ; preds = %bb.1, %bb.3\n  br label %bb.3\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "shiltian",
+      "body": "* **#176620** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176620?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176620?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-18T02:55:45Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Utils/ControlFlowUtils.cpp": [
+      [
+        97,
+        103
+      ],
+      [
+        107,
+        113
+      ],
+      [
+        166,
+        174
+      ],
+      [
+        248,
+        253
+      ],
+      [
+        300,
+        306
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Utils/ControlFlowUtils.cpp": [
+      "ControlFlowHub::finalize",
+      "calcPredicateUsingBooleans",
+      "calcPredicateUsingInteger",
+      "reconnectPhis"
+    ]
+  }
+}

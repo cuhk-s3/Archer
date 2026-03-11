@@ -1,0 +1,210 @@
+{
+  "pr_id": 174849,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174849",
+  "state": "closed",
+  "title": "InstCombine: Handle fpext in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "62d4aa1ad8fe7ddf881e97f31a8d39aee567da89",
+  "fix_commit": "30f4a8d37091939f77eef213658f75b532f36e25",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex d140b4712c180..2348927fd9b9a 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -20,6 +20,7 @@\n \n namespace llvm {\n class APFloat;\n+struct fltSemantics;\n \n struct KnownFPClass {\n   /// Floating-point classes the value could be one of.\n@@ -289,6 +290,11 @@ struct KnownFPClass {\n   static LLVM_ABI KnownFPClass\n   log(const KnownFPClass &Src, DenormalMode Mode = DenormalMode::getDynamic());\n \n+  /// Propagate known class for fpext.\n+  static LLVM_ABI KnownFPClass fpext(const KnownFPClass &KnownSrc,\n+                                     const fltSemantics &DstTy,\n+                                     const fltSemantics &SrcTy);\n+\n   void resetAll() { *this = KnownFPClass(); }\n };\n \ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 995aa8ed56de9..0c76522efdc29 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5759,27 +5759,16 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n     break;\n   }\n   case Instruction::FPExt: {\n-    // Infinity, nan and zero propagate from source.\n+    KnownFPClass KnownSrc;\n     computeKnownFPClass(Op->getOperand(0), DemandedElts, InterestedClasses,\n-                        Known, Q, Depth + 1);\n+                        KnownSrc, Q, Depth + 1);\n \n     const fltSemantics &DstTy =\n         Op->getType()->getScalarType()->getFltSemantics();\n     const fltSemantics &SrcTy =\n         Op->getOperand(0)->getType()->getScalarType()->getFltSemantics();\n \n-    // All subnormal inputs should be in the normal range in the result type.\n-    if (APFloat::isRepresentableAsNormalIn(SrcTy, DstTy)) {\n-      if (Known.KnownFPClasses & fcPosSubnormal)\n-        Known.KnownFPClasses |= fcPosNormal;\n-      if (Known.KnownFPClasses & fcNegSubnormal)\n-        Known.KnownFPClasses |= fcNegNormal;\n-      Known.knownNot(fcSubnormal);\n-    }\n-\n-    // Sign bit of a nan isn't guaranteed.\n-    if (!Known.isKnownNeverNaN())\n-      Known.SignBit = std::nullopt;\n+    Known = KnownFPClass::fpext(KnownSrc, DstTy, SrcTy);\n     break;\n   }\n   case Instruction::FPTrunc: {\ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex a352f1267be27..7a60221f7e8f8 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -329,3 +329,25 @@ KnownFPClass KnownFPClass::log(const KnownFPClass &KnownSrc,\n \n   return Known;\n }\n+\n+KnownFPClass KnownFPClass::fpext(const KnownFPClass &KnownSrc,\n+                                 const fltSemantics &DstTy,\n+                                 const fltSemantics &SrcTy) {\n+  // Infinity, nan and zero propagate from source.\n+  KnownFPClass Known = KnownSrc;\n+\n+  // All subnormal inputs should be in the normal range in the result type.\n+  if (APFloat::isRepresentableAsNormalIn(SrcTy, DstTy)) {\n+    if (Known.KnownFPClasses & fcPosSubnormal)\n+      Known.KnownFPClasses |= fcPosNormal;\n+    if (Known.KnownFPClasses & fcNegSubnormal)\n+      Known.KnownFPClasses |= fcNegNormal;\n+    Known.knownNot(fcSubnormal);\n+  }\n+\n+  // Sign bit of a nan isn't guaranteed.\n+  if (!Known.isKnownNeverNaN())\n+    Known.SignBit = std::nullopt;\n+\n+  return Known;\n+}\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex f4f7450e69c29..92b4bfe4ec54e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2218,6 +2218,28 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n     FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n     return getFPClassConstant(VTy, ValidResults, /*IsCanonicalizing=*/true);\n   }\n+  case Instruction::FPExt: {\n+    FPClassTest SrcDemandedMask = DemandedMask;\n+\n+    // No subnormal result does not imply not-subnormal in the source type.\n+    if ((DemandedMask & fcNegNormal) != fcNone)\n+      SrcDemandedMask |= fcNegSubnormal;\n+    if ((DemandedMask & fcPosNormal) != fcNone)\n+      SrcDemandedMask |= fcPosSubnormal;\n+\n+    KnownFPClass KnownSrc;\n+    if (SimplifyDemandedFPClass(I, 0, SrcDemandedMask, KnownSrc, Depth + 1))\n+      return I;\n+\n+    const fltSemantics &DstTy = VTy->getScalarType()->getFltSemantics();\n+    const fltSemantics &SrcTy =\n+        I->getOperand(0)->getType()->getScalarType()->getFltSemantics();\n+\n+    Known = KnownFPClass::fpext(KnownSrc, DstTy, SrcTy);\n+    FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n+\n+    return getFPClassConstant(VTy, ValidResults, /*IsCanonicalizing=*/true);\n+  }\n   case Instruction::Call: {\n     CallInst *CI = cast<CallInst>(I);\n     const Intrinsic::ID IID = CI->getIntrinsicID();\n",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fpext.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_no_nzero__fpext__select_nzero_or_unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero_f16()\n\ndefine nofpclass(nzero) float @ret_no_nzero__fpext__select_nzero_or_unknown(i1 %cond, half %unknown) {\n  %nzero = call half @returns_nzero_f16()\n  %select = select i1 %cond, half %nzero, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_negative__fpext__select_negative_or_unknown",
+          "test_body": "declare nofpclass(nan pinf pzero psub pnorm) half @returns_negative_f16()\n\ndefine nofpclass(ninf nzero nsub nnorm) float @ret_no_negative__fpext__select_negative_or_unknown(i1 %cond, half %unknown) {\n  %negative = call half @returns_negative_f16()\n  %select = select i1 %cond, half %negative, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_only_qnan__fpext",
+          "test_body": "define nofpclass(snan inf zero sub norm) float @ret_only_qnan__fpext(half %x) {\n  %result = fpext half %x to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_positive__fpext__select_positive_or_unknown",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) half @returns_positive_f16()\n\ndefine nofpclass(pinf pzero psub pnorm) float @ret_no_positive__fpext__select_positive_or_unknown(i1 %cond, half %unknown) {\n  %positive = call half @returns_positive_f16()\n  %select = select i1 %cond, half %positive, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_ninf__fpext__select_ninf_or_unknown",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) half @returns_ninf_f16()\n\ndefine nofpclass(ninf) float @ret_no_ninf__fpext__select_ninf_or_unknown(i1 %cond, half %unknown) {\n  %ninf = call half @returns_ninf_f16()\n  %select = select i1 %cond, half %ninf, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fpext__select_nan_or_unknown",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan_f16()\n\ndefine nofpclass(nan) float @ret_no_nan__fpext__select_nan_or_unknown(i1 %cond, half %unknown) {\n  %nan = call half @returns_nan_f16()\n  %select = select i1 %cond, half %nan, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_zero__fpext__select_zero_or_unknown",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero_f16()\n\ndefine nofpclass(zero) float @ret_no_zero__fpext__select_zero_or_unknown(i1 %cond, half %unknown) {\n  %zero = call half @returns_zero_f16()\n  %select = select i1 %cond, half %zero, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_positive_no_nan__fpext__select_positive_nan_or_unknown",
+          "test_body": "declare nofpclass(ninf nzero nsub nnorm) half @returns_positive_or_nan_f16()\n\ndefine nofpclass(nan pinf pzero psub pnorm) float @ret_no_positive_no_nan__fpext__select_positive_nan_or_unknown(i1 %cond, half %unknown) {\n  %positive.or.nan = call half @returns_positive_or_nan_f16()\n  %select = select i1 %cond, half %positive.or.nan, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_inf__fpext__select_inf_or_unknown",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf_f16()\n\ndefine nofpclass(inf) float @ret_no_inf__fpext__select_inf_or_unknown(i1 %cond, half %unknown) {\n  %inf = call half @returns_inf_f16()\n  %select = select i1 %cond, half %inf, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_only_nan__fpext",
+          "test_body": "define nofpclass(inf zero sub norm) float @ret_only_nan__fpext(half %x) {\n  %result = fpext half %x to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_pinf__fpext__select_pinf_or_unknown",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf_f16()\n\ndefine nofpclass(pinf) float @ret_no_pinf__fpext__select_pinf_or_unknown(i1 %cond, half %unknown) {\n  %pinf = call half @returns_pinf_f16()\n  %select = select i1 %cond, half %pinf, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_pzero__fpext__select_pzero_or_unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero_f16()\n\ndefine nofpclass(pzero) float @ret_no_pzero__fpext__select_pzero_or_unknown(i1 %cond, half %unknown) {\n  %pzero = call half @returns_pzero_f16()\n  %select = select i1 %cond, half %pzero, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_negative_no_nan__fpext__select_negative_nan_or_unknown",
+          "test_body": "declare nofpclass(pinf pzero psub pnorm) half @returns_negative_or_nan_f16()\n\ndefine nofpclass(nan ninf nzero nsub nnorm) float @ret_no_negative_no_nan__fpext__select_negative_nan_or_unknown(i1 %cond, half %unknown) {\n  %negative.or.nan = call half @returns_negative_or_nan_f16()\n  %select = select i1 %cond, half %negative.or.nan, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_inf_no_nan__fpext__select_inf_or_nan_or_unknown",
+          "test_body": "declare nofpclass(zero sub norm) half @returns_inf_or_nan_f16()\n\ndefine nofpclass(nan inf) float @ret_no_inf_no_nan__fpext__select_inf_or_nan_or_unknown(i1 %cond, half %unknown) {\n  %inf.or.nan = call half @returns_inf_or_nan_f16()\n  %select = select i1 %cond, half %inf.or.nan, half %unknown\n  %result = fpext half %select to float\n  ret float %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175421** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175421?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#175420** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175420?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174849** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174849?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174849?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#174848** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174848?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 188327 tests passed\n* 4997 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `sanitizer-x86_64-linux-bootstrap-asan` running on `sanitizer-buildbot2` while building `llvm` at step 2 \"annotate\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/52/builds/14233\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 2 (annotate) failure: 'python ../sanitizer_buildbot/sanitizers/zorg/buildbot/builders/sanitizers/buildbot_selector.py' (failure)\n...\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/ld.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/main.py:74: note: The test suite configuration requested an individual test timeout of 0 seconds but a timeout of 900 seconds was requested on the command line. Forcing timeout to be 900 seconds.\n-- Testing: 95230 tests, 64 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. \nFAIL: LLVM :: ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll (58671 of 95230)\n******************** TEST 'LLVM :: ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll' FAILED ********************\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 3\n/home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll    /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll | /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# note: command had no output on stdout or stderr\n# RUN: at line 8\n/home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout    -jd extra -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll -jd main /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll | /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout -jd extra -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll -jd main /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll\n# .---command stderr------------\n# | JIT session error: In graph /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll.submodule.0x77e656f461c10789.ll-jitted-objectbuffer, section .text: relocation target 0x7c363a85d02c (__orc_lcl.str3.3:0x7c363a85d030 + 0xfffffffffffffffc) is out of range of Delta32 fixup at address 0x7c363a85d030 (printf_wrapper, 0x783639861000 + 0x3)\n# | JIT session error: Failed to materialize symbols: { (extra.impl, { printf_wrapper }) }\n# `-----------------------------\n# error: command failed with exit status: 1\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# .---command stderr------------\n# | /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll:16:10: error: CHECK: expected string not found in input\n# | ; CHECK: Goodbye from destructor\n# |          ^\n# | <stdin>:14:26: note: scanning from here\n# | Goodbye from __cxa_atexit\n# |                          ^\n# | <stdin>:15:3: note: possible intended match here\n# | [ printf_wrapper ]\n# |   ^\n# | \n# | Input file: <stdin>\n# | Check file: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\nStep 11 (stage2/asan check) failure: stage2/asan check (failure)\n...\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/ld.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/utils/lit/lit/main.py:74: note: The test suite configuration requested an individual test timeout of 0 seconds but a timeout of 900 seconds was requested on the command line. Forcing timeout to be 900 seconds.\n-- Testing: 95230 tests, 64 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. \nFAIL: LLVM :: ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll (58671 of 95230)\n******************** TEST 'LLVM :: ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll' FAILED ********************\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 3\n/home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll    /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll | /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# note: command had no output on stdout or stderr\n# RUN: at line 8\n/home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout    -jd extra -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll -jd main /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll | /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/lli -jit-kind=orc-lazy -orc-lazy-debug=funcs-to-stdout -jd extra -extra-module /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll -jd main /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/Inputs/noop-main.ll\n# .---command stderr------------\n# | JIT session error: In graph /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll.submodule.0x77e656f461c10789.ll-jitted-objectbuffer, section .text: relocation target 0x7c363a85d02c (__orc_lcl.str3.3:0x7c363a85d030 + 0xfffffffffffffffc) is out of range of Delta32 fixup at address 0x7c363a85d030 (printf_wrapper, 0x783639861000 + 0x3)\n# | JIT session error: Failed to materialize symbols: { (extra.impl, { printf_wrapper }) }\n# `-----------------------------\n# error: command failed with exit status: 1\n# executed command: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm_build_asan/bin/FileCheck /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# .---command stderr------------\n# | /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll:16:10: error: CHECK: expected string not found in input\n# | ; CHECK: Goodbye from destructor\n# |          ^\n# | <stdin>:14:26: note: scanning from here\n# | Goodbye from __cxa_atexit\n# |                          ^\n# | <stdin>:15:3: note: possible intended match here\n# | [ printf_wrapper ]\n# |   ^\n# | \n# | Input file: <stdin>\n# | Check file: /home/b/sanitizer-x86_64-linux-bootstrap-asan/build/llvm-project/llvm/test/ExecutionEngine/OrcLazy/global-ctors-and-dtors.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n\n```\n\n</details>"
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `clang-ppc64le-linux-test-suite` running on `ppc64le-clang-test-suite` while building `llvm` at step 6 \"test-build-unified-tree-check-all\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/95/builds/19713\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 6 (test-build-unified-tree-check-all) failure: test (failure)\n******************** TEST 'SanitizerCommon-lsan-powerpc64le-Linux :: Linux/getpwnam_r_invalid_user.cpp' FAILED ********************\nExit Code: -6\n\nCommand Output (stdout):\n--\n# RUN: at line 2\n/home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/build/./bin/clang  --driver-mode=g++ -gline-tables-only -fsanitize=leak  -m64 -fno-function-sections -funwind-tables  -I/home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/llvm-project/compiler-rt/test -ldl -O0 -g /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/llvm-project/compiler-rt/test/sanitizer_common/TestCases/Linux/getpwnam_r_invalid_user.cpp -o /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/build/runtimes/runtimes-bins/compiler-rt/test/sanitizer_common/lsan-powerpc64le-Linux/Linux/Output/getpwnam_r_invalid_user.cpp.tmp &&  /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/build/runtimes/runtimes-bins/compiler-rt/test/sanitizer_common/lsan-powerpc64le-Linux/Linux/Output/getpwnam_r_invalid_user.cpp.tmp\n# executed command: /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/build/./bin/clang --driver-mode=g++ -gline-tables-only -fsanitize=leak -m64 -fno-function-sections -funwind-tables -I/home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/llvm-project/compiler-rt/test -ldl -O0 -g /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/llvm-project/compiler-rt/test/sanitizer_common/TestCases/Linux/getpwnam_r_invalid_user.cpp -o /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/build/runtimes/runtimes-bins/compiler-rt/test/sanitizer_common/lsan-powerpc64le-Linux/Linux/Output/getpwnam_r_invalid_user.cpp.tmp\n# executed command: /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/build/runtimes/runtimes-bins/compiler-rt/test/sanitizer_common/lsan-powerpc64le-Linux/Linux/Output/getpwnam_r_invalid_user.cpp.tmp\n# .---command stderr------------\n# | Result: 110\n# | getpwnam_r_invalid_user.cpp.tmp: /home/buildbots/llvm-external-buildbots/workers/ppc64le-clang-test-suite/clang-ppc64le-test-suite/llvm-project/compiler-rt/test/sanitizer_common/TestCases/Linux/getpwnam_r_invalid_user.cpp:19: int main(): Assertion `res == 0 || res == ENOENT' failed.\n# `-----------------------------\n# error: command failed with exit status: -6\n\n--\n\n********************\n\n\n```\n\n</details>"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-07T19:29:29Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        20,
+        25
+      ],
+      [
+        289,
+        294
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5759,
+        5785
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        329,
+        331
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2218,
+        2223
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fpext.ll": [
+      [
+        46,
+        53
+      ],
+      [
+        114,
+        121
+      ],
+      [
+        129,
+        136
+      ],
+      [
+        144,
+        151
+      ],
+      [
+        159,
+        166
+      ],
+      [
+        174,
+        181
+      ],
+      [
+        237,
+        244
+      ],
+      [
+        267,
+        274
+      ],
+      [
+        282,
+        289
+      ],
+      [
+        312,
+        319
+      ],
+      [
+        447,
+        454
+      ],
+      [
+        461,
+        468
+      ],
+      [
+        475,
+        482
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "operator|",
+      "resetAll"
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::log"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fpext.ll": [
+      "ret_no_snan__fpext__always_inf",
+      "ret_no_snan__fpext__always_zero"
+    ]
+  }
+}

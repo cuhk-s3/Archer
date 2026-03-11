@@ -1,0 +1,109 @@
+{
+  "pr_id": 175875,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175875",
+  "state": "closed",
+  "title": "GlobalMerge: Do not merge globals with non-dbg metadata.",
+  "author": "pcc",
+  "base_commit": "7584c280631a90d72e49e3ec5b9f4f1d3609bd98",
+  "fix_commit": "34cec75c72df83c1f492404f68a85638a7e48da2",
+  "patch": "diff --git a/llvm/include/llvm/IR/GlobalObject.h b/llvm/include/llvm/IR/GlobalObject.h\nindex e273387807cf6..632de13fabf71 100644\n--- a/llvm/include/llvm/IR/GlobalObject.h\n+++ b/llvm/include/llvm/IR/GlobalObject.h\n@@ -143,6 +143,8 @@ class GlobalObject : public GlobalValue {\n   using Value::hasMetadata;\n   using Value::setMetadata;\n \n+  LLVM_ABI bool hasMetadataOtherThanDebugLoc() const;\n+\n   /// Copy metadata from Src, adjusting offsets by Offset.\n   LLVM_ABI void copyMetadata(const GlobalObject *Src, unsigned Offset);\n \ndiff --git a/llvm/lib/CodeGen/GlobalMerge.cpp b/llvm/lib/CodeGen/GlobalMerge.cpp\nindex 653c4e8ee4389..bdc43992448d3 100644\n--- a/llvm/lib/CodeGen/GlobalMerge.cpp\n+++ b/llvm/lib/CodeGen/GlobalMerge.cpp\n@@ -731,6 +731,16 @@ bool GlobalMergeImpl::run(Module &M) {\n     if (GV.isTagged())\n       continue;\n \n+    // Don't merge globals with metadata other than !dbg, as this is essentially\n+    // equivalent to adding metadata to an existing global, which is not\n+    // necessarily a correct transformation depending on the specific metadata's\n+    // semantics. We will later use copyMetadata() to copy metadata from\n+    // component globals to the combined global, which only knows how to do this\n+    // correctly for !dbg (and !type, but by this point LowerTypeTests will have\n+    // already run).\n+    if (GV.hasMetadataOtherThanDebugLoc())\n+      continue;\n+\n     Type *Ty = GV.getValueType();\n     TypeSize AllocSize = DL.getTypeAllocSize(Ty);\n     bool CanMerge = AllocSize < Opt.MaxOffset && AllocSize >= Opt.MinSize;\ndiff --git a/llvm/lib/IR/Globals.cpp b/llvm/lib/IR/Globals.cpp\nindex c3a472b0cc66d..ae81e45202517 100644\n--- a/llvm/lib/IR/Globals.cpp\n+++ b/llvm/lib/IR/Globals.cpp\n@@ -388,6 +388,15 @@ bool GlobalObject::canIncreaseAlignment() const {\n   return true;\n }\n \n+bool GlobalObject::hasMetadataOtherThanDebugLoc() const {\n+  SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;\n+  getAllMetadata(MDs);\n+  for (const auto &V : MDs)\n+    if (V.first != LLVMContext::MD_dbg)\n+      return true;\n+  return false;\n+}\n+\n template <typename Operation>\n static const GlobalObject *\n findBaseObject(const Constant *C, DenseSet<const GlobalAlias *> &Aliases,\ndiff --git a/llvm/lib/Transforms/IPO/ConstantMerge.cpp b/llvm/lib/Transforms/IPO/ConstantMerge.cpp\nindex 6cc35d05ceb1a..282bcabc34534 100644\n--- a/llvm/lib/Transforms/IPO/ConstantMerge.cpp\n+++ b/llvm/lib/Transforms/IPO/ConstantMerge.cpp\n@@ -66,15 +66,6 @@ static bool IsBetterCanonical(const GlobalVariable &A,\n   return A.hasGlobalUnnamedAddr();\n }\n \n-static bool hasMetadataOtherThanDebugLoc(const GlobalVariable *GV) {\n-  SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;\n-  GV->getAllMetadata(MDs);\n-  for (const auto &V : MDs)\n-    if (V.first != LLVMContext::MD_dbg)\n-      return true;\n-  return false;\n-}\n-\n static void copyDebugLocMetadata(const GlobalVariable *From,\n                                  GlobalVariable *To) {\n   SmallVector<DIGlobalVariableExpression *, 1> MDs;\n@@ -104,9 +95,9 @@ enum class CanMerge { No, Yes };\n static CanMerge makeMergeable(GlobalVariable *Old, GlobalVariable *New) {\n   if (!Old->hasGlobalUnnamedAddr() && !New->hasGlobalUnnamedAddr())\n     return CanMerge::No;\n-  if (hasMetadataOtherThanDebugLoc(Old))\n+  if (Old->hasMetadataOtherThanDebugLoc())\n     return CanMerge::No;\n-  assert(!hasMetadataOtherThanDebugLoc(New));\n+  assert(!New->hasMetadataOtherThanDebugLoc());\n   if (!Old->hasGlobalUnnamedAddr())\n     New->setUnnamedAddr(GlobalValue::UnnamedAddr::None);\n   return CanMerge::Yes;\n@@ -172,7 +163,7 @@ static bool mergeConstants(Module &M) {\n         continue;\n \n       // Don't touch globals with metadata other then !dbg.\n-      if (hasMetadataOtherThanDebugLoc(&GV))\n+      if (GV.hasMetadataOtherThanDebugLoc())\n         continue;\n \n       Constant *Init = GV.getInitializer();\n",
+  "components": [
+    "ConstantMerge",
+    "IR"
+  ],
+  "description": "As noticed during the review of #149260, this transformation\nis not necessarily correct for all metadata types.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/GlobalMerge/metadata1.ll",
+      "commands": [
+        "opt -global-merge -global-merge-max-offset=100 -S -o - %s",
+        "opt -passes='global-merge<max-offset=100>' -S -o - %s"
+      ],
+      "tests": [
+        {
+          "test_name": "use1",
+          "test_body": "target datalayout = \"e-p:64:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n@a = external hidden global i32, !foo !0\n@b = external hidden global i32\n\ndefine void @use1() {\n  %x = load i32, ptr @a, align 4\n  %y = load i32, ptr @b, align 4\n  ret void\n}\n\n!0 = !{}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GlobalMerge/metadata2.ll",
+      "commands": [
+        "opt -global-merge -global-merge-max-offset=100 -S -o - %s",
+        "opt -passes='global-merge<max-offset=100>' -S -o - %s"
+      ],
+      "tests": [
+        {
+          "test_name": "use1",
+          "test_body": "target datalayout = \"e-p:64:64\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n@a = external hidden global i32\n@b = external hidden global i32, !foo !0\n\ndefine void @use1() {\n  %x = load i32, ptr @a, align 4\n  %y = load i32, ptr @b, align 4\n  ret void\n}\n\n!0 = !{}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:codegen",
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM IDS CHECK COMMENT-->\n\n\n:warning: LLVM ABI annotation checker, ids-check found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff origin/main HEAD -- 'llvm/include/llvm/**/*.h' 'llvm/include/llvm-c/**/*.h' 'llvm/include/llvm/Demangle/**/*.h'\nThen run idt on the changed files with appropriate --export-macro and --include-header flags.\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from ids-check here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/include/llvm/IR/Type.h b/llvm/include/llvm/IR/Type.h\nindex 1c042500b..6cfccad75 100644\n--- a/llvm/include/llvm/IR/Type.h\n+++ b/llvm/include/llvm/IR/Type.h\n@@ -14,6 +14,7 @@\n #ifndef LLVM_IR_TYPE_H\n #define LLVM_IR_TYPE_H\n \n+#include \"llvm/include/llvm/Support/Compiler.h\"\n #include \"llvm/ADT/ArrayRef.h\"\n #include \"llvm/Support/CBindingWrapping.h\"\n #include \"llvm/Support/Casting.h\"\n@@ -234,7 +235,7 @@ public:\n   bool isTokenTy() const { return getTypeID() == TokenTyID; }\n \n   /// Returns true if this is 'token' or a token-like target type.s\n-  bool isTokenLikeTy() const;\n+  LLVM_ABI bool isTokenLikeTy() const;\n \n   /// True if this is an instance of IntegerType.\n   bool isIntegerTy() const { return getTypeID() == IntegerTyID; }\ndiff --git a/llvm/include/llvm/IR/User.h b/llvm/include/llvm/IR/User.h\nindex da886a508..d68414c89 100644\n--- a/llvm/include/llvm/IR/User.h\n+++ b/llvm/include/llvm/IR/User.h\n@@ -18,6 +18,7 @@\n #ifndef LLVM_IR_USER_H\n #define LLVM_IR_USER_H\n \n+#include \"llvm/include/llvm/Support/Compiler.h\"\n #include \"llvm/ADT/iterator.h\"\n #include \"llvm/ADT/iterator_range.h\"\n #include \"llvm/IR/Use.h\"\n@@ -142,7 +143,7 @@ protected:\n \n protected:\n   // Use deleteValue() to delete a generic User.\n-  ~User();\n+  LLVM_ABI ~User();\n \n public:\n   User(const User &) = delete;\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-14T00:52:41Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/IR/GlobalObject.h": [
+      [
+        143,
+        148
+      ]
+    ],
+    "llvm/lib/CodeGen/GlobalMerge.cpp": [
+      [
+        731,
+        736
+      ]
+    ],
+    "llvm/lib/IR/Globals.cpp": [
+      [
+        388,
+        393
+      ]
+    ],
+    "llvm/lib/Transforms/IPO/ConstantMerge.cpp": [
+      [
+        66,
+        80
+      ],
+      [
+        104,
+        112
+      ],
+      [
+        172,
+        178
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/CodeGen/GlobalMerge.cpp": [
+      "GlobalMergeImpl::run"
+    ],
+    "llvm/lib/IR/Globals.cpp": [
+      "GlobalObject::canIncreaseAlignment",
+      "findBaseObject"
+    ],
+    "llvm/lib/Transforms/IPO/ConstantMerge.cpp": [
+      "IsBetterCanonical",
+      "copyDebugLocMetadata",
+      "hasMetadataOtherThanDebugLoc",
+      "makeMergeable",
+      "mergeConstants"
+    ]
+  }
+}

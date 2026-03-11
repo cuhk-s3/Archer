@@ -1,0 +1,818 @@
+{
+  "pr_id": 174853,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174853",
+  "state": "closed",
+  "title": "InstCombine: Handle fadd in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "a062249932f8b41f9c188ef9189d5a11552ab1b8",
+  "fix_commit": "e08df7e8781acbc445fd4ca9c2c8def32b8780de",
+  "patch": "diff --git a/llvm/include/llvm/ADT/FloatingPointMode.h b/llvm/include/llvm/ADT/FloatingPointMode.h\nindex 0605e0b4f4cf9..1ab14d119fcd3 100644\n--- a/llvm/include/llvm/ADT/FloatingPointMode.h\n+++ b/llvm/include/llvm/ADT/FloatingPointMode.h\n@@ -164,6 +164,23 @@ struct DenormalMode {\n            Output == DenormalModeKind::PositiveZero;\n   }\n \n+  /// Return true if output denormals may be implicitly treated as 0.\n+  constexpr bool outputsMayBeZero() const {\n+    return outputsAreZero() || Output == DenormalMode::Dynamic;\n+  }\n+\n+  /// Return true if input denormals could be flushed to +0.\n+  constexpr bool inputsMayBePositiveZero() const {\n+    return Input == DenormalMode::PositiveZero ||\n+           Input == DenormalMode::Dynamic;\n+  }\n+\n+  /// Return true if output denormals could be flushed to +0.\n+  constexpr bool outputsMayBePositiveZero() const {\n+    return Output == DenormalMode::PositiveZero ||\n+           Output == DenormalMode::Dynamic;\n+  }\n+\n   /// Get the effective denormal mode if the mode if this caller calls into a\n   /// function with \\p Callee. This promotes dynamic modes to the mode of the\n   /// caller.\ndiff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex 193a3511b9f8e..51ca9f5733f51 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -202,6 +202,16 @@ struct KnownFPClass {\n   canonicalize(const KnownFPClass &Src,\n                DenormalMode DenormMode = DenormalMode::getDynamic());\n \n+  /// Report known values for fadd\n+  LLVM_ABI static KnownFPClass\n+  fadd(const KnownFPClass &LHS, const KnownFPClass &RHS,\n+       DenormalMode Mode = DenormalMode::getDynamic());\n+\n+  /// Report known values for fadd x, x\n+  LLVM_ABI static KnownFPClass\n+  fadd_self(const KnownFPClass &Src,\n+            DenormalMode Mode = DenormalMode::getDynamic());\n+\n   /// Report known values for fmul\n   LLVM_ABI static KnownFPClass\n   fmul(const KnownFPClass &LHS, const KnownFPClass &RHS,\ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex 2e43469245563..ae8c4a9133897 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -233,6 +233,52 @@ KnownFPClass KnownFPClass::canonicalize(const KnownFPClass &KnownSrc,\n   return Known;\n }\n \n+KnownFPClass KnownFPClass::fadd(const KnownFPClass &KnownLHS,\n+                                const KnownFPClass &KnownRHS,\n+                                DenormalMode Mode) {\n+  KnownFPClass Known;\n+\n+  // Adding positive and negative infinity produces NaN.\n+  // TODO: Check sign of infinities.\n+  if (KnownLHS.isKnownNeverNaN() && KnownRHS.isKnownNeverNaN() &&\n+      (KnownLHS.isKnownNeverInfinity() || KnownRHS.isKnownNeverInfinity()))\n+    Known.knownNot(fcNan);\n+\n+  if (KnownLHS.cannotBeOrderedLessThanZero() &&\n+      KnownRHS.cannotBeOrderedLessThanZero())\n+    Known.knownNot(OrderedLessThanZeroMask);\n+\n+  if (KnownLHS.cannotBeOrderedGreaterThanZero() &&\n+      KnownRHS.cannotBeOrderedGreaterThanZero())\n+    Known.knownNot(OrderedGreaterThanZeroMask);\n+\n+  // (fadd x, 0.0) is guaranteed to return +0.0, not -0.0.\n+  if ((KnownLHS.isKnownNeverLogicalNegZero(Mode) ||\n+       KnownRHS.isKnownNeverLogicalNegZero(Mode)) &&\n+      // Make sure output negative denormal can't flush to -0\n+      (Mode.Output == DenormalMode::IEEE ||\n+       Mode.Output == DenormalMode::PositiveZero))\n+    Known.knownNot(fcNegZero);\n+\n+  return Known;\n+}\n+\n+KnownFPClass KnownFPClass::fadd_self(const KnownFPClass &KnownSrc,\n+                                     DenormalMode Mode) {\n+  KnownFPClass Known = fadd(KnownSrc, KnownSrc, Mode);\n+\n+  // Doubling 0 will give the same 0.\n+  if (KnownSrc.isKnownNeverLogicalPosZero(Mode) &&\n+      (Mode.Output == DenormalMode::IEEE ||\n+       (Mode.Output == DenormalMode::PreserveSign &&\n+        KnownSrc.isKnownNeverPosSubnormal()) ||\n+       (Mode.Output == DenormalMode::PositiveZero &&\n+        KnownSrc.isKnownNeverSubnormal())))\n+    Known.knownNot(fcPosZero);\n+\n+  return Known;\n+}\n+\n KnownFPClass KnownFPClass::fmul(const KnownFPClass &KnownLHS,\n                                 const KnownFPClass &KnownRHS,\n                                 DenormalMode Mode) {\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 19e0eafc9c8b2..3d51c5d986ef6 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2033,6 +2033,25 @@ static Constant *getFPClassConstant(Type *Ty, FPClassTest Mask,\n   }\n }\n \n+/// Try to set an inferred no-nans or no-infs in \\p FMF. \\p\n+/// ValidResults is a mask of known valid results for the operator\n+/// (already computed from the result, and the known operand inputs,\n+/// \\p KnownLHS and \\p KnownRHS)\n+static FastMathFlags\n+inferFastMathValueFlagsBinOp(FastMathFlags FMF, FPClassTest ValidResults,\n+                             const KnownFPClass &KnownLHS,\n+                             const KnownFPClass &KnownRHS) {\n+  if (!FMF.noNaNs() && (ValidResults & fcNan) == fcNone &&\n+      KnownLHS.isKnownNeverNaN() && KnownRHS.isKnownNeverNaN())\n+    FMF.setNoNaNs();\n+\n+  if (!FMF.noInfs() && (ValidResults & fcInf) == fcNone &&\n+      KnownLHS.isKnownNeverInfinity() && KnownRHS.isKnownNeverInfinity())\n+    FMF.setNoInfs();\n+\n+  return FMF;\n+}\n+\n Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n                                                     FPClassTest DemandedMask,\n                                                     KnownFPClass &Known,\n@@ -2062,6 +2081,100 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n     Known.fneg();\n     break;\n   }\n+  case Instruction::FAdd: {\n+    KnownFPClass KnownLHS, KnownRHS;\n+\n+    const SimplifyQuery &SQ = getSimplifyQuery();\n+\n+    // fadd x, x can be handled more aggressively.\n+    if (I->getOperand(0) == I->getOperand(1) &&\n+        isGuaranteedNotToBeUndef(I->getOperand(0), SQ.AC, CxtI, SQ.DT,\n+                                 Depth + 1)) {\n+      Type *EltTy = VTy->getScalarType();\n+      DenormalMode Mode = F.getDenormalMode(EltTy->getFltSemantics());\n+\n+      FPClassTest SrcDemandedMask = DemandedMask;\n+\n+      // Doubling a subnormal could have resulted in a normal value.\n+      if (DemandedMask & fcPosNormal)\n+        SrcDemandedMask |= fcPosSubnormal;\n+      if (DemandedMask & fcNegNormal)\n+        SrcDemandedMask |= fcNegSubnormal;\n+\n+      // Doubling a subnormal may produce 0 if FTZ/DAZ.\n+      if (Mode != DenormalMode::getIEEE()) {\n+        if (DemandedMask & fcPosZero) {\n+          SrcDemandedMask |= fcPosSubnormal;\n+\n+          if (Mode.inputsMayBePositiveZero() || Mode.outputsMayBePositiveZero())\n+            SrcDemandedMask |= fcNegSubnormal;\n+        }\n+\n+        if (DemandedMask & fcNegZero)\n+          SrcDemandedMask |= fcNegSubnormal;\n+      }\n+\n+      // Doubling a normal could have resulted in an infinity.\n+      if (DemandedMask & fcPosInf)\n+        SrcDemandedMask |= fcPosNormal;\n+      if (DemandedMask & fcNegInf)\n+        SrcDemandedMask |= fcNegNormal;\n+\n+      if (SimplifyDemandedFPClass(I, 0, SrcDemandedMask, KnownLHS, Depth + 1))\n+        return I;\n+\n+      Known = KnownFPClass::fadd_self(KnownLHS, Mode);\n+      KnownRHS = KnownLHS;\n+    } else {\n+      FPClassTest SrcDemandedMask = fcFinite;\n+\n+      // inf + (-inf) = nan\n+      if (DemandedMask & fcNan)\n+        SrcDemandedMask |= fcNan | fcInf;\n+\n+      if (DemandedMask & fcInf)\n+        SrcDemandedMask |= fcInf;\n+\n+      if (SimplifyDemandedFPClass(I, 1, SrcDemandedMask, KnownRHS, Depth + 1) ||\n+          SimplifyDemandedFPClass(I, 0, SrcDemandedMask, KnownLHS, Depth + 1))\n+        return I;\n+\n+      Type *EltTy = VTy->getScalarType();\n+      DenormalMode Mode = F.getDenormalMode(EltTy->getFltSemantics());\n+      Known = KnownFPClass::fadd(KnownLHS, KnownRHS, Mode);\n+    }\n+\n+    FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n+    if (Constant *SingleVal =\n+            getFPClassConstant(VTy, ValidResults, /*IsCanonicalizing=*/true))\n+      return SingleVal;\n+\n+    // Propagate known result to simplify edge case checks.\n+    bool ResultNotNan = (DemandedMask & fcNan) == fcNone;\n+    if (ResultNotNan) {\n+      KnownLHS.knownNot(fcNan);\n+      KnownRHS.knownNot(fcNan);\n+    }\n+\n+    // With nnan: X + {+/-}Inf --> {+/-}Inf\n+    if (KnownRHS.isKnownAlways(fcInf | fcNan) &&\n+        KnownLHS.isKnownNever(fcNan))\n+      return I->getOperand(1);\n+\n+    // With nnan: {+/-}Inf + X --> {+/-}Inf\n+    if (KnownLHS.isKnownAlways(fcInf | fcNan) &&\n+        KnownRHS.isKnownNever(fcNan))\n+      return I->getOperand(0);\n+\n+    FastMathFlags InferredFMF =\n+        inferFastMathValueFlagsBinOp(FMF, ValidResults, KnownLHS, KnownRHS);\n+    if (InferredFMF != FMF) {\n+      I->setFastMathFlags(InferredFMF);\n+      return I;\n+    }\n+\n+    return nullptr;\n+  }\n   case Instruction::FMul: {\n     KnownFPClass KnownLHS, KnownRHS;\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Note some of the tests currently fail with alive, but not\ndue to this patch. Namely, when performing the fadd x, 0 -> x\nsimplification in functions with non-IEEE denormal handling.\nThe existing instsimplify ignores the denormals-are-zero hazard by\nchecking cannotBeNegativeZero instead of isKnownNeverLogicalZero.\n\nAlso note the self handling doesn't really do anything yet, other\nthan propagate consistent known-fpclass information until there is\nmultiple use support.\n\nThis also leaves behind the original ValueTracking support, without\nswitching to the new KnownFPClass:fadd utility. This will be easier\nto clean up after the subsequent fsub support patch.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fadd.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pzero__fadd__not_nzero__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fadd__not_nzero__daz(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %pzero, %not.nzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_nzero_select_nsub_source__fadd_self__ftz_ieee",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_nsub_source__fadd_self__ftz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,ieee\" }\n"
+        },
+        {
+          "test_name": "ret_only_inf",
+          "test_body": "define nofpclass(nan zero sub norm) half @ret_only_inf(half %x, half %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_nsub_source__fadd_self__ftz_daz",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_nsub_source__fadd_self__ftz_daz(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_nsub_source__fadd_self__ieee",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_nsub_source__fadd_self__ieee(i1 %cond, half noundef %unknown) {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "demand_zero_select_sub_source__fadd_self__ieee_daz",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(sub norm) half @demand_zero_select_sub_source__fadd_self__ieee_daz(i1 %cond, half noundef %unknown) #0 {\n  %sub = call noundef half @returns_sub()\n  %select = select i1 %cond, half %unknown, half %sub\n  %result = fadd half %sub, %sub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_nzero_select_psub_source__fadd_self__ieee_daz",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_psub_source__fadd_self__ieee_daz(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_psub_source__fadd_self__ieee",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_psub_source__fadd_self__ieee(i1 %cond, half noundef %unknown) {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_fabs_fadd_known_positive_sources",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) half @returns_positive()\n\ndefine nofpclass(nan) half @ret_nonan_fabs_fadd_known_positive_sources() {\n  %positive0 = call half @returns_positive()\n  %positive1 = call half @returns_positive()\n  %known.positive.add = fadd half %positive1, %positive1\n  %fabs = call half @llvm.fabs.f16(half %known.positive.add)\n  ret half %fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_psub_source__fadd_self__dynamic_dynamic",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_psub_source__fadd_self__dynamic_dynamic(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "pzero__fadd_nsz__unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fadd_nsz__unknown(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fadd nsz half %pzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__fadd_self__nonan_maybe_undef0",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndefine nofpclass(nan) half @ret_nonan__fadd_self__nonan_maybe_undef0(i1 %cond, half %unknown) {\n  %nan = call noundef half @returns_nan()\n  %select = select i1 %cond, half %nan, half %unknown\n  %add = fadd half %select, %select\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_only_zero",
+          "test_body": "define nofpclass(nan inf sub norm) half @ret_only_zero(half %x, half %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_only_nzero",
+          "test_body": "define nofpclass(nan inf pzero sub norm) half @ret_only_nzero(half %x, half %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero_nsub__fadd__pzero__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero_nsub__fadd__pzero__dynamic(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %not.nzero.nsub, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "demand_nzero_select_nsub_source__fadd_self__dynamic_dynamic",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_nsub_source__fadd_self__dynamic_dynamic(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__inf__fadd__unknown",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan) half @ret_nonan__inf__fadd__unknown(half %unknown) {\n  %inf = call half @returns_inf()\n  %add = fadd half %inf, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero__fadd__pzero__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero__fadd__pzero__dynamic(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %not.nzero, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "ret_nonan_fneg_fabs_fadd_known_negative_sources",
+          "test_body": "declare nofpclass(nan pinf pzero psub pnorm) half @returns_negative()\n\ndefine nofpclass(nan) half @ret_nonan_fneg_fabs_fadd_known_negative_sources() {\n  %negative0 = call half @returns_negative()\n  %negative1 = call half @returns_negative()\n  %known.negative.op = fadd half %negative0, %negative1\n  %fabs = call half @llvm.fabs.f16(half %known.negative.op)\n  %neg.fabs = fneg half %fabs\n  ret half %neg.fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_psub_source__fadd_self__ftz_ieee",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_psub_source__fadd_self__ftz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,ieee\" }\n"
+        },
+        {
+          "test_name": "ret_only_snan",
+          "test_body": "define nofpclass(qnan inf zero sub norm) half @ret_only_snan(half %x, half %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_pinf_input_rhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_pinf_input_rhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %pinf = call half @returns_pinf()\n  %y.or.inf = select i1 %cond, half %y, half %pinf\n  %add = fadd half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero__fadd__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero__fadd__pzero(half nofpclass(nzero) %not.nzero) {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %not.nzero, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_psub_source__fadd_self__ftpz_ieee",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_psub_source__fadd_self__ftpz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"positive-zero,ieee\" }\n"
+        },
+        {
+          "test_name": "demand_zero_select_sub_source__fadd_self__ftz_ieee",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(sub norm) half @demand_zero_select_sub_source__fadd_self__ftz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %sub = call noundef half @returns_sub()\n  %select = select i1 %cond, half %unknown, half %sub\n  %result = fadd half %sub, %sub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,ieee\" }\n"
+        },
+        {
+          "test_name": "unknown__fadd__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @unknown__fadd__pzero(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %unknown, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "unknown__fadd__nzero",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(snan) half @unknown__fadd__nzero(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fadd half %unknown, %nzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_infs_inputs",
+          "test_body": "define nofpclass(snan) half @no_infs_inputs(half nofpclass(inf) %x, half nofpclass(inf) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__fadd_self__nonan",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndefine nofpclass(nan) half @ret_nonan__fadd_self__nonan(i1 %cond, half noundef %unknown) {\n  %nan = call noundef half @returns_nan()\n  %select = select i1 %cond, half %nan, half %unknown\n  %add = fadd half %select, %select\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_fneg_fabs_fadd_known_negative_or_nan_sources",
+          "test_body": "declare nofpclass(pinf pzero psub pnorm) half @returns_negative_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan_fneg_fabs_fadd_known_negative_or_nan_sources() {\n  %negative.or.nan0 = call half @returns_negative_or_nan()\n  %negative.or.nan1 = call half @returns_negative_or_nan()\n  %known.negative.add = fadd half %negative.or.nan0, %negative.or.nan1\n  %fabs = call half @llvm.fabs.f16(half %known.negative.add)\n  %neg.fabs = fneg half %fabs\n  ret half %neg.fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_nsub_source__fadd_self__ftz_daz",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_nsub_source__fadd_self__ftz_daz(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_nzero_select_nsub_source__fadd_self__ieee_daz",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_nsub_source__fadd_self__ieee_daz(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_zero_select_sub_source__fadd_self__ieee",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(sub norm) half @demand_zero_select_sub_source__fadd_self__ieee(i1 %cond, half noundef %unknown) {\n  %sub = call noundef half @returns_sub()\n  %select = select i1 %cond, half %unknown, half %sub\n  %result = fadd half %sub, %sub\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fadd__inf",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fadd__inf(half %unknown) {\n  %inf = call half @returns_inf()\n  %add = fadd half %unknown, %inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_only_nan",
+          "test_body": "define nofpclass(inf zero sub norm) half @ret_only_nan(half %x, half %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fadd__zero",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fadd__zero(half %unknown) {\n  %zero = call half @returns_zero()\n  %add = fadd half %unknown, %zero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_fabs_fadd_known_positive_or_nan_sources",
+          "test_body": "declare nofpclass(ninf nzero nsub nnorm) half @returns_positive_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan_fabs_fadd_known_positive_or_nan_sources() {\n  %positive.or.nan0 = call half @returns_positive_or_nan()\n  %positive.or.nan1 = call half @returns_positive_or_nan()\n  %known.positive.add = fadd half %positive.or.nan0, %positive.or.nan1\n  %fabs = call half @llvm.fabs.f16(half %known.positive.add)\n  ret half %fabs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "no_nans_infs_inputs__nonans_output",
+          "test_body": "define nofpclass(nan) half @no_nans_infs_inputs__nonans_output(half nofpclass(nan inf) %x, half nofpclass(nan inf) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_inf_input_rhs",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_inf_input_rhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %inf = call half @returns_inf()\n  %y.or.inf = select i1 %cond, half %y, half %inf\n  %add = fadd half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_infs_inputs_and_outputs",
+          "test_body": "define nofpclass(inf) half @no_infs_inputs_and_outputs(half nofpclass(inf) %x, half nofpclass(inf) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__pzero__fadd__unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(nan) half @ret_nonan__pzero__fadd__unknown(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %pzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_psub_source__fadd_self__ftz_ieee",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_psub_source__fadd_self__ftz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,ieee\" }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_nsub_source__fadd_self__ftz_ieee",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_nsub_source__fadd_self__ftz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,ieee\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__fadd_self__nonan__other_use",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndeclare void @use(half)\n\ndefine nofpclass(nan) half @ret_nonan__fadd_self__nonan__other_use(i1 %cond, half noundef %unknown) {\n  %nan = call noundef half @returns_nan()\n  %select = select i1 %cond, half %nan, half %unknown\n  call void @use(half %select)\n  %add = fadd half %select, %select\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_zero_select_sub_source__fadd_self__dynamic_dynamic",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(sub norm) half @demand_zero_select_sub_source__fadd_self__dynamic_dynamic(i1 %cond, half noundef %unknown) #0 {\n  %sub = call noundef half @returns_sub()\n  %select = select i1 %cond, half %unknown, half %sub\n  %result = fadd half %sub, %sub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "pzero__fadd__unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fadd__unknown(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %pzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_inf_input_lhs",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_inf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %inf = call half @returns_inf()\n  %x.or.inf = select i1 %cond, half %x, half %inf\n  %add = fadd half %x.or.inf, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_psub_source__fadd_self__ieee",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_psub_source__fadd_self__ieee(i1 %cond, half noundef %unknown) {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_psub_source__fadd_self__ftz_daz",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_psub_source__fadd_self__ftz_daz(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "no_nans_infs_inputs__noinfs_output",
+          "test_body": "define nofpclass(inf) half @no_nans_infs_inputs__noinfs_output(half nofpclass(nan inf) %x, half nofpclass(nan inf) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_psub_source__fadd_self__ieee_dapz",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_psub_source__fadd_self__ieee_dapz(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,positive-zero\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__inf_or_nan__fadd__unknown",
+          "test_body": "declare nofpclass(zero sub norm) half @returns_inf_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan__inf_or_nan__fadd__unknown(half %unknown) {\n  %inf.or.nan = call half @returns_inf_or_nan()\n  %add = fadd half %inf.or.nan, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "unknown__fadd_nsz__pzero_or_nan",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @unknown__fadd_nsz__pzero_or_nan(half %unknown) {\n  %pzero.or.nan = call half @returns_pzero()\n  %add = fadd nsz half %unknown, %pzero.or.nan\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inf_result_demands_ninf_input_rhs",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) half @returns_ninf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_ninf_input_rhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %ninf = call half @returns_ninf()\n  %y.or.inf = select i1 %cond, half %y, half %ninf\n  %add = fadd half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_zero_select_sub_source__fadd_self__ieee_dapz",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(sub norm) half @demand_zero_select_sub_source__fadd_self__ieee_dapz(i1 %cond, half noundef %unknown) #0 {\n  %sub = call noundef half @returns_sub()\n  %select = select i1 %cond, half %unknown, half %sub\n  %result = fadd half %sub, %sub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,positive-zero\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__nzero__fadd__unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(nan) half @ret_nonan__nzero__fadd__unknown(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fadd half %nzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fadd__not_nzero_nsub__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fadd__not_nzero_nsub__dynamic(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %pzero, %not.nzero.nsub\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "no_nans_infs_inputs",
+          "test_body": "define nofpclass(snan) half @no_nans_infs_inputs(half nofpclass(nan inf) %x, half nofpclass(nan inf) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_pzero_select_psub_source__fadd_self__ieee_dapz",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_psub_source__fadd_self__ieee_dapz(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,positive-zero\" }\n"
+        },
+        {
+          "test_name": "inf_result_demands_ninf_input_lhs",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) half @returns_ninf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_ninf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %ninf = call half @returns_ninf()\n  %x.or.inf = select i1 %cond, half %x, half %ninf\n  %add = fadd half %x.or.inf, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_pzero_select_nsub_source__fadd_self__ftpz_ieee",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_nsub_source__fadd_self__ftpz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"positive-zero,ieee\" }\n"
+        },
+        {
+          "test_name": "inferred_nan_output__noinfs_only_lhs",
+          "test_body": "define nofpclass(nzero) half @inferred_nan_output__noinfs_only_lhs(half nofpclass(nan inf) %x, half nofpclass(nan) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_pzero_select_psub_source__fadd_self__ftz_daz",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_psub_source__fadd_self__ftz_daz(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_psub_source__fadd_self__ieee_daz",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_psub_source__fadd_self__ieee_daz(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fadd__nzero",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fadd__nzero(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fadd half %unknown, %nzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "not_nzero__fadd__pzero__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero__fadd__pzero__daz(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %not.nzero, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_nsub_source__fadd_self__dynamic_dynamic",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_nsub_source__fadd_self__dynamic_dynamic(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_nsub_source__fadd_self__ieee_dapz",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_nsub_source__fadd_self__ieee_dapz(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,positive-zero\" }\n"
+        },
+        {
+          "test_name": "pzero__fadd__not_nzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fadd__not_nzero(half nofpclass(nzero) %not.nzero) {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %pzero, %not.nzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_psub_source__fadd__dynamic_dynamic",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_psub_source__fadd__dynamic_dynamic(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fadd__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fadd__pzero(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %unknown, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "unknown__fadd_nsz__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @unknown__fadd_nsz__pzero(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %add = fadd nsz half %unknown, %pzero\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_pzero_select_psub_source__fadd_self__ftpz_ieee",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_psub_source__fadd_self__ftpz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %psub = call noundef half @returns_psub()\n  %select = select i1 %cond, half %unknown, half %psub\n  %result = fadd half %psub, %psub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"positive-zero,ieee\" }\n"
+        },
+        {
+          "test_name": "no_nans_input_and_output",
+          "test_body": "define nofpclass(nan) half @no_nans_input_and_output(half nofpclass(nan) %x, half nofpclass(nan) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fadd__not_nzero__dynamic",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fadd__not_nzero__dynamic(half nofpclass(nzero) %not.nzero) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %pzero, %not.nzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,dynamic\" }\n"
+        },
+        {
+          "test_name": "demand_pzero_select_nsub_source__fadd_self__ieee_daz",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nzero sub norm) half @demand_pzero_select_nsub_source__fadd_self__ieee_daz(i1 %cond, half noundef %unknown) #0 {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_nonan__zero__fadd__unknown",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan) half @ret_nonan__zero__fadd__unknown(half %unknown) {\n  %zero = call half @returns_zero()\n  %add = fadd half %zero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "no_nans_inputs",
+          "test_body": "define nofpclass(snan) half @no_nans_inputs(half nofpclass(nan) %x, half nofpclass(nan) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_nzero_select_nsub_source__fadd_self__ieee",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(pzero sub norm) half @demand_nzero_select_nsub_source__fadd_self__ieee(i1 %cond, half noundef %unknown) {\n  %nsub = call noundef half @returns_nsub()\n  %select = select i1 %cond, half %unknown, half %nsub\n  %result = fadd half %nsub, %nsub\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_inf_input_lhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(inf sub norm) half @nan_result_demands_inf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(nan inf zero) %y) {\n  %pinf = call half @returns_pinf()\n  %x.or.inf = select i1 %cond, half %x, half %pinf\n  %add = fadd half %x.or.inf, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "nzero__fadd__unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(snan) half @nzero__fadd__unknown(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %add = fadd half %nzero, %unknown\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "inferred_nan_output__noinfs_only_rhs",
+          "test_body": "define nofpclass(nzero) half @inferred_nan_output__noinfs_only_rhs(half nofpclass(nan) %x, half nofpclass(nan inf) %y) {\n  %add = fadd half %x, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_zero_select_sub_source__fadd_self__ftz_daz",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(sub norm) half @demand_zero_select_sub_source__fadd_self__ftz_daz(i1 %cond, half noundef %unknown) #0 {\n  %sub = call noundef half @returns_sub()\n  %select = select i1 %cond, half %unknown, half %sub\n  %result = fadd half %sub, %sub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "not_nzero_nsub__fadd__pzero__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @not_nzero_nsub__fadd__pzero__daz(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %not.nzero.nsub, %pzero\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "nan_result_demands_inf_input_rhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(inf sub norm) half @nan_result_demands_inf_input_rhs(i1 %cond, half nofpclass(zero) %x, half %y) {\n  %pinf = call half @returns_pinf()\n  %y.or.inf = select i1 %cond, half %y, half %pinf\n  %add = fadd half %x, %y.or.inf\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fadd__inf_or_nan",
+          "test_body": "declare nofpclass(zero sub norm) half @returns_inf_or_nan()\n\ndefine nofpclass(nan) half @ret_nonan__unknown__fadd__inf_or_nan(half %unknown) {\n  %inf.or.nan = call half @returns_inf_or_nan()\n  %add = fadd half %unknown, %inf.or.nan\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "pzero__fadd__not_nzero_nsub__daz",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(snan) half @pzero__fadd__not_nzero_nsub__daz(half nofpclass(nzero nsub) %not.nzero.nsub) #0 {\n  %pzero = call half @returns_pzero()\n  %add = fadd half %pzero, %not.nzero.nsub\n  ret half %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "inf_result_demands_pinf_input_lhs",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(nan zero sub norm) half @inf_result_demands_pinf_input_lhs(i1 %cond, half nofpclass(zero) %x, half nofpclass(zero) %y) {\n  %pinf = call half @returns_pinf()\n  %x.or.inf = select i1 %cond, half %x, half %pinf\n  %add = fadd half %x.or.inf, %y\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__fadd_self__nonan_maybe_undef1",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndefine nofpclass(nan) half @ret_nonan__fadd_self__nonan_maybe_undef1(i1 %cond, half noundef %unknown) {\n  %nan = call half @returns_nan()\n  %select = select i1 %cond, half %nan, half %unknown\n  %add = fadd half %select, %select\n  ret half %add\n}\n"
+        },
+        {
+          "test_name": "demand_zero_select_sub_source__fadd_self__ftpz_ieee",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(sub norm) half @demand_zero_select_sub_source__fadd_self__ftpz_ieee(i1 %cond, half noundef %unknown) #0 {\n  %sub = call noundef half @returns_sub()\n  %select = select i1 %cond, half %unknown, half %sub\n  %result = fadd half %sub, %sub\n  ret half %result\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"positive-zero,ieee\" }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:transforms",
+    "llvm:adt"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175614** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175614?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>: 2  dependent PRs ([#175615](https://github.com/llvm/llvm-project/pull/175615) <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175615?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>, [#175999](https://github.com/llvm/llvm-project/pull/175999) <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175999?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>)\n* **#175613** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175613?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174853** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174853?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174853?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#174852** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174852?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions h,cpp -- llvm/include/llvm/ADT/FloatingPointMode.h llvm/include/llvm/Support/KnownFPClass.h llvm/lib/Support/KnownFPClass.cpp llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 3d51c5d98..1fa78ff25 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2157,13 +2157,11 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n     }\n \n     // With nnan: X + {+/-}Inf --> {+/-}Inf\n-    if (KnownRHS.isKnownAlways(fcInf | fcNan) &&\n-        KnownLHS.isKnownNever(fcNan))\n+    if (KnownRHS.isKnownAlways(fcInf | fcNan) && KnownLHS.isKnownNever(fcNan))\n       return I->getOperand(1);\n \n     // With nnan: {+/-}Inf + X --> {+/-}Inf\n-    if (KnownLHS.isKnownAlways(fcInf | fcNan) &&\n-        KnownRHS.isKnownNever(fcNan))\n+    if (KnownLHS.isKnownAlways(fcInf | fcNan) && KnownRHS.isKnownNever(fcNan))\n       return I->getOperand(0);\n \n     FastMathFlags InferredFMF =\n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM IDS CHECK COMMENT-->\n\n\n:warning: LLVM ABI annotation checker, ids-check found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff origin/main HEAD -- 'llvm/include/llvm/**/*.h' 'llvm/include/llvm-c/**/*.h' 'llvm/include/llvm/Demangle/**/*.h'\nThen run idt on the changed files with appropriate --export-macro and --include-header flags.\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from ids-check here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex 51ca9f573..8c5b8bcdb 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -14,6 +14,7 @@\n #ifndef LLVM_SUPPORT_KNOWNFPCLASS_H\n #define LLVM_SUPPORT_KNOWNFPCLASS_H\n \n+#include \"llvm/include/llvm/Support/Compiler.h\"\n #include \"llvm/ADT/FloatingPointMode.h\"\n #include \"llvm/Support/Compiler.h\"\n #include <optional>\n@@ -32,7 +33,7 @@ struct KnownFPClass {\n \n   KnownFPClass(FPClassTest Known = fcAllFlags, std::optional<bool> Sign = {})\n       : KnownFPClasses(Known), SignBit(Sign) {}\n-  KnownFPClass(const APFloat &C);\n+  LLVM_ABI KnownFPClass(const APFloat &C);\n \n   bool operator==(KnownFPClass Other) const {\n     return KnownFPClasses == Other.KnownFPClasses && SignBit == Other.SignBit;\n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `clang-m68k-linux-cross` running on `suse-gary-m68k-cross` while building `llvm` at step 5 \"ninja check 1\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/27/builds/21475\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 5 (ninja check 1) failure: stage 1 checked (failure)\n...\n[72/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/IndexTests.cpp.o\n[73/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/FileIndexTests.cpp.o\n[74/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/PreambleTests.cpp.o\n[75/711] Building CXX object tools/clang/tools/extra/unittests/clang-tidy/CMakeFiles/ClangTidyTests.dir/TransformerClangTidyCheckTest.cpp.o\n[76/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/RenameTests.cpp.o\n[77/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/CodeCompleteTests.cpp.o\n[78/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/SymbolDocumentationTests.cpp.o\n[79/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/PrintASTTests.cpp.o\n[80/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/ParsedASTTests.cpp.o\n[81/711] Building CXX object tools/clang/tools/extra/include-cleaner/unittests/CMakeFiles/ClangIncludeCleanerTests.dir/FindHeadersTest.cpp.o\nFAILED: tools/clang/tools/extra/include-cleaner/unittests/CMakeFiles/ClangIncludeCleanerTests.dir/FindHeadersTest.cpp.o \n/usr/bin/c++ -DLLVM_BUILD_STATIC -D_DEBUG -D_GLIBCXX_ASSERTIONS -D_GLIBCXX_USE_CXX11_ABI=1 -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/stage1/tools/clang/tools/extra/include-cleaner/unittests -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/include-cleaner/unittests -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang/include -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/stage1/tools/clang/include -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/stage1/include -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/llvm/include -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/include-cleaner/include -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/include-cleaner/unittests/../lib -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/third-party/unittest/googletest/include -I/var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/third-party/unittest/googlemock/include -fPIC -fno-semantic-interposition -fvisibility-inlines-hidden -Werror=date-time -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wno-missing-field-initializers -pedantic -Wno-long-long -Wimplicit-fallthrough -Wno-uninitialized -Wno-nonnull -Wno-class-memaccess -Wno-dangling-reference -Wno-redundant-move -Wno-pessimizing-move -Wno-array-bounds -Wno-stringop-overread -Wno-noexcept-type -Wdelete-non-virtual-dtor -Wsuggest-override -Wno-comment -Wno-misleading-indentation -Wctad-maybe-unsupported -fdiagnostics-color -ffunction-sections -fdata-sections -fno-common -Woverloaded-virtual -O3 -DNDEBUG -std=c++17 -UNDEBUG -Wno-variadic-macros -fno-exceptions -funwind-tables -fno-rtti -Wno-suggest-override -MD -MT tools/clang/tools/extra/include-cleaner/unittests/CMakeFiles/ClangIncludeCleanerTests.dir/FindHeadersTest.cpp.o -MF tools/clang/tools/extra/include-cleaner/unittests/CMakeFiles/ClangIncludeCleanerTests.dir/FindHeadersTest.cpp.o.d -o tools/clang/tools/extra/include-cleaner/unittests/CMakeFiles/ClangIncludeCleanerTests.dir/FindHeadersTest.cpp.o -c /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/include-cleaner/unittests/FindHeadersTest.cpp\nc++: fatal error: Killed signal terminated program cc1plus\ncompilation terminated.\n[82/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/ExtractFunctionTests.cpp.o\n[83/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/ObjCLocalizeStringLiteralTests.cpp.o\n[84/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/ExpandDeducedTypeTests.cpp.o\n[85/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/SemanticHighlightingTests.cpp.o\n[86/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/MemberwiseConstructorTests.cpp.o\n[87/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/TestWorkspace.cpp.o\n[88/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/DumpSymbolTests.cpp.o\n[89/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/AnnotateHighlightingsTests.cpp.o\n[90/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/DumpASTTests.cpp.o\n[91/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/SerializationTests.cpp.o\n[92/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/ExtractVariableTests.cpp.o\n[93/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/ExpandMacroTests.cpp.o\n[94/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/DumpRecordLayoutTests.cpp.o\n[95/711] Building CXX object tools/clang/tools/extra/unittests/clang-tidy/CMakeFiles/ClangTidyTests.dir/OverlappingReplacementsTest.cpp.o\n[96/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/AddUsingTests.cpp.o\n[97/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/DefineOutlineTests.cpp.o\n[98/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/DefineInlineTests.cpp.o\n[99/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/SymbolInfoTests.cpp.o\n[100/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/tweaks/ObjCMemberwiseInitializerTests.cpp.o\n[101/711] Building CXX object tools/clang/tools/extra/clangd/unittests/CMakeFiles/ClangdTests.dir/SelectionTests.cpp.o\nIn file included from /usr/include/c++/14/string:51,\n                 from /usr/include/c++/14/bits/locale_classes.h:40,\n                 from /usr/include/c++/14/bits/ios_base.h:41,\n                 from /usr/include/c++/14/streambuf:43,\n                 from /usr/include/c++/14/bits/streambuf_iterator.h:35,\n                 from /usr/include/c++/14/iterator:66,\n                 from /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/llvm/include/llvm/ADT/ADL.h:13,\n                 from /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/llvm/include/llvm/ADT/iterator_range.h:21,\n                 from /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/llvm/include/llvm/ADT/StringRef.h:14,\n                 from /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/clangd/URI.h:12,\n                 from /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/clangd/Protocol.h:26,\n                 from /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/clangd/unittests/Annotations.h:15,\n                 from /var/lib/buildbot/workers/suse-gary-m68k-cross/clang-m68k-linux-cross/llvm/clang-tools-extra/clangd/unittests/SelectionTests.cpp:8:\nIn static member function \u2018static _Up* std::__copy_move<_IsMove, true, std::random_access_iterator_tag>::__copy_m(_Tp*, _Tp*, _Up*) [with _Tp = const clang::clangd::SelectionTree::Node* const; _Up = const clang::clangd::SelectionTree::Node*; bool _IsMove = false]\u2019,\n    inlined from \u2018_OI std::__copy_move_a2(_II, _II, _OI) [with bool _IsMove = false; _II = const clang::clangd::SelectionTree::Node* const*; _OI = const clang::clangd::SelectionTree::Node**]\u2019 at /usr/include/c++/14/bits/stl_algobase.h:521:30,\n\n```\n\n</details>"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-07T19:33:46Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/ADT/FloatingPointMode.h": [
+      [
+        164,
+        169
+      ]
+    ],
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        202,
+        207
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        233,
+        238
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2033,
+        2038
+      ],
+      [
+        2062,
+        2067
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fadd.ll": [
+      [
+        34,
+        41
+      ],
+      [
+        64,
+        70
+      ],
+      [
+        92,
+        98
+      ],
+      [
+        216,
+        224
+      ],
+      [
+        234,
+        240
+      ],
+      [
+        249,
+        255
+      ],
+      [
+        265,
+        271
+      ],
+      [
+        280,
+        286
+      ],
+      [
+        294,
+        301
+      ],
+      [
+        309,
+        316
+      ],
+      [
+        324,
+        331
+      ],
+      [
+        339,
+        346
+      ],
+      [
+        365,
+        371
+      ],
+      [
+        388,
+        394
+      ],
+      [
+        399,
+        405
+      ],
+      [
+        410,
+        416
+      ],
+      [
+        421,
+        427
+      ],
+      [
+        432,
+        438
+      ],
+      [
+        443,
+        449
+      ],
+      [
+        515,
+        521
+      ],
+      [
+        530,
+        536
+      ],
+      [
+        592,
+        599
+      ],
+      [
+        604,
+        611
+      ],
+      [
+        616,
+        623
+      ],
+      [
+        628,
+        635
+      ],
+      [
+        664,
+        670
+      ],
+      [
+        676,
+        682
+      ],
+      [
+        688,
+        694
+      ],
+      [
+        700,
+        706
+      ],
+      [
+        712,
+        718
+      ],
+      [
+        724,
+        730
+      ],
+      [
+        736,
+        743
+      ],
+      [
+        748,
+        755
+      ],
+      [
+        784,
+        791
+      ],
+      [
+        796,
+        803
+      ],
+      [
+        832,
+        839
+      ],
+      [
+        844,
+        851
+      ],
+      [
+        904,
+        911
+      ],
+      [
+        916,
+        923
+      ],
+      [
+        928,
+        935
+      ],
+      [
+        1028,
+        1035
+      ],
+      [
+        1040,
+        1047
+      ],
+      [
+        1052,
+        1059
+      ],
+      [
+        1064,
+        1071
+      ],
+      [
+        1076,
+        1083
+      ],
+      [
+        1088,
+        1095
+      ],
+      [
+        1100,
+        1107
+      ],
+      [
+        1112,
+        1119
+      ],
+      [
+        1286,
+        1293
+      ],
+      [
+        1300,
+        1307
+      ],
+      [
+        1314,
+        1321
+      ],
+      [
+        1330,
+        1336
+      ],
+      [
+        1485,
+        1491
+      ],
+      [
+        1499,
+        1505
+      ],
+      [
+        1512,
+        1518
+      ],
+      [
+        1529,
+        1535
+      ],
+      [
+        1603,
+        1610
+      ],
+      [
+        1616,
+        1622
+      ],
+      [
+        1628,
+        1634
+      ],
+      [
+        1640,
+        1646
+      ],
+      [
+        1652,
+        1658
+      ],
+      [
+        1666,
+        1672
+      ],
+      [
+        1679,
+        1685
+      ],
+      [
+        1692,
+        1699
+      ],
+      [
+        1705,
+        1711
+      ],
+      [
+        1718,
+        1724
+      ],
+      [
+        1731,
+        1737
+      ],
+      [
+        1744,
+        1750
+      ],
+      [
+        1757,
+        1763
+      ],
+      [
+        1769,
+        1775
+      ],
+      [
+        1782,
+        1788
+      ],
+      [
+        1795,
+        1801
+      ],
+      [
+        1808,
+        1814
+      ],
+      [
+        1821,
+        1828
+      ],
+      [
+        1834,
+        1840
+      ],
+      [
+        1847,
+        1853
+      ],
+      [
+        1860,
+        1866
+      ],
+      [
+        1873,
+        1879
+      ],
+      [
+        1886,
+        1893
+      ],
+      [
+        1899,
+        1905
+      ],
+      [
+        1912,
+        1918
+      ],
+      [
+        1926,
+        1932
+      ],
+      [
+        1951,
+        1957
+      ],
+      [
+        1963,
+        1969
+      ],
+      [
+        1977,
+        1983
+      ],
+      [
+        1991,
+        1997
+      ],
+      [
+        2016,
+        2022
+      ],
+      [
+        2028,
+        2034
+      ],
+      [
+        2042,
+        2048
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/ADT/FloatingPointMode.h": [
+      "mergeCalleeMode",
+      "outputsAreZero"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::canonicalize",
+      "KnownFPClass::fmul"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass",
+      "getFPClassConstant"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fadd.ll": [
+      "pzero_or_nan__fadd__not_nzero",
+      "ret_nonan_fabs_fadd_known_positive_or_nan_sources",
+      "ret_nonan_fabs_fadd_known_positive_sources",
+      "ret_nonan_fneg_fabs_fadd_known_negative_sources"
+    ]
+  }
+}

@@ -1,0 +1,111 @@
+{
+  "pr_id": 174171,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174171",
+  "state": "closed",
+  "title": "[LoopInfo] Preserve profile information in makeLoopInvariant",
+  "author": "boomanaiden154",
+  "base_commit": "a6416a8411add524066ffbad288617e280bd0fbe",
+  "fix_commit": "5546df538da1b0a7067c09976226b53303a510b5",
+  "patch": "diff --git a/llvm/lib/Analysis/LoopInfo.cpp b/llvm/lib/Analysis/LoopInfo.cpp\nindex a364b21c64b01..7060a0bd9dcfa 100644\n--- a/llvm/lib/Analysis/LoopInfo.cpp\n+++ b/llvm/lib/Analysis/LoopInfo.cpp\n@@ -34,6 +34,7 @@\n #include \"llvm/IR/Module.h\"\n #include \"llvm/IR/PassManager.h\"\n #include \"llvm/IR/PrintPasses.h\"\n+#include \"llvm/IR/ProfDataUtils.h\"\n #include \"llvm/InitializePasses.h\"\n #include \"llvm/Support/CommandLine.h\"\n #include \"llvm/Support/Compiler.h\"\n@@ -54,6 +55,10 @@ static cl::opt<bool, true>\n     VerifyLoopInfoX(\"verify-loop-info\", cl::location(VerifyLoopInfo),\n                     cl::Hidden, cl::desc(\"Verify loop info (time consuming)\"));\n \n+namespace llvm {\n+extern cl::opt<bool> ProfcheckDisableMetadataFixes;\n+} // end namespace llvm\n+\n //===----------------------------------------------------------------------===//\n // Loop implementation\n //\n@@ -79,6 +84,7 @@ bool Loop::makeLoopInvariant(Value *V, bool &Changed, Instruction *InsertPt,\n bool Loop::makeLoopInvariant(Instruction *I, bool &Changed,\n                              Instruction *InsertPt, MemorySSAUpdater *MSSAU,\n                              ScalarEvolution *SE) const {\n+  BasicBlock *OriginalParent = I->getParent();\n   // Test if the value is already loop-invariant.\n   if (isLoopInvariant(I))\n     return true;\n@@ -109,11 +115,27 @@ bool Loop::makeLoopInvariant(Instruction *I, bool &Changed,\n       MSSAU->moveToPlace(MUD, InsertPt->getParent(),\n                          MemorySSA::BeforeTerminator);\n \n+  // We want to preserve profile metadata if possible. However, we need to\n+  // ensure that profile metadata would remain the same outside of the loop.\n+  // Given at this point we know the conditional is loop-invariant, we just\n+  // need to worry about other control flow in the loop conditioned on values\n+  // that are potentially not independent of the condition of the instruction\n+  // we are interested in hoisting. Given this is not knowable in the general\n+  // case, we only hoist from a loop header (which covers a reasonable number\n+  // of cases) where we are guaranteed to not run into problems.\n+  SmallVector<unsigned, 1> ProfileMetadataToPreserve;\n+  if (!ProfcheckDisableMetadataFixes)\n+    if (OriginalParent == getHeader())\n+      ProfileMetadataToPreserve.push_back(LLVMContext::MD_prof);\n+\n   // There is possibility of hoisting this instruction above some arbitrary\n   // condition. Any metadata defined on it can be control dependent on this\n   // condition. Conservatively strip it here so that we don't give any wrong\n   // information to the optimizer.\n-  I->dropUnknownNonDebugMetadata();\n+  I->dropUnknownNonDebugMetadata(ProfileMetadataToPreserve);\n+\n+  if (ProfileMetadataToPreserve.empty() && isa<SelectInst>(I))\n+    setExplicitlyUnknownBranchWeightsIfProfiled(*I, \"LoopInfo\");\n \n   if (SE)\n     SE->forgetBlockAndLoopDispositions(I);\ndiff --git a/llvm/utils/profcheck-xfail.txt b/llvm/utils/profcheck-xfail.txt\nindex 58309774692be..e5cdf8c220f4b 100644\n--- a/llvm/utils/profcheck-xfail.txt\n+++ b/llvm/utils/profcheck-xfail.txt\n@@ -140,7 +140,6 @@ Transforms/InstCombine/wcslen-1.ll\n Transforms/InstCombine/wcslen-3.ll\n Transforms/InstCombine/xor-and-or.ll\n Transforms/InstCombine/zext-bool-add-sub.ll\n-Transforms/LoopDeletion/invalidate-scev-after-hoisting.ll\n Transforms/LoopIdiom/AArch64/byte-compare-index.ll\n Transforms/LoopIdiom/AArch64/find-first-byte.ll\n Transforms/LowerAtomic/atomic-load.ll\n",
+  "components": [
+    "LoopInfo"
+  ],
+  "description": "When hoisting loop invariant instructions, we can preserve profile metadata because it depends solely on the condition (which is loop invariant) rather than where we are in the control flow graph.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopDeletion/invalidate-scev-after-hoisting.ll",
+      "commands": [
+        "opt -passes='loop(indvars,loop-deletion),verify<scalar-evolution>,print<scalar-evolution>' -S %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "test_pr58314",
+          "test_body": "define void @test_pr58314() !prof !0 {\nentry:\n  br label %outer.header\n\nouter.header:                                     ; preds = %outer.latch, %entry\n  br label %inner\n\ninner:                                            ; preds = %inner, %outer.header\n  %c = icmp ne i16 0, 0\n  %sel = select i1 %c, i1 false, i1 true, !prof !1\n  br i1 true, label %inner, label %outer.latch\n\nouter.latch:                                      ; preds = %inner\n  br i1 %sel, label %outer.header, label %exit\n\nexit:                                             ; preds = %outer.latch\n  ret void\n}\n\n!0 = !{!\"function_entry_count\", i64 1000}\n!1 = !{!\"branch_weights\", i32 4, i32 1}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopSimplify/profile-info.ll",
+      "commands": [
+        "opt -passes=\"loop-simplify\" -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_drop",
+          "test_body": "define void @test_drop(i8 %a) !prof !0 {\nentry:\n  br label %header\n\nheader:                                           ; preds = %body, %header, %entry\n  br i1 false, label %header, label %body\n\nbody:                                             ; preds = %header\n  %s = select i1 true, i1 true, i1 false, !prof !1\n  %cmp = icmp eq i8 %a, 0\n  br i1 %cmp, label %exit, label %header\n\nexit:                                             ; preds = %body\n  ret void\n}\n\n!0 = !{!\"function_entry_count\", i64 1000}\n!1 = !{!\"branch_weights\", i32 4, i32 1}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "nikic",
+      "body": "> When hoisting loop invariant instructions, we can preserve profile metadata because it depends solely on the condition (which is loop invariant) rather than where we are in the control flow graph.\r\n\r\nI don't think this is generally true, because the instruction might be guarded by control flow. Just to give the most obvious example, if you have:\r\n\r\n```\r\nloop {\r\n  if (c) {\r\n    c ? x : a;\r\n  }\r\n}\r\n```\r\nThen at the current position, the branch probability of the select is 1, while outside the loop it is unknown."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "boomanaiden154",
+      "body": "> I don't think this is generally true, because the instruction might be guarded by control flow. Just to give the most obvious example, if you have:\r\n\r\nGood point. I've updated the patch to account for that. Now we only propagate profile information if the instruction is in either the header or in the latch (and there is a single latch), effectively excluding any control flow in the loop body. When tested compiling LLVM, this gives works pretty well (~85% of the time), so I think it's worth the slight additional complexity."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-02T01:18:07Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/LoopInfo.cpp": [
+      [
+        34,
+        39
+      ],
+      [
+        54,
+        59
+      ],
+      [
+        79,
+        84
+      ],
+      [
+        109,
+        119
+      ]
+    ],
+    "llvm/test/Transforms/LoopDeletion/invalidate-scev-after-hoisting.ll": [
+      [
+        1,
+        4
+      ],
+      [
+        123,
+        135
+      ],
+      [
+        147,
+        153
+      ],
+      [
+        156,
+        158
+      ]
+    ],
+    "llvm/utils/profcheck-xfail.txt": [
+      [
+        140,
+        146
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/LoopInfo.cpp": [
+      "Loop::makeLoopInvariant"
+    ],
+    "llvm/test/Transforms/LoopDeletion/invalidate-scev-after-hoisting.ll": [
+      "test_pr57837"
+    ]
+  }
+}

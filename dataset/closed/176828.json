@@ -1,0 +1,282 @@
+{
+  "pr_id": 176828,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176828",
+  "state": "closed",
+  "title": "[VPlan] Run initial recipe simplification on VPlan0.",
+  "author": "fhahn",
+  "base_commit": "c2b69b1a173704e246f7501f8e87268ff6afcd01",
+  "fix_commit": "f3ed49644d12dd3aa14ebe6ab4c53c1f1767d3fc",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 9b2641c2b9bb7..5c3049b54c2de 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8134,6 +8134,8 @@ void LoopVectorizationPlanner::buildVPlansWithVPRecipes(ElementCount MinVF,\n       Legal->getReductionVars(), Legal->getFixedOrderRecurrences(),\n       CM.getInLoopReductions(), Hints.allowReordering());\n \n+  VPlanTransforms::simplifyRecipes(*VPlan0);\n+\n   auto MaxVFTimes2 = MaxVF * 2;\n   for (ElementCount VF = MinVF; ElementCount::isKnownLT(VF, MaxVFTimes2);) {\n     VFRange SubRange = {VF, MaxVFTimes2};\n@@ -8463,7 +8465,9 @@ void LoopVectorizationPlanner::addReductionResultComputation(\n   for (VPRecipeBase &R :\n        Plan->getVectorLoopRegion()->getEntryBasicBlock()->phis()) {\n     VPReductionPHIRecipe *PhiR = dyn_cast<VPReductionPHIRecipe>(&R);\n-    if (!PhiR)\n+    // TODO: Remove check for constant incoming value once removeDeadRecipes is\n+    // used on VPlan0.\n+    if (!PhiR || isa<VPIRValue>(PhiR->getOperand(1)))\n       continue;\n \n     const RecurrenceDescriptor &RdxDesc = Legal->getRecurrenceDescriptor(\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\nindex 4f97f8000c187..5bd4f6b8026b8 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n@@ -131,7 +131,21 @@ Type *VPTypeAnalysis::inferScalarTypeForRecipe(const VPInstruction *R) {\n   case VPInstruction::BranchOnCond:\n   case VPInstruction::BranchOnTwoConds:\n   case VPInstruction::BranchOnCount:\n+  case Instruction::Store:\n     return Type::getVoidTy(Ctx);\n+  case Instruction::Load:\n+    return cast<LoadInst>(R->getUnderlyingValue())->getType();\n+  case Instruction::Alloca:\n+    return cast<AllocaInst>(R->getUnderlyingValue())->getType();\n+  case Instruction::Call: {\n+    unsigned CallIdx = R->getNumOperandsWithoutMask() - 1;\n+    return cast<Function>(R->getOperand(CallIdx)->getLiveInIRValue())\n+        ->getReturnType();\n+  }\n+  case Instruction::GetElementPtr:\n+    return inferScalarType(R->getOperand(0));\n+  case Instruction::ExtractValue:\n+    return cast<ExtractValueInst>(R->getUnderlyingValue())->getType();\n   default:\n     break;\n   }\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 58ab147226ee2..4941da315fdbc 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -1220,6 +1220,18 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n   }\n \n   VPBuilder Builder(Def);\n+\n+  // Avoid replacing VPInstructions with underlying values with new\n+  // VPInstructions, as we would fail to create widen/replicate recpes from the\n+  // new VPInstructions without an underlying value, and miss out on some\n+  // transformations that only apply to widened/replicated recipes later, by\n+  // doing so.\n+  // TODO: We should also not replace non-VPInstructions like VPWidenRecipe with\n+  // VPInstructions without underlying values, as those will get skipped during\n+  // cost computation.\n+  bool CanCreateNewRecipe =\n+      !isa<VPInstruction>(Def) || !Def->getUnderlyingValue();\n+\n   VPValue *A;\n   if (match(Def, m_Trunc(m_ZExtOrSExt(m_VPValue(A))))) {\n     Type *TruncTy = TypeInfo.inferScalarType(Def);\n@@ -1227,8 +1239,8 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n     if (TruncTy == ATy) {\n       Def->replaceAllUsesWith(A);\n     } else {\n-      // Don't replace a scalarizing recipe with a widened cast.\n-      if (isa<VPReplicateRecipe>(Def))\n+      // Don't replace a non-widened cast recipe with a widened cast.\n+      if (!isa<VPWidenCastRecipe>(Def))\n         return;\n       if (ATy->getScalarSizeInBits() < TruncTy->getScalarSizeInBits()) {\n \n@@ -1304,7 +1316,8 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n     return Def->replaceAllUsesWith(X);\n \n   // (x && y) | (x && z) -> x && (y | z)\n-  if (match(Def, m_c_BinaryOr(m_LogicalAnd(m_VPValue(X), m_VPValue(Y)),\n+  if (CanCreateNewRecipe &&\n+      match(Def, m_c_BinaryOr(m_LogicalAnd(m_VPValue(X), m_VPValue(Y)),\n                               m_LogicalAnd(m_Deferred(X), m_VPValue(Z)))) &&\n       // Simplify only if one of the operands has one use to avoid creating an\n       // extra recipe.\n@@ -1322,7 +1335,8 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n \n   // select c, false, true -> not c\n   VPValue *C;\n-  if (match(Def, m_Select(m_VPValue(C), m_False(), m_True())))\n+  if (CanCreateNewRecipe &&\n+      match(Def, m_Select(m_VPValue(C), m_False(), m_True())))\n     return Def->replaceAllUsesWith(Builder.createNot(C));\n \n   // select !c, x, y -> select c, y, x\n@@ -1344,7 +1358,8 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n         Def->getOperand(0) == A ? Def->getOperand(1) : Def->getOperand(0));\n \n   const APInt *APC;\n-  if (match(Def, m_c_Mul(m_VPValue(A), m_APInt(APC))) && APC->isPowerOf2())\n+  if (CanCreateNewRecipe && match(Def, m_c_Mul(m_VPValue(A), m_APInt(APC))) &&\n+      APC->isPowerOf2())\n     return Def->replaceAllUsesWith(Builder.createNaryOp(\n         Instruction::Shl,\n         {A, Plan->getConstantInt(APC->getBitWidth(), APC->exactLogBase2())},\n@@ -1354,8 +1369,8 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n   // not allowed in them.\n   const VPRegionBlock *ParentRegion = Def->getParent()->getParent();\n   bool IsInReplicateRegion = ParentRegion && ParentRegion->isReplicator();\n-  if (!IsInReplicateRegion && match(Def, m_UDiv(m_VPValue(A), m_APInt(APC))) &&\n-      APC->isPowerOf2())\n+  if (CanCreateNewRecipe && !IsInReplicateRegion &&\n+      match(Def, m_UDiv(m_VPValue(A), m_APInt(APC))) && APC->isPowerOf2())\n     return Def->replaceAllUsesWith(Builder.createNaryOp(\n         Instruction::LShr,\n         {A, Plan->getConstantInt(APC->getBitWidth(), APC->exactLogBase2())},\n@@ -1426,7 +1441,8 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n   // Fold (fcmp uno %X, %X) or (fcmp uno %Y, %Y) -> fcmp uno %X, %Y\n   // This is useful for fmax/fmin without fast-math flags, where we need to\n   // check if any operand is NaN.\n-  if (match(Def, m_BinaryOr(m_SpecificCmp(CmpInst::FCMP_UNO, m_VPValue(X),\n+  if (CanCreateNewRecipe &&\n+      match(Def, m_BinaryOr(m_SpecificCmp(CmpInst::FCMP_UNO, m_VPValue(X),\n                                           m_Deferred(X)),\n                             m_SpecificCmp(CmpInst::FCMP_UNO, m_VPValue(Y),\n                                           m_Deferred(Y))))) {\n@@ -2202,6 +2218,11 @@ static bool\n sinkRecurrenceUsersAfterPrevious(VPFirstOrderRecurrencePHIRecipe *FOR,\n                                  VPRecipeBase *Previous,\n                                  VPDominatorTree &VPDT) {\n+  // If Previous is a live-in (no defining recipe), it naturally dominates all\n+  // recipes in the loop, so no sinking is needed.\n+  if (!Previous)\n+    return true;\n+\n   // Collect recipes that need sinking.\n   SmallVector<VPRecipeBase *> WorkList;\n   SmallPtrSet<VPRecipeBase *, 8> Seen;\n@@ -2378,8 +2399,9 @@ bool VPlanTransforms::adjustFixedOrderRecurrences(VPlan &Plan,\n \n     // Introduce a recipe to combine the incoming and previous values of a\n     // fixed-order recurrence.\n-    VPBasicBlock *InsertBlock = Previous->getParent();\n-    if (isa<VPHeaderPHIRecipe>(Previous))\n+    VPBasicBlock *InsertBlock =\n+        Previous ? Previous->getParent() : FOR->getParent();\n+    if (!Previous || isa<VPHeaderPHIRecipe>(Previous))\n       LoopBuilder.setInsertPoint(InsertBlock, InsertBlock->getFirstNonPhi());\n     else\n       LoopBuilder.setInsertPoint(InsertBlock,\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "In some cases, LV gets simplifyable IR as input. Directly apply\r\nsimplifications on the initial VPlan0 to avoid vectorization in cases\r\nwhere the loop body can be folded away.\r\n\r\nUsing the end-to-end pipeline, this is relatively rare, but when\r\nreducing test cases, the reduction often ends up with cases with trivial\r\nfolds. Rejecting those will result in more robust & realistic test\r\ncases.\r\n\r\nAs follow-up, I also plan to add initial dead recipe removal.\r\n\r\nDepends on https://github.com/llvm/llvm-project/pull/176795.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/VPlan/icmp-uniforms.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-width=4 -force-vector-interleave=1 -debug-only=loop-vectorize -disable-output -print-after=instcombine 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "more_than_one_use",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine i32 @more_than_one_use(ptr %a, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %r = phi i32 [ %tmp3, %for.body ], [ 0, %entry ]\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  %tmp0 = select i1 %cond, i64 %i.next, i64 0\n  %tmp1 = getelementptr inbounds i32, ptr %a, i64 %tmp0\n  %tmp2 = load i32, ptr %tmp1, align 8\n  %tmp3 = add i32 %r, %tmp2\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  %tmp4 = phi i32 [ %tmp3, %for.body ]\n  ret i32 %tmp4\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/cost-conditional-branches.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -mtriple=x86_64-apple-macosx10.8.0 -mcpu=corei7-avx -S"
+      ],
+      "tests": [
+        {
+          "test_name": "cost_ashr_with_op_known_invariant_via_scev",
+          "test_body": "target triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i32 @cost_ashr_with_op_known_invariant_via_scev(i8 %a) {\nentry:\n  %cmp.i = icmp eq i16 0, 0\n  %conv.i = sext i16 0 to i32\n  %conv5.i = sext i8 %a to i32\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i8 [ 100, %entry ], [ %iv.next, %loop.latch ]\n  br i1 %cmp.i, label %then, label %else\n\nthen:                                             ; preds = %else, %loop.header\n  %p.1 = phi i32 [ %rem.i, %else ], [ 0, %loop.header ]\n  %shr.i = ashr i32 %conv5.i, %p.1\n  %tobool6.not.i = icmp eq i32 %shr.i, 0\n  %sext.i = shl i32 %p.1, 24\n  %0 = ashr exact i32 %sext.i, 24\n  %1 = select i1 %tobool6.not.i, i32 %0, i32 0\n  br label %loop.latch\n\nelse:                                             ; preds = %loop.header\n  %rem.i = urem i32 -1, %conv.i\n  %cmp3.i = icmp sgt i32 %rem.i, 1\n  br i1 %cmp3.i, label %loop.latch, label %then\n\nloop.latch:                                       ; preds = %else, %then\n  %p.2 = phi i32 [ 0, %else ], [ %1, %then ]\n  %iv.next = add i8 %iv, -1\n  %ec = icmp eq i8 %iv.next, 0\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret i32 %p.2\n}\n"
+        },
+        {
+          "test_name": "sdiv_by_zero",
+          "test_body": "target triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine void @sdiv_by_zero(ptr noalias %src, ptr noalias %dst, i32 %d) #0 {\nbb:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %bb\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 0, %bb ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i64 %iv\n  %l = load i32, ptr %gep.src, align 4\n  %icmp = icmp eq i32 %l, 0\n  br i1 %icmp, label %loop.latch, label %then\n\nthen:                                             ; preds = %loop.header\n  %sdiv = sdiv i32 %l, 0\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %then, %loop.header\n  %merge = phi i32 [ %sdiv, %then ], [ 0, %loop.header ]\n  %gep.dst = getelementptr inbounds i32, ptr %dst, i64 %iv\n  store i32 %merge, ptr %gep.dst, align 4\n  %iv.next = add i64 %iv, 1\n  %ec = icmp ult i64 %iv, 16\n  br i1 %ec, label %loop.header, label %exit\n\nexit:                                             ; preds = %loop.latch\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"znver3\" }\n"
+        },
+        {
+          "test_name": "test_predicated_udiv",
+          "test_body": "target triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i64 @test_predicated_udiv(i32 %d, i1 %c) #0 {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  br i1 %c, label %loop.latch, label %then\n\nthen:                                             ; preds = %loop.header\n  %call = tail call i32 @llvm.usub.sat.i32(i32 %iv, i32 1)\n  %udiv = udiv i32 %call, %d\n  %zext = zext i32 %udiv to i64\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %then, %loop.header\n  %merge = phi i64 [ %zext, %then ], [ 0, %loop.header ]\n  %iv.next = add i32 %iv, 1\n  %ec = icmp eq i32 %iv, 1000\n  br i1 %ec, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret i64 %merge\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.usub.sat.i32(i32, i32) #1\n\nattributes #0 = { \"target-cpu\"=\"znver3\" }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/drop-poison-generating-flags.ll",
+      "commands": [
+        "opt %s -passes=loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "recipe_without_underlying_instr_lanes_used",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-pc-linux-gnu\"\n\n@c = external global [5 x i8]\n\ndefine void @recipe_without_underlying_instr_lanes_used(i64 %n, ptr noalias %dst, ptr noalias %aux) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %inc, %loop.latch ]\n  %cmp = icmp eq i64 %iv, %n\n  br i1 %cmp, label %loop.latch, label %then\n\nthen:                                             ; preds = %loop.header\n  %rem = srem i64 3, 0\n  %add3 = add i64 %rem, -3\n  %add5 = add i64 %iv, %add3\n  %gep = getelementptr [5 x i8], ptr @c, i64 0, i64 %add5\n  %l = load i8, ptr %gep, align 1\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %then, %loop.header\n  %sr = phi i8 [ 0, %loop.header ], [ %l, %then ]\n  %p = phi i64 [ 0, %loop.header ], [ %rem, %then ]\n  store i64 %p, ptr %aux, align 8\n  %gep.dst = getelementptr i8, ptr %dst, i64 %iv\n  store i8 %sr, ptr %gep.dst, align 4\n  %inc = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %inc, 4\n  br i1 %exitcond.not, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/pr141968-instsimplifyfolder.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pr141968",
+          "test_body": "target triple = \"x86_64\"\n\ndefine void @pr141968(i1 %cond, i8 %v, ptr %p) {\nentry:\n  %zext.true = zext i1 true to i16\n  %sext = sext i8 %v to i16\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i8 [ %iv.next, %loop.latch ], [ 0, %entry ]\n  br i1 %cond, label %loop.latch, label %cond.false\n\ncond.false:                                       ; preds = %loop.header\n  %sdiv = sdiv i16 %sext, %zext.true\n  %sdiv.trunc = trunc i16 %sdiv to i8\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %cond.false, %loop.header\n  %ret = phi i8 [ %sdiv.trunc, %cond.false ], [ 0, %loop.header ]\n  store i8 %ret, ptr %p, align 1\n  %iv.next = add i8 %iv, 1\n  %exitcond = icmp eq i8 %iv.next, 0\n  br i1 %exitcond, label %exit, label %loop.header\n\nexit:                                             ; preds = %loop.latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/epilog-vectorization-reductions.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-width=4 -enable-epilogue-vectorization -epilogue-vectorization-force-VF=4 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "reduction_with_const_or",
+          "test_body": "define i1 @reduction_with_const_or(ptr %A, i8 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %or.red = phi i1 [ false, %entry ], [ %or.next, %loop ]\n  %iv = phi i8 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.ext = zext i8 %iv to i64\n  %gep = getelementptr inbounds i64, ptr %A, i64 %iv.ext\n  store i64 %iv.ext, ptr %gep, align 8\n  %or.next = or i1 %or.red, true\n  %iv.next = add i8 %iv, 1\n  %exitcond = icmp eq i8 %iv, %n\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i1 %or.next\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/pr154045-dont-fold-extractelement-livein.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=2 -force-widen-divrem-via-safe-divisor=false -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pr154045",
+          "test_body": "define void @pr154045(ptr %p, i1 %c, i64 %x) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %latch ]\n  br i1 %c, label %latch, label %else\n\nelse:                                             ; preds = %loop\n  %rem = srem i64 0, %x\n  br label %latch\n\nlatch:                                            ; preds = %else, %loop\n  %phi = phi i64 [ %rem, %else ], [ 0, %loop ]\n  %phi.trunc = trunc i64 %phi to i32\n  %shl = shl i32 %phi.trunc, 0\n  store i32 %shl, ptr %p, align 4\n  %iv.next = add i64 %iv, 1\n  %exitcond = icmp eq i64 %iv, 1\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/select-neg-cond.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "neg_cond",
+          "test_body": "define void @neg_cond(ptr noalias %p, ptr noalias %q) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %p.gep = getelementptr i32, ptr %p, i32 %iv\n  %x = load i32, ptr %p.gep, align 4\n  %q.gep = getelementptr i32, ptr %q, i32 %iv\n  %y = load i32, ptr %q.gep, align 4\n  %cmp = icmp eq i32 %x, 42\n  %not = xor i1 %cmp, true\n  %sel = select i1 %not, i32 42, i32 43\n  store i32 %sel, ptr %p.gep, align 4\n  %iv.next = add i32 %iv, 1\n  %done = icmp eq i32 %iv.next, 1024\n  br i1 %done, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189963 tests passed\n* 5063 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130786 tests passed\n* 2929 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "fhahn",
+      "body": "This has been rebased on current `main` now and shoulkd be ready for review"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `lldb-x86_64-debian` running on `lldb-x86_64-debian` while building `llvm` at step 6 \"test\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/162/builds/40963\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 6 (test) failure: build (failure)\n...\nPASS: lldb-api :: tools/lldb-dap/launch/TestDAP_launch_no_lldbinit_flag.py (485 of 3391)\nPASS: lldb-api :: lang/cpp/enum_types/TestCPP11EnumTypes.py (486 of 3391)\nPASS: lldb-api :: tools/lldb-dap/exception/TestDAP_exception.py (487 of 3391)\nPASS: lldb-api :: functionalities/breakpoint/breakpoint_on_lambda_capture/TestBreakOnLambdaCapture.py (488 of 3391)\nPASS: lldb-api :: tools/lldb-dap/launch/TestDAP_launch_basic.py (489 of 3391)\nPASS: lldb-api :: commands/log/basic/TestLogging.py (490 of 3391)\nPASS: lldb-api :: commands/expression/inline-namespace/TestInlineNamespace.py (491 of 3391)\nPASS: lldb-api :: lang/c/set_values/TestSetValues.py (492 of 3391)\nPASS: lldb-api :: tools/lldb-dap/launch/TestDAP_launch_disableSTDIO.py (493 of 3391)\nUNRESOLVED: lldb-api :: python_api/run_locker/TestRunLocker.py (494 of 3391)\n******************** TEST 'lldb-api :: python_api/run_locker/TestRunLocker.py' FAILED ********************\nScript:\n--\n/usr/bin/python3 /home/worker/2.0.1/lldb-x86_64-debian/llvm-project/lldb/test/API/dotest.py -u CXXFLAGS -u CFLAGS --env LLVM_LIBS_DIR=/home/worker/2.0.1/lldb-x86_64-debian/build/./lib --env LLVM_INCLUDE_DIR=/home/worker/2.0.1/lldb-x86_64-debian/build/include --env LLVM_TOOLS_DIR=/home/worker/2.0.1/lldb-x86_64-debian/build/./bin --arch x86_64 --build-dir /home/worker/2.0.1/lldb-x86_64-debian/build/lldb-test-build.noindex --lldb-module-cache-dir /home/worker/2.0.1/lldb-x86_64-debian/build/lldb-test-build.noindex/module-cache-lldb/lldb-api --clang-module-cache-dir /home/worker/2.0.1/lldb-x86_64-debian/build/lldb-test-build.noindex/module-cache-clang/lldb-api --executable /home/worker/2.0.1/lldb-x86_64-debian/build/./bin/lldb --compiler /home/worker/2.0.1/lldb-x86_64-debian/build/./bin/clang --dsymutil /home/worker/2.0.1/lldb-x86_64-debian/build/./bin/dsymutil --make /usr/bin/gmake --llvm-tools-dir /home/worker/2.0.1/lldb-x86_64-debian/build/./bin --lldb-obj-root /home/worker/2.0.1/lldb-x86_64-debian/build/tools/lldb --lldb-libs-dir /home/worker/2.0.1/lldb-x86_64-debian/build/./lib --cmake-build-type Release -t /home/worker/2.0.1/lldb-x86_64-debian/llvm-project/lldb/test/API/python_api/run_locker -p TestRunLocker.py\n--\nExit Code: -6\n\nCommand Output (stdout):\n--\nlldb version 23.0.0git (https://github.com/llvm/llvm-project.git revision a55fbab0cffc9b4af497b9e4f187b61143743e06)\n  clang revision a55fbab0cffc9b4af497b9e4f187b61143743e06\n  llvm revision a55fbab0cffc9b4af497b9e4f187b61143743e06\n\n--\nCommand Output (stderr):\n--\nChange dir to: /home/worker/2.0.1/lldb-x86_64-debian/llvm-project/lldb/test/API/python_api/run_locker\nrunCmd: settings clear --all\n\noutput: \n\nrunCmd: settings set symbols.enable-external-lookup false\n\noutput: \n\nrunCmd: settings set target.inherit-tcc true\n\noutput: \n\nrunCmd: settings set target.disable-aslr false\n\noutput: \n\nrunCmd: settings set target.detach-on-error false\n\noutput: \n\nrunCmd: settings set target.auto-apply-fixits false\n\n\n```\n\n</details>"
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `sanitizer-aarch64-linux-bootstrap-hwasan` running on `sanitizer-buildbot11` while building `llvm` at step 2 \"annotate\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/55/builds/24100\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 2 (annotate) failure: 'python ../sanitizer_buildbot/sanitizers/zorg/buildbot/builders/sanitizers/buildbot_selector.py' (failure)\n...\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/lld-link\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/lld-link\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/main.py:74: note: The test suite configuration requested an individual test timeout of 0 seconds but a timeout of 900 seconds was requested on the command line. Forcing timeout to be 900 seconds.\n-- Testing: 91209 tests, 72 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. 60.. 70.. 80.. 90..\nFAIL: lld :: ELF/ppc64-toc-call-to-pcrel-long-jump.s (90318 of 91209)\n******************** TEST 'lld :: ELF/ppc64-toc-call-to-pcrel-long-jump.s' FAILED ********************\nExit Code: -11\n\nCommand Output (stdout):\n--\n# RUN: at line 2\nsplit-file /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp\n# executed command: split-file /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp\n# note: command had no output on stdout or stderr\n# RUN: at line 4\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64le /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64le /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# note: command had no output on stdout or stderr\n# RUN: at line 5\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# .---command stderr------------\n# | ld.lld: warning: cannot find entry symbol _start; not setting start address\n# `-----------------------------\n# RUN: at line 6\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-objdump --no-show-raw-insn -d /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le | /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-objdump --no-show-raw-insn -d /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s\n# note: command had no output on stdout or stderr\n# RUN: at line 7\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-readelf -s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le | /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s --check-prefix=SYM\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-readelf -s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s --check-prefix=SYM\n# note: command had no output on stdout or stderr\n# RUN: at line 9\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64 /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64 /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# note: command had no output on stdout or stderr\n# RUN: at line 10\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_be\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_be\nStep 14 (stage3/hwasan check) failure: stage3/hwasan check (failure)\n...\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/lld-link\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/lld-link\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/llvm/utils/lit/lit/main.py:74: note: The test suite configuration requested an individual test timeout of 0 seconds but a timeout of 900 seconds was requested on the command line. Forcing timeout to be 900 seconds.\n-- Testing: 91209 tests, 72 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. 60.. 70.. 80.. 90..\nFAIL: lld :: ELF/ppc64-toc-call-to-pcrel-long-jump.s (90318 of 91209)\n******************** TEST 'lld :: ELF/ppc64-toc-call-to-pcrel-long-jump.s' FAILED ********************\nExit Code: -11\n\nCommand Output (stdout):\n--\n# RUN: at line 2\nsplit-file /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp\n# executed command: split-file /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp\n# note: command had no output on stdout or stderr\n# RUN: at line 4\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64le /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64le /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# note: command had no output on stdout or stderr\n# RUN: at line 5\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# .---command stderr------------\n# | ld.lld: warning: cannot find entry symbol _start; not setting start address\n# `-----------------------------\n# RUN: at line 6\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-objdump --no-show-raw-insn -d /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le | /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-objdump --no-show-raw-insn -d /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s\n# note: command had no output on stdout or stderr\n# RUN: at line 7\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-readelf -s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le | /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s --check-prefix=SYM\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-readelf -s /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_le\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/FileCheck /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm-project/lld/test/ELF/ppc64-toc-call-to-pcrel-long-jump.s --check-prefix=SYM\n# note: command had no output on stdout or stderr\n# RUN: at line 9\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64 /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/llvm-mc -filetype=obj -triple=powerpc64 /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/asm -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o\n# note: command had no output on stdout or stderr\n# RUN: at line 10\n/home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_be\n# executed command: /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/bin/ld.lld -T /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp/lts /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp.o -o /home/b/sanitizer-aarch64-linux-bootstrap-hwasan/build/llvm_build2_hwasan/tools/lld/test/ELF/Output/ppc64-toc-call-to-pcrel-long-jump.s.tmp_be\n\n```\n\n</details>"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-19T21:58:33Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        8134,
+        8139
+      ],
+      [
+        8463,
+        8469
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      [
+        131,
+        137
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        1220,
+        1225
+      ],
+      [
+        1227,
+        1234
+      ],
+      [
+        1304,
+        1310
+      ],
+      [
+        1322,
+        1328
+      ],
+      [
+        1344,
+        1350
+      ],
+      [
+        1354,
+        1361
+      ],
+      [
+        1426,
+        1432
+      ],
+      [
+        2202,
+        2207
+      ],
+      [
+        2378,
+        2385
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/VPlan/icmp-uniforms.ll": [
+      [
+        31,
+        38
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/cost-conditional-branches.ll": [
+      [
+        686,
+        938
+      ],
+      [
+        950,
+        958
+      ],
+      [
+        1078,
+        1084
+      ],
+      [
+        1098,
+        1104
+      ],
+      [
+        1435,
+        1448
+      ],
+      [
+        1531,
+        1537
+      ],
+      [
+        1552,
+        1558
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/drop-poison-generating-flags.ll": [
+      [
+        747,
+        755
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/pr141968-instsimplifyfolder.ll": [
+      [
+        6,
+        109
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/epilog-vectorization-reductions.ll": [
+      [
+        696,
+        702
+      ],
+      [
+        725,
+        731
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/pr154045-dont-fold-extractelement-livein.ll": [
+      [
+        10,
+        30
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/select-neg-cond.ll": [
+      [
+        12,
+        19
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationPlanner::addReductionResultComputation",
+      "LoopVectorizationPlanner::buildVPlansWithVPRecipes"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      "VPTypeAnalysis::inferScalarTypeForRecipe"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "VPlanTransforms::adjustFixedOrderRecurrences",
+      "simplifyRecipe",
+      "sinkRecurrenceUsersAfterPrevious"
+    ],
+    "llvm/test/Transforms/LoopVectorize/epilog-vectorization-reductions.ll": [
+      "fp_reduction_max"
+    ]
+  }
+}

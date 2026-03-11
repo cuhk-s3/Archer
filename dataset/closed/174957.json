@@ -1,0 +1,105 @@
+{
+  "pr_id": 174957,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174957",
+  "state": "closed",
+  "title": "ValueTracking: Refactor computeKnownFPClass select handling",
+  "author": "arsenm",
+  "base_commit": "769dbe369a549319e0b7c14585fbc3dd71468175",
+  "fix_commit": "6d357123a910173ed2fb79a67d515de3881918f8",
+  "patch": "diff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex b730a36488780..2ce49c558b241 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -116,6 +116,13 @@ LLVM_ABI void adjustKnownBitsForSelectArm(KnownBits &Known, Value *Cond,\n                                           const SimplifyQuery &Q,\n                                           unsigned Depth = 0);\n \n+/// Adjust \\p Known for the given select \\p Arm to include information from the\n+/// select \\p Cond.\n+LLVM_ABI void adjustKnownFPClassForSelectArm(KnownFPClass &Known, Value *Cond,\n+                                             Value *Arm, bool Invert,\n+                                             const SimplifyQuery &Q,\n+                                             unsigned Depth = 0);\n+\n /// Return true if LHS and RHS have no common bits set.\n LLVM_ABI bool haveNoCommonBitsSet(const WithCache<const Value *> &LHSCache,\n                                   const WithCache<const Value *> &RHSCache,\n@@ -231,6 +238,10 @@ LLVM_ABI Intrinsic::ID getIntrinsicForCallSite(const CallBase &CB,\n LLVM_ABI bool isSignBitCheck(ICmpInst::Predicate Pred, const APInt &RHS,\n                              bool &TrueIfSigned);\n \n+LLVM_ABI KnownFPClass analyzeKnownFPClassFromSelect(\n+    const Instruction *I, const KnownFPClass &KnownLHS,\n+    const KnownFPClass &KnownRHS, const SimplifyQuery &SQ, unsigned Depth = 0);\n+\n /// Determine which floating-point classes are valid for \\p V, and return them\n /// in KnownFPClass bit sets.\n ///\ndiff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex a3a485a961877..d140b4712c180 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -29,7 +29,8 @@ struct KnownFPClass {\n   /// definitely set or false if the sign bit is definitely unset.\n   std::optional<bool> SignBit;\n \n-  KnownFPClass() = default;\n+  KnownFPClass(FPClassTest Known = fcAllFlags, std::optional<bool> Sign = {})\n+      : KnownFPClasses(Known), SignBit(Sign) {}\n   KnownFPClass(const APFloat &C);\n \n   bool operator==(KnownFPClass Other) const {\n@@ -135,6 +136,11 @@ struct KnownFPClass {\n     return isKnownNever(fcPositive) && isKnownNeverLogicalNegZero(Mode);\n   }\n \n+  KnownFPClass intersectWith(const KnownFPClass &RHS) {\n+    return KnownFPClass(~(~KnownFPClasses & ~RHS.KnownFPClasses),\n+                        SignBit == RHS.SignBit ? SignBit : std::nullopt);\n+  }\n+\n   KnownFPClass &operator|=(const KnownFPClass &RHS) {\n     KnownFPClasses = KnownFPClasses | RHS.KnownFPClasses;\n \ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 77bb3be7bdb72..43f514b4b735d 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -4868,6 +4868,17 @@ static KnownFPClass computeKnownFPClassFromContext(const Value *V,\n   return KnownFromContext;\n }\n \n+void llvm::adjustKnownFPClassForSelectArm(KnownFPClass &Known, Value *Cond,\n+                                          Value *Arm, bool Invert,\n+                                          const SimplifyQuery &SQ,\n+                                          unsigned Depth) {\n+  computeKnownFPClassFromCond(Arm, Cond,\n+                              /*CondIsTrue=*/!Invert, SQ.CxtI, Known,\n+                              Depth + 1);\n+  // TODO: Do we need to check isGuaranteedNotToBeUndef, like the KnownBits\n+  // case?\n+}\n+\n void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n                          FPClassTest InterestedClasses, KnownFPClass &Known,\n                          const SimplifyQuery &Q, unsigned Depth);\n@@ -5040,55 +5051,18 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n     break;\n   }\n   case Instruction::Select: {\n-    Value *Cond = Op->getOperand(0);\n-    Value *LHS = Op->getOperand(1);\n-    Value *RHS = Op->getOperand(2);\n-\n-    FPClassTest FilterLHS = fcAllFlags;\n-    FPClassTest FilterRHS = fcAllFlags;\n-\n-    Value *TestedValue = nullptr;\n-    FPClassTest MaskIfTrue = fcAllFlags;\n-    FPClassTest MaskIfFalse = fcAllFlags;\n-    uint64_t ClassVal = 0;\n-    const Function *F = cast<Instruction>(Op)->getFunction();\n-    CmpPredicate Pred;\n-    Value *CmpLHS, *CmpRHS;\n-    if (F && match(Cond, m_FCmp(Pred, m_Value(CmpLHS), m_Value(CmpRHS)))) {\n-      // If the select filters out a value based on the class, it no longer\n-      // participates in the class of the result\n-\n-      // TODO: In some degenerate cases we can infer something if we try again\n-      // without looking through sign operations.\n-      bool LookThroughFAbsFNeg = CmpLHS != LHS && CmpLHS != RHS;\n-      std::tie(TestedValue, MaskIfTrue, MaskIfFalse) =\n-          fcmpImpliesClass(Pred, *F, CmpLHS, CmpRHS, LookThroughFAbsFNeg);\n-    } else if (match(Cond,\n-                     m_Intrinsic<Intrinsic::is_fpclass>(\n-                         m_Value(TestedValue), m_ConstantInt(ClassVal)))) {\n-      FPClassTest TestedMask = static_cast<FPClassTest>(ClassVal);\n-      MaskIfTrue = TestedMask;\n-      MaskIfFalse = ~TestedMask;\n-    }\n-\n-    if (TestedValue == LHS) {\n-      // match !isnan(x) ? x : y\n-      FilterLHS = MaskIfTrue;\n-    } else if (TestedValue == RHS) { // && IsExactClass\n-      // match !isnan(x) ? y : x\n-      FilterRHS = MaskIfFalse;\n-    }\n-\n-    KnownFPClass Known2;\n-    computeKnownFPClass(LHS, DemandedElts, InterestedClasses & FilterLHS, Known,\n-                        Q, Depth + 1);\n-    Known.KnownFPClasses &= FilterLHS;\n-\n-    computeKnownFPClass(RHS, DemandedElts, InterestedClasses & FilterRHS,\n-                        Known2, Q, Depth + 1);\n-    Known2.KnownFPClasses &= FilterRHS;\n-\n-    Known |= Known2;\n+    auto ComputeForArm = [&](Value *Arm, bool Invert) {\n+      KnownFPClass Res;\n+      computeKnownFPClass(Arm, DemandedElts, InterestedClasses, Res, Q,\n+                          Depth + 1);\n+      adjustKnownFPClassForSelectArm(Res, Op->getOperand(0), Arm, Invert, Q,\n+                                     Depth);\n+      return Res;\n+    };\n+    // Only known if known in both the LHS and RHS.\n+    Known =\n+        ComputeForArm(Op->getOperand(1), /*Invert=*/false)\n+            .intersectWith(ComputeForArm(Op->getOperand(2), /*Invert=*/true));\n     break;\n   }\n   case Instruction::Call: {\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "Match the structure of ComputeKnownBits. Expose the condition\nhandling as a utility function so SimplifyDemanedFPClass can make\nuse of this. Avoids some redundant code and improves accuracy in\nat least one case.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass-select.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "clamp_inf_to_fabs",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_inf_to_fabs(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.inf = fcmp oeq float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.inf, float %fabs, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "not_clamp_inf_to_fabs",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @not_clamp_inf_to_fabs(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.inf = fcmp oeq float %fabs, 0x7FF0000000000000\n  %select = select i1 %is.inf, float %arg, float %fabs\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "clamp_only_denormal_or_zero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @clamp_only_denormal_or_zero(float %arg) {\n  %fabs = call float @llvm.fabs.f32(float %arg)\n  %is.denorm.or.zero = fcmp olt float %fabs, 0x3810000000000000\n  %select = select i1 %is.denorm.or.zero, float %arg, float 0.000000e+00\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#174958** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174958?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174957** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174957?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174957?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-08T12:05:07Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Analysis/ValueTracking.h": [
+      [
+        116,
+        121
+      ],
+      [
+        231,
+        236
+      ]
+    ],
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        29,
+        35
+      ],
+      [
+        135,
+        140
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        4868,
+        4873
+      ],
+      [
+        5040,
+        5094
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass-select.ll": [
+      [
+        265,
+        271
+      ],
+      [
+        279,
+        285
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "KnownFPClass",
+      "cannotBeOrderedGreaterEqZero",
+      "operator==",
+      "operator|="
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClassFromContext"
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass-select.ll": [
+      "not_clamp_inf_to_fabs"
+    ]
+  }
+}

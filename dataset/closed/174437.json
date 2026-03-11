@@ -1,0 +1,97 @@
+{
+  "pr_id": 174437,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174437",
+  "state": "closed",
+  "title": "[SCEV] Sink SCEVPtrToAddr to leaf SCEVUnknowns.",
+  "author": "fhahn",
+  "base_commit": "c9e0cf139cc93f2f531900b401bf7b8cd51468fb",
+  "fix_commit": "6bbc54151846fc8ab15bb6a3cac96d20adf8c072",
+  "patch": "diff --git a/llvm/lib/Analysis/ScalarEvolution.cpp b/llvm/lib/Analysis/ScalarEvolution.cpp\nindex f1da1afee0b82..0603b9feaa860 100644\n--- a/llvm/lib/Analysis/ScalarEvolution.cpp\n+++ b/llvm/lib/Analysis/ScalarEvolution.cpp\n@@ -1129,34 +1129,27 @@ const SCEV *ScalarEvolution::getPtrToAddrExpr(const SCEV *Op) {\n   assert(Op->getType()->isPointerTy() && \"Op must be a pointer\");\n   Type *Ty = DL.getAddressType(Op->getType());\n \n-  FoldingSetNodeID ID;\n-  ID.AddInteger(scPtrToAddr);\n-  ID.AddPointer(Op);\n-\n-  void *IP = nullptr;\n-\n-  // Is there already an expression for such a cast?\n-  if (const SCEV *S = UniqueSCEVs.FindNodeOrInsertPos(ID, IP))\n-    return S;\n-\n-  // If not, is this expression something we can't reduce any further?\n-  if (auto *U = dyn_cast<SCEVUnknown>(Op)) {\n-    // Perform some basic constant folding. If the operand of the ptr2addr cast\n-    // is a null pointer, don't create a ptr2addr SCEV expression (that will be\n-    // left as-is), but produce a zero constant.\n-    // NOTE: We could handle a more general case, but lack motivational cases.\n-    if (isa<ConstantPointerNull>(U->getValue()))\n-      return getZero(Ty);\n-  }\n-\n-  // Create an explicit cast node.\n-  // We can reuse the existing insert position since if we get here,\n-  // we won't have made any changes which would invalidate it.\n-  SCEV *S =\n-      new (SCEVAllocator) SCEVPtrToAddrExpr(ID.Intern(SCEVAllocator), Op, Ty);\n-  UniqueSCEVs.InsertNode(S, IP);\n-  registerUser(S, Op);\n-  return S;\n+  // Use the rewriter to sink the cast down to SCEVUnknown leaves.\n+  // The rewriter handles null pointer constant folding.\n+  const SCEV *IntOp = SCEVCastSinkingRewriter::rewrite(\n+      Op, *this, Ty, [this, Ty](const SCEVUnknown *U) {\n+        FoldingSetNodeID ID;\n+        ID.AddInteger(scPtrToAddr);\n+        ID.AddPointer(U);\n+        ID.AddPointer(Ty);\n+        void *IP = nullptr;\n+        if (const SCEV *S = UniqueSCEVs.FindNodeOrInsertPos(ID, IP))\n+          return S;\n+        SCEV *S = new (SCEVAllocator)\n+            SCEVPtrToAddrExpr(ID.Intern(SCEVAllocator), U, Ty);\n+        UniqueSCEVs.InsertNode(S, IP);\n+        registerUser(S, U);\n+        return static_cast<const SCEV *>(S);\n+      });\n+  assert(IntOp->getType()->isIntegerTy() &&\n+         \"We must have succeeded in sinking the cast, \"\n+         \"and ending up with an integer-typed expression!\");\n+  return IntOp;\n }\n \n const SCEV *ScalarEvolution::getPtrToIntExpr(const SCEV *Op, Type *Ty) {\n",
+  "components": [
+    "ScalarEvolution"
+  ],
+  "description": "Use CastSinkingRewriter for SCEVPtrToAddr expressions as well, sinking\r\nthem the same as SCEVPtrToInt expressions.\r\n\r\nDepends on https://github.com/llvm/llvm-project/pull/174435 (included in PR)\r\nand https://github.com/llvm/llvm-project/pull/158032 (included in PR)",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/ScalarEvolution/ptrtoaddr-i32-index-width.ll",
+      "commands": [
+        "opt -passes='print<scalar-evolution>' -disable-output %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ntarget datalayout=\"p:64:64:64:32\"\n\ndefine void @ptrtoaddr(ptr %in, ptr %out0) {\n;\n  %p0 = ptrtoaddr ptr %in to i32\n  store i32  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_as1(ptr addrspace(1) %in, ptr %out0) {\n;\n  %p0 = ptrtoaddr ptr addrspace(1) %in to i32\n  store i32  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_bitcast(ptr %in, ptr %out0) {\n;\n  %in_casted = bitcast ptr %in to ptr\n  %p0 = ptrtoaddr ptr %in_casted to i32\n  store i32 %p0, ptr %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_nullptr(ptr %out0) {\n;\n  %p0 = ptrtoaddr ptr null to i32\n  store i32 %p0, ptr %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_gep(ptr %in, ptr %out0) {\n;\n  %in_adj = getelementptr inbounds i8, ptr %in, i64 42\n  %p0 = ptrtoaddr ptr %in_adj to i32\n  store i32  %p0, ptr  %out0\n  ret void\n}"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Analysis/ScalarEvolution/ptrtoaddr.ll",
+      "commands": [
+        "opt -passes='print<scalar-evolution>' -disable-output %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ntarget datalayout=\"p64:64:64:64\"\n\ndefine void @ptrtoaddr(ptr %in, ptr %out0, ptr %out1, ptr %out2, ptr %out3) {\n;\n  %p0 = ptrtoaddr ptr %in to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_as1(ptr addrspace(1) %in, ptr %out0, ptr %out1, ptr %out2, ptr %out3) {\n;\n  %p0 = ptrtoaddr ptr addrspace(1) %in to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_bitcast(ptr %in, ptr %out0) {\n;\n  %in_casted = bitcast ptr %in to ptr\n  %p0 = ptrtoaddr ptr %in_casted to i64\n  store i64 %p0, ptr %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_nullptr(ptr %out0) {\n;\n  %p0 = ptrtoaddr ptr null to i64\n  store i64 %p0, ptr %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_gep(ptr %in, ptr %out0) {\n;\n  %in_adj = getelementptr inbounds i8, ptr %in, i64 42\n  %p0 = ptrtoaddr ptr %in_adj to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}\n\ndefine void @ptrtoaddr_of_gep_with_unknown_int(ptr %in, ptr %out0, ptr %offset) {\n;\n  %l = load i64, ptr %offset\n  %in_adj = getelementptr inbounds i8, ptr %in, i64 %l\n  %p0 = ptrtoaddr ptr %in_adj to i64\n  store i64  %p0, ptr  %out0\n  ret void\n}"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 188576 tests passed\n* 5009 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 129549 tests passed\n* 2866 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "nikic",
+      "body": "Reverse ping"
+    },
+    {
+      "author": "fhahn",
+      "body": "planning on sharing a set of patches to use PtrToAddr more widely in SCEV in the next few days"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-05T16:46:09Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ScalarEvolution.cpp": [
+      [
+        1129,
+        1162
+      ]
+    ],
+    "llvm/test/Analysis/ScalarEvolution/ptrtoaddr-i32-index-width.ll": [
+      [
+        60,
+        66
+      ]
+    ],
+    "llvm/test/Analysis/ScalarEvolution/ptrtoaddr.ll": [
+      [
+        60,
+        66
+      ],
+      [
+        68,
+        70
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ScalarEvolution.cpp": [
+      "ScalarEvolution::getPtrToAddrExpr",
+      "ScalarEvolution::getPtrToIntExpr"
+    ]
+  }
+}

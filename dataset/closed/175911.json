@@ -1,0 +1,110 @@
+{
+  "pr_id": 175911,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175911",
+  "state": "closed",
+  "title": "[DSE][Verifier] Respect the calling convention of the function specified by \"alloc-variant-zeroed\"",
+  "author": "chenzhuoyu",
+  "base_commit": "94913cf1506587343dd9aeeb036555b0fd54195a",
+  "fix_commit": "220e9e4d8e1e06e37c9c649a03620d462bc3bdb5",
+  "patch": "diff --git a/llvm/lib/IR/Verifier.cpp b/llvm/lib/IR/Verifier.cpp\nindex bb552861130d2..28b63c22770ac 100644\n--- a/llvm/lib/IR/Verifier.cpp\n+++ b/llvm/lib/IR/Verifier.cpp\n@@ -2535,6 +2535,11 @@ void Verifier::verifyFunctionAttrs(FunctionType *FT, AttributeList Attrs,\n       Check(FT == Variant->getFunctionType(),\n             \"'alloc-variant-zeroed' must name a function with the same \"\n             \"signature\");\n+\n+      if (const Function *F = dyn_cast<Function>(V))\n+        Check(F->getCallingConv() == Variant->getCallingConv(),\n+              \"'alloc-variant-zeroed' must name a function with the same \"\n+              \"calling convention\");\n     }\n   }\n \ndiff --git a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\nindex 4ac1321860f66..1feb474d1ed1b 100644\n--- a/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp\n@@ -2079,9 +2079,13 @@ struct DSEState {\n               .removeFnAttribute(Ctx, \"alloc-variant-zeroed\");\n       FunctionCallee ZeroedVariant = Malloc->getModule()->getOrInsertFunction(\n           ZeroedVariantName, InnerCallee->getFunctionType(), Attrs);\n+      cast<Function>(ZeroedVariant.getCallee())\n+          ->setCallingConv(Malloc->getCallingConv());\n       SmallVector<Value *, 3> Args;\n       Args.append(Malloc->arg_begin(), Malloc->arg_end());\n-      Calloc = IRB.CreateCall(ZeroedVariant, Args, ZeroedVariantName);\n+      CallInst *CI = IRB.CreateCall(ZeroedVariant, Args, ZeroedVariantName);\n+      CI->setCallingConv(Malloc->getCallingConv());\n+      Calloc = CI;\n     } else {\n       Type *SizeTTy = Malloc->getArgOperand(0)->getType();\n       Calloc =\n",
+  "components": [
+    "DeadStoreElimination",
+    "IR"
+  ],
+  "description": "Say we are using custom allocators with custom calling convension (`cc99` in this example):\r\n\r\n```llvm\r\ndeclare cc99 noalias noundef ptr @alloc(i64 noundef, i64 allocalign noundef) unnamed_addr #1\r\ndeclare cc99 noalias noundef ptr @alloc_zeroed(i64 noundef, i64 allocalign noundef) unnamed_addr #2\r\ndeclare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #3\r\n\r\nattributes #1 = { nounwind nonlazybind allockind(\"alloc,uninitialized,aligned\") allocsize(0) uwtable \"alloc-family\"=\"zalloc\" \"alloc-variant-zeroed\"=\"alloc_zeroed\" }\r\nattributes #2 = { nounwind nonlazybind allockind(\"alloc,zeroed,aligned\") allocsize(0) uwtable \"alloc-family\"=\"zalloc\" }\r\nattributes #3 = { nocallback nofree nounwind willreturn memory(argmem: write) }\r\n\r\ndefine cc99 ptr @foo() {\r\n  %1 = call cc99 ptr @alloc(i64 24, i64 8)\r\n  call void @llvm.memset.p0.i64(ptr align 8 %1, i8 0, i64 24, i1 false)\r\n  ret ptr %1\r\n}\r\n```\r\n\r\nCurrently `opt -O3` gives:\r\n\r\n```llvm\r\n; ModuleID = 'zalloc.ll'\r\nsource_filename = \"zalloc.ll\"\r\n\r\n; Function Attrs: nounwind\r\ndefine cc99 noalias noundef ptr @foo() local_unnamed_addr #0 {\r\n  %alloc_zeroed = tail call align 8 dereferenceable_or_null(24) ptr @alloc_zeroed(i64 24, i64 8)\r\n  ret ptr %alloc_zeroed\r\n}\r\n\r\n; Function Attrs: nounwind nonlazybind allockind(\"alloc,zeroed,aligned\") allocsize(0) uwtable\r\ndeclare noalias noundef ptr @alloc_zeroed(i64 noundef, i64 allocalign noundef) local_unnamed_addr #1\r\n\r\nattributes #0 = { nounwind }\r\nattributes #1 = { nounwind nonlazybind allockind(\"alloc,zeroed,aligned\") allocsize(0) uwtable \"alloc-family\"=\"zalloc\" }\r\n```\r\n\r\nWhile the expected output should be:\r\n\r\n```llvm\r\n; ModuleID = 'zalloc.ll'\r\nsource_filename = \"zalloc.ll\"\r\n\r\n; Function Attrs: nounwind nonlazybind allockind(\"alloc,zeroed,aligned\") allocsize(0) uwtable\r\ndeclare cc99 noalias noundef ptr @alloc_zeroed(i64 noundef, i64 allocalign noundef) unnamed_addr #0\r\n;       ^^^^\r\n\r\n; Function Attrs: nounwind\r\ndefine cc99 noalias noundef ptr @foo() local_unnamed_addr #1 {\r\n  %alloc_zeroed = tail call cc99 align 8 dereferenceable_or_null(24) ptr @alloc_zeroed(i64 24, i64 8)\r\n  ;                         ^^^^\r\n  ret ptr %alloc_zeroed\r\n}\r\n\r\nattributes #0 = { nounwind nonlazybind allockind(\"alloc,zeroed,aligned\") allocsize(0) uwtable \"alloc-family\"=\"zalloc\" }\r\nattributes #1 = { nounwind }\r\n```\r\n\r\nWe can notice that the `tail call` is missing calling conventions, which may lead to invalid code generation.\r\n\r\nThis PR should fix this issue.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/DeadStoreElimination/noop-stores.ll",
+      "commands": [
+        "opt < %s -aa-pipeline=basic-aa -passes='dse,verify<memoryssa>' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "calloc",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndeclare noalias ptr @malloc(i64)\n\n; Function Attrs: memory(inaccessiblemem: readwrite)\ndefine ptr @calloc(i64 %nmemb, i64 %size) #1 {\nentry:\n  %mul = mul i64 %size, %nmemb\n  %call = tail call noalias align 16 ptr @malloc(i64 %mul)\n  %tobool.not = icmp eq ptr %call, null\n  br i1 %tobool.not, label %if.end, label %if.then\n\nif.then:                                          ; preds = %entry\n  tail call void @llvm.memset.p0.i64(ptr nonnull align 16 %call, i8 0, i64 %mul, i1 false)\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret ptr %call\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "customalloc_memset",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndefine ptr @customalloc_memset(i64 %size, i64 %align) {\n  %call = call ptr @customalloc(i64 %size, i64 %align)\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %size, i1 false)\n  ret ptr %call\n}\n\n; Function Attrs: allockind(\"alloc\")\ndeclare ptr @customalloc(i64, i64) #1\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { allockind(\"alloc\") \"alloc-family\"=\"customalloc\" \"alloc-variant-zeroed\"=\"customalloc_zeroed\" }\n"
+        },
+        {
+          "test_name": "customalloc_memset_custom_cc",
+          "test_body": "target datalayout = \"E-p:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128\"\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #0\n\ndefine cc99 ptr @customalloc_memset_custom_cc(i64 %size, i64 %align) {\n  %call = call cc99 ptr @customalloc_custom_cc(i64 %size, i64 %align)\n  call void @llvm.memset.p0.i64(ptr %call, i8 0, i64 %size, i1 false)\n  ret ptr %call\n}\n\n; Function Attrs: allockind(\"alloc\")\ndeclare cc99 ptr @customalloc_custom_cc(i64, i64) #1\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: write) }\nattributes #1 = { allockind(\"alloc\") \"alloc-family\"=\"customalloc_custom_cc\" \"alloc-variant-zeroed\"=\"customalloc_zeroed_custom_cc\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Verifier/alloc-variant-zeroed.ll",
+      "commands": [
+        "not llvm-as %s -o /dev/null 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "\ndeclare ptr @a(i64) \"alloc-variant-zeroed\"=\"\"\n\ndeclare ptr @b(i64) \"alloc-variant-zeroed\"=\"\"\n\ndeclare ptr @c(i64) \"alloc-variant-zeroed\"=\"c_zeroed\" \"alloc-family\"=\"C\"\ndeclare ptr @c_zeroed(i64)\n\ndeclare ptr @d(i64) \"alloc-variant-zeroed\"=\"d_zeroed\" \"alloc-family\"=\"D\"\ndeclare ptr @d_zeroed(i64) \"alloc-family\"=\"D\"\n\ndeclare ptr @e(i64) \"alloc-variant-zeroed\"=\"e_zeroed\" \"alloc-family\"=\"E\"\ndeclare ptr @e_zeroed(i64, i64) \"alloc-family\"=\"E\" allockind(\"zeroed\")\n\ndeclare cc99 ptr @f(i64) \"alloc-variant-zeroed\"=\"f_zeroed\" \"alloc-family\"=\"F\"\ndeclare cc100 ptr @f_zeroed(i64) \"alloc-family\"=\"F\" allockind(\"zeroed\")"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "chenzhuoyu",
+      "body": "@nikic I reverted changes in GlobalOpt, and modified Verifier to ensure they have the same calling convention."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "chenzhuoyu",
+      "body": "@nikic Ping"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM BUILDBOT INFORMATION COMMENT-->\n\n@chenzhuoyu Congratulations on having your first Pull Request (PR) merged into the LLVM Project!\n\nYour changes will be combined with recent changes from other authors, then tested by our [build bots](https://lab.llvm.org/buildbot/). If there is a problem with a build, you may receive a report in an email or a comment on this PR.\n\nPlease check whether problems have been caused by your change specifically, as the builds can include changes from many authors. It is not uncommon for your change to be included in a build that fails due to someone else's changes, or infrastructure issues.\n\nHow to do this, and the rest of the post-merge process, is covered in detail [here](https://llvm.org/docs/MyFirstTypoFix.html#myfirsttypofix-issues-after-landing-your-pr).\n\nIf your change does cause a problem, it may be reverted, or you can revert it yourself. This is a normal part of [LLVM development](https://llvm.org/docs/DeveloperPolicy.html#patch-reversion-policy). You can fix your changes and open a new PR to merge them again.\n\nIf you don't get any reports, no action is required from you. Your changes are working as expected, well done!\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-14T09:58:50Z",
+  "patch_location_lineno": {
+    "llvm/lib/IR/Verifier.cpp": [
+      [
+        2535,
+        2540
+      ]
+    ],
+    "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+      [
+        2079,
+        2087
+      ]
+    ],
+    "llvm/test/Transforms/DeadStoreElimination/noop-stores.ll": [
+      [
+        387,
+        392
+      ]
+    ],
+    "llvm/test/Verifier/alloc-variant-zeroed.ll": [
+      [
+        17,
+        19
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/IR/Verifier.cpp": [
+      "Verifier::verifyFunctionAttrs"
+    ],
+    "llvm/lib/Transforms/Scalar/DeadStoreElimination.cpp": [
+      "tryFoldIntoCalloc"
+    ]
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "pr_id": 176359,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176359",
+  "state": "closed",
+  "title": "InstCombine: Improve single use fabs SimplifyDemandedFPClass handling",
+  "author": "arsenm",
+  "base_commit": "9a2d3ab6adc41d47f96651c07cf1ce543ad1b063",
+  "fix_commit": "7ec2aec1aacd4f9636b62e0356a4e18c399826e0",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 67123cbf13f7d..260a57376c378 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2033,6 +2033,30 @@ static Constant *getFPClassConstant(Type *Ty, FPClassTest Mask,\n   }\n }\n \n+/// Perform multiple-use aware simplfications for fabs(\\p Src). Returns a\n+/// replacement value if it's simplified, otherwise nullptr. Updates \\p Known\n+/// with the known fpclass if not simplified.\n+static Value *simplifyDemandedFPClassFabs(KnownFPClass &Known, Value *Src,\n+                                          FPClassTest DemandedMask,\n+                                          KnownFPClass KnownSrc, bool NSZ) {\n+  if ((DemandedMask & fcNan) == fcNone)\n+    KnownSrc.knownNot(fcNan);\n+  if ((DemandedMask & fcInf) == fcNone)\n+    KnownSrc.knownNot(fcInf);\n+\n+  if (KnownSrc.SignBit == false ||\n+      ((DemandedMask & fcNan) == fcNone && KnownSrc.isKnownNever(fcNegative)))\n+    return Src;\n+\n+  // If the only sign bit difference is due to -0, ignore it with nsz\n+  if (NSZ &&\n+      KnownSrc.isKnownNever(KnownFPClass::OrderedLessThanZeroMask | fcNan))\n+    return Src;\n+\n+  Known = KnownFPClass::fabs(KnownSrc);\n+  return nullptr;\n+}\n+\n static Value *\n simplifyDemandedFPClassMinMax(KnownFPClass &Known, Intrinsic::ID IID,\n                               const CallInst *CI, FPClassTest DemandedMask,\n@@ -2469,17 +2493,18 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n     CallInst *CI = cast<CallInst>(I);\n     const Intrinsic::ID IID = CI->getIntrinsicID();\n     switch (IID) {\n-    case Intrinsic::fabs:\n-      if (SimplifyDemandedFPClass(I, 0, llvm::inverse_fabs(DemandedMask), Known,\n-                                  Depth + 1))\n+    case Intrinsic::fabs: {\n+      KnownFPClass KnownSrc;\n+      if (SimplifyDemandedFPClass(I, 0, llvm::inverse_fabs(DemandedMask),\n+                                  KnownSrc, Depth + 1))\n         return I;\n \n-      if (Known.SignBit == false ||\n-          ((DemandedMask & fcNan) == fcNone && Known.isKnownNever(fcNegative)))\n-        return CI->getArgOperand(0);\n-\n-      Known.fabs();\n+      if (Value *Simplified = simplifyDemandedFPClassFabs(\n+              Known, CI->getArgOperand(0), DemandedMask, KnownSrc,\n+              FMF.noSignedZeros()))\n+        return Simplified;\n       break;\n+    }\n     case Intrinsic::arithmetic_fence:\n       if (SimplifyDemandedFPClass(I, 0, DemandedMask, Known, Depth + 1))\n         return I;\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "SimplifyDemandedFPClass's handling of fabs recently became smarter in\nthe multiple use case than single. Unify these so the single use case\nis equally as smart. This includes propagating ninf / nnan context into\nthe instruction, and accounting for nsz if the only bit difference is\nfor zero.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fabs_nsz_src_known_positive_except_negzero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fabs_nsz_src_known_positive_except_negzero(float nofpclass(nan ninf nsub nnorm) %always.positive.or.nzero) {\n  %fabs = call nsz float @llvm.fabs.f32(float %always.positive.or.nzero)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fneg_fabs_nsz_src_known_negative_or_poszero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fneg_fabs_nsz_src_known_negative_or_poszero(float nofpclass(nan pinf psub pnorm) %always.negative.or.pzero) {\n  %fabs = call nsz float @llvm.fabs.f32(float %always.negative.or.pzero)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fneg_nsz_fabs_src_known_negative_or_poszero_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fneg_nsz_fabs_src_known_negative_or_poszero_multiple_uses(float nofpclass(nan pinf psub pnorm) %always.negative.or.pzero, ptr %ptr) {\n  %fabs = call float @llvm.fabs.f32(float %always.negative.or.pzero)\n  %fneg.fabs = fneg nsz float %fabs\n  store float %fneg.fabs, ptr %ptr, align 4\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fabs_nsz_src_known_positive_except_negzero_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fabs_nsz_src_known_positive_except_negzero_multiple_uses(float nofpclass(nan ninf nsub nnorm) %always.positive.or.nzero, ptr %ptr) {\n  %fabs = call nsz float @llvm.fabs.f32(float %always.positive.or.nzero)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fneg_fabs_nsz_src_known_negative_or_poszero_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fneg_fabs_nsz_src_known_negative_or_poszero_multiple_uses(float nofpclass(nan pinf psub pnorm) %always.negative.or.pzero, ptr %ptr) {\n  %fabs = call nsz float @llvm.fabs.f32(float %always.negative.or.pzero)\n  %fneg.fabs = fneg float %fabs\n  store float %fneg.fabs, ptr %ptr, align 4\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fneg_nsz_fabs_src_known_negative_or_poszero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fneg_nsz_fabs_src_known_negative_or_poszero(float nofpclass(nan pinf psub pnorm) %always.negative.or.pzero) {\n  %fabs = call float @llvm.fabs.f32(float %always.negative.or.pzero)\n  %fneg.fabs = fneg nsz float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#176917** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176917?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176916** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176916?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176915** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176915?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176360** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176360?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176359** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176359?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176359?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#176156** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176156?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176149** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176149?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176035** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176035?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-16T12:26:01Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2033,
+        2038
+      ],
+      [
+        2469,
+        2485
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll": [
+      [
+        705,
+        710
+      ],
+      [
+        918,
+        923
+      ],
+      [
+        932,
+        937
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass",
+      "getFPClassConstant",
+      "simplifyDemandedFPClassMinMax"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll": [
+      "fabs_nsz_src_known_positive_except_negzero_multiple_uses",
+      "fabs_src_known_positive_except_negzero_multiple_uses",
+      "fneg_fabs_nsz_src_known_negative_or_poszero_multiple_uses",
+      "fneg_fabs_src_known_negative_or_poszero_multiple_uses",
+      "fneg_nsz_fabs_src_known_negative_or_poszero_multiple_uses",
+      "ret_fneg_ninf_fabs_src_known_negative_or_posinf_multiple_uses"
+    ]
+  }
+}

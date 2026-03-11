@@ -1,0 +1,174 @@
+{
+  "pr_id": 174410,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174410",
+  "state": "closed",
+  "title": "[ValueTracking] Support horizontal vector add in computeKnownBits",
+  "author": "SavchenkoValeriy",
+  "base_commit": "363903eb3ed34f64164632266140ba3d609bdb81",
+  "fix_commit": "1b1ce68f3dce0423e6341762c224338767b81bce",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownBits.h b/llvm/include/llvm/Support/KnownBits.h\nindex bff944325880b..ad901be01f0ae 100644\n--- a/llvm/include/llvm/Support/KnownBits.h\n+++ b/llvm/include/llvm/Support/KnownBits.h\n@@ -511,6 +511,11 @@ struct KnownBits {\n   /// Compute known bits for the absolute value.\n   LLVM_ABI KnownBits abs(bool IntMinIsPoison = false) const;\n \n+  /// Compute known bits for horizontal add for a vector with NumElts\n+  /// elements, where each element has the known bits represented by this\n+  /// object.\n+  LLVM_ABI KnownBits reduceAdd(unsigned NumElts) const;\n+\n   KnownBits byteSwap() const {\n     return KnownBits(Zero.byteSwap(), One.byteSwap());\n   }\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 9cb6f19b9340c..3d2315811b7af 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -2132,6 +2132,14 @@ static void computeKnownBitsFromOperator(const Operator *I,\n           Known.One.clearAllBits();\n         break;\n       }\n+      case Intrinsic::vector_reduce_add: {\n+        auto *VecTy = dyn_cast<FixedVectorType>(I->getOperand(0)->getType());\n+        if (!VecTy)\n+          break;\n+        computeKnownBits(I->getOperand(0), Known, Q, Depth + 1);\n+        Known = Known.reduceAdd(VecTy->getNumElements());\n+        break;\n+      }\n       case Intrinsic::umin:\n         computeKnownBits(I->getOperand(0), DemandedElts, Known, Q, Depth + 1);\n         computeKnownBits(I->getOperand(1), DemandedElts, Known2, Q, Depth + 1);\ndiff --git a/llvm/lib/Support/KnownBits.cpp b/llvm/lib/Support/KnownBits.cpp\nindex 7db8e1641462e..c7eb37808d166 100644\n--- a/llvm/lib/Support/KnownBits.cpp\n+++ b/llvm/lib/Support/KnownBits.cpp\n@@ -601,6 +601,46 @@ KnownBits KnownBits::abs(bool IntMinIsPoison) const {\n   return KnownAbs;\n }\n \n+KnownBits KnownBits::reduceAdd(unsigned NumElts) const {\n+  if (NumElts == 0)\n+    return KnownBits(getBitWidth());\n+\n+  unsigned BitWidth = getBitWidth();\n+  KnownBits Result(BitWidth);\n+\n+  if (isConstant())\n+    // If all elements are the same constant, we can simply compute it\n+    return KnownBits::makeConstant(NumElts * getConstant());\n+\n+  // The main idea is as follows.\n+  //\n+  // If KnownBits for each element has L leading zeros then\n+  // X_i < 2^(W - L) for every i from [1, N].\n+  //\n+  //   ADD X_i <= ADD max(X_i) = N * max(X_i)\n+  //           <  N * 2^(W - L)\n+  //           <  2^(W - L + ceil(log2(N)))\n+  //\n+  // As the result, we can conclude that\n+  //\n+  //   L' = L - ceil(log2(N))\n+  //\n+  // Similar logic can be applied to leading ones.\n+  unsigned LostBits = Log2_32_Ceil(NumElts);\n+\n+  if (isNonNegative()) {\n+    unsigned LeadingZeros = countMinLeadingZeros();\n+    LeadingZeros = LeadingZeros > LostBits ? LeadingZeros - LostBits : 0;\n+    Result.Zero.setHighBits(LeadingZeros);\n+  } else if (isNegative()) {\n+    unsigned LeadingOnes = countMinLeadingOnes();\n+    LeadingOnes = LeadingOnes > LostBits ? LeadingOnes - LostBits : 0;\n+    Result.One.setHighBits(LeadingOnes);\n+  }\n+\n+  return Result;\n+}\n+\n static KnownBits computeForSatAddSub(bool Add, bool Signed,\n                                      const KnownBits &LHS,\n                                      const KnownBits &RHS) {\ndiff --git a/llvm/unittests/Support/KnownBitsTest.cpp b/llvm/unittests/Support/KnownBitsTest.cpp\nindex ce0bf86e39dd7..93777a90efd3b 100644\n--- a/llvm/unittests/Support/KnownBitsTest.cpp\n+++ b/llvm/unittests/Support/KnownBitsTest.cpp\n@@ -845,4 +845,38 @@ TEST(KnownBitsTest, MulExhaustive) {\n   }\n }\n \n+TEST(KnownBitsTest, ReduceAddExhaustive) {\n+  unsigned Bits = 4;\n+  for (unsigned NumElts : {2, 4, 5}) {\n+    ForeachKnownBits(Bits, [&](const KnownBits &EltKnown) {\n+      KnownBits Computed = EltKnown.reduceAdd(NumElts);\n+      KnownBits Exact(Bits);\n+      Exact.Zero.setAllBits();\n+      Exact.One.setAllBits();\n+\n+      llvm::function_ref<void(unsigned, APInt)> EnumerateCombinations;\n+      auto EnumerateCombinationsImpl = [&](unsigned Depth, APInt CurrentSum) {\n+        if (Depth == NumElts) {\n+          Exact.One &= CurrentSum;\n+          Exact.Zero &= ~CurrentSum;\n+          return;\n+        }\n+        ForeachNumInKnownBits(EltKnown, [&](const APInt &Elt) {\n+          EnumerateCombinations(Depth + 1, CurrentSum + Elt);\n+        });\n+      };\n+      EnumerateCombinations = EnumerateCombinationsImpl;\n+\n+      // Here we recursively generate NumElts unique elements matching known\n+      // bits and collect exact known bits for all possible combinations.\n+      EnumerateCombinations(0, APInt(Bits, 0));\n+\n+      if (!Exact.hasConflict()) {\n+        EXPECT_TRUE(checkResult(\"reduceAdd\", Exact, Computed, {EltKnown},\n+                                /*CheckOptimality=*/false));\n+      }\n+    });\n+  }\n+}\n+\n } // end anonymous namespace\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "Alive2 proofs:\r\n * Leading zeros - [4vi32](https://alive2.llvm.org/ce/z/w--S2D), [16vi8](https://alive2.llvm.org/ce/z/hEdVks)\r\n * Leading ones - [4vi16](https://alive2.llvm.org/ce/z/RyPdBS), [v16i8](https://alive2.llvm.org/ce/z/UTFFt9)",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/vector-reduce-add-known-bits.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "reduce_add_simplify_comparison",
+          "test_body": "define i1 @reduce_add_simplify_comparison(ptr %p) {\n  %vec = load <8 x i32>, ptr %p, align 32\n  %and = and <8 x i32> %vec, splat (i32 16777215)\n  %sum = call i32 @llvm.vector.reduce.add.v8i32(<8 x i32> %and)\n  %cmp = icmp ult i32 %sum, 134217728\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v8i32(<8 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "reduce_add_sext",
+          "test_body": "define i64 @reduce_add_sext(ptr %p) {\n  %vec = load <2 x i32>, ptr %p, align 8\n  %and = and <2 x i32> %vec, splat (i32 4194303)\n  %sum = call i32 @llvm.vector.reduce.add.v2i32(<2 x i32> %and)\n  %ext = sext i32 %sum to i64\n  ret i64 %ext\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v2i32(<2 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "reduce_add_eliminate_mask",
+          "test_body": "define i32 @reduce_add_eliminate_mask(ptr %p) {\n  %vec = load <4 x i32>, ptr %p, align 16\n  %and = and <4 x i32> %vec, splat (i32 268435455)\n  %sum = call i32 @llvm.vector.reduce.add.v4i32(<4 x i32> %and)\n  %masked = and i32 %sum, 1073741823\n  ret i32 %masked\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/AArch64/udotabd.ll",
+      "commands": [
+        "opt -S -O3 < %s",
+        "opt -S -passes=\"default<O3>,default<O3>\" < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32\"\ntarget triple = \"aarch64\"\n\n; Function Attrs: nounwind uwtable vscale_range(1,16)\ndefine dso_local i32 @test(ptr noundef %p1, i32 noundef %s_p1, ptr noundef %p2, i32 noundef %s_p2) #0 {\nentry:\n  %p1.addr = alloca ptr, align 8\n  %s_p1.addr = alloca i32, align 4\n  %p2.addr = alloca ptr, align 8\n  %s_p2.addr = alloca i32, align 4\n  %i_sum = alloca i32, align 4\n  %y = alloca i32, align 4\n  %cleanup.dest.slot = alloca i32, align 4\n  %x = alloca i32, align 4\n  store ptr %p1, ptr %p1.addr, align 8, !tbaa !0\n  store i32 %s_p1, ptr %s_p1.addr, align 4, !tbaa !5\n  store ptr %p2, ptr %p2.addr, align 8, !tbaa !0\n  store i32 %s_p2, ptr %s_p2.addr, align 4, !tbaa !5\n  call void @llvm.lifetime.start.p0(ptr %i_sum) #3\n  store i32 0, ptr %i_sum, align 4, !tbaa !5\n  call void @llvm.lifetime.start.p0(ptr %y) #3\n  store i32 0, ptr %y, align 4, !tbaa !5\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.inc10, %entry\n  %0 = load i32, ptr %y, align 4, !tbaa !5\n  %cmp = icmp slt i32 %0, 16\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond\n  store i32 2, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %y) #3\n  br label %for.end12\n\nfor.body:                                         ; preds = %for.cond\n  call void @llvm.lifetime.start.p0(ptr %x) #3\n  store i32 0, ptr %x, align 4, !tbaa !5\n  br label %for.cond1\n\nfor.cond1:                                        ; preds = %for.inc, %for.body\n  %1 = load i32, ptr %x, align 4, !tbaa !5\n  %cmp2 = icmp slt i32 %1, 16\n  br i1 %cmp2, label %for.body4, label %for.cond.cleanup3\n\nfor.cond.cleanup3:                                ; preds = %for.cond1\n  store i32 5, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %x) #3\n  br label %for.end\n\nfor.body4:                                        ; preds = %for.cond1\n  %2 = load ptr, ptr %p1.addr, align 8, !tbaa !0\n  %3 = load i32, ptr %x, align 4, !tbaa !5\n  %idxprom = sext i32 %3 to i64\n  %arrayidx = getelementptr inbounds i8, ptr %2, i64 %idxprom\n  %4 = load i8, ptr %arrayidx, align 1, !tbaa !7\n  %conv = zext i8 %4 to i32\n  %5 = load ptr, ptr %p2.addr, align 8, !tbaa !0\n  %6 = load i32, ptr %x, align 4, !tbaa !5\n  %idxprom5 = sext i32 %6 to i64\n  %arrayidx6 = getelementptr inbounds i8, ptr %5, i64 %idxprom5\n  %7 = load i8, ptr %arrayidx6, align 1, !tbaa !7\n  %conv7 = zext i8 %7 to i32\n  %sub = sub nsw i32 %conv, %conv7\n  %8 = call i32 @llvm.abs.i32(i32 %sub, i1 true)\n  %9 = load i32, ptr %i_sum, align 4, !tbaa !5\n  %add = add nsw i32 %9, %8\n  store i32 %add, ptr %i_sum, align 4, !tbaa !5\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.body4\n  %10 = load i32, ptr %x, align 4, !tbaa !5\n  %inc = add nsw i32 %10, 1\n  store i32 %inc, ptr %x, align 4, !tbaa !5\n  br label %for.cond1, !llvm.loop !8\n\nfor.end:                                          ; preds = %for.cond.cleanup3\n  %11 = load i32, ptr %s_p1.addr, align 4, !tbaa !5\n  %12 = load ptr, ptr %p1.addr, align 8, !tbaa !0\n  %idx.ext = sext i32 %11 to i64\n  %add.ptr = getelementptr inbounds i8, ptr %12, i64 %idx.ext\n  store ptr %add.ptr, ptr %p1.addr, align 8, !tbaa !0\n  %13 = load i32, ptr %s_p2.addr, align 4, !tbaa !5\n  %14 = load ptr, ptr %p2.addr, align 8, !tbaa !0\n  %idx.ext8 = sext i32 %13 to i64\n  %add.ptr9 = getelementptr inbounds i8, ptr %14, i64 %idx.ext8\n  store ptr %add.ptr9, ptr %p2.addr, align 8, !tbaa !0\n  br label %for.inc10\n\nfor.inc10:                                        ; preds = %for.end\n  %15 = load i32, ptr %y, align 4, !tbaa !5\n  %inc11 = add nsw i32 %15, 1\n  store i32 %inc11, ptr %y, align 4, !tbaa !5\n  br label %for.cond, !llvm.loop !10\n\nfor.end12:                                        ; preds = %for.cond.cleanup\n  %16 = load i32, ptr %i_sum, align 4, !tbaa !5\n  store i32 1, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %i_sum) #3\n  ret i32 %16\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.abs.i32(i32, i1 immarg) #2\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\nattributes #0 = { nounwind uwtable vscale_range(1,16) \"frame-pointer\"=\"non-leaf\" \"no-trapping-math\"=\"true\" \"stack-protector-buffer-size\"=\"8\" \"target-cpu\"=\"generic\" \"target-features\"=\"+bf16,+bti,+ccidx,+complxnum,+crc,+dit,+dotprod,+ete,+flagm,+fp-armv8,+fp16fml,+fullfp16,+i8mm,+jsconv,+lse,+mte,+neon,+pauth,+perfmon,+predres,+rand,+ras,+rcpc,+rdm,+sb,+spe,+ssbs,+sve,+sve-bitperm,+sve2,+trbe,+v8.1a,+v8.2a,+v8.3a,+v8.4a,+v8.5a,+v8a,+v9a,-fmv\" }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\nattributes #2 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #3 = { nounwind }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"p1 omnipotent char\", !2, i64 0}\n!2 = !{!\"any pointer\", !3, i64 0}\n!3 = !{!\"omnipotent char\", !4, i64 0}\n!4 = !{!\"Simple C/C++ TBAA\"}\n!5 = !{!6, !6, i64 0}\n!6 = !{!\"int\", !3, i64 0}\n!7 = !{!3, !3, i64 0}\n!8 = distinct !{!8, !9}\n!9 = !{!\"llvm.loop.mustprogress\"}\n!10 = distinct !{!10, !9}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "SavchenkoValeriy",
+      "body": "Extracted from #173069 to be and independent change"
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "> Would it make sense to move this to KnownBits itself and add an exhaustive unit test in KnownBitsTest.cpp ?\r\n\r\nAt the moment, we don't support any reductions in KnownBits.cpp itself, so I'd say that it would make sense to move it if we move all of the other intrinsics there and that can get quite involved.\r\n\r\nIn principle, I don't oppose that change, but if we want to do it just for the sake of better testing, maybe it can be a printer for known-bits that we can CHECK in lit tests instead?"
+    },
+    {
+      "author": "nikic",
+      "body": "Moving non-trivial logic into KnownBits is generally a good idea, because that's how we reuse logic between the middle-end and back-end implementations of computeKnownBits(). (We could use the same logic for VECREDUCE_ADD.)"
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "> Moving non-trivial logic into KnownBits is generally a good idea, because that's how we reuse logic between the middle-end and back-end implementations of computeKnownBits(). (We could use the same logic for VECREDUCE_ADD.)\r\n\r\nSo, moving just that bit of logic into KnownBits would be enough, right? And what about the signature for it. I guess it should be something like `(KnownBits Arg, std::optional<unsigned> N)`?"
+    },
+    {
+      "author": "RKSimon",
+      "body": "Maybe a class method?\r\n```\r\n  KnownBits KnownBits::reduce_add(unsigned NumElts) const\r\n```"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "SavchenkoValeriy",
+      "body": "@nikic @RKSimon I moved it into KnownBits and added an exhaustive test. I had to limit the scope for it so it doesn't take forever."
+    },
+    {
+      "author": "llvm-ci",
+      "body": "LLVM Buildbot has detected a new failure on builder `sanitizer-x86_64-linux-fast` running on `sanitizer-buildbot3` while building `llvm` at step 2 \"annotate\".\n\nFull details are available at: https://lab.llvm.org/buildbot/#/builders/169/builds/18855\n\n<details>\n<summary>Here is the relevant piece of the build log for the reference</summary>\n\n```\nStep 2 (annotate) failure: 'python ../sanitizer_buildbot/sanitizers/zorg/buildbot/builders/sanitizers/buildbot_selector.py' (failure)\n...\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/ld.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/main.py:74: note: The test suite configuration requested an individual test timeout of 0 seconds but a timeout of 900 seconds was requested on the command line. Forcing timeout to be 900 seconds.\n-- Testing: 95231 tests, 64 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. 60.. 70.. 80\nFAIL: LLVM :: CodeGen/X86/basic-block-sections-clusters-bb-hash.ll (26497 of 95231)\n******************** TEST 'LLVM :: CodeGen/X86/basic-block-sections-clusters-bb-hash.ll' FAILED ********************\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 11\n/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -O0 -mtriple=x86_64-pc-linux -function-sections -filetype=obj -basic-block-address-map -emit-bb-hash -o /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -O0 -mtriple=x86_64-pc-linux -function-sections -filetype=obj -basic-block-address-map -emit-bb-hash -o /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o\n# note: command had no output on stdout or stderr\n# RUN: at line 16\necho 'v1' > /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: echo v1\n# note: command had no output on stdout or stderr\n# RUN: at line 17\necho 'f foo' >> /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: echo 'f foo'\n# note: command had no output on stdout or stderr\n# RUN: at line 18\necho 'g 0:100,1:100,2:0 1:100,3:100 2:0,3:0 3:100' >> /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: echo 'g 0:100,1:100,2:0 1:100,3:100 2:0,3:0 3:100'\n# note: command had no output on stdout or stderr\n# RUN: at line 22\n/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llvm-readobj /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o --bb-addr-map |  awk 'BEGIN {printf \"h\"}      /ID: [0-9]+/ {id=$2}      /Hash: 0x[0-9A-Fa-f]+/ {gsub(/^0x/, \"\", $2); hash=$2; printf \" %s:%s\", id, hash}      END {print \"\"}'  >> /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llvm-readobj /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o --bb-addr-map\n# note: command had no output on stdout or stderr\n# executed command: awk 'BEGIN {printf \"h\"}      /ID: [0-9]+/ {id=$2}      /Hash: 0x[0-9A-Fa-f]+/ {gsub(/^0x/, \"\", $2); hash=$2; printf \" %s:%s\", id, hash}      END {print \"\"}'\n# note: command had no output on stdout or stderr\n# RUN: at line 29\n/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc < /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -O0 -mtriple=x86_64-pc-linux -function-sections -basic-block-sections=/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1 -basic-block-section-match-infer |  /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/FileCheck /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -check-prefixes=CHECK,LINUX-SECTIONS1\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc -O0 -mtriple=x86_64-pc-linux -function-sections -basic-block-sections=/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1 -basic-block-section-match-infer\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/FileCheck /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -check-prefixes=CHECK,LINUX-SECTIONS1\n# .---command stderr------------\n# | /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll:80:26: error: LINUX-SECTIONS1-LABEL: expected string not found in input\n# | ; LINUX-SECTIONS1-LABEL: # %bb.1:\n# |                          ^\n# | <stdin>:6:5: note: scanning from here\n# | foo: # @foo\nStep 14 (stage2/msan check) failure: stage2/msan check (failure)\n...\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld.lld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/ld.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using lld-link: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/lld-link\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using ld64.lld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/ld64.lld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/llvm/config.py:561: note: using wasm-ld: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/wasm-ld\nllvm-lit: /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/utils/lit/lit/main.py:74: note: The test suite configuration requested an individual test timeout of 0 seconds but a timeout of 900 seconds was requested on the command line. Forcing timeout to be 900 seconds.\n-- Testing: 95231 tests, 64 workers --\nTesting:  0.. 10.. 20.. 30.. 40.. 50.. 60.. 70.. 80\nFAIL: LLVM :: CodeGen/X86/basic-block-sections-clusters-bb-hash.ll (26497 of 95231)\n******************** TEST 'LLVM :: CodeGen/X86/basic-block-sections-clusters-bb-hash.ll' FAILED ********************\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 11\n/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -O0 -mtriple=x86_64-pc-linux -function-sections -filetype=obj -basic-block-address-map -emit-bb-hash -o /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -O0 -mtriple=x86_64-pc-linux -function-sections -filetype=obj -basic-block-address-map -emit-bb-hash -o /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o\n# note: command had no output on stdout or stderr\n# RUN: at line 16\necho 'v1' > /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: echo v1\n# note: command had no output on stdout or stderr\n# RUN: at line 17\necho 'f foo' >> /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: echo 'f foo'\n# note: command had no output on stdout or stderr\n# RUN: at line 18\necho 'g 0:100,1:100,2:0 1:100,3:100 2:0,3:0 3:100' >> /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: echo 'g 0:100,1:100,2:0 1:100,3:100 2:0,3:0 3:100'\n# note: command had no output on stdout or stderr\n# RUN: at line 22\n/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llvm-readobj /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o --bb-addr-map |  awk 'BEGIN {printf \"h\"}      /ID: [0-9]+/ {id=$2}      /Hash: 0x[0-9A-Fa-f]+/ {gsub(/^0x/, \"\", $2); hash=$2; printf \" %s:%s\", id, hash}      END {print \"\"}'  >> /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llvm-readobj /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp.o --bb-addr-map\n# note: command had no output on stdout or stderr\n# executed command: awk 'BEGIN {printf \"h\"}      /ID: [0-9]+/ {id=$2}      /Hash: 0x[0-9A-Fa-f]+/ {gsub(/^0x/, \"\", $2); hash=$2; printf \" %s:%s\", id, hash}      END {print \"\"}'\n# note: command had no output on stdout or stderr\n# RUN: at line 29\n/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc < /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -O0 -mtriple=x86_64-pc-linux -function-sections -basic-block-sections=/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1 -basic-block-section-match-infer |  /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/FileCheck /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -check-prefixes=CHECK,LINUX-SECTIONS1\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/llc -O0 -mtriple=x86_64-pc-linux -function-sections -basic-block-sections=/home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/test/CodeGen/X86/Output/basic-block-sections-clusters-bb-hash.ll.tmp1 -basic-block-section-match-infer\n# note: command had no output on stdout or stderr\n# executed command: /home/b/sanitizer-x86_64-linux-fast/build/llvm_build_msan/bin/FileCheck /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll -check-prefixes=CHECK,LINUX-SECTIONS1\n# .---command stderr------------\n# | /home/b/sanitizer-x86_64-linux-fast/build/llvm-project/llvm/test/CodeGen/X86/basic-block-sections-clusters-bb-hash.ll:80:26: error: LINUX-SECTIONS1-LABEL: expected string not found in input\n# | ; LINUX-SECTIONS1-LABEL: # %bb.1:\n# |                          ^\n# | <stdin>:6:5: note: scanning from here\n# | foo: # @foo\n\n```\n\n</details>"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-05T14:27:03Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownBits.h": [
+      [
+        511,
+        516
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        2132,
+        2137
+      ]
+    ],
+    "llvm/lib/Support/KnownBits.cpp": [
+      [
+        601,
+        606
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/AArch64/udotabd.ll": [
+      [
+        29,
+        35
+      ],
+      [
+        40,
+        46
+      ],
+      [
+        51,
+        57
+      ],
+      [
+        62,
+        68
+      ],
+      [
+        73,
+        79
+      ],
+      [
+        209,
+        215
+      ],
+      [
+        220,
+        226
+      ],
+      [
+        231,
+        237
+      ],
+      [
+        242,
+        248
+      ],
+      [
+        253,
+        259
+      ]
+    ],
+    "llvm/unittests/Support/KnownBitsTest.cpp": [
+      [
+        845,
+        848
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownBits.h": [
+      "byteSwap",
+      "operator>>="
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownBitsFromOperator"
+    ],
+    "llvm/lib/Support/KnownBits.cpp": [
+      "KnownBits::abs",
+      "computeForSatAddSub"
+    ],
+    "llvm/unittests/Support/KnownBitsTest.cpp": [
+      "TEST"
+    ]
+  }
+}

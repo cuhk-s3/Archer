@@ -1,0 +1,111 @@
+{
+  "pr_id": 174573,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174573",
+  "state": "closed",
+  "title": "[LV] Consider UserIC when limiting VF.",
+  "author": "fhahn",
+  "base_commit": "d265996cc6203a7288f10d8760c0ddbb35f502bd",
+  "fix_commit": "83d4510e77b69413b6fa0f3bc91e52cb9b7aa34e",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\nindex ddef767f6937c..fd7742d509824 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n@@ -566,7 +566,7 @@ class LoopVectorizationPlanner {\n   /// for vectorizing the epilogue. Returns VectorizationFactor::Disabled if\n   /// epilogue vectorization is not supported for the loop.\n   VectorizationFactor\n-  selectEpilogueVectorizationFactor(const ElementCount MaxVF, unsigned IC);\n+  selectEpilogueVectorizationFactor(const ElementCount MainLoopVF, unsigned IC);\n \n   /// Emit remarks for recipes with invalid costs in the available VPlans.\n   void emitInvalidCostRemarks(OptimizationRemarkEmitter *ORE);\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 251917f4b91c1..f8448358d9ce8 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -1503,12 +1503,13 @@ class LoopVectorizationCostModel {\n   /// disabled or unsupported, then the scalable part will be equal to\n   /// ElementCount::getScalable(0).\n   FixedScalableVFPair computeFeasibleMaxVF(unsigned MaxTripCount,\n-                                           ElementCount UserVF,\n+                                           ElementCount UserVF, unsigned UserIC,\n                                            bool FoldTailByMasking);\n \n-  /// If \\p VF > MaxTripcount, clamps it to the next lower VF that is <=\n-  /// MaxTripCount.\n+  /// If \\p VF * \\p UserIC > MaxTripcount, clamps VF to the next lower VF that\n+  /// results in VF * UserIC <= MaxTripCount.\n   ElementCount clampVFByMaxTripCount(ElementCount VF, unsigned MaxTripCount,\n+                                     unsigned UserIC,\n                                      bool FoldTailByMasking) const;\n \n   /// \\return the maximized element count based on the targets vector\n@@ -1517,7 +1518,7 @@ class LoopVectorizationCostModel {\n   ElementCount getMaximizedVFForTarget(unsigned MaxTripCount,\n                                        unsigned SmallestType,\n                                        unsigned WidestType,\n-                                       ElementCount MaxSafeVF,\n+                                       ElementCount MaxSafeVF, unsigned UserIC,\n                                        bool FoldTailByMasking);\n \n   /// Checks if scalable vectorization is supported and enabled. Caches the\n@@ -3444,7 +3445,8 @@ LoopVectorizationCostModel::getMaxLegalScalableVF(unsigned MaxSafeElements) {\n }\n \n FixedScalableVFPair LoopVectorizationCostModel::computeFeasibleMaxVF(\n-    unsigned MaxTripCount, ElementCount UserVF, bool FoldTailByMasking) {\n+    unsigned MaxTripCount, ElementCount UserVF, unsigned UserIC,\n+    bool FoldTailByMasking) {\n   MinBWs = computeMinimumValueSizes(TheLoop->getBlocks(), *DB, &TTI);\n   unsigned SmallestType, WidestType;\n   std::tie(SmallestType, WidestType) = getSmallestAndWidestTypes();\n@@ -3540,12 +3542,12 @@ FixedScalableVFPair LoopVectorizationCostModel::computeFeasibleMaxVF(\n                              ElementCount::getScalable(0));\n   if (auto MaxVF =\n           getMaximizedVFForTarget(MaxTripCount, SmallestType, WidestType,\n-                                  MaxSafeFixedVF, FoldTailByMasking))\n+                                  MaxSafeFixedVF, UserIC, FoldTailByMasking))\n     Result.FixedVF = MaxVF;\n \n   if (auto MaxVF =\n           getMaximizedVFForTarget(MaxTripCount, SmallestType, WidestType,\n-                                  MaxSafeScalableVF, FoldTailByMasking))\n+                                  MaxSafeScalableVF, UserIC, FoldTailByMasking))\n     if (MaxVF.isScalable()) {\n       Result.ScalableVF = MaxVF;\n       LLVM_DEBUG(dbgs() << \"LV: Found feasible scalable VF = \" << MaxVF\n@@ -3598,7 +3600,7 @@ LoopVectorizationCostModel::computeMaxVF(ElementCount UserVF, unsigned UserIC) {\n \n   switch (ScalarEpilogueStatus) {\n   case CM_ScalarEpilogueAllowed:\n-    return computeFeasibleMaxVF(MaxTC, UserVF, false);\n+    return computeFeasibleMaxVF(MaxTC, UserVF, UserIC, false);\n   case CM_ScalarEpilogueNotAllowedUsePredicate:\n     [[fallthrough]];\n   case CM_ScalarEpilogueNotNeededUsePredicate:\n@@ -3637,7 +3639,8 @@ LoopVectorizationCostModel::computeMaxVF(ElementCount UserVF, unsigned UserIC) {\n     InterleaveInfo.invalidateGroupsRequiringScalarEpilogue();\n   }\n \n-  FixedScalableVFPair MaxFactors = computeFeasibleMaxVF(MaxTC, UserVF, true);\n+  FixedScalableVFPair MaxFactors =\n+      computeFeasibleMaxVF(MaxTC, UserVF, UserIC, true);\n \n   // Avoid tail folding if the trip count is known to be a multiple of any VF\n   // we choose.\n@@ -3792,7 +3795,8 @@ bool LoopVectorizationCostModel::useMaxBandwidth(\n }\n \n ElementCount LoopVectorizationCostModel::clampVFByMaxTripCount(\n-    ElementCount VF, unsigned MaxTripCount, bool FoldTailByMasking) const {\n+    ElementCount VF, unsigned MaxTripCount, unsigned UserIC,\n+    bool FoldTailByMasking) const {\n   unsigned EstimatedVF = VF.getKnownMinValue();\n   if (VF.isScalable() && TheFunction->hasFnAttribute(Attribute::VScaleRange)) {\n     auto Attr = TheFunction->getFnAttribute(Attribute::VScaleRange);\n@@ -3806,16 +3810,24 @@ ElementCount LoopVectorizationCostModel::clampVFByMaxTripCount(\n   if (MaxTripCount > 0 && requiresScalarEpilogue(true))\n     MaxTripCount -= 1;\n \n-  if (MaxTripCount && MaxTripCount <= EstimatedVF &&\n+  // When the user specifies an interleave count, we need to ensure that\n+  // VF * UserIC <= MaxTripCount to avoid a dead vector loop.\n+  unsigned IC = UserIC > 0 ? UserIC : 1;\n+  unsigned EstimatedVFTimesIC = EstimatedVF * IC;\n+\n+  if (MaxTripCount && MaxTripCount <= EstimatedVFTimesIC &&\n       (!FoldTailByMasking || isPowerOf2_32(MaxTripCount))) {\n     // If upper bound loop trip count (TC) is known at compile time there is no\n-    // point in choosing VF greater than TC (as done in the loop below). Select\n-    // maximum power of two which doesn't exceed TC. If VF is\n+    // point in choosing VF greater than TC / IC (as done in the loop below).\n+    // Select maximum power of two which doesn't exceed TC / IC. If VF is\n     // scalable, we only fall back on a fixed VF when the TC is less than or\n     // equal to the known number of lanes.\n-    auto ClampedUpperTripCount = llvm::bit_floor(MaxTripCount);\n+    auto ClampedUpperTripCount = llvm::bit_floor(MaxTripCount / IC);\n+    if (ClampedUpperTripCount == 0)\n+      ClampedUpperTripCount = 1;\n     LLVM_DEBUG(dbgs() << \"LV: Clamping the MaxVF to maximum power of two not \"\n-                         \"exceeding the constant trip count: \"\n+                         \"exceeding the constant trip count\"\n+                      << (UserIC > 0 ? \" divided by UserIC\" : \"\") << \": \"\n                       << ClampedUpperTripCount << \"\\n\");\n     return ElementCount::get(ClampedUpperTripCount,\n                              FoldTailByMasking ? VF.isScalable() : false);\n@@ -3825,7 +3837,7 @@ ElementCount LoopVectorizationCostModel::clampVFByMaxTripCount(\n \n ElementCount LoopVectorizationCostModel::getMaximizedVFForTarget(\n     unsigned MaxTripCount, unsigned SmallestType, unsigned WidestType,\n-    ElementCount MaxSafeVF, bool FoldTailByMasking) {\n+    ElementCount MaxSafeVF, unsigned UserIC, bool FoldTailByMasking) {\n   bool ComputeScalableMaxVF = MaxSafeVF.isScalable();\n   const TypeSize WidestRegister = TTI.getRegisterBitWidth(\n       ComputeScalableMaxVF ? TargetTransformInfo::RGK_ScalableVector\n@@ -3854,8 +3866,8 @@ ElementCount LoopVectorizationCostModel::getMaximizedVFForTarget(\n     return ElementCount::getFixed(1);\n   }\n \n-  ElementCount MaxVF = clampVFByMaxTripCount(MaxVectorElementCount,\n-                                             MaxTripCount, FoldTailByMasking);\n+  ElementCount MaxVF = clampVFByMaxTripCount(\n+      MaxVectorElementCount, MaxTripCount, UserIC, FoldTailByMasking);\n   // If the MaxVF was already clamped, there's no point in trying to pick a\n   // larger one.\n   if (MaxVF != MaxVectorElementCount)\n@@ -3885,7 +3897,8 @@ ElementCount LoopVectorizationCostModel::getMaximizedVFForTarget(\n       }\n     }\n \n-    MaxVF = clampVFByMaxTripCount(MaxVF, MaxTripCount, FoldTailByMasking);\n+    MaxVF =\n+        clampVFByMaxTripCount(MaxVF, MaxTripCount, UserIC, FoldTailByMasking);\n \n     if (MaxVectorElementCount != MaxVF) {\n       // Invalidate any widening decisions we might have made, in case the loop\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "If a UserIC is provided, the vector loop will process VF * UserIC. Pass it through UserIC to computeFeasibleMaxVF and use it to limit the max VF to factors where VF * UserIC <= MaxTripCount. This avoids creating dead vector loops with user provided interleave counts.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/epilog-vectorization-factors.ll",
+      "commands": [
+        "opt -S < %s -passes=loop-vectorize -force-vector-interleave=4 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "small_trip_count_loop",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"aarch64\"\n\ndefine void @small_trip_count_loop(ptr %arg, ptr %arg2) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.A = getelementptr inbounds i8, ptr %arg, i32 %iv\n  %load = load i8, ptr %gep.A, align 1\n  %select = add i8 %load, 10\n  %gep.B = getelementptr inbounds i8, ptr %arg2, i32 %iv\n  store i8 %select, ptr %gep.B, align 1\n  %iv.next = add i32 %iv, 1\n  %ec = icmp eq i32 %iv, 20\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 129163 tests passed\n* 2842 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-06T11:47:18Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+      [
+        566,
+        572
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        1503,
+        1514
+      ],
+      [
+        1517,
+        1523
+      ],
+      [
+        3444,
+        3450
+      ],
+      [
+        3540,
+        3551
+      ],
+      [
+        3598,
+        3604
+      ],
+      [
+        3637,
+        3643
+      ],
+      [
+        3792,
+        3798
+      ],
+      [
+        3806,
+        3821
+      ],
+      [
+        3825,
+        3831
+      ],
+      [
+        3854,
+        3861
+      ],
+      [
+        3885,
+        3891
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/epilog-vectorization-factors.ll": [
+      [
+        331,
+        337
+      ],
+      [
+        340,
+        392
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationCostModel::clampVFByMaxTripCount",
+      "LoopVectorizationCostModel::computeFeasibleMaxVF",
+      "LoopVectorizationCostModel::computeMaxVF",
+      "LoopVectorizationCostModel::getMaximizedVFForTarget"
+    ]
+  }
+}

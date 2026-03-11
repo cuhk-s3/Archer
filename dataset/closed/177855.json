@@ -1,0 +1,128 @@
+{
+  "pr_id": 177855,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177855",
+  "state": "closed",
+  "title": "[SLP]Support for tree throttling in SLP graphs with gathered loads",
+  "author": "alexey-bataev",
+  "base_commit": "21fdd49c24362087d6b6d6dfaa4a7cd922b6500c",
+  "fix_commit": "b98e16096457b928d777ba3447aca14bcf3608a3",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 22b8ea481f2c3..fa9b86484c21f 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -4519,6 +4519,10 @@ class slpvectorizer::BoUpSLP {\n   LLVM_DUMP_METHOD void dumpVectorizableTree() const {\n     for (unsigned Id = 0, IdE = VectorizableTree.size(); Id != IdE; ++Id) {\n       VectorizableTree[Id]->dump();\n+      if (TransformedToGatherNodes.contains(VectorizableTree[Id].get()))\n+        dbgs() << \"[[TRANSFORMED TO GATHER]]\";\n+      else if (DeletedNodes.contains(VectorizableTree[Id].get()))\n+        dbgs() << \"[[DELETED NODE]]\";\n       dbgs() << \"\\n\";\n     }\n   }\n@@ -16482,7 +16486,7 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n     ArrayRef<Value *> VectorizedVals) {\n   SmallDenseMap<const TreeEntry *, InstructionCost> NodesCosts;\n   SmallPtrSet<Value *, 4> CheckedExtracts;\n-  SmallPtrSet<const TreeEntry *, 4> GatheredLoadsNodes;\n+  SmallSetVector<TreeEntry *, 4> GatheredLoadsNodes;\n   LLVM_DEBUG(dbgs() << \"SLP: Calculating cost for tree of size \"\n                     << VectorizableTree.size() << \".\\n\");\n   InstructionCost Cost = 0;\n@@ -16533,11 +16537,6 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n   if (SLPCostThreshold.getNumOccurrences() > 0 && SLPCostThreshold < 0 &&\n       Cost < -SLPCostThreshold)\n     return Cost;\n-  // Bail out, if gathered loads nodes are found.\n-  // TODO: add analysis for gathered load to include their cost correctly into\n-  // the related subtrees.\n-  if (!GatheredLoadsNodes.empty())\n-    return Cost;\n   // The narrow non-profitable tree in loop? Skip, may cause regressions.\n   constexpr unsigned PartLimit = 2;\n   const unsigned Sz =\n@@ -16551,17 +16550,38 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n     return Cost;\n   SmallVector<std::pair<InstructionCost, SmallVector<unsigned>>> SubtreeCosts(\n       VectorizableTree.size());\n+  auto UpdateParentNodes =\n+      [&](const TreeEntry *UserTE, const TreeEntry *TE, InstructionCost C,\n+          SmallDenseSet<std::pair<const TreeEntry *, const TreeEntry *>, 4>\n+              &VisitedUser,\n+          bool AddToList = true) {\n+        while (UserTE &&\n+               VisitedUser.insert(std::make_pair(TE, UserTE)).second) {\n+          SubtreeCosts[UserTE->Idx].first += C;\n+          if (AddToList)\n+            SubtreeCosts[UserTE->Idx].second.push_back(TE->Idx);\n+          UserTE = UserTE->UserTreeIndex.UserTE;\n+        }\n+      };\n   for (const std::unique_ptr<TreeEntry> &Ptr : VectorizableTree) {\n     TreeEntry &TE = *Ptr;\n     InstructionCost C = NodesCosts.at(&TE);\n     SubtreeCosts[TE.Idx].first += C;\n-    const TreeEntry *UserTE = TE.UserTreeIndex.UserTE;\n-    while (UserTE) {\n-      SubtreeCosts[UserTE->Idx].first += C;\n-      SubtreeCosts[UserTE->Idx].second.push_back(TE.Idx);\n-      UserTE = UserTE->UserTreeIndex.UserTE;\n+    if (const TreeEntry *UserTE = TE.UserTreeIndex.UserTE) {\n+      SmallDenseSet<std::pair<const TreeEntry *, const TreeEntry *>, 4>\n+          VisitedUser;\n+      UpdateParentNodes(UserTE, &TE, C, VisitedUser);\n+    }\n+  }\n+  SmallDenseSet<std::pair<const TreeEntry *, const TreeEntry *>, 4> Visited;\n+  for (TreeEntry *TE : GatheredLoadsNodes) {\n+    InstructionCost C = SubtreeCosts[TE->Idx].first;\n+    for (Value *V : TE->Scalars) {\n+      for (const TreeEntry *BVTE : ValueToGatherNodes.lookup(V))\n+        UpdateParentNodes(BVTE, TE, C, Visited, /*AddToList=*/false);\n     }\n   }\n+  Visited.clear();\n   using CostIndicesTy =\n       std::pair<TreeEntry *, std::pair<InstructionCost, SmallVector<unsigned>>>;\n   struct FirstGreater {\n@@ -16583,6 +16603,7 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n       (Worklist.top().first->Idx == 0 || Worklist.top().first->Idx == 1))\n     return Cost;\n \n+  constexpr TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n   bool Changed = false;\n   while (!Worklist.empty() && Worklist.top().second.first > 0) {\n     TreeEntry *TE = Worklist.top().first;\n@@ -16624,7 +16645,6 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n       if (isConstant(V))\n         DemandedElts.clearBit(Idx);\n     }\n-    constexpr TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n \n     Type *ScalarTy = getValueType(TE->Scalars.front());\n     auto *VecTy = getWidenedType(ScalarTy, Sz);\n@@ -16663,7 +16683,7 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n     // Erase subtree if it is non-profitable.\n     if (SubtreeCost > GatherCost) {\n       // If the remaining tree is just a buildvector - exit, it will cause\n-      // enless attempts to vectorize.\n+      // endless attempts to vectorize.\n       if (VectorizableTree.front()->hasState() &&\n           VectorizableTree.front()->getOpcode() == Instruction::InsertElement &&\n           TE->Idx == 1)\n@@ -16694,6 +16714,71 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n   if (!Changed)\n     return SubtreeCosts.front().first;\n \n+  SmallPtrSet<TreeEntry *, 4> GatheredLoadsToDelete;\n+  InstructionCost LoadsExtractsCost = 0;\n+  // Check if all loads of gathered loads nodes are marked for deletion. In this\n+  // case the whole gathered loads subtree must be deleted.\n+  // Also, try to account for extracts, which might be required, if only part of\n+  // gathered load must be vectorized. Keep partially vectorized nodes, if\n+  // extracts are cheaper than gathers.\n+  for (TreeEntry *TE : GatheredLoadsNodes) {\n+    if (DeletedNodes.contains(TE) || TransformedToGatherNodes.contains(TE))\n+      continue;\n+    GatheredLoadsToDelete.insert(TE);\n+    APInt DemandedElts = APInt::getZero(TE->getVectorFactor());\n+    // All loads are removed from gathered? Need to delete the subtree.\n+    SmallDenseMap<const TreeEntry *, SmallVector<Value *>> ValuesToInsert;\n+    for (Value *V : TE->Scalars) {\n+      unsigned Pos = TE->findLaneForValue(V);\n+      for (const TreeEntry *BVE : ValueToGatherNodes.lookup(V)) {\n+        if (DeletedNodes.contains(BVE))\n+          continue;\n+        DemandedElts.setBit(Pos);\n+        ValuesToInsert.try_emplace(BVE).first->second.push_back(V);\n+      }\n+    }\n+    if (!DemandedElts.isZero()) {\n+      Type *ScalarTy = TE->Scalars.front()->getType();\n+      auto *VecTy = getWidenedType(ScalarTy, TE->getVectorFactor());\n+      InstructionCost ExtractsCost = ::getScalarizationOverhead(\n+          *TTI, ScalarTy, VecTy, DemandedElts,\n+          /*Insert=*/false, /*Extract=*/true, CostKind);\n+      InstructionCost BVCost = 0;\n+      for (const auto &[BVE, Values] : ValuesToInsert) {\n+        APInt BVDemandedElts = APInt::getZero(BVE->getVectorFactor());\n+        SmallVector<Value *> BVValues(BVE->getVectorFactor(),\n+                                      PoisonValue::get(ScalarTy));\n+        for (Value *V : Values) {\n+          unsigned Pos = BVE->findLaneForValue(V);\n+          BVValues[Pos] = V;\n+          BVDemandedElts.setBit(Pos);\n+        }\n+        auto *BVVecTy = getWidenedType(ScalarTy, BVE->getVectorFactor());\n+        BVCost += ::getScalarizationOverhead(\n+            *TTI, ScalarTy, BVVecTy, BVDemandedElts,\n+            /*Insert=*/true, /*Extract=*/false, CostKind,\n+            BVDemandedElts.isAllOnes(), BVValues);\n+      }\n+      if (ExtractsCost < BVCost) {\n+        LoadsExtractsCost += ExtractsCost;\n+        GatheredLoadsToDelete.erase(TE);\n+        continue;\n+      }\n+      LoadsExtractsCost += BVCost;\n+    }\n+    NodesCosts.erase(TE);\n+  }\n+\n+  // Deleted all subtrees rooted at gathered loads nodes.\n+  for (std::unique_ptr<TreeEntry> &TE : VectorizableTree) {\n+    if (TE->UserTreeIndex &&\n+        GatheredLoadsToDelete.contains(TE->UserTreeIndex.UserTE)) {\n+      DeletedNodes.insert(TE.get());\n+      NodesCosts.erase(TE.get());\n+      GatheredLoadsToDelete.insert(TE.get());\n+    }\n+  }\n+\n   for (std::unique_ptr<TreeEntry> &TE : VectorizableTree) {\n     if (!TE->UserTreeIndex && TransformedToGatherNodes.contains(TE.get())) {\n       assert(TE->getOpcode() == Instruction::Load && \"Expected load only.\");\n@@ -16717,7 +16802,7 @@ InstructionCost BoUpSLP::calculateTreeCostAndTrimNonProfitable(\n                       << \".\\n\"\n                       << \"SLP: Current total cost = \" << Cost << \"\\n\");\n   }\n-  if (NewCost >= Cost) {\n+  if (NewCost + LoadsExtractsCost >= Cost) {\n     DeletedNodes.clear();\n     TransformedToGatherNodes.clear();\n     NewCost = Cost;\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Gathered loads forming DAG instead of trees in SLP vectorizer. When\ndoing the throttling analysis for such graphs, need to consider partially\nmatched gathered loads DAG nodes and consider extract and/or gather\noperations and their costs.\nThe patch adds this analysis and allows cutting off the expensive\nsub-graphs with gathered loads.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/vec_list_bias-inseltpoison.ll",
+      "commands": [
+        "opt < %s -passes=slp-vectorizer -mtriple=x86_64-unknown-linux-gnu -mcpu=skylake -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "define void @test(ptr nocapture %t2) {\n  %t3 = load i32, ptr %t2, align 4\n  %t4 = getelementptr inbounds i32, ptr %t2, i64 7\n  %t5 = load i32, ptr %t4, align 4\n  %t8 = getelementptr inbounds i32, ptr %t2, i64 1\n  %t9 = load i32, ptr %t8, align 4\n  %t10 = getelementptr inbounds i32, ptr %t2, i64 6\n  %t11 = load i32, ptr %t10, align 4\n  %t14 = getelementptr inbounds i32, ptr %t2, i64 2\n  %t15 = load i32, ptr %t14, align 4\n  %t16 = getelementptr inbounds i32, ptr %t2, i64 5\n  %t17 = load i32, ptr %t16, align 4\n  %t20 = getelementptr inbounds i32, ptr %t2, i64 3\n  %t21 = load i32, ptr %t20, align 4\n  %t22 = getelementptr inbounds i32, ptr %t2, i64 4\n  %t23 = load i32, ptr %t22, align 4\n  %t24 = add nsw i32 %t23, %t21\n  %t25 = sub nsw i32 %t21, %t23\n  %t27 = sub nsw i32 %t3, %t24\n  %t28 = add nsw i32 %t15, %t9\n  %t29 = sub nsw i32 %t9, %t15\n  %t30 = add nsw i32 %t27, %t29\n  %t31 = mul nsw i32 %t30, 4433\n  %t32 = mul nsw i32 %t27, 6270\n  %t34 = mul nsw i32 %t29, -15137\n  %t37 = add nsw i32 %t25, %t11\n  %t38 = add nsw i32 %t17, %t5\n  %t39 = add nsw i32 %t37, %t38\n  %t40 = mul nsw i32 %t39, 9633\n  %t41 = mul nsw i32 %t25, 2446\n  %t42 = mul nsw i32 %t17, 16819\n  %t47 = mul nsw i32 %t37, -16069\n  %t48 = mul nsw i32 %t38, -3196\n  %t49 = add nsw i32 %t40, %t47\n  %t50 = add nsw i32 %t40, %t48\n  %t65 = insertelement <8 x i32> poison, i32 %t28, i32 0\n  %t66 = insertelement <8 x i32> %t65, i32 %t50, i32 1\n  %t67 = insertelement <8 x i32> %t66, i32 %t32, i32 2\n  %t68 = insertelement <8 x i32> %t67, i32 %t49, i32 3\n  %t69 = insertelement <8 x i32> %t68, i32 %t28, i32 4\n  %t70 = insertelement <8 x i32> %t69, i32 %t50, i32 5\n  %t71 = insertelement <8 x i32> %t70, i32 %t34, i32 6\n  %t72 = insertelement <8 x i32> %t71, i32 %t49, i32 7\n  %t76 = shl <8 x i32> %t72, splat (i32 3)\n  store <8 x i32> %t76, ptr %t2, align 4\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189189 tests passed\n* 5019 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "nico",
+      "body": "This makes clang assert on this standalone repro: \r\n[Archive.zip](https://github.com/user-attachments/files/24898222/Archive.zip)\r\n"
+    },
+    {
+      "author": "nico",
+      "body": "Reverted in d733771113339608aff6002d1fa89aaf4a51c502 for now."
+    },
+    {
+      "author": "nico",
+      "body": "`clang/utils/reduce-clang-crash.py --llvm-bin out/gn/bin ./rrRasterizer-9503e0.sh rrRasterizer-9503e0.cpp` came up with this, in case it's useful:\r\n\r\n```\r\n          ******** /Users/thakis/src/llvm-project/rrRasterizer-9503e0.reduced.cpp ********\r\n\r\ntemplate <typename a, int b> class c {\r\npublic:\r\n  a d[b];\r\n  c();\r\n  c<float, b> e() { return cast<float>(); }\r\n  a operator[](int f) const { return d[f]; }\r\n  void operator[](int);\r\n  template <typename g> c<g, b> cast() const;\r\n};\r\ntemplate <typename a, int b> c<a, b>::c() {}\r\ntemplate <typename a, int b>\r\ntemplate <typename g>\r\nc<g, b> c<a, b>::cast() const {\r\n  c<g, b> h;\r\n  for (int i; i < b; i++)\r\n    h.d[i] = d[i];\r\n  return h;\r\n}\r\ntemplate <typename a, int b>\r\nc<a, b> operator/(const c<a, b> f, const c<a, b> j) {\r\n  c<a, b> h;\r\n  for (int i; i < b; i++)\r\n    h.d[i] = f[i] / j[i];\r\n  return h;\r\n}\r\nclass k {\r\n  void l(int &);\r\n  template <int> void m(int *, float *, int, int &);\r\n};\r\ntemplate <int n> void k::m(int *, float *j, int, int &) {\r\n  c<long, 4> o;\r\n  c<long long, 4> r[n];\r\n  for (int p = 0; p < n; p++)\r\n    for (int t; t; t++) {\r\n      o[t];\r\n      r[p][t];\r\n    }\r\n  for (int p = 0; p < n; p++) {\r\n    c q = o.e(), x = r[p].e();\r\n    const c s = q / x;\r\n    j[p] = s[1];\r\n  }\r\n}\r\nvoid k::l(int &f) { m<4>(0, 0, 0, f); }\r\n\r\nReducing the clang crash command...\r\nReduced command: /Users/thakis/src/llvm-project/out/gn/bin/clang -cc1 -triple i386-pc-windows-msvc19.34.0 -O3 -emit-obj -target-feature +sse3 -ftrivial-auto-var-init=pattern -vectorize-slp rrRasterizer-9503e0.reduced.cpp\r\n```"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Hmm, this looks like a codegen issue, crashes in SelectionDAG"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "@RKSimon "
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Reproducer https://godbolt.org/z/rbqEYov8P"
+    },
+    {
+      "author": "nico",
+      "body": "Looks like the crash was fixed in #178410. Thanks!"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-25T13:33:35Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        4519,
+        4524
+      ],
+      [
+        16482,
+        16488
+      ],
+      [
+        16533,
+        16543
+      ],
+      [
+        16551,
+        16567
+      ],
+      [
+        16583,
+        16588
+      ],
+      [
+        16624,
+        16630
+      ],
+      [
+        16663,
+        16669
+      ],
+      [
+        16694,
+        16699
+      ],
+      [
+        16717,
+        16723
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/vec_list_bias-inseltpoison.ll": [
+      [
+        25,
+        30
+      ],
+      [
+        33,
+        38
+      ],
+      [
+        40,
+        59
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::calculateTreeCostAndTrimNonProfitable",
+      "dumpVectorizableTree",
+      "operator()"
+    ]
+  }
+}

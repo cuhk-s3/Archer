@@ -1,0 +1,97 @@
+{
+  "pr_id": 176795,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176795",
+  "state": "closed",
+  "title": "[VPlan] Remove non-reductions after simplifications.",
+  "author": "fhahn",
+  "base_commit": "9d800ad0a4e9845cba0bf3418878ea729001edea",
+  "fix_commit": "bd776c60f5d1697ccfe583b71303c14363da3ab5",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\nindex ba124153c6fb5..42682d756eb28 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n@@ -248,6 +248,9 @@ inline match_combine_and<LTy, RTy> m_CombineAnd(const LTy &L, const RTy &R) {\n /// Match a VPValue, capturing it if we match.\n inline bind_ty<VPValue> m_VPValue(VPValue *&V) { return V; }\n \n+/// Match a VPIRValue.\n+inline bind_ty<VPIRValue> m_VPIRValue(VPIRValue *&V) { return V; }\n+\n /// Match a VPInstruction, capturing if we match.\n inline bind_ty<VPInstruction> m_VPInstruction(VPInstruction *&V) { return V; }\n \ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 278b746758148..dc6f5fe32dd4b 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -127,6 +127,7 @@ bool VPRecipeBase::mayReadFromMemory() const {\n   case VPBranchOnMaskSC:\n   case VPDerivedIVSC:\n   case VPFirstOrderRecurrencePHISC:\n+  case VPReductionPHISC:\n   case VPPredInstPHISC:\n   case VPScalarIVStepsSC:\n   case VPWidenStoreEVLSC:\n@@ -162,6 +163,7 @@ bool VPRecipeBase::mayHaveSideEffects() const {\n     return cast<VPExpressionRecipe>(this)->mayHaveSideEffects();\n   case VPDerivedIVSC:\n   case VPFirstOrderRecurrencePHISC:\n+  case VPReductionPHISC:\n   case VPPredInstPHISC:\n   case VPVectorEndPointerSC:\n     return false;\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex c09e0d4e1ad94..c4427cb05c9b6 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -1510,6 +1510,11 @@ static void simplifyRecipe(VPSingleDefRecipe *Def, VPTypeAnalysis &TypeInfo) {\n     return;\n   }\n \n+  VPIRValue *IRV;\n+  if (Def->getNumOperands() == 1 &&\n+      match(Def, m_ComputeReductionResult(m_VPIRValue(IRV))))\n+    return Def->replaceAllUsesWith(IRV);\n+\n   // Some simplifications can only be applied after unrolling. Perform them\n   // below.\n   if (!Plan->isUnrolled())\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanUtils.h b/llvm/lib/Transforms/Vectorize/VPlanUtils.h\nindex 204a9627e120e..31248cca50543 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanUtils.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanUtils.h\n@@ -113,9 +113,9 @@ inline VPRecipeBase *findRecipe(VPValue *Start, PredT Pred) {\n   for (unsigned I = 0; I != Worklist.size(); ++I) {\n     VPValue *Cur = Worklist[I];\n     auto *R = Cur->getDefiningRecipe();\n-    // TODO: Skip live-ins once no degenerate reductions (ones with constant\n-    // backedge values) are generated.\n-    if (R && Pred(R))\n+    if (!R)\n+      continue;\n+    if (Pred(R))\n       return R;\n     for (VPUser *U : Cur->users()) {\n       for (VPValue *V : cast<VPRecipeBase>(U)->definedValues())\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "In some cases, we identify patterns as reductions, even though they can be simplified to a non-reduction.\r\n\r\nMark VPReductionPHIRecipe as not reading from memory & not having side-effects, to clean them up.\r\n\r\nWe also need to remove ComputeReductionResult VPInstructions with live-in arguments. This means there is actually no reduction, and we need to fold it to the live in. Otherwise we would incorrectly reduce the live-in.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/epilog-vectorization-reductions.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-width=4 -enable-epilogue-vectorization -epilogue-vectorization-force-VF=4 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "reduction_with_const_or",
+          "test_body": "define i1 @reduction_with_const_or(ptr %A, i8 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %or.red = phi i1 [ false, %entry ], [ %or.next, %loop ]\n  %iv = phi i8 [ 0, %entry ], [ %iv.next, %loop ]\n  %iv.ext = zext i8 %iv to i64\n  %gep = getelementptr inbounds i64, ptr %A, i64 %iv.ext\n  store i64 %iv.ext, ptr %gep, align 8\n  %or.next = or i1 %or.red, true\n  %iv.next = add i8 %iv, 1\n  %exitcond = icmp eq i8 %iv, %n\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i1 %or.next\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-01-19T18:17:55Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      [
+        248,
+        253
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        127,
+        132
+      ],
+      [
+        162,
+        167
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        1510,
+        1515
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanUtils.h": [
+      [
+        113,
+        121
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/epilog-vectorization-reductions.ll": [
+      [
+        686,
+        692
+      ],
+      [
+        706,
+        744
+      ],
+      [
+        747,
+        753
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      "m_VPInstruction",
+      "m_VPValue"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPRecipeBase::mayHaveSideEffects",
+      "VPRecipeBase::mayReadFromMemory"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "simplifyRecipe"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanUtils.h": [
+      "findRecipe"
+    ],
+    "llvm/test/Transforms/LoopVectorize/epilog-vectorization-reductions.ll": [
+      "fp_reduction_max"
+    ]
+  }
+}

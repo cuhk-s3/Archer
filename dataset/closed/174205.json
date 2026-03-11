@@ -1,0 +1,363 @@
+{
+  "pr_id": 174205,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174205",
+  "state": "closed",
+  "title": "[SLP]Remove LoadCombine workaround after handling of the copyables",
+  "author": "alexey-bataev",
+  "base_commit": "05a2b146fbc2944507fd3570254d0e456dc2a795",
+  "fix_commit": "800e930e7bdd641bfb6a14beb04d1884e2949c0e",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 7575cfb250516..e7e5fa76427fb 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -2100,12 +2100,16 @@ class slpvectorizer::BoUpSLP {\n         VectorizableTree.front()->getVectorFactor());\n   }\n \n-  /// Returns the opcode of the root node, or 0, if the root node is gather.\n+  /// Returns true if the tree results in one of the reduced bitcasts variants.\n   bool isReducedBitcastRoot() const {\n     return VectorizableTree.front()->hasState() &&\n            (VectorizableTree.front()->CombinedOp == TreeEntry::ReducedBitcast ||\n             VectorizableTree.front()->CombinedOp ==\n-                TreeEntry::ReducedBitcastBSwap) &&\n+                TreeEntry::ReducedBitcastBSwap ||\n+            VectorizableTree.front()->CombinedOp ==\n+                TreeEntry::ReducedBitcastLoads ||\n+            VectorizableTree.front()->CombinedOp ==\n+                TreeEntry::ReducedBitcastBSwapLoads) &&\n            VectorizableTree.front()->State == TreeEntry::Vectorize;\n   }\n \n@@ -2270,23 +2274,6 @@ class slpvectorizer::BoUpSLP {\n   /// effectively than the base graph.\n   bool isTreeNotExtendable() const;\n \n-  /// Assume that a legal-sized 'or'-reduction of shifted/zexted loaded values\n-  /// can be load combined in the backend. Load combining may not be allowed in\n-  /// the IR optimizer, so we do not want to alter the pattern. For example,\n-  /// partially transforming a scalar bswap() pattern into vector code is\n-  /// effectively impossible for the backend to undo.\n-  /// TODO: If load combining is allowed in the IR optimizer, this analysis\n-  ///       may not be necessary.\n-  bool isLoadCombineReductionCandidate(RecurKind RdxKind) const;\n-\n-  /// Assume that a vector of stores of bitwise-or/shifted/zexted loaded values\n-  /// can be load combined in the backend. Load combining may not be allowed in\n-  /// the IR optimizer, so we do not want to alter the pattern. For example,\n-  /// partially transforming a scalar bswap() pattern into vector code is\n-  /// effectively impossible for the backend to undo.\n-  /// TODO: If load combining is allowed in the IR optimizer, this analysis\n-  ///       may not be necessary.\n-  bool isLoadCombineCandidate(ArrayRef<Value *> Stores) const;\n   bool isStridedLoad(ArrayRef<Value *> PointerOps, Type *ScalarTy,\n                      Align Alignment, const int64_t Diff,\n                      const size_t Sz) const;\n@@ -3932,8 +3919,9 @@ class slpvectorizer::BoUpSLP {\n   /// .., 56))-like pattern.\n   /// If the int shifts unique, also strided, but not ordered, sets \\p Order.\n   /// If the node can be represented as a bitcast + bswap, sets \\p IsBSwap.\n-  bool matchesShlZExt(const TreeEntry &TE, OrdersType &Order,\n-                      bool &IsBSwap) const;\n+  /// If the root nodes are loads, sets \\p ForLoads to true.\n+  bool matchesShlZExt(const TreeEntry &TE, OrdersType &Order, bool &IsBSwap,\n+                      bool &ForLoads) const;\n \n   class TreeEntry {\n   public:\n@@ -4066,6 +4054,8 @@ class slpvectorizer::BoUpSLP {\n       FMulAdd,\n       ReducedBitcast,\n       ReducedBitcastBSwap,\n+      ReducedBitcastLoads,\n+      ReducedBitcastBSwapLoads,\n     };\n     CombinedOpcode CombinedOp = NotCombinedOp;\n \n@@ -13353,10 +13343,11 @@ static InstructionCost canConvertToFMA(ArrayRef<Value *> VL,\n }\n \n bool BoUpSLP::matchesShlZExt(const TreeEntry &TE, OrdersType &Order,\n-                             bool &IsBSwap) const {\n+                             bool &IsBSwap, bool &ForLoads) const {\n   assert(TE.hasState() && TE.getOpcode() == Instruction::Shl &&\n          \"Expected Shl node.\");\n   IsBSwap = false;\n+  ForLoads = false;\n   if (TE.State != TreeEntry::Vectorize || !TE.ReorderIndices.empty() ||\n       !TE.ReuseShuffleIndices.empty() || MinBWs.contains(&TE) ||\n       any_of(TE.Scalars, [](Value *V) { return !V->hasOneUse(); }))\n@@ -13463,6 +13454,44 @@ bool BoUpSLP::matchesShlZExt(const TreeEntry &TE, OrdersType &Order,\n     if (BSwapCost <= BitcastCost) {\n       BitcastCost = BSwapCost;\n       IsBSwap = true;\n+      Order.clear();\n+      // Check for loads in the ZExt node.\n+      const TreeEntry *SrcTE = getOperandEntry(LhsTE, /*Idx=*/0);\n+      if (SrcTE->State == TreeEntry::Vectorize &&\n+          SrcTE->ReorderIndices.empty() && SrcTE->ReuseShuffleIndices.empty() &&\n+          SrcTE->getOpcode() == Instruction::Load && !SrcTE->isAltShuffle() &&\n+          all_of(SrcTE->Scalars, [](Value *V) { return V->hasOneUse(); })) {\n+        auto *LI = cast<LoadInst>(SrcTE->getMainOp());\n+        IntrinsicCostAttributes CostAttrs(Intrinsic::bswap, ScalarTy,\n+                                          {ScalarTy});\n+        InstructionCost BSwapCost =\n+            TTI->getMemoryOpCost(Instruction::Load, ScalarTy, LI->getAlign(),\n+                                 LI->getPointerAddressSpace(), CostKind) +\n+            TTI->getIntrinsicInstrCost(CostAttrs, CostKind);\n+        if (BSwapCost <= BitcastCost) {\n+          VecCost +=\n+              TTI->getMemoryOpCost(Instruction::Load, SrcVecTy, LI->getAlign(),\n+                                   LI->getPointerAddressSpace(), CostKind);\n+          BitcastCost = BSwapCost;\n+          ForLoads = true;\n+        }\n+      }\n+    }\n+  } else if (Order.empty() && DL->getTypeSizeInBits(SrcScalarTy) == ByteSize) {\n+    // Check for loads in the ZExt node.\n+    const TreeEntry *SrcTE = getOperandEntry(LhsTE, /*Idx=*/0);\n+    if (SrcTE->State == TreeEntry::Vectorize && SrcTE->ReorderIndices.empty() &&\n+        SrcTE->ReuseShuffleIndices.empty() &&\n+        SrcTE->getOpcode() == Instruction::Load && !SrcTE->isAltShuffle() &&\n+        all_of(SrcTE->Scalars, [](Value *V) { return V->hasOneUse(); })) {\n+      auto *LI = cast<LoadInst>(SrcTE->getMainOp());\n+      BitcastCost =\n+          TTI->getMemoryOpCost(Instruction::Load, ScalarTy, LI->getAlign(),\n+                               LI->getPointerAddressSpace(), CostKind);\n+      VecCost +=\n+          TTI->getMemoryOpCost(Instruction::Load, SrcVecTy, LI->getAlign(),\n+                               LI->getPointerAddressSpace(), CostKind);\n+      ForLoads = true;\n     }\n   }\n   return BitcastCost < VecCost;\n@@ -13884,14 +13913,17 @@ void BoUpSLP::transformNodes() {\n         break;\n       OrdersType Order;\n       bool IsBSwap;\n-      if (!matchesShlZExt(E, Order, IsBSwap))\n+      bool ForLoads;\n+      if (!matchesShlZExt(E, Order, IsBSwap, ForLoads))\n         break;\n       // This node is a (reduced disjoint or) bitcast node.\n       TreeEntry::CombinedOpcode Code =\n-          IsBSwap ? TreeEntry::ReducedBitcastBSwap : TreeEntry::ReducedBitcast;\n+          IsBSwap ? (ForLoads ? TreeEntry::ReducedBitcastBSwapLoads\n+                              : TreeEntry::ReducedBitcastBSwap)\n+                  : (ForLoads ? TreeEntry::ReducedBitcastLoads\n+                              : TreeEntry::ReducedBitcast);\n       E.CombinedOp = Code;\n-      if (!IsBSwap)\n-        E.ReorderIndices = std::move(Order);\n+      E.ReorderIndices = std::move(Order);\n       TreeEntry *ZExtEntry = getOperandEntry(&E, 0);\n       assert(ZExtEntry->UserTreeIndex &&\n              ZExtEntry->State == TreeEntry::Vectorize &&\n@@ -13900,6 +13932,16 @@ void BoUpSLP::transformNodes() {\n       // The ZExt node is part of the combined node.\n       ZExtEntry->State = TreeEntry::CombinedVectorize;\n       ZExtEntry->CombinedOp = Code;\n+      if (ForLoads) {\n+        TreeEntry *LoadsEntry = getOperandEntry(ZExtEntry, 0);\n+        assert(LoadsEntry->UserTreeIndex &&\n+               LoadsEntry->State == TreeEntry::Vectorize &&\n+               LoadsEntry->getOpcode() == Instruction::Load &&\n+               \"Expected Load node.\");\n+        // The Load node is part of the combined node.\n+        LoadsEntry->State = TreeEntry::CombinedVectorize;\n+        LoadsEntry->CombinedOp = Code;\n+      }\n       TreeEntry *ConstEntry = getOperandEntry(&E, 1);\n       assert(ConstEntry->UserTreeIndex && ConstEntry->isGather() &&\n              \"Expected ZExt node.\");\n@@ -15559,6 +15601,44 @@ BoUpSLP::getEntryCost(const TreeEntry *E, ArrayRef<Value *> VectorizedVals,\n     };\n     return GetCostDiff(GetScalarCost, GetVectorCost);\n   }\n+  case TreeEntry::ReducedBitcastLoads:\n+  case TreeEntry::ReducedBitcastBSwapLoads: {\n+    auto GetScalarCost = [&, &TTI = *TTI](unsigned Idx) {\n+      if (isa<PoisonValue>(UniqueValues[Idx]))\n+        return InstructionCost(TTI::TCC_Free);\n+      auto *Shl = dyn_cast<Instruction>(UniqueValues[Idx]);\n+      if (!Shl)\n+        return InstructionCost(TTI::TCC_Free);\n+      InstructionCost ScalarCost = TTI.getInstructionCost(Shl, CostKind);\n+      auto *ZExt = dyn_cast<Instruction>(Shl->getOperand(0));\n+      if (!ZExt)\n+        return ScalarCost;\n+      ScalarCost += TTI.getInstructionCost(ZExt, CostKind);\n+      auto *Load = dyn_cast<Instruction>(ZExt->getOperand(0));\n+      if (!Load)\n+        return ScalarCost;\n+      ScalarCost += TTI.getInstructionCost(Load, CostKind);\n+      return ScalarCost;\n+    };\n+    auto GetVectorCost = [&, &TTI = *TTI](InstructionCost CommonCost) {\n+      const TreeEntry *LhsTE = getOperandEntry(E, /*Idx=*/0);\n+      const TreeEntry *LoadTE = getOperandEntry(LhsTE, /*Idx=*/0);\n+      auto *LI0 = cast<LoadInst>(LoadTE->getMainOp());\n+      auto *OrigScalarTy = E->getMainOp()->getType();\n+      InstructionCost LoadCost =\n+          TTI.getMemoryOpCost(Instruction::Load, OrigScalarTy, LI0->getAlign(),\n+                              LI0->getPointerAddressSpace(), CostKind);\n+      if (ShuffleOrOp == TreeEntry::ReducedBitcastBSwapLoads) {\n+        IntrinsicCostAttributes CostAttrs(Intrinsic::bswap, OrigScalarTy,\n+                                          {OrigScalarTy});\n+        InstructionCost IntrinsicCost =\n+            TTI.getIntrinsicInstrCost(CostAttrs, CostKind);\n+        LoadCost += IntrinsicCost;\n+      }\n+      return LoadCost + CommonCost;\n+    };\n+    return GetCostDiff(GetScalarCost, GetVectorCost);\n+  }\n   case Instruction::FNeg:\n   case Instruction::Add:\n   case Instruction::FAdd:\n@@ -16043,69 +16123,6 @@ bool BoUpSLP::isFullyVectorizableTinyTree(bool ForReduction) const {\n   return true;\n }\n \n-static bool isLoadCombineCandidateImpl(Value *Root, unsigned NumElts,\n-                                       TargetTransformInfo *TTI,\n-                                       bool MustMatchOrInst) {\n-  // Look past the root to find a source value. Arbitrarily follow the\n-  // path through operand 0 of any 'or'. Also, peek through optional\n-  // shift-left-by-multiple-of-8-bits.\n-  Value *ZextLoad = Root;\n-  const APInt *ShAmtC;\n-  bool FoundOr = false;\n-  while (!isa<ConstantExpr>(ZextLoad) &&\n-         (match(ZextLoad, m_Or(m_Value(), m_Value())) ||\n-          (match(ZextLoad, m_Shl(m_Value(), m_APInt(ShAmtC))) &&\n-           ShAmtC->urem(8) == 0))) {\n-    auto *BinOp = cast<BinaryOperator>(ZextLoad);\n-    ZextLoad = BinOp->getOperand(0);\n-    if (BinOp->getOpcode() == Instruction::Or)\n-      FoundOr = true;\n-  }\n-  // Check if the input is an extended load of the required or/shift expression.\n-  Value *Load;\n-  if ((MustMatchOrInst && !FoundOr) || ZextLoad == Root ||\n-      !match(ZextLoad, m_ZExt(m_Value(Load))) || !isa<LoadInst>(Load))\n-    return false;\n-\n-  // Require that the total load bit width is a legal integer type.\n-  // For example, <8 x i8> --> i64 is a legal integer on a 64-bit target.\n-  // But <16 x i8> --> i128 is not, so the backend probably can't reduce it.\n-  Type *SrcTy = Load->getType();\n-  unsigned LoadBitWidth = SrcTy->getIntegerBitWidth() * NumElts;\n-  if (!TTI->isTypeLegal(IntegerType::get(Root->getContext(), LoadBitWidth)))\n-    return false;\n-\n-  // Everything matched - assume that we can fold the whole sequence using\n-  // load combining.\n-  LLVM_DEBUG(dbgs() << \"SLP: Assume load combining for tree starting at \"\n-             << *(cast<Instruction>(Root)) << \"\\n\");\n-\n-  return true;\n-}\n-\n-bool BoUpSLP::isLoadCombineReductionCandidate(RecurKind RdxKind) const {\n-  if (RdxKind != RecurKind::Or)\n-    return false;\n-\n-  unsigned NumElts = VectorizableTree[0]->Scalars.size();\n-  Value *FirstReduced = VectorizableTree[0]->Scalars[0];\n-  return isLoadCombineCandidateImpl(FirstReduced, NumElts, TTI,\n-                                    /* MatchOr */ false);\n-}\n-\n-bool BoUpSLP::isLoadCombineCandidate(ArrayRef<Value *> Stores) const {\n-  // Peek through a final sequence of stores and check if all operations are\n-  // likely to be load-combined.\n-  unsigned NumElts = Stores.size();\n-  for (Value *Scalar : Stores) {\n-    Value *X;\n-    if (!match(Scalar, m_Store(m_Value(X), m_Value())) ||\n-        !isLoadCombineCandidateImpl(X, NumElts, TTI, /* MatchOr */ true))\n-      return false;\n-  }\n-  return true;\n-}\n-\n bool BoUpSLP::isTreeTinyAndNotFullyVectorizable(bool ForReduction) const {\n   if (!DebugCounter::shouldExecute(VectorizedGraphs))\n     return true;\n@@ -16334,7 +16351,9 @@ InstructionCost BoUpSLP::getSpillCost() {\n   SmallPtrSet<const TreeEntry *, 8> ScalarOrPseudoEntries;\n   for (const auto &TEPtr : VectorizableTree) {\n     if (TEPtr->CombinedOp == TreeEntry::ReducedBitcast ||\n-        TEPtr->CombinedOp == TreeEntry::ReducedBitcastBSwap) {\n+        TEPtr->CombinedOp == TreeEntry::ReducedBitcastBSwap ||\n+        TEPtr->CombinedOp == TreeEntry::ReducedBitcastLoads ||\n+        TEPtr->CombinedOp == TreeEntry::ReducedBitcastBSwapLoads) {\n       ScalarOrPseudoEntries.insert(TEPtr.get());\n       continue;\n     }\n@@ -20269,6 +20288,8 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {\n     switch (E->CombinedOp) {\n     case TreeEntry::ReducedBitcast:\n     case TreeEntry::ReducedBitcastBSwap:\n+    case TreeEntry::ReducedBitcastLoads:\n+    case TreeEntry::ReducedBitcastBSwapLoads:\n       ShuffleOrOp = E->CombinedOp;\n       break;\n     default:\n@@ -21236,6 +21257,31 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {\n       ++NumVectorInstructions;\n       return V;\n     }\n+    case TreeEntry::ReducedBitcastLoads:\n+    case TreeEntry::ReducedBitcastBSwapLoads: {\n+      assert(UserIgnoreList && \"Expected reduction operations only.\");\n+      setInsertPointAfterBundle(E);\n+      TreeEntry *ZExt = getOperandEntry(E, /*Idx=*/0);\n+      ZExt->VectorizedValue = PoisonValue::get(getWidenedType(\n+          ZExt->getMainOp()->getType(), ZExt->getVectorFactor()));\n+      TreeEntry *Const = getOperandEntry(E, /*Idx=*/1);\n+      Const->VectorizedValue = PoisonValue::get(getWidenedType(\n+          Const->Scalars.front()->getType(), Const->getVectorFactor()));\n+      TreeEntry *Load = getOperandEntry(ZExt, /*Idx=*/0);\n+      Load->VectorizedValue = PoisonValue::get(getWidenedType(\n+          Load->getMainOp()->getType(), Load->getVectorFactor()));\n+      LoadInst *LI = cast<LoadInst>(Load->getMainOp());\n+      Value *PO = LI->getPointerOperand();\n+      Type *ScalarTy = ZExt->getMainOp()->getType();\n+      Value *V = Builder.CreateAlignedLoad(ScalarTy, PO, LI->getAlign());\n+      ++NumVectorInstructions;\n+      if (ShuffleOrOp == TreeEntry::ReducedBitcastBSwapLoads) {\n+        V = Builder.CreateUnaryIntrinsic(Intrinsic::bswap, V);\n+        ++NumVectorInstructions;\n+      }\n+      E->VectorizedValue = V;\n+      return V;\n+    }\n     default:\n       llvm_unreachable(\"unknown inst\");\n   }\n@@ -21263,7 +21309,9 @@ Value *BoUpSLP::vectorizeTree(\n     if (TE->isGather() || DeletedNodes.contains(TE.get()) ||\n         (TE->State == TreeEntry::CombinedVectorize &&\n          (TE->CombinedOp == TreeEntry::ReducedBitcast ||\n-          TE->CombinedOp == TreeEntry::ReducedBitcastBSwap)))\n+          TE->CombinedOp == TreeEntry::ReducedBitcastBSwap ||\n+          TE->CombinedOp == TreeEntry::ReducedBitcastLoads ||\n+          TE->CombinedOp == TreeEntry::ReducedBitcastBSwapLoads)))\n       continue;\n     (void)getLastInstructionInBundle(TE.get());\n   }\n@@ -21822,7 +21870,9 @@ Value *BoUpSLP::vectorizeTree(\n       continue;\n \n     if (Entry->CombinedOp == TreeEntry::ReducedBitcast ||\n-        Entry->CombinedOp == TreeEntry::ReducedBitcastBSwap) {\n+        Entry->CombinedOp == TreeEntry::ReducedBitcastBSwap ||\n+        Entry->CombinedOp == TreeEntry::ReducedBitcastLoads ||\n+        Entry->CombinedOp == TreeEntry::ReducedBitcastBSwapLoads) {\n       // Skip constant node\n       if (!Entry->hasState()) {\n         assert(allConstant(Entry->Scalars) && \"Expected constants only.\");\n@@ -24138,8 +24188,6 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,\n       return false;\n     }\n   }\n-  if (R.isLoadCombineCandidate(Chain))\n-    return true;\n   R.buildTree(Chain);\n   // Check if tree tiny and store itself or its value is not vectorized.\n   if (R.isTreeTinyAndNotFullyVectorizable()) {\n@@ -25744,11 +25792,6 @@ class HorizontalReduction {\n             V.analyzedReductionVals(VL);\n           continue;\n         }\n-        if (V.isLoadCombineReductionCandidate(RdxKind)) {\n-          if (!AdjustReducedVals())\n-            V.analyzedReductionVals(VL);\n-          continue;\n-        }\n         V.reorderTopToBottom();\n         // No need to reorder the root node at all for reassociative reduction.\n         V.reorderBottomToTop(/*IgnoreReorder=*/RdxFMF.allowReassoc() ||\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "LoadCombine pattern handling was added as a workaround for the cases,\nwhere the SLP vectorizer could not vectorize the code effectively. With\nthe copyables support, it can handle it directly.\n\nAlso, patch adds support for scalar loads[ + bswap] pattern for byte\nsized loads (+ reverse bytes for bswap)\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/X86/loadcombine.ll",
+      "commands": [
+        "opt -O3 -S -mtriple=x86_64-- -mattr=+avx2 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "loadCombine_4consecutive_1324",
+          "test_body": "define i32 @loadCombine_4consecutive_1324(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %e1, %s3\n  %o2 = or i32 %o1, %s2\n  %o3 = or i32 %o2, %s4\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_3142",
+          "test_body": "define i32 @loadCombine_4consecutive_3142(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s3, %e1\n  %o2 = or i32 %o1, %s4\n  %o3 = or i32 %o2, %s2\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_1423",
+          "test_body": "define i32 @loadCombine_4consecutive_1423(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %e1, %s4\n  %o2 = or i32 %o1, %s2\n  %o3 = or i32 %o2, %s3\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_3421",
+          "test_body": "define i32 @loadCombine_4consecutive_3421(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s3, %s4\n  %o2 = or i32 %o1, %s2\n  %o3 = or i32 %o2, %e1\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_4213",
+          "test_body": "define i32 @loadCombine_4consecutive_4213(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s4, %s2\n  %o2 = or i32 %o1, %e1\n  %o3 = or i32 %o2, %s3\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_1432",
+          "test_body": "define i32 @loadCombine_4consecutive_1432(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %e1, %s4\n  %o2 = or i32 %o1, %s3\n  %o3 = or i32 %o2, %s2\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_2341",
+          "test_body": "define i32 @loadCombine_4consecutive_2341(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s2, %s3\n  %o2 = or i32 %o1, %s4\n  %o3 = or i32 %o2, %e1\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_4231",
+          "test_body": "define i32 @loadCombine_4consecutive_4231(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s4, %s2\n  %o2 = or i32 %o1, %s3\n  %o3 = or i32 %o2, %e1\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_2431",
+          "test_body": "define i32 @loadCombine_4consecutive_2431(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s2, %s4\n  %o2 = or i32 %o1, %s3\n  %o3 = or i32 %o2, %e1\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_2413",
+          "test_body": "define i32 @loadCombine_4consecutive_2413(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s2, %s4\n  %o2 = or i32 %o1, %e1\n  %o3 = or i32 %o2, %s3\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_3124",
+          "test_body": "define i32 @loadCombine_4consecutive_3124(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s3, %e1\n  %o2 = or i32 %o1, %s2\n  %o3 = or i32 %o2, %s4\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_1243",
+          "test_body": "define i32 @loadCombine_4consecutive_1243(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %e1, %s2\n  %o2 = or i32 %o1, %s4\n  %o3 = or i32 %o2, %s3\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_1342",
+          "test_body": "define i32 @loadCombine_4consecutive_1342(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %e1, %s3\n  %o2 = or i32 %o1, %s4\n  %o3 = or i32 %o2, %s2\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_4123",
+          "test_body": "define i32 @loadCombine_4consecutive_4123(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s4, %e1\n  %o2 = or i32 %o1, %s2\n  %o3 = or i32 %o2, %s3\n  ret i32 %o3\n}\n"
+        },
+        {
+          "test_name": "loadCombine_4consecutive_4132",
+          "test_body": "define i32 @loadCombine_4consecutive_4132(ptr %p) {\n  %p1 = getelementptr i8, ptr %p, i32 1\n  %p2 = getelementptr i8, ptr %p, i32 2\n  %p3 = getelementptr i8, ptr %p, i32 3\n  %l1 = load i8, ptr %p, align 1\n  %l2 = load i8, ptr %p1, align 1\n  %l3 = load i8, ptr %p2, align 1\n  %l4 = load i8, ptr %p3, align 1\n  %e1 = zext i8 %l1 to i32\n  %e2 = zext i8 %l2 to i32\n  %e3 = zext i8 %l3 to i32\n  %e4 = zext i8 %l4 to i32\n  %s2 = shl i32 %e2, 8\n  %s3 = shl i32 %e3, 16\n  %s4 = shl i32 %e4, 24\n  %o1 = or i32 %s4, %e1\n  %o2 = or i32 %o1, %s3\n  %o3 = or i32 %o2, %s2\n  ret i32 %o3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/bad-reduction.ll",
+      "commands": [
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-- -mattr=avx2"
+      ],
+      "tests": [
+        {
+          "test_name": "load_bswap_nop_shift_disjoint",
+          "test_body": "%v8i8 = type { i8, i8, i8, i8, i8, i8, i8, i8 }\n\ndefine i64 @load_bswap_nop_shift_disjoint(ptr %p) {\n  %g1 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 1\n  %g2 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 2\n  %g3 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 3\n  %g4 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 4\n  %g5 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 5\n  %g6 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 6\n  %g7 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 7\n  %t0 = load i8, ptr %p, align 1\n  %t1 = load i8, ptr %g1, align 1\n  %t2 = load i8, ptr %g2, align 1\n  %t3 = load i8, ptr %g3, align 1\n  %t4 = load i8, ptr %g4, align 1\n  %t5 = load i8, ptr %g5, align 1\n  %t6 = load i8, ptr %g6, align 1\n  %t7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %t0 to i64\n  %z1 = zext i8 %t1 to i64\n  %z2 = zext i8 %t2 to i64\n  %z3 = zext i8 %t3 to i64\n  %z4 = zext i8 %t4 to i64\n  %z5 = zext i8 %t5 to i64\n  %z6 = zext i8 %t6 to i64\n  %z7 = zext i8 %t7 to i64\n  %sh0 = shl nuw i64 %z0, 56\n  %sh1 = shl nuw nsw i64 %z1, 48\n  %sh2 = shl nuw nsw i64 %z2, 40\n  %sh3 = shl nuw nsw i64 %z3, 32\n  %sh4 = shl nuw nsw i64 %z4, 24\n  %sh5 = shl nuw nsw i64 %z5, 16\n  %sh6 = shl nuw nsw i64 %z6, 8\n  %sh7 = shl nuw nsw i64 %z7, 0\n  %or01 = or disjoint i64 %sh0, %sh1\n  %or012 = or disjoint i64 %or01, %sh2\n  %or0123 = or disjoint i64 %or012, %sh3\n  %or01234 = or disjoint i64 %or0123, %sh4\n  %or012345 = or disjoint i64 %or01234, %sh5\n  %or0123456 = or disjoint i64 %or012345, %sh6\n  %or01234567 = or disjoint i64 %or0123456, %sh7\n  ret i64 %or01234567\n}\n"
+        },
+        {
+          "test_name": "load_bswap_disjoint",
+          "test_body": "%v8i8 = type { i8, i8, i8, i8, i8, i8, i8, i8 }\n\ndefine i64 @load_bswap_disjoint(ptr %p) {\n  %g1 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 1\n  %g2 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 2\n  %g3 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 3\n  %g4 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 4\n  %g5 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 5\n  %g6 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 6\n  %g7 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 7\n  %t0 = load i8, ptr %p, align 1\n  %t1 = load i8, ptr %g1, align 1\n  %t2 = load i8, ptr %g2, align 1\n  %t3 = load i8, ptr %g3, align 1\n  %t4 = load i8, ptr %g4, align 1\n  %t5 = load i8, ptr %g5, align 1\n  %t6 = load i8, ptr %g6, align 1\n  %t7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %t0 to i64\n  %z1 = zext i8 %t1 to i64\n  %z2 = zext i8 %t2 to i64\n  %z3 = zext i8 %t3 to i64\n  %z4 = zext i8 %t4 to i64\n  %z5 = zext i8 %t5 to i64\n  %z6 = zext i8 %t6 to i64\n  %z7 = zext i8 %t7 to i64\n  %sh0 = shl nuw i64 %z0, 56\n  %sh1 = shl nuw nsw i64 %z1, 48\n  %sh2 = shl nuw nsw i64 %z2, 40\n  %sh3 = shl nuw nsw i64 %z3, 32\n  %sh4 = shl nuw nsw i64 %z4, 24\n  %sh5 = shl nuw nsw i64 %z5, 16\n  %sh6 = shl nuw nsw i64 %z6, 8\n  %or01 = or disjoint i64 %sh0, %sh1\n  %or012 = or disjoint i64 %or01, %sh2\n  %or0123 = or disjoint i64 %or012, %sh3\n  %or01234 = or disjoint i64 %or0123, %sh4\n  %or012345 = or disjoint i64 %or01234, %sh5\n  %or0123456 = or disjoint i64 %or012345, %sh6\n  %or01234567 = or disjoint i64 %or0123456, %z7\n  ret i64 %or01234567\n}\n"
+        },
+        {
+          "test_name": "load64le_nop_shift",
+          "test_body": "define i64 @load64le_nop_shift(ptr %arg) {\n  %g1 = getelementptr inbounds i8, ptr %arg, i64 1\n  %g2 = getelementptr inbounds i8, ptr %arg, i64 2\n  %g3 = getelementptr inbounds i8, ptr %arg, i64 3\n  %g4 = getelementptr inbounds i8, ptr %arg, i64 4\n  %g5 = getelementptr inbounds i8, ptr %arg, i64 5\n  %g6 = getelementptr inbounds i8, ptr %arg, i64 6\n  %g7 = getelementptr inbounds i8, ptr %arg, i64 7\n  %ld0 = load i8, ptr %arg, align 1\n  %ld1 = load i8, ptr %g1, align 1\n  %ld2 = load i8, ptr %g2, align 1\n  %ld3 = load i8, ptr %g3, align 1\n  %ld4 = load i8, ptr %g4, align 1\n  %ld5 = load i8, ptr %g5, align 1\n  %ld6 = load i8, ptr %g6, align 1\n  %ld7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %ld0 to i64\n  %z1 = zext i8 %ld1 to i64\n  %z2 = zext i8 %ld2 to i64\n  %z3 = zext i8 %ld3 to i64\n  %z4 = zext i8 %ld4 to i64\n  %z5 = zext i8 %ld5 to i64\n  %z6 = zext i8 %ld6 to i64\n  %z7 = zext i8 %ld7 to i64\n  %s0 = shl nuw nsw i64 %z0, 0\n  %s1 = shl nuw nsw i64 %z1, 8\n  %s2 = shl nuw nsw i64 %z2, 16\n  %s3 = shl nuw nsw i64 %z3, 24\n  %s4 = shl nuw nsw i64 %z4, 32\n  %s5 = shl nuw nsw i64 %z5, 40\n  %s6 = shl nuw nsw i64 %z6, 48\n  %s7 = shl nuw i64 %z7, 56\n  %o1 = or i64 %s1, %s0\n  %o2 = or i64 %o1, %s2\n  %o3 = or i64 %o2, %s3\n  %o4 = or i64 %o3, %s4\n  %o5 = or i64 %o4, %s5\n  %o6 = or i64 %o5, %s6\n  %o7 = or i64 %o6, %s7\n  ret i64 %o7\n}\n"
+        },
+        {
+          "test_name": "load_bswap",
+          "test_body": "%v8i8 = type { i8, i8, i8, i8, i8, i8, i8, i8 }\n\ndefine i64 @load_bswap(ptr %p) {\n  %g1 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 1\n  %g2 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 2\n  %g3 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 3\n  %g4 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 4\n  %g5 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 5\n  %g6 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 6\n  %g7 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 7\n  %t0 = load i8, ptr %p, align 1\n  %t1 = load i8, ptr %g1, align 1\n  %t2 = load i8, ptr %g2, align 1\n  %t3 = load i8, ptr %g3, align 1\n  %t4 = load i8, ptr %g4, align 1\n  %t5 = load i8, ptr %g5, align 1\n  %t6 = load i8, ptr %g6, align 1\n  %t7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %t0 to i64\n  %z1 = zext i8 %t1 to i64\n  %z2 = zext i8 %t2 to i64\n  %z3 = zext i8 %t3 to i64\n  %z4 = zext i8 %t4 to i64\n  %z5 = zext i8 %t5 to i64\n  %z6 = zext i8 %t6 to i64\n  %z7 = zext i8 %t7 to i64\n  %sh0 = shl nuw i64 %z0, 56\n  %sh1 = shl nuw nsw i64 %z1, 48\n  %sh2 = shl nuw nsw i64 %z2, 40\n  %sh3 = shl nuw nsw i64 %z3, 32\n  %sh4 = shl nuw nsw i64 %z4, 24\n  %sh5 = shl nuw nsw i64 %z5, 16\n  %sh6 = shl nuw nsw i64 %z6, 8\n  %or01 = or i64 %sh0, %sh1\n  %or012 = or i64 %or01, %sh2\n  %or0123 = or i64 %or012, %sh3\n  %or01234 = or i64 %or0123, %sh4\n  %or012345 = or i64 %or01234, %sh5\n  %or0123456 = or i64 %or012345, %sh6\n  %or01234567 = or i64 %or0123456, %z7\n  ret i64 %or01234567\n}\n"
+        },
+        {
+          "test_name": "load64le_disjoint",
+          "test_body": "define i64 @load64le_disjoint(ptr %arg) {\n  %g1 = getelementptr inbounds i8, ptr %arg, i64 1\n  %g2 = getelementptr inbounds i8, ptr %arg, i64 2\n  %g3 = getelementptr inbounds i8, ptr %arg, i64 3\n  %g4 = getelementptr inbounds i8, ptr %arg, i64 4\n  %g5 = getelementptr inbounds i8, ptr %arg, i64 5\n  %g6 = getelementptr inbounds i8, ptr %arg, i64 6\n  %g7 = getelementptr inbounds i8, ptr %arg, i64 7\n  %ld0 = load i8, ptr %arg, align 1\n  %ld1 = load i8, ptr %g1, align 1\n  %ld2 = load i8, ptr %g2, align 1\n  %ld3 = load i8, ptr %g3, align 1\n  %ld4 = load i8, ptr %g4, align 1\n  %ld5 = load i8, ptr %g5, align 1\n  %ld6 = load i8, ptr %g6, align 1\n  %ld7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %ld0 to i64\n  %z1 = zext i8 %ld1 to i64\n  %z2 = zext i8 %ld2 to i64\n  %z3 = zext i8 %ld3 to i64\n  %z4 = zext i8 %ld4 to i64\n  %z5 = zext i8 %ld5 to i64\n  %z6 = zext i8 %ld6 to i64\n  %z7 = zext i8 %ld7 to i64\n  %s1 = shl nuw nsw i64 %z1, 8\n  %s2 = shl nuw nsw i64 %z2, 16\n  %s3 = shl nuw nsw i64 %z3, 24\n  %s4 = shl nuw nsw i64 %z4, 32\n  %s5 = shl nuw nsw i64 %z5, 40\n  %s6 = shl nuw nsw i64 %z6, 48\n  %s7 = shl nuw i64 %z7, 56\n  %o1 = or disjoint i64 %s1, %z0\n  %o2 = or disjoint i64 %o1, %s2\n  %o3 = or disjoint i64 %o2, %s3\n  %o4 = or disjoint i64 %o3, %s4\n  %o5 = or disjoint i64 %o4, %s5\n  %o6 = or disjoint i64 %o5, %s6\n  %o7 = or disjoint i64 %o6, %s7\n  ret i64 %o7\n}\n"
+        },
+        {
+          "test_name": "PR39538",
+          "test_body": "define void @PR39538(ptr %t0, ptr %t1) {\n  %t6 = getelementptr inbounds i8, ptr %t0, i64 1\n  %t11 = getelementptr inbounds i8, ptr %t0, i64 2\n  %t16 = getelementptr inbounds i8, ptr %t0, i64 3\n  %t20 = getelementptr inbounds i8, ptr %t0, i64 4\n  %t24 = getelementptr inbounds i8, ptr %t0, i64 5\n  %t29 = getelementptr inbounds i8, ptr %t0, i64 6\n  %t34 = getelementptr inbounds i8, ptr %t0, i64 7\n  %t39 = getelementptr inbounds i8, ptr %t0, i64 8\n  %t43 = getelementptr inbounds i8, ptr %t0, i64 9\n  %t48 = getelementptr inbounds i8, ptr %t0, i64 10\n  %t53 = getelementptr inbounds i8, ptr %t0, i64 11\n  %t58 = getelementptr inbounds i8, ptr %t0, i64 12\n  %t62 = getelementptr inbounds i8, ptr %t0, i64 13\n  %t67 = getelementptr inbounds i8, ptr %t0, i64 14\n  %t72 = getelementptr inbounds i8, ptr %t0, i64 15\n  %t38 = getelementptr inbounds i32, ptr %t1, i64 1\n  %t57 = getelementptr inbounds i32, ptr %t1, i64 2\n  %t76 = getelementptr inbounds i32, ptr %t1, i64 3\n  %t3 = load i8, ptr %t0, align 1\n  %t7 = load i8, ptr %t6, align 1\n  %t12 = load i8, ptr %t11, align 1\n  %t17 = load i8, ptr %t16, align 1\n  %t21 = load i8, ptr %t20, align 1\n  %t25 = load i8, ptr %t24, align 1\n  %t30 = load i8, ptr %t29, align 1\n  %t35 = load i8, ptr %t34, align 1\n  %t40 = load i8, ptr %t39, align 1\n  %t44 = load i8, ptr %t43, align 1\n  %t49 = load i8, ptr %t48, align 1\n  %t54 = load i8, ptr %t53, align 1\n  %t59 = load i8, ptr %t58, align 1\n  %t63 = load i8, ptr %t62, align 1\n  %t68 = load i8, ptr %t67, align 1\n  %t73 = load i8, ptr %t72, align 1\n  %t4 = zext i8 %t3 to i32\n  %t8 = zext i8 %t7 to i32\n  %t13 = zext i8 %t12 to i32\n  %t18 = zext i8 %t17 to i32\n  %t22 = zext i8 %t21 to i32\n  %t26 = zext i8 %t25 to i32\n  %t31 = zext i8 %t30 to i32\n  %t36 = zext i8 %t35 to i32\n  %t41 = zext i8 %t40 to i32\n  %t45 = zext i8 %t44 to i32\n  %t50 = zext i8 %t49 to i32\n  %t55 = zext i8 %t54 to i32\n  %t60 = zext i8 %t59 to i32\n  %t64 = zext i8 %t63 to i32\n  %t69 = zext i8 %t68 to i32\n  %t74 = zext i8 %t73 to i32\n  %t5 = shl nuw i32 %t4, 24\n  %t23 = shl nuw i32 %t22, 24\n  %t42 = shl nuw i32 %t41, 24\n  %t61 = shl nuw i32 %t60, 24\n  %t9 = shl nuw nsw i32 %t8, 16\n  %t27 = shl nuw nsw i32 %t26, 16\n  %t46 = shl nuw nsw i32 %t45, 16\n  %t65 = shl nuw nsw i32 %t64, 16\n  %t14 = shl nuw nsw i32 %t13, 8\n  %t32 = shl nuw nsw i32 %t31, 8\n  %t51 = shl nuw nsw i32 %t50, 8\n  %t70 = shl nuw nsw i32 %t69, 8\n  %t10 = or i32 %t9, %t5\n  %t15 = or i32 %t10, %t14\n  %t19 = or i32 %t15, %t18\n  %t28 = or i32 %t27, %t23\n  %t33 = or i32 %t28, %t32\n  %t37 = or i32 %t33, %t36\n  %t47 = or i32 %t46, %t42\n  %t52 = or i32 %t47, %t51\n  %t56 = or i32 %t52, %t55\n  %t66 = or i32 %t65, %t61\n  %t71 = or i32 %t66, %t70\n  %t75 = or i32 %t71, %t74\n  store i32 %t19, ptr %t1, align 4\n  store i32 %t37, ptr %t38, align 4\n  store i32 %t56, ptr %t57, align 4\n  store i32 %t75, ptr %t76, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "load_bswap_nop_shift",
+          "test_body": "%v8i8 = type { i8, i8, i8, i8, i8, i8, i8, i8 }\n\ndefine i64 @load_bswap_nop_shift(ptr %p) {\n  %g1 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 1\n  %g2 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 2\n  %g3 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 3\n  %g4 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 4\n  %g5 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 5\n  %g6 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 6\n  %g7 = getelementptr inbounds %v8i8, ptr %p, i64 0, i32 7\n  %t0 = load i8, ptr %p, align 1\n  %t1 = load i8, ptr %g1, align 1\n  %t2 = load i8, ptr %g2, align 1\n  %t3 = load i8, ptr %g3, align 1\n  %t4 = load i8, ptr %g4, align 1\n  %t5 = load i8, ptr %g5, align 1\n  %t6 = load i8, ptr %g6, align 1\n  %t7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %t0 to i64\n  %z1 = zext i8 %t1 to i64\n  %z2 = zext i8 %t2 to i64\n  %z3 = zext i8 %t3 to i64\n  %z4 = zext i8 %t4 to i64\n  %z5 = zext i8 %t5 to i64\n  %z6 = zext i8 %t6 to i64\n  %z7 = zext i8 %t7 to i64\n  %sh0 = shl nuw i64 %z0, 56\n  %sh1 = shl nuw nsw i64 %z1, 48\n  %sh2 = shl nuw nsw i64 %z2, 40\n  %sh3 = shl nuw nsw i64 %z3, 32\n  %sh4 = shl nuw nsw i64 %z4, 24\n  %sh5 = shl nuw nsw i64 %z5, 16\n  %sh6 = shl nuw nsw i64 %z6, 8\n  %sh7 = shl nuw nsw i64 %z7, 0\n  %or01 = or i64 %sh0, %sh1\n  %or012 = or i64 %or01, %sh2\n  %or0123 = or i64 %or012, %sh3\n  %or01234 = or i64 %or0123, %sh4\n  %or012345 = or i64 %or01234, %sh5\n  %or0123456 = or i64 %or012345, %sh6\n  %or01234567 = or i64 %or0123456, %sh7\n  ret i64 %or01234567\n}\n"
+        },
+        {
+          "test_name": "load64le_nop_shift_disjoint",
+          "test_body": "define i64 @load64le_nop_shift_disjoint(ptr %arg) {\n  %g1 = getelementptr inbounds i8, ptr %arg, i64 1\n  %g2 = getelementptr inbounds i8, ptr %arg, i64 2\n  %g3 = getelementptr inbounds i8, ptr %arg, i64 3\n  %g4 = getelementptr inbounds i8, ptr %arg, i64 4\n  %g5 = getelementptr inbounds i8, ptr %arg, i64 5\n  %g6 = getelementptr inbounds i8, ptr %arg, i64 6\n  %g7 = getelementptr inbounds i8, ptr %arg, i64 7\n  %ld0 = load i8, ptr %arg, align 1\n  %ld1 = load i8, ptr %g1, align 1\n  %ld2 = load i8, ptr %g2, align 1\n  %ld3 = load i8, ptr %g3, align 1\n  %ld4 = load i8, ptr %g4, align 1\n  %ld5 = load i8, ptr %g5, align 1\n  %ld6 = load i8, ptr %g6, align 1\n  %ld7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %ld0 to i64\n  %z1 = zext i8 %ld1 to i64\n  %z2 = zext i8 %ld2 to i64\n  %z3 = zext i8 %ld3 to i64\n  %z4 = zext i8 %ld4 to i64\n  %z5 = zext i8 %ld5 to i64\n  %z6 = zext i8 %ld6 to i64\n  %z7 = zext i8 %ld7 to i64\n  %s0 = shl nuw nsw i64 %z0, 0\n  %s1 = shl nuw nsw i64 %z1, 8\n  %s2 = shl nuw nsw i64 %z2, 16\n  %s3 = shl nuw nsw i64 %z3, 24\n  %s4 = shl nuw nsw i64 %z4, 32\n  %s5 = shl nuw nsw i64 %z5, 40\n  %s6 = shl nuw nsw i64 %z6, 48\n  %s7 = shl nuw i64 %z7, 56\n  %o1 = or disjoint i64 %s1, %s0\n  %o2 = or disjoint i64 %o1, %s2\n  %o3 = or disjoint i64 %o2, %s3\n  %o4 = or disjoint i64 %o3, %s4\n  %o5 = or disjoint i64 %o4, %s5\n  %o6 = or disjoint i64 %o5, %s6\n  %o7 = or disjoint i64 %o6, %s7\n  ret i64 %o7\n}\n"
+        },
+        {
+          "test_name": "load64le",
+          "test_body": "define i64 @load64le(ptr %arg) {\n  %g1 = getelementptr inbounds i8, ptr %arg, i64 1\n  %g2 = getelementptr inbounds i8, ptr %arg, i64 2\n  %g3 = getelementptr inbounds i8, ptr %arg, i64 3\n  %g4 = getelementptr inbounds i8, ptr %arg, i64 4\n  %g5 = getelementptr inbounds i8, ptr %arg, i64 5\n  %g6 = getelementptr inbounds i8, ptr %arg, i64 6\n  %g7 = getelementptr inbounds i8, ptr %arg, i64 7\n  %ld0 = load i8, ptr %arg, align 1\n  %ld1 = load i8, ptr %g1, align 1\n  %ld2 = load i8, ptr %g2, align 1\n  %ld3 = load i8, ptr %g3, align 1\n  %ld4 = load i8, ptr %g4, align 1\n  %ld5 = load i8, ptr %g5, align 1\n  %ld6 = load i8, ptr %g6, align 1\n  %ld7 = load i8, ptr %g7, align 1\n  %z0 = zext i8 %ld0 to i64\n  %z1 = zext i8 %ld1 to i64\n  %z2 = zext i8 %ld2 to i64\n  %z3 = zext i8 %ld3 to i64\n  %z4 = zext i8 %ld4 to i64\n  %z5 = zext i8 %ld5 to i64\n  %z6 = zext i8 %ld6 to i64\n  %z7 = zext i8 %ld7 to i64\n  %s1 = shl nuw nsw i64 %z1, 8\n  %s2 = shl nuw nsw i64 %z2, 16\n  %s3 = shl nuw nsw i64 %z3, 24\n  %s4 = shl nuw nsw i64 %z4, 32\n  %s5 = shl nuw nsw i64 %z5, 40\n  %s6 = shl nuw nsw i64 %z6, 48\n  %s7 = shl nuw i64 %z7, 56\n  %o1 = or i64 %s1, %z0\n  %o2 = or i64 %o1, %s2\n  %o3 = or i64 %o2, %s3\n  %o4 = or i64 %o3, %s4\n  %o5 = or i64 %o4, %s5\n  %o6 = or i64 %o5, %s6\n  %o7 = or i64 %o6, %s7\n  ret i64 %o7\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/load-merge-inseltpoison.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -slp-vectorize-hor -slp-vectorize-hor-store -S < %s -mtriple=x86_64-apple-macosx -mcpu=haswell",
+        "opt -passes=slp-vectorizer -slp-vectorize-hor -slp-vectorize-hor-store -S < %s -mtriple=x86_64-apple-macosx -mcpu=x86-64-v4"
+      ],
+      "tests": [
+        {
+          "test_name": "_Z9load_le32Ph",
+          "test_body": "define i32 @_Z9load_le32Ph(ptr nocapture readonly %data) {\nentry:\n  %0 = load i8, ptr %data, align 1\n  %conv = zext i8 %0 to i32\n  %arrayidx1 = getelementptr inbounds i8, ptr %data, i64 1\n  %1 = load i8, ptr %arrayidx1, align 1\n  %conv2 = zext i8 %1 to i32\n  %shl3 = shl nuw nsw i32 %conv2, 8\n  %or = or i32 %shl3, %conv\n  %arrayidx4 = getelementptr inbounds i8, ptr %data, i64 2\n  %2 = load i8, ptr %arrayidx4, align 1\n  %conv5 = zext i8 %2 to i32\n  %shl6 = shl nuw nsw i32 %conv5, 16\n  %or7 = or i32 %or, %shl6\n  %arrayidx8 = getelementptr inbounds i8, ptr %data, i64 3\n  %3 = load i8, ptr %arrayidx8, align 1\n  %conv9 = zext i8 %3 to i32\n  %shl10 = shl nuw i32 %conv9, 24\n  %or11 = or i32 %or7, %shl10\n  ret i32 %or11\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/load-merge.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -slp-vectorize-hor -slp-vectorize-hor-store -S < %s -mtriple=x86_64-apple-macosx -mcpu=haswell",
+        "opt -passes=slp-vectorizer -slp-vectorize-hor -slp-vectorize-hor-store -S < %s -mtriple=x86_64-apple-macosx -mcpu=x86-64-v4"
+      ],
+      "tests": [
+        {
+          "test_name": "_Z9load_le32Ph",
+          "test_body": "define i32 @_Z9load_le32Ph(ptr nocapture readonly %data) {\nentry:\n  %0 = load i8, ptr %data, align 1\n  %conv = zext i8 %0 to i32\n  %arrayidx1 = getelementptr inbounds i8, ptr %data, i64 1\n  %1 = load i8, ptr %arrayidx1, align 1\n  %conv2 = zext i8 %1 to i32\n  %shl3 = shl nuw nsw i32 %conv2, 8\n  %or = or i32 %shl3, %conv\n  %arrayidx4 = getelementptr inbounds i8, ptr %data, i64 2\n  %2 = load i8, ptr %arrayidx4, align 1\n  %conv5 = zext i8 %2 to i32\n  %shl6 = shl nuw nsw i32 %conv5, 16\n  %or7 = or i32 %or, %shl6\n  %arrayidx8 = getelementptr inbounds i8, ptr %data, i64 3\n  %3 = load i8, ptr %arrayidx8, align 1\n  %conv9 = zext i8 %3 to i32\n  %shl10 = shl nuw i32 %conv9, 24\n  %or11 = or i32 %or7, %shl10\n  ret i32 %or11\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-02T12:45:10Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        2100,
+        2111
+      ],
+      [
+        2270,
+        2292
+      ],
+      [
+        3932,
+        3939
+      ],
+      [
+        4066,
+        4071
+      ],
+      [
+        13353,
+        13362
+      ],
+      [
+        13463,
+        13468
+      ],
+      [
+        13884,
+        13897
+      ],
+      [
+        13900,
+        13905
+      ],
+      [
+        15559,
+        15564
+      ],
+      [
+        16043,
+        16111
+      ],
+      [
+        16334,
+        16340
+      ],
+      [
+        20269,
+        20274
+      ],
+      [
+        21236,
+        21241
+      ],
+      [
+        21263,
+        21269
+      ],
+      [
+        21822,
+        21828
+      ],
+      [
+        24138,
+        24145
+      ],
+      [
+        25744,
+        25754
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/X86/loadcombine.ll": [
+      [
+        70,
+        92
+      ],
+      [
+        114,
+        136
+      ],
+      [
+        158,
+        180
+      ],
+      [
+        202,
+        224
+      ],
+      [
+        369,
+        391
+      ],
+      [
+        413,
+        435
+      ],
+      [
+        457,
+        479
+      ],
+      [
+        501,
+        523
+      ],
+      [
+        668,
+        690
+      ],
+      [
+        712,
+        734
+      ],
+      [
+        756,
+        778
+      ],
+      [
+        800,
+        822
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/bad-reduction.ll": [
+      [
+        7,
+        49
+      ],
+      [
+        93,
+        136
+      ],
+      [
+        182,
+        224
+      ],
+      [
+        268,
+        311
+      ],
+      [
+        355,
+        397
+      ],
+      [
+        441,
+        484
+      ],
+      [
+        528,
+        570
+      ],
+      [
+        614,
+        657
+      ],
+      [
+        701,
+        784
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/load-merge-inseltpoison.ll": [
+      [
+        10,
+        32
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/load-merge.ll": [
+      [
+        10,
+        32
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::getEntryCost",
+      "BoUpSLP::getSpillCost",
+      "BoUpSLP::isFullyVectorizableTinyTree",
+      "BoUpSLP::isLoadCombineCandidate",
+      "BoUpSLP::isLoadCombineReductionCandidate",
+      "BoUpSLP::isTreeTinyAndNotFullyVectorizable",
+      "BoUpSLP::matchesShlZExt",
+      "BoUpSLP::transformNodes",
+      "BoUpSLP::vectorizeTree",
+      "SLPVectorizerPass::vectorizeStoreChain",
+      "getReductionType",
+      "isLoadCombineCandidateImpl",
+      "isReducedBitcastRoot",
+      "tryToReduce"
+    ]
+  }
+}

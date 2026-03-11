@@ -1,0 +1,217 @@
+{
+  "pr_id": 176122,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176122",
+  "state": "closed",
+  "title": "InstCombine: Implement SimplifyDemandedFPClass for frexp",
+  "author": "arsenm",
+  "base_commit": "7a5e59e68304ce9e173da7d81c5564b94c82b146",
+  "fix_commit": "caf23d7da84924ff25f2c5ae5bfcef5e21ecabb6",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex e779b61b4ca52..c582754c39712 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -342,6 +342,10 @@ struct KnownFPClass {\n                                                bool IsTrunc,\n                                                bool IsMultiUnitFPType);\n \n+  /// Propagate known class for mantissa component of frexp\n+  static LLVM_ABI KnownFPClass frexp_mant(\n+      const KnownFPClass &Src, DenormalMode Mode = DenormalMode::getDynamic());\n+\n   void resetAll() { *this = KnownFPClass(); }\n };\n \ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex ab7fee012ac52..cf765350f7aab 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5929,27 +5929,9 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n           const fltSemantics &FltSem =\n               Op->getType()->getScalarType()->getFltSemantics();\n \n-          if (KnownSrc.isKnownNever(fcNegative))\n-            Known.knownNot(fcNegative);\n-          else {\n-            if (F &&\n-                KnownSrc.isKnownNeverLogicalNegZero(F->getDenormalMode(FltSem)))\n-              Known.knownNot(fcNegZero);\n-            if (KnownSrc.isKnownNever(fcNegInf))\n-              Known.knownNot(fcNegInf);\n-          }\n-\n-          if (KnownSrc.isKnownNever(fcPositive))\n-            Known.knownNot(fcPositive);\n-          else {\n-            if (F &&\n-                KnownSrc.isKnownNeverLogicalPosZero(F->getDenormalMode(FltSem)))\n-              Known.knownNot(fcPosZero);\n-            if (KnownSrc.isKnownNever(fcPosInf))\n-              Known.knownNot(fcPosInf);\n-          }\n-\n-          Known.propagateNaN(KnownSrc);\n+          DenormalMode Mode =\n+              F ? F->getDenormalMode(FltSem) : DenormalMode::getDynamic();\n+          Known = KnownFPClass::frexp_mant(KnownSrc, Mode);\n           return;\n         }\n         default:\ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex 522557d382b90..a13ec7acd866e 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -464,3 +464,30 @@ KnownFPClass KnownFPClass::roundToIntegral(const KnownFPClass &KnownSrc,\n \n   return Known;\n }\n+\n+KnownFPClass KnownFPClass::frexp_mant(const KnownFPClass &KnownSrc,\n+                                      DenormalMode Mode) {\n+  KnownFPClass Known;\n+  Known.knownNot(fcSubnormal);\n+\n+  if (KnownSrc.isKnownNever(fcNegative))\n+    Known.knownNot(fcNegative);\n+  else {\n+    if (KnownSrc.isKnownNeverLogicalNegZero(Mode))\n+      Known.knownNot(fcNegZero);\n+    if (KnownSrc.isKnownNever(fcNegInf))\n+      Known.knownNot(fcNegInf);\n+  }\n+\n+  if (KnownSrc.isKnownNever(fcPositive))\n+    Known.knownNot(fcPositive);\n+  else {\n+    if (KnownSrc.isKnownNeverLogicalPosZero(Mode))\n+      Known.knownNot(fcPosZero);\n+    if (KnownSrc.isKnownNever(fcPosInf))\n+      Known.knownNot(fcPosInf);\n+  }\n+\n+  Known.propagateNaN(KnownSrc);\n+  return Known;\n+}\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 645dc54f68378..d8f8a03a76a2f 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -3014,6 +3014,53 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n     Known = KnownLHS | KnownRHS;\n     break;\n   }\n+  case Instruction::ExtractValue: {\n+    Value *ExtractSrc;\n+    if (match(I, m_ExtractValue<0>(m_OneUse(m_Value(ExtractSrc))))) {\n+      if (auto *II = dyn_cast<IntrinsicInst>(ExtractSrc)) {\n+        const Intrinsic::ID IID = II->getIntrinsicID();\n+        switch (IID) {\n+        case Intrinsic::frexp: {\n+          FPClassTest SrcDemandedMask = fcNone;\n+          if (DemandedMask & fcNan)\n+            SrcDemandedMask |= fcNan;\n+          if (DemandedMask & fcNegFinite)\n+            SrcDemandedMask |= fcNegFinite;\n+          if (DemandedMask & fcPosFinite)\n+            SrcDemandedMask |= fcPosFinite;\n+          if (DemandedMask & fcPosInf)\n+            SrcDemandedMask |= fcPosInf;\n+          if (DemandedMask & fcNegInf)\n+            SrcDemandedMask |= fcNegInf;\n+\n+          KnownFPClass KnownSrc;\n+          if (SimplifyDemandedFPClass(II, 0, SrcDemandedMask, KnownSrc,\n+                                      Depth + 1))\n+            return I;\n+\n+          Type *EltTy = VTy->getScalarType();\n+          DenormalMode Mode = F.getDenormalMode(EltTy->getFltSemantics());\n+\n+          Known = KnownFPClass::frexp_mant(KnownSrc, Mode);\n+          Known.KnownFPClasses &= DemandedMask;\n+\n+          if (Constant *SingleVal =\n+                  getFPClassConstant(VTy, Known.KnownFPClasses,\n+                                     /*IsCanonicalizing=*/true))\n+            return SingleVal;\n+\n+          if (Known.isKnownAlways(fcInf | fcNan))\n+            return II->getArgOperand(0);\n+\n+          return nullptr;\n+        }\n+        default:\n+          break;\n+        }\n+      }\n+    }\n+    [[fallthrough]];\n+  }\n   default:\n     Known = computeKnownFPClass(I, DemandedMask, CxtI, Depth + 1);\n     break;\n",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-frexp.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "src_only_inf__frexp",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(snan) half @src_only_inf__frexp() {\n  %only.inf = call half @returns_inf()\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %only.inf)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nofpclass_inf__frexp_select_unknown_or_inf",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(inf) half @ret_nofpclass_inf__frexp_select_unknown_or_inf(i1 %cond, half %unknown) {\n  %only.inf = call half @returns_inf()\n  %select = select i1 %cond, half %unknown, half %only.inf\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nofpclass_nan__frexp_select_unknown_nan",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndefine nofpclass(nan) half @ret_nofpclass_nan__frexp_select_unknown_nan(i1 %cond, half %unknown) {\n  %only.nan = call half @returns_nan()\n  %select = select i1 %cond, half %unknown, half %only.nan\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nofpclass_pinf__frexp_select_unknown_or_pinf",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) half @returns_pinf()\n\ndefine nofpclass(pinf) half @ret_nofpclass_pinf__frexp_select_unknown_or_pinf(i1 %cond, half %unknown) {\n  %only.pinf = call half @returns_pinf()\n  %select = select i1 %cond, half %unknown, half %only.pinf\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_inf_src_only_nan__frexp",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndefine nofpclass(inf) half @ret_no_inf_src_only_nan__frexp() {\n  %nan = call half @returns_nan()\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %nan)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "src_only_nan__frexp",
+          "test_body": "declare nofpclass(inf zero sub norm) half @returns_nan()\n\ndefine nofpclass(snan) half @src_only_nan__frexp() {\n  %only.nan = call half @returns_nan()\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %only.nan)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_negative_or_nan__frexp_select_positive_or_unknown",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) half @returns_positive()\n\ndefine nofpclass(pinf pzero psub pnorm) half @ret_only_negative_or_nan__frexp_select_positive_or_unknown(i1 %cond, half %unknown) {\n  %positive = call half @returns_positive()\n  %select = select i1 %cond, half %unknown, half %positive\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nofpclass_pzero__frexp_select_unknown_only_pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(pzero) half @ret_nofpclass_pzero__frexp_select_unknown_only_pzero(i1 %cond, half %unknown) {\n  %only.pzero = call half @returns_pzero()\n  %select = select i1 %cond, half %unknown, half %only.pzero\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nofpclass_nzero__frexp_select_unknown_or_not_nzero",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(nzero) half @ret_nofpclass_nzero__frexp_select_unknown_or_not_nzero(i1 %cond, half %unknown) {\n  %only.nzero = call half @returns_nzero()\n  %select = select i1 %cond, half %unknown, half %only.nzero\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_inf__frexp",
+          "test_body": "define nofpclass(nan zero sub norm) half @ret_only_inf__frexp(half %unknown) {\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %unknown)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_nan__frexp",
+          "test_body": "define nofpclass(inf zero sub norm) half @ret_only_nan__frexp(half %unknown) {\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %unknown)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nan_src_only_inf__frexp",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan) half @ret_no_nan_src_only_inf__frexp() {\n  %inf = call half @returns_inf()\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %inf)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "extractvalue_not_frexp",
+          "test_body": "declare { half, i32 } @returns_frexp_struct()\n\ndefine nofpclass(nan) half @extractvalue_not_frexp() {\n  %struct = call { half, i32 } @returns_frexp_struct()\n  %extract = extractvalue { half, i32 } %struct, 0\n  ret half %extract\n}\n"
+        },
+        {
+          "test_name": "ret_nofpclass_ninf__frexp_select_unknown_or_ninf",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) half @returns_ninf()\n\ndefine nofpclass(ninf) half @ret_nofpclass_ninf__frexp_select_unknown_or_ninf(i1 %cond, half %unknown) {\n  %only.ninf = call half @returns_ninf()\n  %select = select i1 %cond, half %unknown, half %only.ninf\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_positive_or_nan__frexp_select_negative_or_unknown",
+          "test_body": "declare nofpclass(nan pinf pzero psub pnorm) half @returns_negative()\n\ndefine nofpclass(ninf nzero nsub nnorm) half @ret_only_positive_or_nan__frexp_select_negative_or_unknown(i1 %cond, half %unknown) {\n  %negative = call half @returns_negative()\n  %select = select i1 %cond, half %unknown, half %negative\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %select)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_ninf__frexp",
+          "test_body": "define nofpclass(nan pinf zero sub norm) half @ret_only_ninf__frexp(half %unknown) {\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %unknown)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_qnan__frexp",
+          "test_body": "define nofpclass(snan inf zero sub norm) half @ret_only_qnan__frexp(half %unknown) {\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %unknown)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_snan__frexp",
+          "test_body": "define nofpclass(qnan inf zero sub norm) half @ret_only_snan__frexp(half %unknown) {\n  %frexp = call { half, i32 } @llvm.frexp.f16.i32(half %unknown)\n  %frexp.mant = extractvalue { half, i32 } %frexp, 0\n  ret half %frexp.mant\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { half, i32 } @llvm.frexp.f16.i32(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#176123** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176123?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176122** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176122?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176122?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#176121** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176121?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\nThe build failed before running any tests. Detailed information about the build failure could not be automatically obtained.\n\nDownload the build's log file to see the details.\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-15T10:24:30Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        342,
+        347
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5929,
+        5955
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        464,
+        466
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        3014,
+        3019
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-frexp.ll": [
+      [
+        65,
+        73
+      ],
+      [
+        77,
+        85
+      ],
+      [
+        89,
+        97
+      ],
+      [
+        121,
+        129
+      ],
+      [
+        206,
+        213
+      ],
+      [
+        279,
+        286
+      ],
+      [
+        295,
+        302
+      ],
+      [
+        343,
+        350
+      ],
+      [
+        359,
+        366
+      ],
+      [
+        375,
+        382
+      ],
+      [
+        505,
+        512
+      ],
+      [
+        521,
+        528
+      ],
+      [
+        549,
+        557
+      ],
+      [
+        601,
+        609
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "operator|",
+      "resetAll"
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::roundToIntegral"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-frexp.ll": [
+      "ret_no_inf_src_only_nan__frexp"
+    ]
+  }
+}

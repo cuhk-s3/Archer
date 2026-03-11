@@ -1,0 +1,81 @@
+{
+  "pr_id": 175784,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175784",
+  "state": "closed",
+  "title": "[SLPVectorizer] Check std::optional coming out of getPointersDiff",
+  "author": "gbaraldi",
+  "base_commit": "6977e6812c3e2027f0f427506ee151011f1e55bb",
+  "fix_commit": "7d9aea220e16efef23057dd888f7445d20705f0d",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex e075268a0a8e9..b9e1855640963 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -7082,12 +7082,17 @@ bool BoUpSLP::analyzeConstantStrideCandidate(\n     Value *Ptr0, Value *PtrN, StridedPtrInfo &SPtrInfo) const {\n   const size_t Sz = PointerOps.size();\n   SmallVector<int64_t> SortedOffsetsFromBase(Sz);\n-  // Go through `PointerOps` in sorted order and record offsets from `Ptr0`.\n+  // Go through `PointerOps` in sorted order and record offsets from\n+  // PointerOps[0]. We use PointerOps[0] rather than Ptr0 because\n+  // sortPtrAccesses only validates getPointersDiff for pairs relative to\n+  // PointerOps[0]. This is safe since only offset differences are used below.\n   for (unsigned I : seq<unsigned>(Sz)) {\n     Value *Ptr =\n         SortedIndices.empty() ? PointerOps[I] : PointerOps[SortedIndices[I]];\n-    SortedOffsetsFromBase[I] =\n-        *getPointersDiff(ScalarTy, Ptr0, ScalarTy, Ptr, *DL, *SE);\n+    std::optional<int64_t> Offset =\n+        getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, Ptr, *DL, *SE);\n+    assert(Offset && \"sortPtrAccesses should have validated this pointer\");\n+    SortedOffsetsFromBase[I] = *Offset;\n   }\n \n   // The code below checks that `SortedOffsetsFromBase` looks as follows:\n@@ -7436,10 +7441,18 @@ BoUpSLP::LoadsState BoUpSLP::canVectorizeLoads(\n       Ptr0 = PointerOps[Order.front()];\n       PtrN = PointerOps[Order.back()];\n     }\n-    std::optional<int64_t> Diff =\n-        getPointersDiff(ScalarTy, Ptr0, ScalarTy, PtrN, *DL, *SE);\n+    // sortPtrAccesses validates getPointersDiff for all pointers relative to\n+    // PointerOps[0], so compute the span using PointerOps[0] as intermediate:\n+    //   Diff = offset(PtrN) - offset(Ptr0) relative to PointerOps[0]\n+    std::optional<int64_t> Diff0 =\n+        getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, Ptr0, *DL, *SE);\n+    std::optional<int64_t> DiffN =\n+        getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, PtrN, *DL, *SE);\n+    assert(Diff0 && DiffN &&\n+           \"sortPtrAccesses should have validated these pointers\");\n+    int64_t Diff = *DiffN - *Diff0;\n     // Check that the sorted loads are consecutive.\n-    if (static_cast<uint64_t>(*Diff) == Sz - 1)\n+    if (static_cast<uint64_t>(Diff) == Sz - 1)\n       return LoadsState::Vectorize;\n     if (isMaskedLoadCompress(VL, PointerOps, Order, *TTI, *DL, *SE, *AC, *DT,\n                              *TLI, [&](Value *V) {\n@@ -7451,7 +7464,7 @@ BoUpSLP::LoadsState BoUpSLP::canVectorizeLoads(\n         cast<LoadInst>(Order.empty() ? VL.front() : VL[Order.front()])\n             ->getAlign();\n     if (analyzeConstantStrideCandidate(PointerOps, ScalarTy, Alignment, Order,\n-                                       *Diff, Ptr0, PtrN, SPtrInfo))\n+                                       Diff, Ptr0, PtrN, SPtrInfo))\n       return LoadsState::StridedVectorize;\n   }\n   if (!TTI->isLegalMaskedGather(VecTy, CommonAlignment) ||\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Fixes https://github.com/llvm/llvm-project/issues/175768 \nThere are other unchecked uses std::optional in this pass but I couldn't figure out a test that triggers them\n\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/crash_getpointersdiff-nullopt.ll",
+      "commands": [
+        "opt < %s -passes=slp-vectorizer -S -mtriple=x86_64-unknown-linux-gnu"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @test(i64 %arg0, i64 %arg1) {\nentry:\n  %init = add i64 %arg0, 1\n  br label %loop\n\nloop:                                             ; preds = %reduce, %entry\n  %iv = phi i64 [ %init, %entry ], [ %iv.next, %reduce ]\n  %counter = phi i64 [ 1, %entry ], [ %counter.next, %reduce ]\n  %off0 = add i64 %iv, -4\n  %off1 = add i64 %iv, -3\n  %off2 = add i64 %iv, -2\n  %off3 = add i64 %iv, -1\n  %ptr = call ptr null(ptr null, ptr null)\n  %idx0 = add i64 %arg1, %off0\n  %idx0.scaled = shl i64 %idx0, 3\n  %gep0 = getelementptr i8, ptr %ptr, i64 %idx0.scaled\n  %gep0.off = getelementptr i8, ptr %gep0, i64 -8\n  %load0 = load double, ptr %gep0.off, align 8\n  %idx1 = add i64 %arg1, %off1\n  %idx1.scaled = shl i64 %idx1, 3\n  %gep1 = getelementptr i8, ptr %ptr, i64 %idx1.scaled\n  %gep1.off = getelementptr i8, ptr %gep1, i64 -8\n  %load1 = load double, ptr %gep1.off, align 8\n  %idx2 = add i64 %arg1, %off2\n  %idx2.scaled = shl i64 %idx2, 3\n  %gep2 = getelementptr i8, ptr %ptr, i64 %idx2.scaled\n  %gep2.off = getelementptr i8, ptr %gep2, i64 -8\n  %load2 = load double, ptr %gep2.off, align 8\n  %idx3 = add i64 %arg1, %off3\n  %idx3.scaled = shl i64 %idx3, 3\n  %gep3 = getelementptr i8, ptr %ptr, i64 %idx3.scaled\n  %gep3.off = getelementptr i8, ptr %gep3, i64 -8\n  %load3 = load double, ptr %gep3.off, align 8\n  %idx4 = add i64 %arg1, %iv\n  %idx4.scaled = shl i64 %idx4, 3\n  %gep4 = getelementptr i8, ptr %ptr, i64 %idx4.scaled\n  %gep4.off = getelementptr i8, ptr %gep4, i64 -8\n  %load4 = load double, ptr %gep4.off, align 8\n  %load5 = load double, ptr %gep4, align 8\n  br label %reduce\n\ndead:                                             ; No predecessors!\n  br label %reduce\n\nreduce:                                           ; preds = %dead, %loop\n  %phi0 = phi double [ %load0, %loop ], [ 0.000000e+00, %dead ]\n  %phi1 = phi double [ %load1, %loop ], [ 0.000000e+00, %dead ]\n  %phi2 = phi double [ %load2, %loop ], [ 0.000000e+00, %dead ]\n  %phi3 = phi double [ %load3, %loop ], [ 0.000000e+00, %dead ]\n  %phi4 = phi double [ %load4, %loop ], [ 0.000000e+00, %dead ]\n  %phi5 = phi double [ %load5, %loop ], [ 0.000000e+00, %dead ]\n  %min0 = call double @llvm.minimum.f64(double 0.000000e+00, double %phi0)\n  %min1 = call double @llvm.minimum.f64(double %min0, double %phi1)\n  %min2 = call double @llvm.minimum.f64(double %min1, double %phi2)\n  %min3 = call double @llvm.minimum.f64(double %min2, double %phi3)\n  %min4 = call double @llvm.minimum.f64(double %min3, double %phi4)\n  %min5 = call double @llvm.minimum.f64(double %min4, double %phi5)\n  %min6 = call double @llvm.minimum.f64(double %min5, double 0.000000e+00)\n  %counter.next = add i64 %counter, 1\n  %iv.next = add i64 %counter, %init\n  br label %loop\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.minimum.f64(double, double) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "alexey-bataev",
+      "body": "sortPtrAccesses should check for it already; we should have an assert here. Why do we have nullopt here?"
+    },
+    {
+      "author": "gbaraldi",
+      "body": "So PtrA1 is %gep0 = getelementptr i8, ptr %ptr, i64 %idx0.scaled\r\nand PtrB1 is %gep4 = getelementptr i8, ptr %ptr, i64 %idx4.scaled\r\nputting us in the SCEV branch which is then\r\np PtrSCEVA->dump()\r\n({(-32 + (8 * (%arg0 + %arg1))),+,8}<%loop> + %ptr)\r\nand \r\n p PtrSCEVB->dump()\r\n({(8 * (1 + %arg0 + %arg1)),+,8}<%loop> + %ptr)\r\nwhich hits \r\nhttps://github.com/llvm/llvm-project/blob/86755dd0bf559ec64fafc753142ca7e1d5c247f7/llvm/lib/Analysis/LoopAccessAnalysis.cpp#L1704-L1709\r\nand that returns nullopt"
+    },
+    {
+      "author": "gbaraldi",
+      "body": "Digging deeper it seems the issue is that the sorting is only valid if we assume Ptr0 is still the same. But here Ptr0 is not the same as PointerOps[0]. One option might be to make the Diff always use PointerOps[0] instead of the new Ptr0?"
+    },
+    {
+      "author": "gbaraldi",
+      "body": "I asked claude to help me a bit and it suggested \r\n```diff\r\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\r\nindex d30d92e38d60..f59427bce9e6 100644\r\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\r\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\r\n@@ -7082,12 +7082,18 @@ bool BoUpSLP::analyzeConstantStrideCandidate(\r\n     Value *Ptr0, Value *PtrN, StridedPtrInfo &SPtrInfo) const {\r\n   const size_t Sz = PointerOps.size();\r\n   SmallVector<int64_t> SortedOffsetsFromBase(Sz);\r\n-  // Go through `PointerOps` in sorted order and record offsets from `Ptr0`.\r\n+  // Go through `PointerOps` in sorted order and record offsets from\r\n+  // PointerOps[0]. We use PointerOps[0] rather than Ptr0 because\r\n+  // sortPtrAccesses only validates getPointersDiff for pairs relative to\r\n+  // PointerOps[0]. This is safe since only offset differences are used below.\r\n   for (unsigned I : seq<unsigned>(Sz)) {\r\n     Value *Ptr =\r\n         SortedIndices.empty() ? PointerOps[I] : PointerOps[SortedIndices[I]];\r\n-    SortedOffsetsFromBase[I] =\r\n-        *getPointersDiff(ScalarTy, Ptr0, ScalarTy, Ptr, *DL, *SE);\r\n+    std::optional<int64_t> Offset =\r\n+        getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, Ptr, *DL, *SE);\r\n+    if (!Offset)\r\n+      return false;\r\n+    SortedOffsetsFromBase[I] = *Offset;\r\n   }\r\n \r\n   // The code below checks that `SortedOffsetsFromBase` looks as follows:\r\n@@ -7436,11 +7442,22 @@ BoUpSLP::LoadsState BoUpSLP::canVectorizeLoads(\r\n       Ptr0 = PointerOps[Order.front()];\r\n       PtrN = PointerOps[Order.back()];\r\n     }\r\n-    std::optional<int64_t> Diff =\r\n-        getPointersDiff(ScalarTy, Ptr0, ScalarTy, PtrN, *DL, *SE);\r\n-    // Check that the sorted loads are consecutive.\r\n+    // sortPtrAccesses validates getPointersDiff only for pairs relative to\r\n+    // PointerOps[0]. When Order is non-empty, Ptr0 may differ from\r\n+    // PointerOps[0], so we compute the span transitively:\r\n+    //   Diff = offset(PtrN) - offset(Ptr0) relative to PointerOps[0]\r\n+    std::optional<int64_t> Diff;\r\n+    if (Order.empty()) {\r\n+      Diff = getPointersDiff(ScalarTy, Ptr0, ScalarTy, PtrN, *DL, *SE);\r\n+    } else {\r\n+      auto Diff0 = getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, Ptr0, *DL, *SE);\r\n+      auto DiffN = getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, PtrN, *DL, *SE);\r\n+      if (Diff0 && DiffN)\r\n+        Diff = *DiffN - *Diff0;\r\n+    }\r\n     if (!Diff)\r\n       return LoadsState::Gather;\r\n+    // Check that the sorted loads are consecutive.\r\n     if (static_cast<uint64_t>(*Diff) == Sz - 1)\r\n       return LoadsState::Vectorize;\r\n     if (isMaskedLoadCompress(VL, PointerOps, Order, *TTI, *DL, *SE, *AC, *DT,\r\n```"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "> I asked claude to help me a bit and it suggested\r\n> \r\n> ```diff\r\n> diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\r\n> index d30d92e38d60..f59427bce9e6 100644\r\n> --- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\r\n> +++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\r\n> @@ -7082,12 +7082,18 @@ bool BoUpSLP::analyzeConstantStrideCandidate(\r\n>      Value *Ptr0, Value *PtrN, StridedPtrInfo &SPtrInfo) const {\r\n>    const size_t Sz = PointerOps.size();\r\n>    SmallVector<int64_t> SortedOffsetsFromBase(Sz);\r\n> -  // Go through `PointerOps` in sorted order and record offsets from `Ptr0`.\r\n> +  // Go through `PointerOps` in sorted order and record offsets from\r\n> +  // PointerOps[0]. We use PointerOps[0] rather than Ptr0 because\r\n> +  // sortPtrAccesses only validates getPointersDiff for pairs relative to\r\n> +  // PointerOps[0]. This is safe since only offset differences are used below.\r\n>    for (unsigned I : seq<unsigned>(Sz)) {\r\n>      Value *Ptr =\r\n>          SortedIndices.empty() ? PointerOps[I] : PointerOps[SortedIndices[I]];\r\n> -    SortedOffsetsFromBase[I] =\r\n> -        *getPointersDiff(ScalarTy, Ptr0, ScalarTy, Ptr, *DL, *SE);\r\n> +    std::optional<int64_t> Offset =\r\n> +        getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, Ptr, *DL, *SE);\r\n> +    if (!Offset)\r\n> +      return false;\r\n> +    SortedOffsetsFromBase[I] = *Offset;\r\n>    }\r\n>  \r\n>    // The code below checks that `SortedOffsetsFromBase` looks as follows:\r\n> @@ -7436,11 +7442,22 @@ BoUpSLP::LoadsState BoUpSLP::canVectorizeLoads(\r\n>        Ptr0 = PointerOps[Order.front()];\r\n>        PtrN = PointerOps[Order.back()];\r\n>      }\r\n> -    std::optional<int64_t> Diff =\r\n> -        getPointersDiff(ScalarTy, Ptr0, ScalarTy, PtrN, *DL, *SE);\r\n> -    // Check that the sorted loads are consecutive.\r\n> +    // sortPtrAccesses validates getPointersDiff only for pairs relative to\r\n> +    // PointerOps[0]. When Order is non-empty, Ptr0 may differ from\r\n> +    // PointerOps[0], so we compute the span transitively:\r\n> +    //   Diff = offset(PtrN) - offset(Ptr0) relative to PointerOps[0]\r\n> +    std::optional<int64_t> Diff;\r\n> +    if (Order.empty()) {\r\n> +      Diff = getPointersDiff(ScalarTy, Ptr0, ScalarTy, PtrN, *DL, *SE);\r\n> +    } else {\r\n> +      auto Diff0 = getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, Ptr0, *DL, *SE);\r\n> +      auto DiffN = getPointersDiff(ScalarTy, PointerOps[0], ScalarTy, PtrN, *DL, *SE);\r\n> +      if (Diff0 && DiffN)\r\n> +        Diff = *DiffN - *Diff0;\r\n> +    }\r\n>      if (!Diff)\r\n>        return LoadsState::Gather;\r\n> +    // Check that the sorted loads are consecutive.\r\n>      if (static_cast<uint64_t>(*Diff) == Sz - 1)\r\n>        return LoadsState::Vectorize;\r\n>      if (isMaskedLoadCompress(VL, PointerOps, Order, *TTI, *DL, *SE, *AC, *DT,\r\n> ```\r\n\r\nCan we instead try to use `PointerOps[0]` as the intermediate pointer for the calculations? I mean, calculate the different not as `diff(Ptr0,Ptr1)` but as `diff(diff(PointerOps[0], PtrN), diff(PointerOps[0], Ptr0))`  ?"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-13T15:55:07Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        7082,
+        7093
+      ],
+      [
+        7436,
+        7445
+      ],
+      [
+        7451,
+        7457
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::analyzeConstantStrideCandidate",
+      "BoUpSLP::canVectorizeLoads"
+    ]
+  }
+}

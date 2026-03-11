@@ -1,0 +1,161 @@
+{
+  "pr_id": 177041,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177041",
+  "state": "closed",
+  "title": "[SLP]Model disjoint or reduction of shl(zext, (0, stride, 2* stride)) as bitcast",
+  "author": "alexey-bataev",
+  "base_commit": "a746d42ec4ff9faf4d43a0bd5d451fd3650c3381",
+  "fix_commit": "3b30cacac116cd961ef12b0958cc58656075597c",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 762b394f8ea8a..d40d4407ce008 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -2093,6 +2093,13 @@ class slpvectorizer::BoUpSLP {\n         VectorizableTree.front()->getVectorFactor());\n   }\n \n+  /// Returns the opcode of the root node, or 0, if the root node is gather.\n+  bool isReducedBitcastRoot() const {\n+    return VectorizableTree.front()->hasState() &&\n+           VectorizableTree.front()->CombinedOp == TreeEntry::ReducedBitcast &&\n+           VectorizableTree.front()->State == TreeEntry::Vectorize;\n+  }\n+\n   /// Builds external uses of the vectorized scalars, i.e. the list of\n   /// vectorized scalars to be extracted, their lanes and their scalar users. \\p\n   /// ExternallyUsedValues contains additional list of external uses to handle\n@@ -3730,7 +3737,8 @@ class slpvectorizer::BoUpSLP {\n \n   /// Return information about the vector formed for the specified index\n   /// of a vector of (the same) instruction.\n-  TargetTransformInfo::OperandValueInfo getOperandInfo(ArrayRef<Value *> Ops);\n+  TargetTransformInfo::OperandValueInfo\n+  getOperandInfo(ArrayRef<Value *> Ops) const;\n \n   /// \\returns the graph entry for the \\p Idx operand of the \\p E entry.\n   const TreeEntry *getOperandEntry(const TreeEntry *E, unsigned Idx) const;\n@@ -3911,6 +3919,10 @@ class slpvectorizer::BoUpSLP {\n   /// opportunities.\n   void reorderGatherNode(TreeEntry &TE);\n \n+  /// Checks if the tree represents disjoint or reduction of shl(zext, (0, 8,\n+  /// .., 56))-like pattern.\n+  bool matchesShlZExt(const TreeEntry &TE) const;\n+\n   class TreeEntry {\n   public:\n     using VecTreeTy = SmallVector<std::unique_ptr<TreeEntry>, 8>;\n@@ -4040,6 +4052,7 @@ class slpvectorizer::BoUpSLP {\n       NotCombinedOp = -1,\n       MinMax = Instruction::OtherOpsEnd + 1,\n       FMulAdd,\n+      ReducedBitcast,\n     };\n     CombinedOpcode CombinedOp = NotCombinedOp;\n \n@@ -12598,7 +12611,7 @@ static bool isAlternateInstruction(Instruction *I, Instruction *MainOp,\n   return InstructionsState(MainOp, AltOp).getMatchingMainOpOrAltOp(I) == AltOp;\n }\n \n-TTI::OperandValueInfo BoUpSLP::getOperandInfo(ArrayRef<Value *> Ops) {\n+TTI::OperandValueInfo BoUpSLP::getOperandInfo(ArrayRef<Value *> Ops) const {\n   assert(!Ops.empty());\n   const auto *Op0 = Ops.front();\n \n@@ -13322,6 +13335,71 @@ static InstructionCost canConvertToFMA(ArrayRef<Value *> VL,\n   return FMACost < FMulPlusFAddCost ? FMACost : InstructionCost::getInvalid();\n }\n \n+bool BoUpSLP::matchesShlZExt(const TreeEntry &TE) const {\n+  assert(TE.hasState() && TE.getOpcode() == Instruction::Shl &&\n+         \"Expected Shl node.\");\n+  if (TE.State != TreeEntry::Vectorize || !TE.ReorderIndices.empty() ||\n+      !TE.ReuseShuffleIndices.empty() || MinBWs.contains(&TE) ||\n+      any_of(TE.Scalars, [](Value *V) { return !V->hasOneUse(); }))\n+    return false;\n+  Type *ScalarTy = TE.getMainOp()->getType();\n+  // TODO: Check if same can be done for the vector types.\n+  if (!ScalarTy->isIntegerTy())\n+    return false;\n+  if (ScalarTy->isVectorTy())\n+    return false;\n+  const unsigned Sz = DL->getTypeSizeInBits(ScalarTy);\n+  if (!isPowerOf2_64(Sz))\n+    return false;\n+  const TreeEntry *LhsTE = getOperandEntry(&TE, /*Idx=*/0);\n+  const TreeEntry *RhsTE = getOperandEntry(&TE, /*Idx=*/1);\n+  // Lhs should be zext i<stride> to I<sz>.\n+  if (!(LhsTE->State == TreeEntry::Vectorize &&\n+        LhsTE->getOpcode() == Instruction::ZExt &&\n+        LhsTE->ReorderIndices.empty() && LhsTE->ReuseShuffleIndices.empty() &&\n+        !MinBWs.contains(LhsTE) &&\n+        all_of(LhsTE->Scalars, [](Value *V) { return V->hasOneUse(); })))\n+    return false;\n+  Type *SrcScalarTy = cast<ZExtInst>(LhsTE->getMainOp())->getSrcTy();\n+  unsigned Stride = DL->getTypeSizeInBits(SrcScalarTy);\n+  if (!isPowerOf2_64(Stride))\n+    return false;\n+  // Rhs should be (0, Stride, 2 * Stride, , ..., Sz-Stride).\n+  unsigned CurrentValue = 0;\n+  if (!(RhsTE->isGather() && RhsTE->ReorderIndices.empty() &&\n+        RhsTE->ReuseShuffleIndices.empty() && !MinBWs.contains(RhsTE) &&\n+        all_of(RhsTE->Scalars,\n+               [&](Value *V) {\n+                 CurrentValue += Stride;\n+                 if (isa<UndefValue>(V))\n+                   return true;\n+                 auto *C = dyn_cast<Constant>(V);\n+                 if (!C)\n+                   return false;\n+                 return C->getUniqueInteger() == CurrentValue - Stride;\n+               }) &&\n+        CurrentValue == Sz))\n+    return false;\n+  TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n+  FastMathFlags FMF;\n+  SmallPtrSet<Value *, 4> CheckedExtracts;\n+  auto *VecTy = getWidenedType(ScalarTy, TE.getVectorFactor());\n+  auto *SrcVecTy = getWidenedType(SrcScalarTy, LhsTE->getVectorFactor());\n+  TTI::CastContextHint CastCtx =\n+      getCastContextHint(*getOperandEntry(LhsTE, /*Idx=*/0));\n+  InstructionCost VecCost =\n+      TTI->getArithmeticReductionCost(Instruction::Or, VecTy, FMF, CostKind) +\n+      TTI->getArithmeticInstrCost(Instruction::Shl, VecTy, CostKind,\n+                                  getOperandInfo(LhsTE->Scalars)) +\n+      TTI->getCastInstrCost(\n+          Instruction::ZExt, VecTy,\n+          getWidenedType(SrcScalarTy, LhsTE->getVectorFactor()), CastCtx,\n+          CostKind);\n+  InstructionCost BitcastCost = TTI->getCastInstrCost(\n+      Instruction::BitCast, ScalarTy, SrcVecTy, CastCtx, CostKind);\n+  return BitcastCost < VecCost;\n+}\n+\n void BoUpSLP::transformNodes() {\n   constexpr TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n   BaseGraphSize = VectorizableTree.size();\n@@ -13726,6 +13804,36 @@ void BoUpSLP::transformNodes() {\n       }\n       break;\n     }\n+    case Instruction::Shl: {\n+      if (E.Idx != 0)\n+        break;\n+      if (!UserIgnoreList)\n+        break;\n+      // Check that all reduction operands are disjoint or instructions.\n+      if (any_of(*UserIgnoreList, [](Value *V) {\n+            return !match(V, m_DisjointOr(m_Value(), m_Value()));\n+          }))\n+        break;\n+      if (!matchesShlZExt(E))\n+        break;\n+      // This node is a (reduced disjoint or) bitcast node.\n+      E.CombinedOp = TreeEntry::ReducedBitcast;\n+      TreeEntry *ZExtEntry = getOperandEntry(&E, 0);\n+      assert(ZExtEntry->UserTreeIndex &&\n+             ZExtEntry->State == TreeEntry::Vectorize &&\n+             ZExtEntry->getOpcode() == Instruction::ZExt &&\n+             \"Expected ZExt node.\");\n+      // The ZExt node is part of the combined node.\n+      ZExtEntry->State = TreeEntry::CombinedVectorize;\n+      ZExtEntry->CombinedOp = TreeEntry::ReducedBitcast;\n+      TreeEntry *ConstEntry = getOperandEntry(&E, 1);\n+      assert(ConstEntry->UserTreeIndex && ConstEntry->isGather() &&\n+             \"Expected ZExt node.\");\n+      // The ConstNode node is part of the combined node.\n+      ConstEntry->State = TreeEntry::CombinedVectorize;\n+      ConstEntry->CombinedOp = TreeEntry::ReducedBitcast;\n+      break;\n+    }\n     default:\n       break;\n     }\n@@ -15339,6 +15447,32 @@ BoUpSLP::getEntryCost(const TreeEntry *E, ArrayRef<Value *> VectorizedVals,\n     };\n     return GetCostDiff(GetScalarCost, GetVectorCost);\n   }\n+  case TreeEntry::ReducedBitcast: {\n+    auto GetScalarCost = [&, &TTI = *TTI](unsigned Idx) {\n+      if (isa<PoisonValue>(UniqueValues[Idx]))\n+        return InstructionCost(TTI::TCC_Free);\n+      auto *Shl = dyn_cast<Instruction>(UniqueValues[Idx]);\n+      if (!Shl)\n+        return InstructionCost(TTI::TCC_Free);\n+      InstructionCost ScalarCost = TTI.getInstructionCost(Shl, CostKind);\n+      auto *ZExt = dyn_cast<Instruction>(Shl->getOperand(0));\n+      if (!ZExt)\n+        return ScalarCost;\n+      ScalarCost += TTI.getInstructionCost(ZExt, CostKind);\n+      return ScalarCost;\n+    };\n+    auto GetVectorCost = [&, &TTI = *TTI](InstructionCost CommonCost) {\n+      const TreeEntry *LhsTE = getOperandEntry(E, /*Idx=*/0);\n+      TTI::CastContextHint CastCtx =\n+          getCastContextHint(*getOperandEntry(LhsTE, /*Idx=*/0));\n+      Type *SrcScalarTy = cast<ZExtInst>(LhsTE->getMainOp())->getSrcTy();\n+      auto *SrcVecTy = getWidenedType(SrcScalarTy, LhsTE->getVectorFactor());\n+      InstructionCost BitcastCost = TTI.getCastInstrCost(\n+          Instruction::BitCast, ScalarTy, SrcVecTy, CastCtx, CostKind);\n+      return BitcastCost + CommonCost;\n+    };\n+    return GetCostDiff(GetScalarCost, GetVectorCost);\n+  }\n   case Instruction::FNeg:\n   case Instruction::Add:\n   case Instruction::FAdd:\n@@ -16111,7 +16245,12 @@ InstructionCost BoUpSLP::getSpillCost() {\n       EntriesToOperands;\n   SmallDenseMap<const TreeEntry *, Instruction *> EntriesToLastInstruction;\n   SmallPtrSet<const Instruction *, 8> LastInstructions;\n+  SmallPtrSet<const TreeEntry *, 8> ScalarOrPseudoEntries;\n   for (const auto &TEPtr : VectorizableTree) {\n+    if (TEPtr->CombinedOp == TreeEntry::ReducedBitcast) {\n+      ScalarOrPseudoEntries.insert(TEPtr.get());\n+      continue;\n+    }\n     if (!TEPtr->isGather()) {\n       Instruction *LastInst = &getLastInstructionInBundle(TEPtr.get());\n       EntriesToLastInstruction.try_emplace(TEPtr.get(), LastInst);\n@@ -16184,6 +16323,8 @@ InstructionCost BoUpSLP::getSpillCost() {\n     return Budget <= BudgetLimit;\n   };\n   auto AddCosts = [&](const TreeEntry *Op) {\n+    if (ScalarOrPseudoEntries.contains(Op))\n+      return;\n     Type *ScalarTy = Op->Scalars.front()->getType();\n     auto It = MinBWs.find(Op);\n     if (It != MinBWs.end())\n@@ -16249,16 +16390,39 @@ InstructionCost BoUpSLP::getSpillCost() {\n     return Res;\n   };\n   SmallVector<const TreeEntry *> LiveEntries(1, Root);\n+  auto FindNonScalarParentEntry = [&](const TreeEntry *E) -> const TreeEntry * {\n+    assert(ScalarOrPseudoEntries.contains(E) &&\n+           \"Expected scalar or pseudo entry.\");\n+    const TreeEntry *Entry = E;\n+    while (Entry->UserTreeIndex) {\n+      Entry = Entry->UserTreeIndex.UserTE;\n+      if (!ScalarOrPseudoEntries.contains(Entry))\n+        return Entry;\n+    }\n+    return nullptr;\n+  };\n   while (!LiveEntries.empty()) {\n     const TreeEntry *Entry = LiveEntries.pop_back_val();\n     SmallVector<const TreeEntry *> Operands = EntriesToOperands.lookup(Entry);\n     if (Operands.empty())\n       continue;\n+    if (ScalarOrPseudoEntries.contains(Entry)) {\n+      Entry = FindNonScalarParentEntry(Entry);\n+      if (!Entry) {\n+        for (const TreeEntry *Op : Operands) {\n+          if (!Op->isGather())\n+            LiveEntries.push_back(Op);\n+        }\n+        continue;\n+      }\n+    }\n     Instruction *LastInst = EntriesToLastInstruction.at(Entry);\n     BasicBlock *Parent = LastInst->getParent();\n     for (const TreeEntry *Op : Operands) {\n       if (!Op->isGather())\n         LiveEntries.push_back(Op);\n+      if (ScalarOrPseudoEntries.contains(Op))\n+        continue;\n       if (Entry->State == TreeEntry::SplitVectorize ||\n           (Entry->getOpcode() != Instruction::PHI && Op->isGather()) ||\n           (Op->isGather() && allConstant(Op->Scalars)))\n@@ -16304,8 +16468,7 @@ InstructionCost BoUpSLP::getSpillCost() {\n       // 1. Check entry's block to the head.\n       if (Entry->getOpcode() != Instruction::PHI &&\n           !CheckForNonVecCallsInSameBlock(\n-              &*LastInst->getParent()->getFirstNonPHIOrDbgOrAlloca(),\n-              LastInst)) {\n+              &*Parent->getFirstNonPHIOrDbgOrAlloca(), LastInst)) {\n         AddCosts(Op);\n         continue;\n       }\n@@ -19924,6 +20087,15 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {\n   assert(!E->isGather() && \"Unhandled state\");\n   unsigned ShuffleOrOp =\n       E->isAltShuffle() ? (unsigned)Instruction::ShuffleVector : E->getOpcode();\n+  if (!E->isAltShuffle()) {\n+    switch (E->CombinedOp) {\n+    case TreeEntry::ReducedBitcast:\n+      ShuffleOrOp = TreeEntry::ReducedBitcast;\n+      break;\n+    default:\n+      break;\n+    }\n+  }\n   Instruction *VL0 = E->getMainOp();\n   auto GetOperandSignedness = [&](unsigned Idx) {\n     const TreeEntry *OpE = getOperandEntry(E, Idx);\n@@ -20851,6 +21023,24 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {\n \n       return V;\n     }\n+    case TreeEntry::ReducedBitcast: {\n+      assert(UserIgnoreList && \"Expected reduction operations only.\");\n+      setInsertPointAfterBundle(E);\n+      TreeEntry *ZExt = getOperandEntry(E, /*Idx=*/0);\n+      ZExt->VectorizedValue = PoisonValue::get(getWidenedType(\n+          ZExt->getMainOp()->getType(), ZExt->getVectorFactor()));\n+      TreeEntry *Const = getOperandEntry(E, /*Idx=*/1);\n+      Const->VectorizedValue = PoisonValue::get(getWidenedType(\n+          Const->Scalars.front()->getType(), Const->getVectorFactor()));\n+      Value *Op = vectorizeOperand(ZExt, 0);\n+      auto *V = Builder.CreateBitCast(\n+          Op, IntegerType::get(\n+                  Op->getContext(),\n+                  DL->getTypeSizeInBits(ZExt->getMainOp()->getType())));\n+      E->VectorizedValue = V;\n+      ++NumVectorInstructions;\n+      return V;\n+    }\n     default:\n       llvm_unreachable(\"unknown inst\");\n   }\n@@ -20875,7 +21065,9 @@ Value *BoUpSLP::vectorizeTree(\n   // Cache last instructions for the nodes to avoid side effects, which may\n   // appear during vectorization, like extra uses, etc.\n   for (const std::unique_ptr<TreeEntry> &TE : VectorizableTree) {\n-    if (TE->isGather() || DeletedNodes.contains(TE.get()))\n+    if (TE->isGather() || DeletedNodes.contains(TE.get()) ||\n+        (TE->State == TreeEntry::CombinedVectorize &&\n+         TE->CombinedOp == TreeEntry::ReducedBitcast))\n       continue;\n     (void)getLastInstructionInBundle(TE.get());\n   }\n@@ -21433,6 +21625,23 @@ Value *BoUpSLP::vectorizeTree(\n         TransformedToGatherNodes.contains(Entry))\n       continue;\n \n+    if (Entry->CombinedOp == TreeEntry::ReducedBitcast) {\n+      // Skip constant node\n+      if (!Entry->hasState()) {\n+        assert(allConstant(Entry->Scalars) && \"Expected constants only.\");\n+        continue;\n+      }\n+      for (Value *Scalar : Entry->Scalars) {\n+        auto *I = dyn_cast<Instruction>(Scalar);\n+\n+        if (!I || Entry->isCopyableElement(I))\n+          continue;\n+        LLVM_DEBUG(dbgs() << \"SLP: \\tErasing scalar:\" << *I << \".\\n\");\n+        RemovedInsts.push_back(I);\n+      }\n+      continue;\n+    }\n+\n     assert(Entry->VectorizedValue && \"Can't find vectorizable value\");\n \n     // For each lane:\n@@ -25421,8 +25630,12 @@ class HorizontalReduction {\n         V.buildExternalUses(LocalExternallyUsedValues);\n \n         // Estimate cost.\n-        InstructionCost ReductionCost =\n-            getReductionCost(TTI, VL, IsCmpSelMinMax, RdxFMF, V, DT, DL, TLI);\n+        InstructionCost ReductionCost;\n+        if (V.isReducedBitcastRoot())\n+          ReductionCost = 0;\n+        else\n+          ReductionCost =\n+              getReductionCost(TTI, VL, IsCmpSelMinMax, RdxFMF, V, DT, DL, TLI);\n         InstructionCost Cost = V.getTreeCost(TreeCost, VL, ReductionCost);\n         LLVM_DEBUG(dbgs() << \"SLP: Found cost = \" << Cost\n                           << \" for reduction\\n\");\n@@ -25545,8 +25758,8 @@ class HorizontalReduction {\n     }\n     if (!VectorValuesAndScales.empty())\n       VectorizedTree = GetNewVectorizedTree(\n-          VectorizedTree,\n-          emitReduction(Builder, *TTI, ReductionRoot->getType()));\n+          VectorizedTree, emitReduction(Builder, *TTI, ReductionRoot->getType(),\n+                                        V.isReducedBitcastRoot()));\n \n     if (!VectorizedTree) {\n       if (!CheckForReusedReductionOps) {\n@@ -25699,10 +25912,12 @@ class HorizontalReduction {\n   /// Creates the reduction from the given \\p Vec vector value with the given\n   /// scale \\p Scale and signedness \\p IsSigned.\n   Value *createSingleOp(IRBuilderBase &Builder, const TargetTransformInfo &TTI,\n-                        Value *Vec, unsigned Scale, bool IsSigned,\n-                        Type *DestTy) {\n+                        Value *Vec, unsigned Scale, bool IsSigned, Type *DestTy,\n+                        bool ReducedInTree) {\n     Value *Rdx;\n-    if (auto *VecTy = dyn_cast<FixedVectorType>(DestTy)) {\n+    if (ReducedInTree) {\n+      Rdx = Vec;\n+    } else if (auto *VecTy = dyn_cast<FixedVectorType>(DestTy)) {\n       unsigned DestTyNumElements = getNumElements(VecTy);\n       unsigned VF = getNumElements(Vec->getType()) / DestTyNumElements;\n       Rdx = PoisonValue::get(\n@@ -25954,11 +26169,12 @@ class HorizontalReduction {\n   /// sub-registers, combines them with the given reduction operation as a\n   /// vector operation and then performs single (small enough) reduction.\n   Value *emitReduction(IRBuilderBase &Builder, const TargetTransformInfo &TTI,\n-                       Type *DestTy) {\n+                       Type *DestTy, bool ReducedInTree) {\n     Value *ReducedSubTree = nullptr;\n     // Creates reduction and combines with the previous reduction.\n     auto CreateSingleOp = [&](Value *Vec, unsigned Scale, bool IsSigned) {\n-      Value *Rdx = createSingleOp(Builder, TTI, Vec, Scale, IsSigned, DestTy);\n+      Value *Rdx = createSingleOp(Builder, TTI, Vec, Scale, IsSigned, DestTy,\n+                                  ReducedInTree);\n       if (ReducedSubTree)\n         ReducedSubTree = createOp(Builder, RdxKind, ReducedSubTree, Rdx,\n                                   \"op.rdx\", ReductionOps);\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Patch models the cost and lowering of disjoint or reduction of shl(zext,\n(0, stride, 2* stride)) as bitcast via modeling as combined ops.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/X86/pr48223.ll",
+      "commands": [
+        "opt -O3 -S -mtriple=x86_64-- -mcpu=x86-64    < %s",
+        "opt -O3 -S -mtriple=x86_64-- -mcpu=x86-64-v2 < %s",
+        "opt -O3 -S -mtriple=x86_64-- -mcpu=x86-64-v3 < %s",
+        "opt -O3 -S -mtriple=x86_64-- -mcpu=x86-64-v4 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "compute_min",
+          "test_body": "%\"struct.std::array\" = type { [8 x i16] }\n\ndefine { i64, i64 } @compute_min(ptr noundef nonnull align 2 dereferenceable(16) %x, ptr noundef nonnull align 2 dereferenceable(16) %y) {\nentry:\n  %retval = alloca %\"struct.std::array\", align 2\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.body, %entry\n  %i.0 = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %cmp.not = icmp eq i32 %i.0, 8\n  br i1 %cmp.not, label %for.cond.cleanup, label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.cond\n  %.fca.0.load = load i64, ptr %retval, align 2\n  %.fca.0.insert = insertvalue { i64, i64 } poison, i64 %.fca.0.load, 0\n  %.fca.1.gep = getelementptr inbounds nuw i8, ptr %retval, i64 8\n  %.fca.1.load = load i64, ptr %.fca.1.gep, align 2\n  %.fca.1.insert = insertvalue { i64, i64 } %.fca.0.insert, i64 %.fca.1.load, 1\n  ret { i64, i64 } %.fca.1.insert\n\nfor.body:                                         ; preds = %for.cond\n  %conv = zext nneg i32 %i.0 to i64\n  %pt1 = getelementptr inbounds nuw [8 x i16], ptr %x, i64 0, i64 %conv\n  %pt0 = getelementptr inbounds nuw [8 x i16], ptr %y, i64 0, i64 %conv\n  %ld0 = load i16, ptr %pt0, align 2\n  %ld1 = load i16, ptr %pt1, align 2\n  %cmp.i = icmp slt i16 %ld0, %ld1\n  %sel = select i1 %cmp.i, ptr %pt0, ptr %pt1\n  %ld2 = load i16, ptr %sel, align 2\n  %pt2 = getelementptr inbounds nuw [8 x i16], ptr %retval, i64 0, i64 %conv\n  store i16 %ld2, ptr %pt2, align 2\n  %inc = add nuw nsw i32 %i.0, 1\n  br label %for.cond\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "RKSimon",
+      "body": "This is a considerable amount of code - would we be better off dealing with this in VectorCombine? The pattern matching would be considerably smaller."
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "We still need the cost modeling, which is main part of the patch, other patches should be much smaller"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-20T22:31:35Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        2093,
+        2098
+      ],
+      [
+        3730,
+        3736
+      ],
+      [
+        3911,
+        3916
+      ],
+      [
+        4040,
+        4045
+      ],
+      [
+        12598,
+        12604
+      ],
+      [
+        13322,
+        13327
+      ],
+      [
+        13726,
+        13731
+      ],
+      [
+        15339,
+        15344
+      ],
+      [
+        16111,
+        16117
+      ],
+      [
+        16184,
+        16189
+      ],
+      [
+        16249,
+        16264
+      ],
+      [
+        16304,
+        16311
+      ],
+      [
+        19924,
+        19929
+      ],
+      [
+        20851,
+        20856
+      ],
+      [
+        20875,
+        20881
+      ],
+      [
+        21433,
+        21438
+      ],
+      [
+        25421,
+        25428
+      ],
+      [
+        25545,
+        25552
+      ],
+      [
+        25699,
+        25708
+      ],
+      [
+        25954,
+        25964
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/X86/pr48223.ll": [
+      [
+        14,
+        29
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::getEntryCost",
+      "BoUpSLP::getOperandInfo",
+      "BoUpSLP::getSpillCost",
+      "BoUpSLP::transformNodes",
+      "BoUpSLP::vectorizeTree",
+      "TreeEntry",
+      "canConvertToFMA",
+      "createSingleOp",
+      "emitReduction",
+      "getOperandEntry",
+      "getReductionType",
+      "isAlternateInstruction",
+      "tryToReduce"
+    ]
+  }
+}

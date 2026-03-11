@@ -1,0 +1,124 @@
+{
+  "pr_id": 174444,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174444",
+  "state": "closed",
+  "title": "[VPlan] Reuse introduces-broadcast logic in narrowToSingleScalars",
+  "author": "artagnon",
+  "base_commit": "40c778ad1d8013db79a7adcfc2db1dcdbdde5111",
+  "fix_commit": "5c0e8784c961d1da1a96602a6f867297ce224227",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 4941da315fdbc..b05d8adff8a2e 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -1720,25 +1720,25 @@ static void narrowToSingleScalarRecipes(VPlan &Plan) {\n       if (!RepOrWidenR || !vputils::isSingleScalar(RepOrWidenR))\n         continue;\n \n-      // Skip recipes for which conversion to single-scalar does introduce\n-      // additional broadcasts. No extra broadcasts are needed, if either only\n-      // the scalars of the recipe are used, or at least one of the operands\n-      // would require a broadcast. In the latter case, the single-scalar may\n-      // need to be broadcasted, but another broadcast is removed.\n-      if (!all_of(RepOrWidenR->users(),\n-                  [RepOrWidenR](const VPUser *U) {\n-                    if (auto *VPI = dyn_cast<VPInstruction>(U)) {\n-                      unsigned Opcode = VPI->getOpcode();\n-                      if (Opcode == VPInstruction::ExtractLastLane ||\n-                          Opcode == VPInstruction::ExtractLastPart ||\n-                          Opcode == VPInstruction::ExtractPenultimateElement)\n-                        return true;\n-                    }\n-\n-                    return U->usesScalars(RepOrWidenR);\n-                  }) &&\n-          none_of(RepOrWidenR->operands(), [RepOrWidenR](VPValue *Op) {\n-            if (Op->getSingleUser() != RepOrWidenR)\n+      // Predicate to check if a user of Op introduces extra broadcasts.\n+      auto IntroducesBCastOf = [](const VPValue *Op) {\n+        return [Op](const VPUser *U) {\n+          if (auto *VPI = dyn_cast<VPInstruction>(U)) {\n+            if (is_contained({VPInstruction::ExtractLastLane,\n+                              VPInstruction::ExtractLastPart,\n+                              VPInstruction::ExtractPenultimateElement},\n+                             VPI->getOpcode()))\n+              return false;\n+          }\n+          return !U->usesScalars(Op);\n+        };\n+      };\n+\n+      if (any_of(RepOrWidenR->users(), IntroducesBCastOf(RepOrWidenR)) &&\n+          none_of(RepOrWidenR->operands(), [&](VPValue *Op) {\n+            if (any_of(\n+                    make_filter_range(Op->users(), not_equal_to(RepOrWidenR)),\n+                    IntroducesBCastOf(Op)))\n               return false;\n             // Non-constant live-ins require broadcasts, while constants do not\n             // need explicit broadcasts.\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "narrowToSingleScalarRecipes' operands check is a bit too restrictive by permitting a single user. Factor out and reuse the existing introduces-broadcast logic to improve results.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/epilog-iv-select-cmp.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -mtriple=arm64-apple-macosx -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "select_icmp_var_start_iv_trunc",
+          "test_body": "define i32 @select_icmp_var_start_iv_trunc(i32 %N, i32 %start) #0 {\nentry:\n  %N.pos = icmp sgt i32 %N, 0\n  call void @llvm.assume(i1 %N.pos)\n  %N.ext = zext i32 %N to i64\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %red = phi i32 [ %start, %entry ], [ %red.next, %loop ]\n  %c = icmp eq i32 %start, 0\n  %iv.trunc = trunc i64 %iv to i32\n  %red.next = select i1 %c, i32 %iv.trunc, i32 %red\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, %N.ext\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %red.next\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\nattributes #0 = { \"target-cpu\"=\"apple-m1\" }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/pr44488-predication.ll",
+      "commands": [
+        "opt < %s -force-vector-width=2 -force-vector-interleave=1 -force-widen-divrem-via-safe-divisor=0 -passes=loop-vectorize -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_true_and_false_branch_equal",
+          "test_body": "@v_38 = external global i16, align 1\n@v_39 = external global i16, align 1\n\ndefine i16 @test_true_and_false_branch_equal() {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.latch, %entry\n  %i.07 = phi i16 [ 99, %entry ], [ %inc7, %for.latch ]\n  %lv = load i16, ptr @v_38, align 1\n  %cmp1 = icmp eq i16 %lv, 32767\n  br i1 %cmp1, label %cond.end, label %cond.end\n\ncond.end:                                         ; preds = %for.body, %for.body\n  %cmp2 = icmp eq i16 %lv, 0\n  br i1 %cmp2, label %for.latch, label %cond.false4\n\ncond.false4:                                      ; preds = %cond.end\n  %rem = srem i16 5786, %lv\n  br label %for.latch\n\nfor.latch:                                        ; preds = %cond.false4, %cond.end\n  %cond6 = phi i16 [ %rem, %cond.false4 ], [ 5786, %cond.end ]\n  store i16 %cond6, ptr @v_39, align 1\n  %inc7 = add nsw i16 %i.07, 1\n  %cmp = icmp slt i16 %inc7, 111\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.latch\n  %rv = load i16, ptr @v_39, align 1\n  ret i16 %rv\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/select-cmp.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=4 -S < %s",
+        "opt -passes=loop-vectorize -force-vector-interleave=4 -force-vector-width=4 -S < %s",
+        "opt -passes=loop-vectorize -force-vector-interleave=4 -force-vector-width=1 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "select_i32_from_icmp_same_inputs",
+          "test_body": "define i32 @select_i32_from_icmp_same_inputs(i32 %a, i32 %b, i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %rdx = phi i32 [ %a, %entry ], [ %sel, %loop ]\n  %cmp.rdx.3 = icmp eq i32 %rdx, 3\n  %sel = select i1 %cmp.rdx.3, i32 %rdx, i32 %b\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cond = icmp eq i64 %iv.next, %n\n  br i1 %exit.cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %sel\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "artagnon",
+      "body": "Gentle ping."
+    },
+    {
+      "author": "artagnon",
+      "body": "Gentle ping."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-05T17:25:11Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        1720,
+        1744
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/epilog-iv-select-cmp.ll": [
+      [
+        136,
+        144
+      ],
+      [
+        150,
+        156
+      ],
+      [
+        178,
+        186
+      ],
+      [
+        192,
+        198
+      ],
+      [
+        205,
+        216
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/pr44488-predication.ll": [
+      [
+        17,
+        26
+      ],
+      [
+        28,
+        43
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/select-cmp.ll": [
+      [
+        942,
+        950
+      ],
+      [
+        983,
+        991
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "narrowToSingleScalarRecipes"
+    ]
+  }
+}

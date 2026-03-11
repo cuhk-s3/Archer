@@ -1,0 +1,352 @@
+{
+  "pr_id": 176584,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176584",
+  "state": "closed",
+  "title": "[ConstraintElim] Fall back to ICmpInst::compare in checkCondition",
+  "author": "artagnon",
+  "base_commit": "1a208185b99e7352e41ac9d249a285f15421796d",
+  "fix_commit": "7829060b2ff0f6e9c4e0380c751c269f72ba5634",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\nindex 480ab8b822595..81d665500b92e 100644\n--- a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n@@ -39,6 +39,7 @@\n #include \"llvm/Support/CommandLine.h\"\n #include \"llvm/Support/Debug.h\"\n #include \"llvm/Support/DebugCounter.h\"\n+#include \"llvm/Support/KnownBits.h\"\n #include \"llvm/Support/MathExtras.h\"\n #include \"llvm/Transforms/Utils/Cloning.h\"\n #include \"llvm/Transforms/Utils/ValueMapper.h\"\n@@ -1499,10 +1500,15 @@ static std::optional<bool> checkCondition(CmpInst::Predicate Pred, Value *A,\n                                           ConstraintInfo &Info) {\n   LLVM_DEBUG(dbgs() << \"Checking \" << *CheckInst << \"\\n\");\n \n+  // Compute known bits for ICmpInst::compare.\n+  const DataLayout &DL = CheckInst->getDataLayout();\n+  KnownBits KnownA = computeKnownBits(A, DL);\n+  KnownBits KnownB = computeKnownBits(B, DL);\n+\n   auto R = Info.getConstraintForSolving(Pred, A, B);\n   if (R.empty() || !R.isValid(Info)) {\n     LLVM_DEBUG(dbgs() << \"   failed to decompose condition\\n\");\n-    return std::nullopt;\n+    return ICmpInst::compare(KnownA, KnownB, Pred);\n   }\n \n   auto &CSToUse = Info.getCS(R.IsSigned);\n@@ -1512,6 +1518,7 @@ static std::optional<bool> checkCondition(CmpInst::Predicate Pred, Value *A,\n   // about the constraint.\n   for (auto &Row : R.ExtraInfo)\n     CSToUse.addVariableRow(Row);\n+\n   llvm::scope_exit InfoRestorer([&]() {\n     for (unsigned I = 0; I < R.ExtraInfo.size(); ++I)\n       CSToUse.popLastConstraint();\n@@ -1532,7 +1539,7 @@ static std::optional<bool> checkCondition(CmpInst::Predicate Pred, Value *A,\n     return ImpliedCondition;\n   }\n \n-  return std::nullopt;\n+  return ICmpInst::compare(KnownA, KnownB, Pred);\n }\n \n static bool checkAndReplaceCondition(\n",
+  "components": [
+    "ConstraintElimination"
+  ],
+  "description": "The simplification allows further simplifications by ConstraintElim.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/abs.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "abs_constant_negative_arg",
+          "test_body": "define i1 @abs_constant_negative_arg() {\n  %abs = tail call i32 @llvm.abs.i32(i32 -3, i1 false)\n  %cmp = icmp sge i32 %abs, 3\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.abs.i32(i32, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "abs_plus_one_unsigned_greater_or_equal_cannot_be_simplified",
+          "test_body": "define i1 @abs_plus_one_unsigned_greater_or_equal_cannot_be_simplified(i32 noundef %arg) {\n  %abs = tail call i32 @llvm.abs.i32(i32 %arg, i1 false)\n  %abs_plus_one = add nuw i32 %abs, 1\n  %cmp = icmp uge i32 %abs_plus_one, %arg\n  ret i1 %cmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.abs.i32(i32, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/add-nuw.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "add_nuw_neg_pr54224_i64",
+          "test_body": "define i1 @add_nuw_neg_pr54224_i64(i64 %a) {\nentry:\n  %neg2 = add nuw i64 %a, -305\n  %c.1 = icmp ugt i64 0, %neg2\n  br i1 %c.1, label %exit.1, label %exit.2\n\nexit.1:                                           ; preds = %entry\n  %c.2 = icmp ugt i64 %a, 0\n  ret i1 %c.2\n\nexit.2:                                           ; preds = %entry\n  %c.3 = icmp ugt i64 %a, 0\n  ret i1 %c.3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/large-constant-ints.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "add_nuw_decomp_recursive",
+          "test_body": "define i1 @add_nuw_decomp_recursive() {\n  %add = add nuw nsw i64 -9223372036854775808, 10\n  %cmp = icmp uge i64 %add, 10\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "add_minus_one_decomp_recursive",
+          "test_body": "define i1 @add_minus_one_decomp_recursive() {\n  %add = add i64 -9223372036854775808, -1\n  %cmp = icmp uge i64 %add, 10\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/loops-bottom-tested-base.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "loop_iv_cond_variable_bound",
+          "test_body": "declare void @use(i1)\n\ndefine void @loop_iv_cond_variable_bound(i32 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %t.1 = icmp ule i32 %iv, %n\n  call void @use(i1 %t.1)\n  %t.2 = icmp sge i32 %iv, 0\n  call void @use(i1 %t.2)\n  %t.3 = icmp sge i32 %iv, -1\n  call void @use(i1 %t.3)\n  %c.1 = icmp ult i32 %iv, %n\n  call void @use(i1 %c.1)\n  %c.2 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.2)\n  %cmp = icmp ult i32 %iv, %n\n  %iv.next = add nuw nsw i32 %iv, 1\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        },
+        {
+          "test_name": "loop_iv_cond_constant_bound",
+          "test_body": "declare void @use(i1)\n\ndefine void @loop_iv_cond_constant_bound() {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %t.1 = icmp ule i32 %iv, 2\n  call void @use(i1 %t.1)\n  %t.2 = icmp sge i32 %iv, 0\n  call void @use(i1 %t.2)\n  %t.3 = icmp sge i32 %iv, -1\n  call void @use(i1 %t.3)\n  %c.1 = icmp ult i32 %iv, 2\n  call void @use(i1 %c.1)\n  %c.2 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.2)\n  %cmp = icmp ult i32 %iv, 2\n  %iv.next = add nuw nsw i32 %iv, 1\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/loops-header-tested-base.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "loop_iv_cond_variable_bound",
+          "test_body": "declare void @use(i1)\n\ndefine void @loop_iv_cond_variable_bound(i32 %n) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %t.1 = icmp ule i32 %iv, %n\n  call void @use(i1 %t.1)\n  %t.2 = icmp sge i32 %iv, 0\n  call void @use(i1 %t.2)\n  %t.3 = icmp sge i32 %iv, -1\n  call void @use(i1 %t.3)\n  %c.1 = icmp ult i32 %iv, %n\n  call void @use(i1 %c.1)\n  %c.2 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.2)\n  %cmp = icmp ult i32 %iv, %n\n  br i1 %cmp, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %t.4 = icmp ule i32 %iv, %n\n  call void @use(i1 %t.4)\n  %c.3 = icmp ult i32 %iv, 2\n  call void @use(i1 %c.3)\n  %c.4 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.4)\n  %iv.next = add nuw nsw i32 %iv, 1\n  br label %loop.header\n\nexit:                                             ; preds = %loop.header\n  ret void\n}\n"
+        },
+        {
+          "test_name": "loop_iv_cond_constant_bound",
+          "test_body": "declare void @use(i1)\n\ndefine void @loop_iv_cond_constant_bound() {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %t.1 = icmp ule i32 %iv, 2\n  call void @use(i1 %t.1)\n  %t.2 = icmp sge i32 %iv, 0\n  call void @use(i1 %t.2)\n  %t.3 = icmp sge i32 %iv, -1\n  call void @use(i1 %t.3)\n  %c.1 = icmp ult i32 %iv, 2\n  call void @use(i1 %c.1)\n  %c.2 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.2)\n  %cmp = icmp ult i32 %iv, 2\n  br i1 %cmp, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %t.4 = icmp ule i32 %iv, 2\n  call void @use(i1 %t.4)\n  %c.3 = icmp ult i32 %iv, 2\n  call void @use(i1 %c.3)\n  %c.4 = icmp ugt i32 %iv, 1\n  call void @use(i1 %c.4)\n  %iv.next = add nuw nsw i32 %iv, 1\n  br label %loop.header\n\nexit:                                             ; preds = %loop.header\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/monotonic-int-phis-multiples.ll",
+      "commands": [
+        "opt -S -passes=constraint-elimination < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "multiple_pow2_start_offset_dynamic",
+          "test_body": "define void @multiple_pow2_start_offset_dynamic(i64 %count) {\nentry:\n  %shl = shl i64 %count, 2\n  %end = add i64 %shl, 1\n  %precond = icmp ne i64 %end, 0\n  br i1 %precond, label %loop, label %exit\n\nloop:                                             ; preds = %loop.latch, %entry\n  %iv = phi i64 [ %iv.next, %loop.latch ], [ 1, %entry ]\n  %iv.next = add i64 %iv, 4\n  %cmp.i.not = icmp eq i64 %iv, %end\n  br i1 %cmp.i.not, label %exit, label %loop.latch\n\nloop.latch:                                       ; preds = %loop\n  %cmp2.i.i = icmp ult i64 %iv, %end\n  br i1 %cmp2.i.i, label %loop, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop, %entry\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/overflows.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_overflow_in_negate_constraint",
+          "test_body": "define i1 @test_overflow_in_negate_constraint(i8 %x, i64 %y) {\nbb:\n  %zext = zext i8 %x to i64\n  %shl = shl nuw nsw i64 %zext, 63\n  %icmp = icmp uge i64 %y, %shl\n  ret i1 %icmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/shl.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "shl_55",
+          "test_body": "define i1 @shl_55() {\nentry:\n  %shl.ub = shl nuw nsw i256 1, 55\n  %shl.cmp = icmp uge i256 %shl.ub, 1\n  ret i1 %shl.cmp\n}\n"
+        },
+        {
+          "test_name": "shl_overflow_3",
+          "test_body": "define i1 @shl_overflow_3() {\nentry:\n  %shl.ub = shl nuw nsw i256 0, 65\n  %shl.cmp = icmp uge i256 %shl.ub, 0\n  ret i1 %shl.cmp\n}\n"
+        },
+        {
+          "test_name": "shl_overflow_2",
+          "test_body": "define i1 @shl_overflow_2() {\nentry:\n  %shl.ub = shl nuw nsw i256 0, 64\n  %shl.cmp = icmp uge i256 %shl.ub, 0\n  ret i1 %shl.cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/sub-nuw.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sub_nuw_i64_signed_min_const",
+          "test_body": "define i1 @sub_nuw_i64_signed_min_const(i64 %a) {\nentry:\n  %neg2 = sub nuw i64 0, -9223372036854775808\n  %c = icmp ugt i64 %neg2, 0\n  ret i1 %c\n}\n"
+        },
+        {
+          "test_name": "sub_nuw_i64_simp",
+          "test_body": "define i1 @sub_nuw_i64_simp(i64 %a) {\nentry:\n  %neg2 = sub nuw i64 %a, 305\n  %c.1 = icmp ugt i64 0, %neg2\n  br i1 %c.1, label %exit.1, label %exit.2\n\nexit.1:                                           ; preds = %entry\n  %c.2 = icmp ugt i64 %a, 0\n  ret i1 %c.2\n\nexit.2:                                           ; preds = %entry\n  %c.3 = icmp ugt i64 %a, 0\n  ret i1 %c.3\n}\n"
+        },
+        {
+          "test_name": "sub_nuw_i16_simp",
+          "test_body": "define i1 @sub_nuw_i16_simp(i16 %a) {\nentry:\n  %neg2 = sub nuw i16 %a, 305\n  %c.1 = icmp ugt i16 0, %neg2\n  br i1 %c.1, label %exit.1, label %exit.2\n\nexit.1:                                           ; preds = %entry\n  %c.2 = icmp ugt i16 %a, 0\n  ret i1 %c.2\n\nexit.2:                                           ; preds = %entry\n  %c.3 = icmp ugt i16 %a, 0\n  ret i1 %c.3\n}\n"
+        },
+        {
+          "test_name": "sub_nuw_neg_i16",
+          "test_body": "define i1 @sub_nuw_neg_i16(i16 %a) {\nentry:\n  %neg2 = sub nuw i16 %a, -305\n  %c.1 = icmp ugt i16 0, %neg2\n  br i1 %c.1, label %exit.1, label %exit.2\n\nexit.1:                                           ; preds = %entry\n  %c.2 = icmp ugt i16 %a, 0\n  ret i1 %c.2\n\nexit.2:                                           ; preds = %entry\n  %c.3 = icmp ugt i16 %a, 0\n  ret i1 %c.3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/transfer-signed-facts-to-unsigned.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sgt_known_neg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @sgt_known_neg(i8 %idx) {\nentry:\n  %cmp = icmp sgt i8 %idx, -1\n  call void @llvm.assume(i1 %cmp)\n  %t.1 = icmp uge i8 %idx, 0\n  %t.2 = icmp uge i8 %idx, 1\n  %res.1 = xor i1 %t.1, %t.2\n  %c.1 = icmp ugt i8 %idx, -1\n  %res.2 = xor i1 %res.1, %c.1\n  ret i1 %res.2\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "sgt_to_ugt_neg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i1 @sgt_to_ugt_neg(i8 %a) {\nentry:\n  %cmp = icmp sgt i8 %a, -1\n  call void @llvm.assume(i1 %cmp)\n  %c.1 = icmp ugt i8 %a, -1\n  ret i1 %c.1\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/ConstraintElimination/zext.ll",
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_pr58009_const_zext",
+          "test_body": "define i1 @test_pr58009_const_zext() {\nentry:\n  %ext.t.1 = zext i1 true to i16\n  %ext.t.2 = zext i1 true to i16\n  %t.1 = icmp uge i16 %ext.t.1, %ext.t.2\n  %f.1 = icmp ugt i16 %ext.t.1, %ext.t.2\n  %res.1 = xor i1 %t.1, %f.1\n  %ext.f.1 = zext i1 false to i16\n  %ext.f.2 = zext i1 false to i16\n  %t.2 = icmp uge i16 %ext.f.1, %ext.f.2\n  %f.2 = icmp ugt i16 %ext.f.1, %ext.f.2\n  %res.2 = xor i1 %res.1, %t.2\n  %res.3 = xor i1 %res.2, %f.2\n  %t.3 = icmp ult i16 %ext.f.1, %ext.t.2\n  %f.3 = icmp ugt i16 %ext.f.1, %ext.t.2\n  %res.4 = xor i1 %res.3, %t.3\n  %res.5 = xor i1 %res.4, %f.3\n  ret i1 %res.5\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "artagnon",
+      "body": "> I don't understand the motivation. Isn't it covered by `InstCombinerImpl::foldICmpUsingKnownBits`?\r\n\r\nJust checking if there's a diff in llvm-opt-benchmark -- I think this simplification allows further simplifications within ConstraintElim?"
+    },
+    {
+      "author": "artagnon",
+      "body": "> > I don't understand the motivation. Isn't it covered by `InstCombinerImpl::foldICmpUsingKnownBits`?\r\n> \r\n> Just checking if there's a diff in llvm-opt-benchmark -- I think this simplification allows further simplifications within ConstraintElim?\r\n\r\nLooks like this is indeed the case?"
+    },
+    {
+      "author": "nikic",
+      "body": "Base on llvm-opt-benchmark, this seems to have essentially no impact."
+    },
+    {
+      "author": "artagnon",
+      "body": "> Base on llvm-opt-benchmark, this seems to have essentially no impact.\r\n\r\nHm, this is the diff? https://github.com/dtcxzyw/llvm-opt-benchmark/pull/3348/changes"
+    },
+    {
+      "author": "nikic",
+      "body": "> > Base on llvm-opt-benchmark, this seems to have essentially no impact.\r\n> \r\n> Hm, this is the diff? https://github.com/dtcxzyw/llvm-opt-benchmark/pull/3348/changes\r\n\r\nExactly. There are only two files with non-trivial improvements, which is very low for this kind of change. Duplicating a fold that a different pass is responsible for requires stronger motivation."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-17T18:20:11Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+      [
+        39,
+        44
+      ],
+      [
+        1499,
+        1508
+      ],
+      [
+        1512,
+        1517
+      ],
+      [
+        1532,
+        1538
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/abs.ll": [
+      [
+        153,
+        160
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/add-nuw.ll": [
+      [
+        454,
+        461
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/large-constant-ints.ll": [
+      [
+        307,
+        314
+      ],
+      [
+        318,
+        325
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/loops-bottom-tested-base.ll": [
+      [
+        11,
+        20
+      ],
+      [
+        58,
+        67
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/loops-header-tested-base.ll": [
+      [
+        299,
+        308
+      ],
+      [
+        364,
+        373
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/monotonic-int-phis-multiples.ll": [
+      [
+        183,
+        190
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/overflows.ll": [
+      [
+        23,
+        30
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/shl.ll": [
+      [
+        1240,
+        1247
+      ],
+      [
+        1253,
+        1260
+      ],
+      [
+        1266,
+        1273
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/sub-nuw.ll": [
+      [
+        264,
+        271
+      ],
+      [
+        290,
+        297
+      ],
+      [
+        316,
+        323
+      ],
+      [
+        372,
+        379
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/transfer-signed-facts-to-unsigned.ll": [
+      [
+        539,
+        546
+      ],
+      [
+        641,
+        648
+      ]
+    ],
+    "llvm/test/Transforms/ConstraintElimination/zext.ll": [
+      [
+        264,
+        273
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+      "checkAndReplaceCondition",
+      "checkCondition"
+    ],
+    "llvm/test/Transforms/ConstraintElimination/abs.ll": [
+      "abs_constant_negative_arg"
+    ],
+    "llvm/test/Transforms/ConstraintElimination/shl.ll": [
+      "shl_55",
+      "shl_overflow_3"
+    ],
+    "llvm/test/Transforms/ConstraintElimination/sub-nuw.ll": [
+      "i64"
+    ]
+  }
+}

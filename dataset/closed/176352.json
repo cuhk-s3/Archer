@@ -1,0 +1,80 @@
+{
+  "pr_id": 176352,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176352",
+  "state": "closed",
+  "title": "[InstCombine] fold addrcast+load through selects",
+  "author": "thetheodor",
+  "base_commit": "fab06fae0064a2f1208331f9c355a26a4f9777f0",
+  "fix_commit": "c21512139b0a4083360fb0053c01c1d661e152eb",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\nindex 5bca0bb8846c0..82d5df6a3cb29 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\n@@ -1137,19 +1137,35 @@ Instruction *InstCombinerImpl::visitLoadInst(LoadInst &LI) {\n     // but it would not be valid if we transformed it to load from null\n     // unconditionally.\n     //\n-    if (SelectInst *SI = dyn_cast<SelectInst>(Op)) {\n+\n+    AddrSpaceCastInst *ASC = dyn_cast<AddrSpaceCastInst>(Op);\n+    Value *SelectOp = Op;\n+    if (ASC && ASC->getOperand(0)->hasOneUse())\n+      SelectOp = ASC->getOperand(0);\n+    if (SelectInst *SI = dyn_cast<SelectInst>(SelectOp)) {\n       // load (select (Cond, &V1, &V2))  --> select(Cond, load &V1, load &V2).\n+      // or\n+      // load (addrspacecast(select (Cond, &V1, &V2))) -->\n+      //  select(Cond, load (addrspacecast(&V1)), load (addrspacecast(&V2))).\n       Align Alignment = LI.getAlign();\n       if (isSafeToLoadUnconditionally(SI->getOperand(1), LI.getType(),\n                                       Alignment, DL, SI) &&\n           isSafeToLoadUnconditionally(SI->getOperand(2), LI.getType(),\n                                       Alignment, DL, SI)) {\n-        LoadInst *V1 =\n-            Builder.CreateLoad(LI.getType(), SI->getOperand(1),\n-                               SI->getOperand(1)->getName() + \".val\");\n-        LoadInst *V2 =\n-            Builder.CreateLoad(LI.getType(), SI->getOperand(2),\n-                               SI->getOperand(2)->getName() + \".val\");\n+\n+        auto MaybeCastedLoadOperand = [&](Value *Op) {\n+          if (ASC)\n+            return Builder.CreateAddrSpaceCast(Op, ASC->getType(),\n+                                               Op->getName() + \".cast\");\n+          return Op;\n+        };\n+        Value *LoadOp1 = MaybeCastedLoadOperand(SI->getOperand(1));\n+        LoadInst *V1 = Builder.CreateLoad(LI.getType(), LoadOp1,\n+                                          LoadOp1->getName() + \".val\");\n+\n+        Value *LoadOp2 = MaybeCastedLoadOperand(SI->getOperand(2));\n+        LoadInst *V2 = Builder.CreateLoad(LI.getType(), LoadOp2,\n+                                          LoadOp2->getName() + \".val\");\n         assert(LI.isUnordered() && \"implied by above\");\n         V1->setAlignment(Alignment);\n         V1->setAtomic(LI.getOrdering(), LI.getSyncScopeID());\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Fold addrspacecast+load through select\r\n    \r\nAdd support for\r\n    \r\nload(addrspacecast(select(Cond, &V1, &V2))) =>\r\nselect(Cond, load(addrspacecast(&V1)), load(addrspacecast(&V2)))\r\n    \r\nNote: alive does not support addrspacecasts and thus proofs are omitted.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/load-addrspacecast-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "load_addrspacecast_select_on_args_dereferenceable",
+          "test_body": "define i32 @load_addrspacecast_select_on_args_dereferenceable(i1 %cond, ptr dereferenceable(4) %a, ptr dereferenceable(4) %b) {\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load i32, ptr addrspace(5) %cast, align 4\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "load_addrspacecast_select_on_args",
+          "test_body": "define i32 @load_addrspacecast_select_on_args(i1 %cond, ptr %a, ptr %b) {\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load i32, ptr addrspace(5) %cast, align 4\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "load_addrspacecast_select_alloca",
+          "test_body": "define i32 @load_addrspacecast_select_alloca(i1 %cond) {\n  %a = alloca i32, align 4\n  %b = alloca i32, align 4\n  store i32 42, ptr %a, align 4\n  store i32 100, ptr %b, align 4\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load i32, ptr addrspace(5) %cast, align 4\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "load_addrspacecast_multi_use",
+          "test_body": "define i32 @load_addrspacecast_multi_use(i1 %cond, ptr addrspace(5) %out) {\n  %a = alloca i32, align 4\n  %b = alloca i32, align 4\n  store i32 42, ptr %a, align 4\n  store i32 100, ptr %b, align 4\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load i32, ptr addrspace(5) %cast, align 4\n  store ptr addrspace(5) %cast, ptr addrspace(5) %out, align 8\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "load_addrspacecast_select_multi_use",
+          "test_body": "define i32 @load_addrspacecast_select_multi_use(i1 %cond, ptr %out) {\n  %a = alloca i32, align 4\n  %b = alloca i32, align 4\n  store i32 42, ptr %a, align 4\n  store i32 100, ptr %b, align 4\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load i32, ptr addrspace(5) %cast, align 4\n  store ptr %sel, ptr %out, align 8\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "load_addrspacecast_select_volatile",
+          "test_body": "define i32 @load_addrspacecast_select_volatile(i1 %cond) {\n  %a = alloca i32, align 4\n  %b = alloca i32, align 4\n  store i32 42, ptr %a, align 4\n  store i32 100, ptr %b, align 4\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load volatile i32, ptr addrspace(5) %cast, align 4\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "load_addrspacecast_select_alloca_vec",
+          "test_body": "define <2 x i32> @load_addrspacecast_select_alloca_vec(i1 %cond) {\n  %a = alloca <2 x i32>, align 8\n  %b = alloca <2 x i32>, align 8\n  store <2 x i32> <i32 42, i32 43>, ptr %a, align 8\n  store <2 x i32> <i32 100, i32 101>, ptr %b, align 8\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load <2 x i32>, ptr addrspace(5) %cast, align 8\n  ret <2 x i32> %load\n}\n"
+        },
+        {
+          "test_name": "load_addrspacecast_select_atomic",
+          "test_body": "define i32 @load_addrspacecast_select_atomic(i1 %cond) {\n  %a = alloca i32, align 4\n  %b = alloca i32, align 4\n  store i32 42, ptr %a, align 4\n  store i32 100, ptr %b, align 4\n  %sel = select i1 %cond, ptr %a, ptr %b\n  %cast = addrspacecast ptr %sel to ptr addrspace(5)\n  %load = load atomic i32, ptr addrspace(5) %cast seq_cst, align 4\n  ret i32 %load\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "manasij7479",
+      "body": "LGTM"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-16T12:07:37Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp": [
+      [
+        1137,
+        1155
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp": [
+      "InstCombinerImpl::visitLoadInst"
+    ]
+  }
+}

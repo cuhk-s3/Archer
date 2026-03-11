@@ -1,0 +1,134 @@
+{
+  "pr_id": 178002,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/178002",
+  "state": "closed",
+  "title": "[InstCombine] Fold select of intrinsic into intrinsic of select",
+  "author": "xaerru",
+  "base_commit": "b19238d0d0a7d026de8e2ad28775db57afccb01d",
+  "fix_commit": "fecfb8d7de42d5990d6e95a0fc13ec13ab3a4a59",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 8c8b300bb2002..8a478bf344536 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -805,6 +805,7 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   Instruction *foldSelectExtConst(SelectInst &Sel);\n   Instruction *foldSelectEqualityTest(SelectInst &SI);\n   Instruction *foldSelectOpOp(SelectInst &SI, Instruction *TI, Instruction *FI);\n+  Instruction *foldSelectIntrinsic(SelectInst &SI);\n   Instruction *foldSelectIntoOp(SelectInst &SI, Value *, Value *);\n   Instruction *foldSPFofSPF(Instruction *Inner, SelectPatternFlavor SPF1,\n                             Value *A, Value *B, Instruction &Outer,\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 00f4118d538d8..03e9876698520 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -492,6 +492,51 @@ Instruction *InstCombinerImpl::foldSelectOpOp(SelectInst &SI, Instruction *TI,\n   return nullptr;\n }\n \n+/// This transforms patterns of the form:\n+///   select cond, intrinsic(x, ...), intrinsic(y, ...)\n+/// into:\n+///   intrinsic(select cond, x, y, ...)\n+Instruction *InstCombinerImpl::foldSelectIntrinsic(SelectInst &SI) {\n+  auto *LHSIntrinsic = dyn_cast<IntrinsicInst>(SI.getTrueValue());\n+  if (!LHSIntrinsic)\n+    return nullptr;\n+  auto *RHSIntrinsic = dyn_cast<IntrinsicInst>(SI.getFalseValue());\n+  if (!RHSIntrinsic ||\n+      LHSIntrinsic->getIntrinsicID() != RHSIntrinsic->getIntrinsicID() ||\n+      !LHSIntrinsic->hasOneUse() || !RHSIntrinsic->hasOneUse())\n+    return nullptr;\n+\n+  const Intrinsic::ID IID = LHSIntrinsic->getIntrinsicID();\n+  switch (IID) {\n+  case Intrinsic::abs:\n+  case Intrinsic::cttz:\n+  case Intrinsic::ctlz: {\n+    auto *TZ = cast<ConstantInt>(LHSIntrinsic->getArgOperand(1));\n+    auto *FZ = cast<ConstantInt>(RHSIntrinsic->getArgOperand(1));\n+\n+    Value *TV = LHSIntrinsic->getArgOperand(0);\n+    Value *FV = RHSIntrinsic->getArgOperand(0);\n+\n+    Value *NewSel = Builder.CreateSelect(SI.getCondition(), TV, FV, \"\", &SI);\n+    Value *NewPoisonFlag = Builder.CreateAnd(TZ, FZ);\n+    Value *NewCall = Builder.CreateBinaryIntrinsic(IID, NewSel, NewPoisonFlag);\n+\n+    return replaceInstUsesWith(SI, NewCall);\n+  }\n+  case Intrinsic::ctpop: {\n+    Value *TV = LHSIntrinsic->getArgOperand(0);\n+    Value *FV = RHSIntrinsic->getArgOperand(0);\n+\n+    Value *NewSel = Builder.CreateSelect(SI.getCondition(), TV, FV, \"\", &SI);\n+    Value *NewCall = Builder.CreateUnaryIntrinsic(IID, NewSel);\n+\n+    return replaceInstUsesWith(SI, NewCall);\n+  }\n+  default:\n+    return nullptr;\n+  }\n+}\n+\n static bool isSelect01(const APInt &C1I, const APInt &C2I) {\n   if (!C1I.isZero() && !C2I.isZero()) // One side must be zero.\n     return false;\n@@ -4440,6 +4485,9 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n     if (Instruction *IV = foldSelectOpOp(SI, TI, FI))\n       return IV;\n \n+  if (Instruction *I = foldSelectIntrinsic(SI))\n+    return I;\n+\n   if (Instruction *I = foldSelectExtConst(SI))\n     return I;\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Fix https://github.com/llvm/llvm-project/issues/140917\r\n\r\nTransform:\r\n`select cond, intrinsic(x, ...), intrinsic(y, ...)`\r\ninto:\r\n`intrinsic(select cond, x, y, ...)`\r\nfor `ctpop/ctlz/cttz/abs`.\r\n\r\nalive2 proof: https://alive2.llvm.org/ce/z/Zp55Dy",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/intrinsic-select.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "select_of_ctpop_vec",
+          "test_body": "define <4 x i32> @select_of_ctpop_vec(<4 x i1> %cond, <4 x i32> %x, <4 x i32> %y) {\n  %ctpop1 = call <4 x i32> @llvm.ctpop.v4i32(<4 x i32> %x)\n  %ctpop2 = call <4 x i32> @llvm.ctpop.v4i32(<4 x i32> %y)\n  %sel = select <4 x i1> %cond, <4 x i32> %ctpop1, <4 x i32> %ctpop2\n  ret <4 x i32> %sel\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.ctpop.v4i32(<4 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctlz_vec",
+          "test_body": "define <4 x i32> @select_of_ctlz_vec(<4 x i1> %cond, <4 x i32> %x, <4 x i32> %y) {\n  %ctlz1 = call <4 x i32> @llvm.ctlz.v4i32(<4 x i32> %x, i1 false)\n  %ctlz2 = call <4 x i32> @llvm.ctlz.v4i32(<4 x i32> %y, i1 false)\n  %sel = select <4 x i1> %cond, <4 x i32> %ctlz2, <4 x i32> %ctlz2\n  ret <4 x i32> %sel\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.ctlz.v4i32(<4 x i32>, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_abs",
+          "test_body": "define i32 @select_of_abs(i1 %cond, i32 %x, i32 %y) {\n  %abs1 = call i32 @llvm.abs.i32(i32 %x, i1 false)\n  %abs2 = call i32 @llvm.abs.i32(i32 %y, i1 false)\n  %sel = select i1 %cond, i32 %abs1, i32 %abs2\n  ret i32 %sel\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.abs.i32(i32, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctpop_negative_tv",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctpop.i32(i32) #0\n\ndefine i32 @select_of_ctpop_negative_tv(i1 %cond, i32 %x, i32 %y) {\n  %ctpop1 = add i32 %x, 0\n  %ctpop2 = call i32 @llvm.ctpop.i32(i32 %y)\n  %sel = select i1 %cond, i32 %ctpop1, i32 %ctpop2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctlz_zero_poison_false",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\ndefine i32 @select_of_ctlz_zero_poison_false(i1 %cond, i32 %x, i32 %y) {\n  %ctlz1 = call i32 @llvm.ctlz.i32(i32 %x, i1 false)\n  %ctlz2 = call i32 @llvm.ctlz.i32(i32 %y, i1 true)\n  %sel = select i1 %cond, i32 %ctlz1, i32 %ctlz2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctlz_negative_multi_use",
+          "test_body": "declare void @use(i32)\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\ndefine i32 @select_of_ctlz_negative_multi_use(i1 %cond, i32 %x, i32 %y) {\n  %ctlz1 = call i32 @llvm.ctlz.i32(i32 %x, i1 false)\n  call void @use(i32 %ctlz1)\n  %ctlz2 = call i32 @llvm.ctlz.i32(i32 %y, i1 false)\n  %sel = select i1 %cond, i32 %ctlz1, i32 %ctlz2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctpop_negative_multi_use",
+          "test_body": "declare void @use(i32)\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctpop.i32(i32) #0\n\ndefine i32 @select_of_ctpop_negative_multi_use(i1 %cond, i32 %x, i32 %y) {\n  %ctpop1 = call i32 @llvm.ctpop.i32(i32 %x)\n  call void @use(i32 %ctpop1)\n  %ctpop2 = call i32 @llvm.ctpop.i32(i32 %y)\n  %sel = select i1 %cond, i32 %ctpop1, i32 %ctpop2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_select_rotate_right_non_splat",
+          "test_body": "define <2 x i8> @test_select_rotate_right_non_splat(i1 %0) {\n  %s = select i1 %0, <2 x i8> <i8 1, i8 2>, <2 x i8> <i8 -1, i8 -2>\n  %ret = call <2 x i8> @llvm.fshr.v2i8(<2 x i8> %s, <2 x i8> %s, <2 x i8> splat (i8 7))\n  ret <2 x i8> %ret\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x i8> @llvm.fshr.v2i8(<2 x i8>, <2 x i8>, <2 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctpop",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctpop.i32(i32) #0\n\ndefine i32 @select_of_ctpop(i1 %cond, i32 %x, i32 %y) {\n  %ctpop1 = call i32 @llvm.ctpop.i32(i32 %x)\n  %ctpop2 = call i32 @llvm.ctpop.i32(i32 %y)\n  %sel = select i1 %cond, i32 %ctpop1, i32 %ctpop2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctlz_zero_poison_true",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\ndefine i32 @select_of_ctlz_zero_poison_true(i1 %cond, i32 %x, i32 %y) {\n  %ctlz1 = call i32 @llvm.ctlz.i32(i32 %x, i1 true)\n  %ctlz2 = call i32 @llvm.ctlz.i32(i32 %y, i1 true)\n  %sel = select i1 %cond, i32 %ctlz1, i32 %ctlz2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_cttz",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.cttz.i32(i32, i1 immarg) #0\n\ndefine i32 @select_of_cttz(i1 %cond, i32 %x, i32 %y) {\n  %cttz1 = call i32 @llvm.cttz.i32(i32 %x, i1 false)\n  %cttz2 = call i32 @llvm.cttz.i32(i32 %y, i1 false)\n  %sel = select i1 %cond, i32 %cttz1, i32 %cttz2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctpop_negative_fv",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctpop.i32(i32) #0\n\ndefine i32 @select_of_ctpop_negative_fv(i1 %cond, i32 %x, i32 %y) {\n  %ctpop1 = call i32 @llvm.ctpop.i32(i32 %y)\n  %ctpop2 = add i32 %x, 0\n  %sel = select i1 %cond, i32 %ctpop1, i32 %ctpop2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "select_of_ctlz",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\ndefine i32 @select_of_ctlz(i1 %cond, i32 %x, i32 %y) {\n  %ctlz1 = call i32 @llvm.ctlz.i32(i32 %x, i1 false)\n  %ctlz2 = call i32 @llvm.ctlz.i32(i32 %y, i1 false)\n  %sel = select i1 %cond, i32 %ctlz1, i32 %ctlz2\n  ret i32 %sel\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "\r\n<img width=\"1048\" height=\"68\" alt=\"image\" src=\"https://github.com/user-attachments/assets/e350de2d-c6e6-4ddc-aa34-19a63214d8f2\" />\r\n\r\n@xaerru Can you please update your email settings? See https://llvm.org/docs/DeveloperPolicy.html#email-addresses\r\nThen I will merge this PR :)"
+    },
+    {
+      "author": "xaerru",
+      "body": "We can't generalize this to all intrinsics, the intrinsic should be side effect free. We can try to find more intrinsics for which this would work."
+    },
+    {
+      "author": "nikic",
+      "body": "> We can't generalize this to all intrinsics, the intrinsic should be side effect free. We can try to find more intrinsics for which this would work.\r\n\r\nYes, of course. What I was referring to was to not hardcode a list of intrinsics and instead do this based on generic queries (like mayHaveSideEffects).\r\n\r\nThough seeing as this has no diff on llvm-opt-benchmark, maybe it's not worth pursuing."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM BUILDBOT INFORMATION COMMENT-->\n\n@xaerru Congratulations on having your first Pull Request (PR) merged into the LLVM Project!\n\nYour changes will be combined with recent changes from other authors, then tested by our [build bots](https://lab.llvm.org/buildbot/). If there is a problem with a build, you may receive a report in an email or a comment on this PR.\n\nPlease check whether problems have been caused by your change specifically, as the builds can include changes from many authors. It is not uncommon for your change to be included in a build that fails due to someone else's changes, or infrastructure issues.\n\nHow to do this, and the rest of the post-merge process, is covered in detail [here](https://llvm.org/docs/MyFirstTypoFix.html#myfirsttypofix-issues-after-landing-your-pr).\n\nIf your change does cause a problem, it may be reverted, or you can revert it yourself. This is a normal part of [LLVM development](https://llvm.org/docs/DeveloperPolicy.html#patch-reversion-policy). You can fix your changes and open a new PR to merge them again.\n\nIf you don't get any reports, no action is required from you. Your changes are working as expected, well done!\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-26T17:36:47Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+      [
+        805,
+        810
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        492,
+        497
+      ],
+      [
+        4440,
+        4445
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/intrinsic-select.ll": [
+      [
+        532,
+        534
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::foldSelectOpOp",
+      "InstCombinerImpl::visitSelectInst",
+      "isSelect01"
+    ]
+  }
+}

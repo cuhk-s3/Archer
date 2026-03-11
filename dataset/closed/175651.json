@@ -1,0 +1,147 @@
+{
+  "pr_id": 175651,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175651",
+  "state": "closed",
+  "title": "[VPlan] Add ExitingIVValue VPInstruction.",
+  "author": "fhahn",
+  "base_commit": "b738491d2ff950391486140dd39747dd30e5c0c1",
+  "fix_commit": "30ad881ba2a3c17b53a1138a3f16d979c9bc365e",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex fba6e9fc702d6..d064a0c66a081 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -1262,7 +1262,12 @@ class LLVM_ABI_FOR_TEST VPInstruction : public VPRecipeWithIRFlags,\n \n     /// Returns the value for vscale.\n     VScale,\n-    OpsEnd = VScale,\n+    /// Compute the exiting value of a wide induction after vectorization, that\n+    /// is the value of the last lane of the induction increment (i.e. its\n+    /// backedge value). Takes the wide induction recipe and the original\n+    /// backedge value as operands.\n+    ExitingIVValue,\n+    OpsEnd = ExitingIVValue,\n   };\n \n   /// Returns true if this VPInstruction generates scalar values for all lanes.\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\nindex 8fbe7d93e6f45..567db952bec29 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp\n@@ -78,6 +78,7 @@ Type *VPTypeAnalysis::inferScalarTypeForRecipe(const VPInstruction *R) {\n   case Instruction::PHI:\n   case VPInstruction::Broadcast:\n   case VPInstruction::ComputeReductionResult:\n+  case VPInstruction::ExitingIVValue:\n   case VPInstruction::ExtractLastLane:\n   case VPInstruction::ExtractPenultimateElement:\n   case VPInstruction::ExtractLastPart:\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\nindex 0018f37e39825..94d22cc67088d 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp\n@@ -643,8 +643,31 @@ createWidenInductionRecipe(PHINode *Phi, VPPhi *PhiR, VPIRValue *Start,\n   // used, so it is safe.\n   VPIRFlags Flags = vputils::getFlagsFromIndDesc(IndDesc);\n \n-  return new VPWidenIntOrFpInductionRecipe(Phi, Start, Step, &Plan.getVF(),\n-                                           IndDesc, Flags, DL);\n+  auto *WideIV = new VPWidenIntOrFpInductionRecipe(\n+      Phi, Start, Step, &Plan.getVF(), IndDesc, Flags, DL);\n+\n+  // Replace live-out extracts of WideIV's backedge value by ExitingIVValue\n+  // recipes.\n+  VPValue *BackedgeVal = PhiR->getOperand(1);\n+  for (VPUser *U : to_vector(BackedgeVal->users())) {\n+    if (!match(U, m_ExtractLastPart(m_VPValue())))\n+      continue;\n+    auto *ExtractLastPart = cast<VPInstruction>(U);\n+    if (!match(ExtractLastPart->getSingleUser(),\n+               m_ExtractLastLane(m_VPValue())))\n+      continue;\n+    auto *ExtractLastLane =\n+        cast<VPInstruction>(ExtractLastPart->getSingleUser());\n+    assert(is_contained(ExtractLastLane->getParent()->successors(),\n+                        Plan.getScalarPreheader()) &&\n+           \"last lane must be extracted in the middle block\");\n+    VPBuilder Builder(ExtractLastLane);\n+    ExtractLastLane->replaceAllUsesWith(Builder.createNaryOp(\n+        VPInstruction::ExitingIVValue, {WideIV, BackedgeVal}));\n+    ExtractLastLane->eraseFromParent();\n+    ExtractLastPart->eraseFromParent();\n+  }\n+  return WideIV;\n }\n \n void VPlanTransforms::createHeaderPhiRecipes(\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\nindex c66ff46de35d7..454ff044dd0d5 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n@@ -505,6 +505,12 @@ inline VPInstruction_match<VPInstruction::StepVector> m_StepVector() {\n   return m_VPInstruction<VPInstruction::StepVector>();\n }\n \n+template <typename Op0_t, typename Op1_t>\n+inline VPInstruction_match<VPInstruction::ExitingIVValue, Op0_t, Op1_t>\n+m_ExitingIVValue(const Op0_t &Op0, const Op1_t &Op1) {\n+  return m_VPInstruction<VPInstruction::ExitingIVValue>(Op0, Op1);\n+}\n+\n template <unsigned Opcode, typename Op0_t>\n inline AllRecipe_match<Opcode, Op0_t> m_Unary(const Op0_t &Op0) {\n   return AllRecipe_match<Opcode, Op0_t>(Op0);\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp b/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\nindex 7f787dcbbf3cb..da3c80ac1a6da 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp\n@@ -319,7 +319,9 @@ VPlanTransforms::introduceMasksAndLinearize(VPlan &Plan, bool FoldTail) {\n     VPBuilder B(Plan.getMiddleBlock()->getTerminator());\n     for (VPRecipeBase &R : *Plan.getMiddleBlock()) {\n       VPValue *Op;\n-      if (!match(&R, m_ExtractLastLane(m_ExtractLastPart(m_VPValue(Op)))))\n+      if (!match(&R, m_CombineOr(\n+                         m_ExitingIVValue(m_VPValue(), m_VPValue(Op)),\n+                         m_ExtractLastLane(m_ExtractLastPart(m_VPValue(Op))))))\n         continue;\n \n       // Compute the index of the last active lane.\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 898507d11a46b..6057de60adb72 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -470,6 +470,7 @@ unsigned VPInstruction::getNumOperandsForOpcode(unsigned Opcode) {\n   case Instruction::Store:\n   case VPInstruction::BranchOnCount:\n   case VPInstruction::BranchOnTwoConds:\n+  case VPInstruction::ExitingIVValue:\n   case VPInstruction::FirstOrderRecurrenceSplice:\n   case VPInstruction::LogicalAnd:\n   case VPInstruction::PtrAdd:\n@@ -1322,6 +1323,7 @@ bool VPInstruction::opcodeMayReadOrWriteFromMemory() const {\n   case VPInstruction::ExtractLastPart:\n   case VPInstruction::ExtractPenultimateElement:\n   case VPInstruction::ActiveLaneMask:\n+  case VPInstruction::ExitingIVValue:\n   case VPInstruction::ExplicitVectorLength:\n   case VPInstruction::FirstActiveLane:\n   case VPInstruction::LastActiveLane:\n@@ -1385,6 +1387,7 @@ bool VPInstruction::usesFirstLaneOnly(const VPValue *Op) const {\n     return false;\n   case VPInstruction::ComputeAnyOfResult:\n     return Op == getOperand(0) || Op == getOperand(1);\n+  case VPInstruction::ExitingIVValue:\n   case VPInstruction::ExtractLane:\n     return Op == getOperand(0);\n   };\n@@ -1470,6 +1473,9 @@ void VPInstruction::printRecipe(raw_ostream &O, const Twine &Indent,\n   case VPInstruction::BuildVector:\n     O << \"buildvector\";\n     break;\n+  case VPInstruction::ExitingIVValue:\n+    O << \"exiting-iv-value\";\n+    break;\n   case VPInstruction::ExtractLane:\n     O << \"extract-lane\";\n     break;\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 6e19c944fe186..2479cb6243b48 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -995,10 +995,14 @@ static VPValue *optimizeLatchExitInductionUser(\n     VPlan &Plan, VPTypeAnalysis &TypeInfo, VPBlockBase *PredVPBB, VPValue *Op,\n     DenseMap<VPValue *, VPValue *> &EndValues, PredicatedScalarEvolution &PSE) {\n   VPValue *Incoming;\n-  if (!match(Op, m_ExtractLastLaneOfLastPart(m_VPValue(Incoming))))\n-    return nullptr;\n+  VPWidenInductionRecipe *WideIV = nullptr;\n+  if (match(Op, m_ExitingIVValue(m_VPValue(), m_VPValue(Incoming)))) {\n+    WideIV = getOptimizableIVOf(Op->getDefiningRecipe()->getOperand(0), PSE);\n+    assert(WideIV && \"must have an optimizable IV\");\n+  } else if (match(Op, m_ExtractLastLaneOfLastPart(m_VPValue(Incoming)))) {\n+    WideIV = getOptimizableIVOf(Incoming, PSE);\n+  }\n \n-  auto *WideIV = getOptimizableIVOf(Incoming, PSE);\n   if (!WideIV)\n     return nullptr;\n \n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "Add a new VPInstruction opcode to compute the exiting value of an induction variable after vectorization. This replaces the pattern of extracting the last lane from the last part of the induction backedge value when applicable.\r\n\r\nThis allows us to always use the pre-computed IV end value. It will also allow unifying end value creation for both induction resume and exit values.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/iv_outside_user.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=2 < %s",
+        "opt -S -passes=loop-vectorize -force-vector-interleave=2 -force-vector-width=1 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_iv_increment_incremented",
+          "test_body": "define i64 @test_iv_increment_incremented(ptr %dst) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv.1 = phi i64 [ 3, %entry ], [ %iv.1.next, %loop ]\n  %iv.2 = phi i64 [ 2, %entry ], [ %iv.2.next, %loop ]\n  %gep = getelementptr i16, ptr %dst, i64 %iv.1\n  store i16 1, ptr %gep, align 2\n  %iv.2.next = add i64 %iv.2, -1\n  %ec = icmp eq i64 %iv.2.next, 0\n  %iv.1.next = add i64 %iv.2.next, 1\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i64 %iv.1.next\n}\n"
+        },
+        {
+          "test_name": "test_iv_uniform_with_outside_use_scev_simplification_2",
+          "test_body": "define i32 @test_iv_uniform_with_outside_use_scev_simplification_2(ptr %dst) {\nentry:\n  %step.1 = sext i8 0 to i32\n  %step.2 = add nsw i32 %step.1, 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.dst = getelementptr inbounds i16, ptr %dst, i32 %iv\n  store i16 0, ptr %gep.dst, align 2\n  %inc = add i32 %iv, 1\n  %iv.next = add i32 %step.2, %inc\n  %cmp.i = icmp slt i32 %iv.next, 8\n  br i1 %cmp.i, label %loop, label %e.exit\n\ne.exit:                                           ; preds = %loop\n  %res = phi i32 [ %iv.next, %loop ]\n  ret i32 %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "fhahn",
+      "body": "ping"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-12T21:40:10Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlan.h": [
+      [
+        1262,
+        1268
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      [
+        78,
+        83
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      [
+        643,
+        650
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      [
+        505,
+        510
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp": [
+      [
+        319,
+        325
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        470,
+        475
+      ],
+      [
+        1322,
+        1327
+      ],
+      [
+        1385,
+        1390
+      ],
+      [
+        1470,
+        1475
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        995,
+        1004
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/iv_outside_user.ll": [
+      [
+        1129,
+        1135
+      ],
+      [
+        1138,
+        1153
+      ],
+      [
+        1165,
+        1179
+      ],
+      [
+        1292,
+        1304
+      ],
+      [
+        1311,
+        1323
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp": [
+      "VPTypeAnalysis::inferScalarTypeForRecipe"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanConstruction.cpp": [
+      "VPlanTransforms::createHeaderPhiRecipes",
+      "createWidenInductionRecipe"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+      "m_StepVector",
+      "m_Unary"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanPredicator.cpp": [
+      "VPlanTransforms::introduceMasksAndLinearize"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPInstruction::getNumOperandsForOpcode",
+      "VPInstruction::opcodeMayReadOrWriteFromMemory",
+      "VPInstruction::printRecipe",
+      "VPInstruction::usesFirstLaneOnly"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "optimizeLatchExitInductionUser"
+    ]
+  }
+}

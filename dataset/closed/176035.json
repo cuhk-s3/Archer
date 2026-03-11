@@ -1,0 +1,110 @@
+{
+  "pr_id": 176035,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176035",
+  "state": "closed",
+  "title": "InstCombine: Handle multiple uses fabs in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "6977e6812c3e2027f0f427506ee151011f1e55bb",
+  "fix_commit": "8b03b371862a1dbe982427743d734950bd4947d3",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex e2b0d20c790a9..6c1a6a7e9b5c3 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -192,6 +192,12 @@ struct KnownFPClass {\n     signBitMustBeZero();\n   }\n \n+  static KnownFPClass fabs(const KnownFPClass &Src) {\n+    KnownFPClass Known = Src;\n+    Known.fabs();\n+    return Known;\n+  }\n+\n   // Enum of min/max intrinsics to avoid dependency on IR.\n   enum class MinMaxKind {\n     minimum,\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 6c004f679cd08..86c229c667eea 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2955,6 +2955,16 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n Value *InstCombinerImpl::SimplifyMultipleUseDemandedFPClass(\n     Instruction *I, FPClassTest DemandedMask, KnownFPClass &Known,\n     Instruction *CxtI, unsigned Depth) {\n+  FastMathFlags FMF;\n+  if (auto *FPOp = dyn_cast<FPMathOperator>(I)) {\n+    FMF = FPOp->getFastMathFlags();\n+    if (FMF.noNaNs())\n+      DemandedMask &= ~fcNan;\n+\n+    if (FMF.noInfs())\n+      DemandedMask &= ~fcInf;\n+  }\n+\n   switch (I->getOpcode()) {\n   case Instruction::Select: {\n     // TODO: Can we infer which side it came from based on adjusted result\n@@ -2981,6 +2991,24 @@ Value *InstCombinerImpl::SimplifyMultipleUseDemandedFPClass(\n     const CallInst *CI = cast<CallInst>(I);\n     const Intrinsic::ID IID = CI->getIntrinsicID();\n     switch (IID) {\n+    case Intrinsic::fabs: {\n+      Value *Src = CI->getArgOperand(0);\n+      KnownFPClass KnownSrc =\n+          computeKnownFPClass(Src, fcAllFlags, CxtI, Depth + 1);\n+\n+      if ((DemandedMask & fcNan) == fcNone)\n+        KnownSrc.knownNot(fcNan);\n+      if ((DemandedMask & fcInf) == fcNone)\n+        KnownSrc.knownNot(fcInf);\n+\n+      // TODO: If the only sign bit difference is due to -0, look at source if\n+      // nsz.\n+      if (KnownSrc.SignBit == false || ((DemandedMask & fcNan) == fcNone &&\n+                                        KnownSrc.isKnownNever(fcNegative)))\n+        return Src;\n+      Known = KnownFPClass::fabs(KnownSrc);\n+      break;\n+    }\n     case Intrinsic::maximum:\n     case Intrinsic::minimum:\n     case Intrinsic::maximumnum:\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_fabs_nnan_src_known_positive_or_nan_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(nsub) float @ret_fabs_nnan_src_known_positive_or_nan_multiple_uses(float nofpclass(ninf nzero nsub nnorm) %always.positive.or.nan, ptr %ptr) {\n  %fabs = call nnan float @llvm.fabs.f32(float %always.positive.or.nan)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fabs_src_known_positive_or_nan_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fabs_src_known_positive_or_nan_multiple_uses(float nofpclass(ninf nzero nsub nnorm) %always.positive.or.nan, ptr %ptr) {\n  %fabs = call float @llvm.fabs.f32(float %always.positive.or.nan)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nonan_fabs_src_known_positive_or_nan_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(nan) float @ret_nonan_fabs_src_known_positive_or_nan_multiple_uses(float nofpclass(ninf nzero nsub nnorm) %always.positive.or.nan, ptr %ptr) {\n  %fabs = call float @llvm.fabs.f32(float %always.positive.or.nan)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_fabs_ninf_src_known_positive_or_ninf_or_nan_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(nsub) float @ret_fabs_ninf_src_known_positive_or_ninf_or_nan_multiple_uses(float nofpclass(nan nzero nsub nnorm) %always.positive.or.ninf, ptr %ptr) {\n  %fabs = call ninf float @llvm.fabs.f32(float %always.positive.or.ninf)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fabs_src_known_negative",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fabs_src_known_negative(float nofpclass(nan pinf pzero psub pnorm) %always.negative) {\n  %fabs = call float @llvm.fabs.f32(float %always.negative)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fabs_nsz_src_known_positive_except_negzero_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fabs_nsz_src_known_positive_except_negzero_multiple_uses(float nofpclass(nan ninf nsub nnorm) %always.positive.or.nzero, ptr %ptr) {\n  %fabs = call nsz float @llvm.fabs.f32(float %always.positive.or.nzero)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fabs_src_known_positive_except_negzero_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fabs_src_known_positive_except_negzero_multiple_uses(float nofpclass(nan ninf nsub nnorm) %always.positive.or.nzero, ptr %ptr) {\n  %fabs = call float @llvm.fabs.f32(float %always.positive.or.nzero)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_nonan_fabs_src_known_positive_or_nan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(nan) float @ret_nonan_fabs_src_known_positive_or_nan(float nofpclass(ninf nzero nsub nnorm) %always.positive.or.nan) {\n  %fabs = call float @llvm.fabs.f32(float %always.positive.or.nan)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fabs_src_known_positive_multiple_uses",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine nofpclass(snan) float @fabs_src_known_positive_multiple_uses(float nofpclass(nan ninf nzero nsub nnorm) %always.positive, ptr %ptr) {\n  %fabs = call float @llvm.fabs.f32(float %always.positive)\n  store float %fabs, ptr %ptr, align 4\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#176917** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176917?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176916** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176916?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176915** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176915?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176360** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176360?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176359** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176359?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176156** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176156?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176149** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176149?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#176035** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176035?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/176035?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-14T21:10:41Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        192,
+        197
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2955,
+        2960
+      ],
+      [
+        2981,
+        2986
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll": [
+      [
+        682,
+        687
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "fabs"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyMultipleUseDemandedFPClass"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass.ll": [
+      "fabs_nnan_src_known_positive_or_nan",
+      "fabs_src_known_negative",
+      "ret_nonan_fabs_src_known_positive_or_nan"
+    ]
+  }
+}

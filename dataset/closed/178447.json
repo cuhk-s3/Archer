@@ -1,0 +1,87 @@
+{
+  "pr_id": 178447,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/178447",
+  "state": "closed",
+  "title": "[LV] Add support for extended fadd reductions",
+  "author": "sdesmalen-arm",
+  "base_commit": "ac00a1142f8af4cfbe8feaa2471290af66fed2c9",
+  "fix_commit": "ae79b8782f863bfa6c4a7f583dd478334f42cc13",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex b88779a7828fb..90664b2416896 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -8195,7 +8195,8 @@ bool VPRecipeBuilder::getScaledReductions(\n       return false;\n \n     BinOpc = std::make_optional(ExtendUser->getOpcode());\n-  } else if (match(Update, m_Add(m_Value(), m_Value()))) {\n+  } else if (match(Update, m_Add(m_Value(), m_Value())) ||\n+             match(Update, m_FAdd(m_Value(), m_Value()))) {\n     // We already know the operands for Update are Op and PhiOp.\n     SmallVector<Value *> Ops({Op});\n     if (!CollectExtInfo(Ops))\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 62fb0e4d220ec..1a90da86691f9 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -2912,19 +2912,22 @@ InstructionCost VPExpressionRecipe::computeCost(ElementCount VF,\n     unsigned Opcode = RecurrenceDescriptor::getOpcode(\n         cast<VPReductionRecipe>(ExpressionRecipes[1])->getRecurrenceKind());\n     auto *ExtR = cast<VPWidenCastRecipe>(ExpressionRecipes[0]);\n+    auto *RedR = cast<VPReductionRecipe>(ExpressionRecipes.back());\n \n-    return cast<VPReductionRecipe>(ExpressionRecipes.back())\n-                   ->isPartialReduction()\n-               ? Ctx.TTI.getPartialReductionCost(\n-                     Opcode, Ctx.Types.inferScalarType(getOperand(0)), nullptr,\n-                     RedTy, VF,\n-                     TargetTransformInfo::getPartialReductionExtendKind(\n-                         ExtR->getOpcode()),\n-                     TargetTransformInfo::PR_None, std::nullopt, Ctx.CostKind,\n-                     std::nullopt)\n-               : Ctx.TTI.getExtendedReductionCost(\n-                     Opcode, ExtR->getOpcode() == Instruction::ZExt, RedTy,\n-                     SrcVecTy, std::nullopt, Ctx.CostKind);\n+    if (RedR->isPartialReduction())\n+      return Ctx.TTI.getPartialReductionCost(\n+          Opcode, Ctx.Types.inferScalarType(getOperand(0)), nullptr, RedTy, VF,\n+          TargetTransformInfo::getPartialReductionExtendKind(ExtR->getOpcode()),\n+          TargetTransformInfo::PR_None, std::nullopt, Ctx.CostKind,\n+          RedTy->isFloatingPointTy() ? std::optional{RedR->getFastMathFlags()}\n+                                     : std::nullopt);\n+    else if (!RedTy->isFloatingPointTy())\n+      // TTI::getExtendedReductionCost only supports integer types.\n+      return Ctx.TTI.getExtendedReductionCost(\n+          Opcode, ExtR->getOpcode() == Instruction::ZExt, RedTy, SrcVecTy,\n+          std::nullopt, Ctx.CostKind);\n+    else\n+      return InstructionCost::getInvalid();\n   }\n   case ExpressionTypes::MulAccReduction:\n     return Ctx.TTI.getMulAccReductionCost(false, Opcode, RedTy, SrcVecTy,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex 27924ae1b6a36..e976a90f2b593 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -4054,7 +4054,7 @@ tryToMatchAndCreateExtendedReduction(VPReductionRecipe *Red, VPCostContext &Ctx,\n           auto *SrcVecTy = cast<VectorType>(toVectorTy(SrcTy, VF));\n           TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput;\n \n-          InstructionCost ExtRedCost;\n+          InstructionCost ExtRedCost = InstructionCost::getInvalid();\n           InstructionCost ExtCost =\n               cast<VPWidenCastRecipe>(VecOp)->computeCost(VF, Ctx);\n           InstructionCost RedCost = Red->computeCost(VF, Ctx);\n@@ -4067,11 +4067,11 @@ tryToMatchAndCreateExtendedReduction(VPReductionRecipe *Red, VPCostContext &Ctx,\n             ExtRedCost = Ctx.TTI.getPartialReductionCost(\n                 Opcode, SrcTy, nullptr, RedTy, VF, ExtKind,\n                 llvm::TargetTransformInfo::PR_None, std::nullopt, Ctx.CostKind,\n-                std::nullopt);\n-          } else {\n-            assert(ExtOpc != Instruction::CastOps::FPExt &&\n-                   \"Floating-point extended reductions are not currently \"\n-                   \"supported\");\n+                RedTy->isFloatingPointTy()\n+                    ? std::optional{Red->getFastMathFlags()}\n+                    : std::nullopt);\n+          } else if (!RedTy->isFloatingPointTy()) {\n+            // TTI::getExtendedReductionCost only supports integer types.\n             ExtRedCost = Ctx.TTI.getExtendedReductionCost(\n                 Opcode, ExtOpc == Instruction::CastOps::ZExt, RedTy, SrcVecTy,\n                 Red->getFastMathFlags(), CostKind);\n@@ -4083,7 +4083,9 @@ tryToMatchAndCreateExtendedReduction(VPReductionRecipe *Red, VPCostContext &Ctx,\n \n   VPValue *A;\n   // Match reduce(ext)).\n-  if (match(VecOp, m_ZExtOrSExt(m_VPValue(A))) &&\n+  if (isa<VPWidenCastRecipe>(VecOp) &&\n+      (match(VecOp, m_ZExtOrSExt(m_VPValue(A))) ||\n+       match(VecOp, m_FPExt(m_VPValue(A)))) &&\n       IsExtendedRedValidAndClampRange(\n           RecurrenceDescriptor::getOpcode(Red->getRecurrenceKind()),\n           cast<VPWidenCastRecipe>(VecOp)->getOpcode(),\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "This makes use of the llvm.vector.partial.reduce.fadd intrinsics added in #163975 to handle the following with FDOT:\r\n```\r\nfloat32_t fdot(float16_t *src, int N) {\r\n  float32_t sum = 0.0f;\r\n  for (int i=0; i<N; ++i)\r\n    sum += src[i];\r\n  return sum;\r\n}\r\n```",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-fdot-product.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -enable-epilogue-vectorization=false -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "extended_reduce_fadd",
+          "test_body": "target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"aarch64-none-unknown-elf\"\n\ndefine float @extended_reduce_fadd(ptr %a) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %accum = phi float [ 0.000000e+00, %entry ], [ %add, %for.body ]\n  %gep.a = getelementptr half, ptr %a, i64 %iv\n  %load.a = load half, ptr %gep.a, align 1\n  %ext.a = fpext half %load.a to float\n  %add = fadd reassoc contract float %ext.a, %accum\n  %iv.next = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 1024\n  br i1 %exitcond.not, label %for.exit, label %for.body, !llvm.loop !0\n\nfor.exit:                                         ; preds = %for.body\n  ret float %add\n}\n\nattributes #0 = { \"target-features\"=\"+sve2p1,+dotprod\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.interleave.count\", i32 1}\n"
+        },
+        {
+          "test_name": "not_extended_reduce_fadd_fpext_outside_loop",
+          "test_body": "target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"aarch64-none-unknown-elf\"\n\ndefine float @not_extended_reduce_fadd_fpext_outside_loop(half %a, i64 %n) #0 {\nentry:\n  %ext.a = fpext half %a to float\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %accum = phi float [ 0.000000e+00, %entry ], [ %add, %for.body ]\n  %add = fadd reassoc contract float %ext.a, %accum\n  %iv.next = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 1024\n  br i1 %exitcond.not, label %for.exit, label %for.body, !llvm.loop !0\n\nfor.exit:                                         ; preds = %for.body\n  ret float %add\n}\n\nattributes #0 = { \"target-features\"=\"+sve2p1,+dotprod\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.interleave.count\", i32 1}\n"
+        },
+        {
+          "test_name": "not_extended_reduce_fadd_no_fmf",
+          "test_body": "target datalayout = \"e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"aarch64-none-unknown-elf\"\n\ndefine float @not_extended_reduce_fadd_no_fmf(ptr %a) #0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %accum = phi float [ 0.000000e+00, %entry ], [ %add, %for.body ]\n  %gep.a = getelementptr half, ptr %a, i64 %iv\n  %load.a = load half, ptr %gep.a, align 1\n  %ext.a = fpext half %load.a to float\n  %add = fadd float %ext.a, %accum\n  %iv.next = add i64 %iv, 1\n  %exitcond.not = icmp eq i64 %iv.next, 1024\n  br i1 %exitcond.not, label %for.exit, label %for.body, !llvm.loop !0\n\nfor.exit:                                         ; preds = %for.body\n  ret float %add\n}\n\nattributes #0 = { \"target-features\"=\"+sve2p1,+dotprod\" }\n\n!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.interleave.count\", i32 1}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-01-28T15:38:05Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        8195,
+        8201
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        2912,
+        2930
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      [
+        4054,
+        4060
+      ],
+      [
+        4067,
+        4077
+      ],
+      [
+        4083,
+        4089
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/partial-reduce-fdot-product.ll": [
+      [
+        750,
+        755
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "VPRecipeBuilder::getScaledReductions"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPExpressionRecipe::computeCost"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+      "tryToMatchAndCreateExtendedReduction"
+    ]
+  }
+}

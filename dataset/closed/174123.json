@@ -1,0 +1,290 @@
+{
+  "pr_id": 174123,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174123",
+  "state": "closed",
+  "title": "ValueTracking: Improve handling of fadd in computeKnownFPClass.",
+  "author": "arsenm",
+  "base_commit": "3d3093e4e313da35b6e86238ef171bf6a18c7ead",
+  "fix_commit": "107b4d4be2e4ff01693848f69121376b2354bf1f",
+  "patch": "diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex a831736b35c26..d7d5daa348412 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5619,14 +5619,24 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n     computeKnownFPClass(Op->getOperand(1), DemandedElts, InterestedSrcs,\n                         KnownRHS, Q, Depth + 1);\n \n+    // Special case fadd x, x, which is the canonical form of fmul x, 2.\n+    bool SelfAdd = Op->getOperand(0) == Op->getOperand(1) &&\n+                   isGuaranteedNotToBeUndef(Op->getOperand(0), Q.AC, Q.CxtI,\n+                                            Q.DT, Depth + 1);\n+    if (SelfAdd)\n+      KnownLHS = KnownRHS;\n+\n     if ((WantNaN && KnownRHS.isKnownNeverNaN()) ||\n         (WantNegative && KnownRHS.cannotBeOrderedLessThanZero()) ||\n         WantNegZero || Opc == Instruction::FSub) {\n \n-      // RHS is canonically cheaper to compute. Skip inspecting the LHS if\n-      // there's no point.\n-      computeKnownFPClass(Op->getOperand(0), DemandedElts, InterestedSrcs,\n-                          KnownLHS, Q, Depth + 1);\n+      if (!SelfAdd) {\n+        // RHS is canonically cheaper to compute. Skip inspecting the LHS if\n+        // there's no point.\n+        computeKnownFPClass(Op->getOperand(0), DemandedElts, InterestedSrcs,\n+                            KnownLHS, Q, Depth + 1);\n+      }\n+\n       // Adding positive and negative infinity produces NaN.\n       // TODO: Check sign of infinities.\n       if (KnownLHS.isKnownNeverNaN() && KnownRHS.isKnownNeverNaN() &&\n@@ -5640,6 +5650,10 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n         if (KnownLHS.cannotBeOrderedLessThanZero() &&\n             KnownRHS.cannotBeOrderedLessThanZero())\n           Known.knownNot(KnownFPClass::OrderedLessThanZeroMask);\n+        if (KnownLHS.cannotBeOrderedGreaterThanZero() &&\n+            KnownRHS.cannotBeOrderedGreaterThanZero())\n+          Known.knownNot(KnownFPClass::OrderedGreaterThanZeroMask);\n+\n         if (!F)\n           break;\n \n@@ -5647,6 +5661,12 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n             Op->getType()->getScalarType()->getFltSemantics();\n         DenormalMode Mode = F->getDenormalMode(FltSem);\n \n+        // Doubling 0 will give the same 0.\n+        if (SelfAdd && KnownRHS.isKnownNeverLogicalPosZero(Mode) &&\n+            (Mode.Output == DenormalMode::IEEE ||\n+             Mode.Output == DenormalMode::PreserveSign))\n+          Known.knownNot(fcPosZero);\n+\n         // (fadd x, 0.0) is guaranteed to return +0.0, not -0.0.\n         if ((KnownLHS.isKnownNeverLogicalNegZero(Mode) ||\n              KnownRHS.isKnownNeverLogicalNegZero(Mode)) &&\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "This already recognized that if both inputs are positive, the\nresult is positive. Extend this to the mirror situation with\nnegative inputs.\n\nAlso special case fadd x, x. Canonically, fmul x, 2 is fadd x, x.\nWe can tell the sign bit won't change, and 0 will propagate.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fadd_double_known_positive_nonsub__ieee_dynamic",
+          "test_body": "define float @fadd_double_known_positive_nonsub__ieee_dynamic(float noundef nofpclass(ninf zero sub nnorm) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,dynamic\" }\n"
+        },
+        {
+          "test_name": "fadd_double_known_positive_nonsub__ieee_daz",
+          "test_body": "define float @fadd_double_known_positive_nonsub__ieee_daz(float noundef nofpclass(ninf zero sub nnorm) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_nonsub__ieee_daz",
+          "test_body": "define float @fadd_double_known_negative_nonsub__ieee_daz(float noundef nofpclass(pinf zero sub pnorm) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_double_no_nopsub_pzero__ieee_daz",
+          "test_body": "define float @fadd_double_no_nopsub_pzero__ieee_daz(float noundef nofpclass(pzero psub) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_double_no_nnorm_nsub",
+          "test_body": "define float @fadd_double_no_nnorm_nsub(float noundef nofpclass(nsub nnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_known_negative_pzero",
+          "test_body": "define float @fadd_known_negative_pzero(float nofpclass(pinf pzero psub pnorm) %arg0, float nofpclass(pinf pzero psub pnorm) %arg1) {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_known_negative_pzero_rhs",
+          "test_body": "define float @fadd_known_negative_pzero_rhs(float nofpclass(pinf psub pnorm) %arg0, float nofpclass(pinf pzero psub pnorm) %arg1) {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_nonsub_ieee",
+          "test_body": "define float @fadd_double_known_negative_nonsub_ieee(float noundef nofpclass(pinf zero sub pnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_nonsub__ftz_daz",
+          "test_body": "define float @fadd_double_known_negative_nonsub__ftz_daz(float noundef nofpclass(pinf zero sub pnorm) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative",
+          "test_body": "define float @fadd_double_known_negative(float noundef nofpclass(pinf pzero psub pnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_nopsub_pzero",
+          "test_body": "define float @fadd_double_no_nopsub_pzero(float noundef nofpclass(pzero psub) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_known_negative_pzero_ftz_daz",
+          "test_body": "define float @fadd_known_negative_pzero_ftz_daz(float nofpclass(pinf pzero psub pnorm) %arg0, float nofpclass(pinf pzero psub pnorm) %arg1) #0 {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_known_negative_daz",
+          "test_body": "define float @fadd_known_negative_daz(float nofpclass(pinf psub pnorm) %arg0, float nofpclass(pinf psub pnorm) %arg1) #0 {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero__output_only_is_ftz",
+          "test_body": "define float @fadd_double_no_zero__output_only_is_ftz(float noundef nofpclass(zero) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,ieee\" }\n"
+        },
+        {
+          "test_name": "fadd_double_known_positive_nonsub_ieee",
+          "test_body": "define float @fadd_double_known_positive_nonsub_ieee(float noundef nofpclass(ninf zero sub nnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero",
+          "test_body": "define float @fadd_double_no_zero(float noundef nofpclass(zero) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_nopsub_pzero__ftz_daz",
+          "test_body": "define float @fadd_double_no_nopsub_pzero__ftz_daz(float noundef nofpclass(pzero psub) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_double_no_nonsub_nzero",
+          "test_body": "define float @fadd_double_no_nonsub_nzero(float noundef nofpclass(nzero nsub) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_positive_non0",
+          "test_body": "define float @fadd_double_known_positive_non0(float noundef nofpclass(ninf zero nsub nnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_non0",
+          "test_body": "define float @fadd_double_known_negative_non0(float noundef nofpclass(pinf zero psub pnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_or_zero",
+          "test_body": "define float @fadd_double_known_negative_or_zero(float noundef nofpclass(pinf psub pnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_positive",
+          "test_body": "define float @fadd_double_known_positive(float noundef nofpclass(ninf nzero nsub nnorm) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_nonsub_nzero__ieee_dynamic",
+          "test_body": "define float @fadd_double_no_nonsub_nzero__ieee_dynamic(float noundef nofpclass(nzero nsub) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,dynamic\" }\n"
+        },
+        {
+          "test_name": "fadd_known_negative_pzero_daz",
+          "test_body": "define float @fadd_known_negative_pzero_daz(float nofpclass(pinf pzero psub pnorm) %arg0, float nofpclass(pinf pzero psub pnorm) %arg1) #0 {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_double_known_positive_nonsub__ftz_daz",
+          "test_body": "define float @fadd_double_known_positive_nonsub__ftz_daz(float noundef nofpclass(ninf zero sub nnorm) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "fadd_known_negative",
+          "test_body": "define float @fadd_known_negative(float nofpclass(pinf psub pnorm) %arg0, float nofpclass(pinf psub pnorm) %arg1) {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_known_negative_pzero_ftz",
+          "test_body": "define float @fadd_known_negative_pzero_ftz(float nofpclass(pinf pzero psub pnorm) %arg0, float nofpclass(pinf pzero psub pnorm) %arg1) #0 {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,ieee\" }\n"
+        },
+        {
+          "test_name": "fadd_double_no_inf",
+          "test_body": "define float @fadd_double_no_inf(float noundef nofpclass(inf) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_nonsub_dynamic",
+          "test_body": "define float @fadd_double_known_negative_nonsub_dynamic(float noundef nofpclass(pinf zero sub pnorm) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,dynamic\" }\n"
+        },
+        {
+          "test_name": "fadd_double_no_pzero_maybe_undef",
+          "test_body": "define float @fadd_double_no_pzero_maybe_undef(float nofpclass(pzero) %arg) {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_known_negative_pzero_lhs",
+          "test_body": "define float @fadd_known_negative_pzero_lhs(float nofpclass(pinf pzero psub pnorm) %arg0, float nofpclass(pinf psub pnorm) %arg1) {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n"
+        },
+        {
+          "test_name": "fadd_known_negative_rhs",
+          "test_body": "define float @fadd_known_negative_rhs(float %arg0, float nofpclass(pinf psub pnorm) %arg1) {\n  %add = fadd float %arg0, %arg1\n  ret float %add\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#174272** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174272?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174123** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174123?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174123?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#174122** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174122?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-01T01:00:01Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5619,
+        5632
+      ],
+      [
+        5640,
+        5645
+      ],
+      [
+        5647,
+        5652
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass.ll": [
+      [
+        3054,
+        3060
+      ],
+      [
+        3087,
+        3093
+      ],
+      [
+        3098,
+        3104
+      ],
+      [
+        3109,
+        3115
+      ],
+      [
+        3120,
+        3126
+      ],
+      [
+        3175,
+        3181
+      ],
+      [
+        3197,
+        3203
+      ],
+      [
+        3208,
+        3214
+      ],
+      [
+        3263,
+        3269
+      ],
+      [
+        3274,
+        3280
+      ],
+      [
+        3285,
+        3291
+      ],
+      [
+        3296,
+        3302
+      ],
+      [
+        3307,
+        3313
+      ],
+      [
+        3318,
+        3324
+      ],
+      [
+        3329,
+        3335
+      ],
+      [
+        3340,
+        3346
+      ],
+      [
+        3406,
+        3412
+      ],
+      [
+        3417,
+        3423
+      ],
+      [
+        3428,
+        3434
+      ],
+      [
+        3439,
+        3445
+      ],
+      [
+        3450,
+        3456
+      ],
+      [
+        3461,
+        3467
+      ],
+      [
+        3472,
+        3478
+      ],
+      [
+        3483,
+        3489
+      ],
+      [
+        3607,
+        3613
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ]
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "pr_id": 176503,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176503",
+  "state": "closed",
+  "title": "[LoopFusion] Optimize away Phi nodes that are sunk from the 2nd loop preheader",
+  "author": "CongzheUalberta",
+  "base_commit": "997fdefa4c6da36f521d921a1292812498596bcd",
+  "fix_commit": "43e674add80f343a6a1096479f186b03640abadd",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/LoopFuse.cpp b/llvm/lib/Transforms/Scalar/LoopFuse.cpp\nindex d7284c98b48c3..9c86b73dfc8d0 100644\n--- a/llvm/lib/Transforms/Scalar/LoopFuse.cpp\n+++ b/llvm/lib/Transforms/Scalar/LoopFuse.cpp\n@@ -1083,28 +1083,6 @@ struct LoopFuser {\n     return true;\n   }\n \n-  /// This function fixes PHI nodes after fusion in \\p SafeToSink.\n-  /// \\p SafeToSink instructions are the instructions that are to be moved past\n-  /// the fused loop. Thus, the PHI nodes in \\p SafeToSink should be updated to\n-  /// receive values from the fused loop if they are currently taking values\n-  /// from the first loop (i.e. FC0)'s latch.\n-  void fixPHINodes(ArrayRef<Instruction *> SafeToSink,\n-                   const FusionCandidate &FC0,\n-                   const FusionCandidate &FC1) const {\n-    for (Instruction *Inst : SafeToSink) {\n-      // No update needed for non-PHI nodes.\n-      PHINode *Phi = dyn_cast<PHINode>(Inst);\n-      if (!Phi)\n-        continue;\n-      for (unsigned I = 0; I < Phi->getNumIncomingValues(); I++) {\n-        if (Phi->getIncomingBlock(I) != FC0.Latch)\n-          continue;\n-        assert(FC1.Latch && \"FC1 latch is not set\");\n-        Phi->setIncomingBlock(I, FC1.Latch);\n-      }\n-    }\n-  }\n-\n   /// Collect instructions in the \\p FC1 Preheader that can be hoisted\n   /// to the \\p FC0 Preheader or sunk into the \\p FC1 Body\n   bool collectMovablePreheaderInsts(\n@@ -1453,11 +1431,19 @@ struct LoopFuser {\n     // insert instructions in reverse order to maintain dominance relationship\n     for (Instruction *I : reverse(SinkInsts)) {\n       assert(I->getParent() == FC1.Preheader);\n-      I->moveBefore(*FC1.ExitBlock, FC1.ExitBlock->getFirstInsertionPt());\n+      if (isa<PHINode>(I)) {\n+        // The Phis to be sunk should have only one incoming value, as is\n+        // assured by the condition that the second loop is dominated by the\n+        // first one which is enforced by isStrictlyAdjacent().\n+        // Replace the phi uses with the corresponding incoming value to clean\n+        // up the code.\n+        assert(cast<PHINode>(I)->getNumIncomingValues() == 1 &&\n+               \"Expected the sunk PHI node to have 1 incoming value.\");\n+        I->replaceAllUsesWith(I->getOperand(0));\n+        I->eraseFromParent();\n+      } else\n+        I->moveBefore(*FC1.ExitBlock, FC1.ExitBlock->getFirstInsertionPt());\n     }\n-    // PHI nodes in SinkInsts need to be updated to receive values from the\n-    // fused loop.\n-    fixPHINodes(SinkInsts, FC0, FC1);\n   }\n \n   /// Determine if two fusion candidates have identical guards\n",
+  "components": [
+    "LoopFuse"
+  ],
+  "description": "Fixed #165087.\r\n\r\nThe bug is that, for the IR from #165087 that caused the crash, after loop fusion the phi instruction in the preheader of the 2nd loop, i.e., `%.sroa.speculated.1.lcssa`, is sunk to the loop exit block, causing the exit block to look like the following:\r\n\r\n```\r\nfor.cond.cleanup6.2.loopexit:                     ; preds = %for.body11.1\r\n  %.sroa.speculated.2.lcssa = phi i8 [ %.sroa.speculated.1.lcssa, %for.body11.1 ]\r\n  %.sroa.speculated.1.lcssa = phi i8 [ 0, %for.body11.1 ]\r\n  ret i8 %.sroa.speculated.2.lcssa\r\n```\r\n\r\nAnd it caused the assertion \"Instruction does not dominate all uses\". It does not matter whether `%.sroa.speculated.1.lcssa` was placed before or after `%.sroa.speculated.2.lcssa` in that basic block, the asssertion would always occur since the verifier checked that `%.sroa.speculated.1.lcssa` was not from `%for.body11.1`.\r\n\r\nThe solution in this MR is that, when we sink phis from the 2nd loop preheader to the exit block, we optimize it a bit further, i.e., propagate the uses of each phi node with its incoming value and optimize away the phis. Those phis only have one incoming value, which is assured by the dominance relationship and `isStrictlyAdjacent()` check as part of the loop fusion legality checks. Deleted `fixPHINodes()` too because the phis are already optimized away and there is no point processing `fixPHINodes()`.\r\n\r\nNote that the IR in issue #165087 is not a canonicalized IR and is not something we would usually see before loop fusion in a normal O3 pipeline. In an optimization pipeline InstCombine would optimize away the Phi instructions like `%.sroa.speculated.1.lcssa`. Therefore what is done in this patch aligns with what would happen in an optimization pipeline in practice. It also simplifies current test cases, i.e., `lcssa.ll` and `sunk-phi-nodes.ll`.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopFusion/lcssa.ll",
+      "commands": [
+        "opt -S -passes=loop-fusion < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "test1",
+          "test_body": "define void @test1() {\nentry:\n  br label %vector.ph\n\nvector.ph:                                        ; preds = %middle.block, %entry\n  br label %middle.block\n\nmiddle.block:                                     ; preds = %vector.ph\n  br i1 true, label %for.cond17.preheader, label %vector.ph\n\nfor.cond17.preheader:                             ; preds = %middle.block\n  %.lcssa92 = phi i16 [ 1, %middle.block ]\n  br label %vector.ph61\n\nvector.ph61:                                      ; preds = %vector.ph61, %for.cond17.preheader\n  br i1 true, label %for.end41, label %vector.ph61\n\nfor.end41:                                        ; preds = %vector.ph61\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopFusion/pr165087.ll",
+      "commands": [
+        "opt -S -passes=loop-fusion < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "_Z3fn1ssb",
+          "test_body": "define i8 @_Z3fn1ssb() {\nentry:\n  br label %for.body11.1\n\nfor.body11.1:                                     ; preds = %for.body11.1, %entry\n  %indvars.iv.1 = phi i64 [ %indvars.iv.next.1, %for.body11.1 ], [ 2, %entry ]\n  %indvars.iv.next.1 = add i64 %indvars.iv.1, 1\n  %exitcond.1.not = icmp eq i64 %indvars.iv.next.1, 0\n  br i1 %exitcond.1.not, label %for.body11.2.preheader, label %for.body11.1\n\nfor.body11.2.preheader:                           ; preds = %for.body11.1\n  %.sroa.speculated.1.lcssa = phi i8 [ 0, %for.body11.1 ]\n  br label %for.body11.2\n\nfor.body11.2:                                     ; preds = %for.body11.2, %for.body11.2.preheader\n  %indvars.iv.2 = phi i64 [ %indvars.iv.next.2, %for.body11.2 ], [ 2, %for.body11.2.preheader ]\n  %indvars.iv.next.2 = add i64 %indvars.iv.2, 1\n  %exitcond.2.not = icmp eq i64 %indvars.iv.next.2, 0\n  br i1 %exitcond.2.not, label %for.cond.cleanup6.2.loopexit, label %for.body11.2\n\nfor.cond.cleanup6.2.loopexit:                     ; preds = %for.body11.2\n  %.sroa.speculated.2.lcssa = phi i8 [ %.sroa.speculated.1.lcssa, %for.body11.2 ]\n  ret i8 %.sroa.speculated.2.lcssa\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopFusion/sunk-phi-nodes.ll",
+      "commands": [
+        "opt -passes=loop-fusion -S < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "check_sunk_phi_nodes",
+          "test_body": "define dso_local i32 @check_sunk_phi_nodes() {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %sum1.02 = phi i32 [ 0, %entry ], [ %add, %for.inc ]\n  %i.01 = phi i32 [ 0, %entry ], [ %inc, %for.inc ]\n  %add = add nsw i32 %sum1.02, %i.01\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %inc = add nsw i32 %i.01, 1\n  %cmp = icmp slt i32 %inc, 10\n  br i1 %cmp, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.inc\n  %sum1.0.lcssa = phi i32 [ %add, %for.inc ]\n  br label %for.body4\n\nfor.body4:                                        ; preds = %for.inc6, %for.end\n  %i1.04 = phi i32 [ 0, %for.end ], [ %inc7, %for.inc6 ]\n  %sum2.03 = phi i32 [ 0, %for.end ], [ %add5, %for.inc6 ]\n  %mul = mul nsw i32 %i1.04, %i1.04\n  %add5 = add nsw i32 %sum2.03, %mul\n  br label %for.inc6\n\nfor.inc6:                                         ; preds = %for.body4\n  %inc7 = add nsw i32 %i1.04, 1\n  %cmp3 = icmp slt i32 %inc7, 10\n  br i1 %cmp3, label %for.body4, label %for.end8\n\nfor.end8:                                         ; preds = %for.inc6\n  %sum2.0.lcssa = phi i32 [ %add5, %for.inc6 ]\n  %0 = add i32 %sum1.0.lcssa, %sum2.0.lcssa\n  ret i32 %0\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "CongzheUalberta",
+      "body": "> please change the title to something more descriptive of the change in the functionality\r\n\r\nthanks, done."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-17T00:10:35Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/LoopFuse.cpp": [
+      [
+        1083,
+        1110
+      ],
+      [
+        1453,
+        1463
+      ]
+    ],
+    "llvm/test/Transforms/LoopFusion/lcssa.ll": [
+      [
+        15,
+        21
+      ]
+    ],
+    "llvm/test/Transforms/LoopFusion/sunk-phi-nodes.ll": [
+      [
+        23,
+        30
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/LoopFuse.cpp": [
+      "canSinkInst",
+      "collectMovablePreheaderInsts",
+      "fixPHINodes",
+      "movePreheaderInsts"
+    ],
+    "llvm/test/Transforms/LoopFusion/lcssa.ll": [
+      "test1"
+    ]
+  }
+}

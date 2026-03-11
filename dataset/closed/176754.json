@@ -1,0 +1,218 @@
+{
+  "pr_id": 176754,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176754",
+  "state": "closed",
+  "title": "[LV] Separate runtime check cost from total overhead in profitability check",
+  "author": "Mel-Chen",
+  "base_commit": "e3c786874ae4064b78526e4b2c110484114b6dcf",
+  "fix_commit": "9be0d5fb91349c85ff529b48a4758df9d8fed64a",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 28cdc57577229..21df45d0e647b 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -9178,21 +9178,15 @@ static bool isOutsideLoopWorkProfitable(GeneratedRTChecks &Checks,\n                                         VPCostContext &CostCtx, VPlan &Plan,\n                                         ScalarEpilogueLowering SEL,\n                                         std::optional<unsigned> VScale) {\n-  InstructionCost TotalCost = Checks.getCost();\n-  if (!TotalCost.isValid())\n+  InstructionCost RtC = Checks.getCost();\n+  if (!RtC.isValid())\n     return false;\n \n-  // Add on the cost of any work required in the vector early exit block, if\n-  // one exists.\n-  TotalCost += calculateEarlyExitCost(CostCtx, Plan, VF.Width);\n-\n-  TotalCost += Plan.getMiddleBlock()->cost(VF.Width, CostCtx);\n-\n   // When interleaving only scalar and vector cost will be equal, which in turn\n   // would lead to a divide by 0. Fall back to hard threshold.\n   if (VF.Width.isScalar()) {\n     // TODO: Should we rename VectorizeMemoryCheckThreshold?\n-    if (TotalCost > VectorizeMemoryCheckThreshold) {\n+    if (RtC > VectorizeMemoryCheckThreshold) {\n       LLVM_DEBUG(\n           dbgs()\n           << \"LV: Interleaving only is not profitable due to runtime checks\\n\");\n@@ -9207,6 +9201,12 @@ static bool isOutsideLoopWorkProfitable(GeneratedRTChecks &Checks,\n   if (ScalarC == 0)\n     return true;\n \n+  InstructionCost TotalCost = RtC;\n+  // Add on the cost of any work required in the vector early exit block, if\n+  // one exists.\n+  TotalCost += calculateEarlyExitCost(CostCtx, Plan, VF.Width);\n+  TotalCost += Plan.getMiddleBlock()->cost(VF.Width, CostCtx);\n+\n   // First, compute the minimum iteration count required so that the vector\n   // loop outperforms the scalar loop.\n   //  The total cost of the scalar loop is\n@@ -9216,10 +9216,10 @@ static bool isOutsideLoopWorkProfitable(GeneratedRTChecks &Checks,\n   //  * ScalarC is the cost of a single scalar iteration.\n   //\n   //  The total cost of the vector loop is\n-  //    RtC + VecC * (TC / VF) + EpiC\n+  //    TotalCost + VecC * (TC / VF) + EpiC\n   //  where\n-  //  * RtC is the sum of the costs cost of\n-  //    - the generated runtime checks\n+  //  * TotalCost is the sum of the costs cost of\n+  //    - the generated runtime checks, i.e. RtC\n   //    - performing any additional work in the vector.early.exit block for\n   //      loops with uncountable early exits.\n   //    - the middle block, if ExpectedTC <=  VF.Width.\n@@ -9231,18 +9231,18 @@ static bool isOutsideLoopWorkProfitable(GeneratedRTChecks &Checks,\n   //\n   // Vectorization is profitable once the total vector cost is less than the\n   // total scalar cost:\n-  //   RtC + VecC * (TC / VF) + EpiC <  ScalarC * TC\n+  //   TotalCost + VecC * (TC / VF) + EpiC <  ScalarC * TC\n   //\n   // Now we can compute the minimum required trip count TC as\n-  //   VF * (RtC + EpiC) / (ScalarC * VF - VecC) < TC\n+  //   VF * (TotalCost + EpiC) / (ScalarC * VF - VecC) < TC\n   //\n   // For now we assume the epilogue cost EpiC = 0 for simplicity. Note that\n   // the computations are performed on doubles, not integers and the result\n   // is rounded up, hence we get an upper estimate of the TC.\n   unsigned IntVF = estimateElementCount(VF.Width, VScale);\n-  uint64_t RtC = TotalCost.getValue();\n   uint64_t Div = ScalarC * IntVF - VF.Cost.getValue();\n-  uint64_t MinTC1 = Div == 0 ? 0 : divideCeil(RtC * IntVF, Div);\n+  uint64_t MinTC1 =\n+      Div == 0 ? 0 : divideCeil(TotalCost.getValue() * IntVF, Div);\n \n   // Second, compute a minimum iteration count so that the cost of the\n   // runtime checks is only a fraction of the total scalar loop cost. This\n@@ -9251,7 +9251,7 @@ static bool isOutsideLoopWorkProfitable(GeneratedRTChecks &Checks,\n   // * TC. To bound the runtime check to be a fraction 1/X of the scalar\n   // cost, compute\n   //   RtC < ScalarC * TC * (1 / X)  ==>  RtC * X / ScalarC < TC\n-  uint64_t MinTC2 = divideCeil(RtC * 10, ScalarC);\n+  uint64_t MinTC2 = divideCeil(RtC.getValue() * 10, ScalarC);\n \n   // Now pick the larger minimum. If it is not a multiple of VF and a scalar\n   // epilogue is allowed, choose the next closest multiple of VF. This should\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "In isOutsideLoopWorkProfitable function, there are two places where only the runtime check cost (RtC) should be used, but incorrectly included the costs of middle blocks and early-exit blocks.\r\n1. VectorizeMemoryCheckThreshold comparison for interleaving-only\r\n2. Minimum trip count that bounds runtime check overhead, i.e. MinTC2 calculation\r\nThis results in an overly conservative minimum profitable trip count.\r\n\r\nThis patch separates the runtime check cost from the total overhead cost, and uses only RtC for VectorizeMemoryCheckThreshold comparison and the MinTC2 calculation.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/conditional-scalar-assignment.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -S < %s 2>&1",
+        "opt -passes=loop-vectorize -mattr=+sve -S < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "int_select_with_extra_arith_payload",
+          "test_body": "target triple = \"aarch64-linux-gnu\"\n\ndefine i32 @int_select_with_extra_arith_payload(i64 %N, ptr readonly %A, ptr readonly %B, ptr noalias %C, i32 %threshold) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %A.phi = phi i32 [ -1, %entry ], [ %select.A, %loop ]\n  %A.addr = getelementptr inbounds i32, ptr %A, i64 %iv\n  %ld.A = load i32, ptr %A.addr, align 4\n  %mul.A = mul i32 %ld.A, 13\n  %B.addr = getelementptr inbounds i32, ptr %B, i64 %iv\n  %ld.B = load i32, ptr %B.addr, align 4\n  %mul.B = mul i32 %ld.B, 5\n  %add = add i32 %mul.A, %mul.B\n  %C.addr = getelementptr inbounds i32, ptr %C, i64 %iv\n  store i32 %add, ptr %C.addr, align 4\n  %select.cmp = icmp slt i32 %threshold, %ld.A\n  %select.A = select i1 %select.cmp, i32 %ld.A, i32 %A.phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %select.A\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/early_exit_costs.ll",
+      "commands": [
+        "-debug-only=loop-vectorize 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "same_exit_block_pre_inc_use1_nosve",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndeclare void @init_mem(ptr, i64)\n\ndefine i64 @same_exit_block_pre_inc_use1_nosve() {\nentry:\n  %p1 = alloca [1024 x i8], align 1\n  %p2 = alloca [1024 x i8], align 1\n  call void @init_mem(ptr %p1, i64 1024)\n  call void @init_mem(ptr %p2, i64 1024)\n  br label %loop\n\nloop:                                             ; preds = %loop.inc, %entry\n  %index = phi i64 [ %index.next, %loop.inc ], [ 3, %entry ]\n  %index2 = phi i64 [ %index2.next, %loop.inc ], [ 15, %entry ]\n  %arrayidx = getelementptr inbounds i8, ptr %p1, i64 %index\n  %ld1 = load i8, ptr %arrayidx, align 1\n  %arrayidx1 = getelementptr inbounds i8, ptr %p2, i64 %index\n  %ld2 = load i8, ptr %arrayidx1, align 1\n  %cmp3 = icmp eq i8 %ld1, %ld2\n  br i1 %cmp3, label %loop.inc, label %loop.end\n\nloop.inc:                                         ; preds = %loop\n  %index.next = add i64 %index, 1\n  %index2.next = add i64 %index2, 2\n  %exitcond = icmp ne i64 %index.next, 67\n  br i1 %exitcond, label %loop, label %loop.end\n\nloop.end:                                         ; preds = %loop.inc, %loop\n  %val1 = phi i64 [ %index, %loop ], [ 67, %loop.inc ]\n  %val2 = phi i64 [ %index2, %loop ], [ 98, %loop.inc ]\n  %retval = add i64 %val1, %val2\n  ret i64 %retval\n}\n"
+        },
+        {
+          "test_name": "vectorization_not_profitable_due_to_trunc",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\ndefine i64 @vectorization_not_profitable_due_to_trunc(ptr dereferenceable(800) %src) {\nentry:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]\n  %gep.src = getelementptr inbounds i64, ptr %src, i64 %iv\n  %l = load i64, ptr %gep.src, align 1\n  %t = trunc i64 %l to i1\n  br i1 %t, label %exit.0, label %loop.latch, !prof !0\n\nloop.latch:                                       ; preds = %loop.header\n  %iv.next = add i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 100\n  br i1 %ec, label %exit.1, label %loop.header\n\nexit.0:                                           ; preds = %loop.header\n  %res = phi i64 [ %l, %loop.header ]\n  ret i64 %res\n\nexit.1:                                           ; preds = %loop.latch\n  ret i64 0\n}\n\n!0 = !{!\"branch_weights\", i32 1, i32 1}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/induction-costs.ll",
+      "commands": [
+        "opt -p loop-vectorize -mtriple=arm64-apple-macosx -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pointer_induction_only",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\n\ndefine i64 @pointer_induction_only(ptr %start, ptr %end) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi ptr [ %start, %entry ], [ %iv.next, %loop ]\n  %recur = phi i64 [ 0, %entry ], [ %recur.next, %loop ]\n  %l = load i32, ptr %iv, align 1\n  %recur.next = zext i32 %l to i64\n  %iv.next = getelementptr inbounds i8, ptr %iv, i64 4\n  %c = icmp eq ptr %iv, %end\n  br i1 %c, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i64 %recur\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/scalable-avoid-scalarization.ll",
+      "commands": [
+        "opt < %s -mtriple=aarch64 -passes=loop-vectorize --force-vector-interleave=1 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_no_scalarization",
+          "test_body": "target triple = \"aarch64-unknown-linux-gnu\"\n\n; Function Attrs: nofree norecurse noreturn nosync nounwind\ndefine void @test_no_scalarization(ptr %a, ptr noalias %b, i32 %idx, i32 %n) #0 {\nL.entry:\n  br label %L.LoopBody\n\nL.LoopBody:                                       ; preds = %L.LoopBody, %L.entry\n  %indvar = phi i32 [ %indvar.next, %L.LoopBody ], [ %idx, %L.entry ]\n  %indvar.next = add nsw i32 %indvar, 1\n  %0 = getelementptr i64, ptr %a, i32 %indvar\n  %1 = load double, ptr %0, align 8\n  %gep.b = getelementptr i64, ptr %b, i32 %indvar\n  store double %1, ptr %gep.b, align 8\n  %2 = icmp slt i32 %indvar.next, %n\n  br i1 %2, label %L.LoopBody, label %L.exit\n\nL.exit:                                           ; preds = %L.LoopBody\n  store i64 1, ptr %0, align 8\n  ret void\n}\n\nattributes #0 = { nofree norecurse noreturn nosync nounwind \"target-features\"=\"+sve\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/conditional-scalar-assignment.ll",
+      "commands": [
+        "opt -passes=loop-vectorize -S < %s 2>&1",
+        "opt -passes=loop-vectorize -mattr=+avx512f -S < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "int_select_with_extra_arith_payload",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @int_select_with_extra_arith_payload(i64 %N, ptr readonly %A, ptr readonly %B, ptr noalias %C, i32 %threshold) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %A.phi = phi i32 [ -1, %entry ], [ %select.A, %loop ]\n  %A.addr = getelementptr inbounds i32, ptr %A, i64 %iv\n  %ld.A = load i32, ptr %A.addr, align 4\n  %mul.A = mul i32 %ld.A, 13\n  %B.addr = getelementptr inbounds i32, ptr %B, i64 %iv\n  %ld.B = load i32, ptr %B.addr, align 4\n  %mul.B = mul i32 %ld.B, 5\n  %add = add i32 %mul.A, %mul.B\n  %C.addr = getelementptr inbounds i32, ptr %C, i64 %iv\n  store i32 %add, ptr %C.addr, align 4\n  %select.cmp = icmp slt i32 %threshold, %ld.A\n  %select.A = select i1 %select.cmp, i32 %ld.A, i32 %A.phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %select.A\n}\n"
+        },
+        {
+          "test_name": "simple_csa_int_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @simple_csa_int_select(i64 %N, ptr %data, i32 %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %data.phi = phi i32 [ -1, %entry ], [ %select.data, %loop ]\n  %ld.addr = getelementptr inbounds i32, ptr %data, i64 %iv\n  %ld = load i32, ptr %ld.addr, align 4\n  %select.cmp = icmp slt i32 %a, %ld\n  %select.data = select i1 %select.cmp, i32 %ld, i32 %data.phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %select.data\n}\n"
+        },
+        {
+          "test_name": "simple_csa_byte_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i8 @simple_csa_byte_select(i64 %N, ptr %data, i8 %a) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %data.phi = phi i8 [ -1, %entry ], [ %select.data, %loop ]\n  %ld.addr = getelementptr inbounds i8, ptr %data, i64 %iv\n  %ld = load i8, ptr %ld.addr, align 4\n  %select.cmp = icmp slt i8 %a, %ld\n  %select.data = select i1 %select.cmp, i8 %ld, i8 %data.phi\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exit.cmp = icmp eq i64 %iv.next, %N\n  br i1 %exit.cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i8 %select.data\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/AArch64/std-find.ll",
+      "commands": [
+        "opt -O3 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "std_find_caller",
+          "test_body": "target triple = \"arm64-apple-macosx15.0.0\"\n\ndefine ptr @std_find_caller(ptr noundef %first, ptr noundef %last) {\nentry:\n  %last.i64 = ptrtoint ptr %last to i64\n  %first.i64 = ptrtoint ptr %first to i64\n  %ptr.sub = sub i64 %last.i64, %first.i64\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %first, i64 2) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %last, i64 2) ]\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %first, i64 %ptr.sub) ]\n  %call = call noundef ptr @std_find_generic_impl(ptr noundef nonnull %first, ptr noundef %last, i16 noundef signext 1)\n  ret ptr %call\n}\n\ndeclare noundef ptr @std_find_generic_impl(ptr noundef, ptr noundef, i16 noundef)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189081 tests passed\n* 5013 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Can we also do something similar for the case, when the maximum trip count is known? Currently the value is hardcoded to be 16 iterations or higher, IIRC"
+    },
+    {
+      "author": "david-arm",
+      "body": "> Yes I think this looks like a separate cost issue.\r\n\r\nYeah I'm looking into this at the moment. It seems like the getelementptr used by the store is being costed as zero, which is clearly wrong because we generate 4 of them - one for each store. There is also no cost attached to the creation of the predicated blocks, i.e. the extractelement of <4 x i1> and the branch. In VPReplicateRecipe::computeCost we bail out for stores if it's a replicated region and fall back on the legacy cost model, but that is woefully incorrect too."
+    },
+    {
+      "author": "Mel-Chen",
+      "body": "> Can we also do something similar for the case, when the maximum trip count is known? Currently the value is hardcoded to be 16 iterations or higher, IIRC\r\n\r\n@alexey-bataev Thank you for pointing out this issue.  Are you referring to `TinyTripCountVectorThreshold` = 16? If so, I think we could probably remove `CM_ScalarEpilogueNotAllowedLowTripLoop` directly.\r\n\r\nHowever, when `CM_ScalarEpilogueNotAllowedLowTripLoop` is in effect, `computeMaxVF` will prioritize fixed VFs without a scalar epilogue, and `isOutsideLoopWorkProfitable` doesn\u2019t seem to account for the scalar epilogue cost yet (not sure whether `MinTC = alignTo(MinTC, IntVF)` is good enough for that). So this might be worth handling in a separate patch I think."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-19T13:42:54Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        9178,
+        9198
+      ],
+      [
+        9207,
+        9212
+      ],
+      [
+        9216,
+        9225
+      ],
+      [
+        9231,
+        9248
+      ],
+      [
+        9251,
+        9257
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/conditional-scalar-assignment.ll": [
+      [
+        470,
+        476
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/early_exit_costs.ll": [
+      [
+        57,
+        65
+      ],
+      [
+        93,
+        99
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/induction-costs.ll": [
+      [
+        94,
+        100
+      ],
+      [
+        996,
+        999
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/scalable-avoid-scalarization.ll": [
+      [
+        16,
+        23
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/conditional-scalar-assignment.ll": [
+      [
+        9,
+        15
+      ],
+      [
+        56,
+        62
+      ],
+      [
+        496,
+        502
+      ],
+      [
+        557,
+        563
+      ],
+      [
+        644,
+        650
+      ],
+      [
+        691,
+        697
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/AArch64/std-find.ll": [
+      [
+        257,
+        263
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "isOutsideLoopWorkProfitable"
+    ]
+  }
+}

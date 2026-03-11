@@ -1,0 +1,112 @@
+{
+  "pr_id": 175096,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175096",
+  "state": "closed",
+  "title": "[LV] capture branch weights for constant trip counts",
+  "author": "mtrofin",
+  "base_commit": "7d5622f7917815d224b780309432ffe4729e4852",
+  "fix_commit": "a68bd3948c2eaf550f212e73fee4c35750e5a990",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VPlan.cpp b/llvm/lib/Transforms/Vectorize/VPlan.cpp\nindex a6a46e36b397d..876c1cc9df22b 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.cpp\n@@ -52,6 +52,10 @@\n using namespace llvm;\n using namespace llvm::VPlanPatternMatch;\n \n+namespace llvm {\n+extern cl::opt<bool> ProfcheckDisableMetadataFixes;\n+} // namespace llvm\n+\n /// @{\n /// Metadata attribute names\n const char LLVMLoopVectorizeFollowupAll[] = \"llvm.loop.vectorize.followup_all\";\n@@ -1692,17 +1696,33 @@ void LoopVectorizationPlanner::updateLoopMetadataAndProfileInfo(\n   // For scalable vectorization we can't know at compile time how many\n   // iterations of the loop are handled in one vector iteration, so instead\n   // use the value of vscale used for tuning.\n-  if (!OrigAverageTripCount)\n-    return;\n-  // Calculate number of iterations in unrolled loop.\n-  unsigned AverageVectorTripCount = *OrigAverageTripCount / EstimatedVFxUF;\n-  // Calculate number of iterations for remainder loop.\n-  unsigned RemainderAverageTripCount = *OrigAverageTripCount % EstimatedVFxUF;\n-\n+  unsigned AverageVectorTripCount = 0;\n+  unsigned RemainderAverageTripCount = 0;\n+  auto EC = VectorLoop->getLoopPreheader()->getParent()->getEntryCount();\n+  auto IsProfiled = EC && EC->getCount();\n+  if (!OrigAverageTripCount) {\n+    if (!IsProfiled)\n+      return;\n+    auto &SE = *PSE.getSE();\n+    AverageVectorTripCount = SE.getSmallConstantTripCount(VectorLoop);\n+    if (ProfcheckDisableMetadataFixes || !AverageVectorTripCount)\n+      return;\n+    if (Plan.getScalarPreheader()->hasPredecessors())\n+      RemainderAverageTripCount =\n+          SE.getSmallConstantTripCount(OrigLoop) % EstimatedVFxUF;\n+    // Setting to 1 should be sufficient to generate the correct branch weights.\n+    OrigLoopInvocationWeight = 1;\n+  } else {\n+    // Calculate number of iterations in unrolled loop.\n+    AverageVectorTripCount = *OrigAverageTripCount / EstimatedVFxUF;\n+    // Calculate number of iterations for remainder loop.\n+    RemainderAverageTripCount = *OrigAverageTripCount % EstimatedVFxUF;\n+  }\n   if (HeaderVPBB) {\n     setLoopEstimatedTripCount(VectorLoop, AverageVectorTripCount,\n                               OrigLoopInvocationWeight);\n   }\n+\n   if (Plan.getScalarPreheader()->hasPredecessors()) {\n     setLoopEstimatedTripCount(OrigLoop, RemainderAverageTripCount,\n                               OrigLoopInvocationWeight);\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "When a vectorized loop has constant trip, it's important to update the profile information accordingly. Hotness analysis will only look at profile info. \n\nFor example, in the `tripcount.ll` test, without producing the profile info, in the `const_trip_over_profile` function, the BFI of the `vector.body` would be 32 (this is the expected value when synthetic branch weights are used, in loops). The real value is 250. The `for.body`value was _very_ incorrect before, too (and detrimentally so, as it would have appeared as \"very hot\" when it wasn't):\n\nThe table below was obtained by printing BFI in the RUN: command, i.e. `build/bin/opt < llvm/test/Transforms/LoopVectorize/tripcount.ll -passes=\"loop-vectorize,print<block-freq>\" -loop-vectorize-with-block-frequency -S -o /dev/null`. Showing only the `float` value, i.e. the BFI relative to the function entry BB.\n\n```\n\nPrinting analysis results of BFI for function 'const_trip_over_profile':  \nblock-frequency-info: const_trip_over_profile\n\n```\n\n| Block | Before | After |\n| ----- | ------ | ----- |\n| `entry` | float = 1.0 | float = 1.0 |\n| `vector.ph` | float = 1.0 | float = 1.0 |\n| `vector.body` | float = **32.0** | float = **250.0** |\n| `middle.block` | float = 1.0 | float = 1.0 |\n| `scalar.ph` | float = 1.0 | float = 1.0 |\n| `for.body` | float = **2147483647.8** | float = **1.0** |\n| `for.end` | float = 1.0 | float = 1.0 |\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/exact.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -force-vector-width=4 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "lshr_exact",
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine void @lshr_exact(ptr %x) !prof !0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %x, i64 %iv\n  %0 = load i32, ptr %arrayidx, align 4\n  %conv1 = lshr exact i32 %0, 1\n  store i32 %conv1, ptr %arrayidx, align 4\n  %iv.next = add nuw nsw i64 %iv, 1\n  %exitcond = icmp eq i64 %iv.next, 256\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n\n!0 = !{!\"function_entry_count\", i32 1}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/tripcount.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -loop-vectorize-with-block-frequency -S"
+      ],
+      "tests": [
+        {
+          "test_name": "const_trip_over_profile",
+          "test_body": "target datalayout = \"E-m:e-p:32:32-i64:32-f64:32:64-a:0:32-n32-S128\"\n\n@tab = external global [32 x i8], align 1\n\ndefine i32 @const_trip_over_profile() !prof !0 {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i.08 = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %arrayidx = getelementptr inbounds [32 x i8], ptr @tab, i32 0, i32 %i.08\n  %0 = load i8, ptr %arrayidx, align 1\n  %cmp1 = icmp eq i8 %0, 0\n  %. = select i1 %cmp1, i8 2, i8 1\n  store i8 %., ptr %arrayidx, align 1\n  %inc = add nsw i32 %i.08, 1\n  %exitcond = icmp slt i32 %i.08, 1000\n  br i1 %exitcond, label %for.body, label %for.end, !prof !1\n\nfor.end:                                          ; preds = %for.body\n  ret i32 0\n}\n\n!0 = !{!\"function_entry_count\", i64 100}\n!1 = !{!\"branch_weights\", i32 100, i32 0}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "mtrofin",
+      "body": "* **#175096** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175096?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175096?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#175095** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175095?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174896** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174896?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130099 tests passed\n* 2880 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189145 tests passed\n* 5017 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "jdenny-ornl",
+      "body": "> it seems like there should be test coverage?\r\n\r\nAgreed."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-08T23:32:44Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VPlan.cpp": [
+      [
+        52,
+        57
+      ],
+      [
+        1692,
+        1708
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/exact.ll": [
+      [
+        1,
+        10
+      ],
+      [
+        21,
+        23
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/tripcount.ll": [
+      [
+        328,
+        336
+      ],
+      [
+        344,
+        350
+      ],
+      [
+        358,
+        364
+      ],
+      [
+        401,
+        406
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VPlan.cpp": [
+      "LoopVectorizationPlanner::updateLoopMetadataAndProfileInfo"
+    ],
+    "llvm/test/Transforms/LoopVectorize/tripcount.ll": [
+      "const_small_trip_count_step",
+      "const_trip_over_profile"
+    ]
+  }
+}

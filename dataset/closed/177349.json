@@ -1,0 +1,135 @@
+{
+  "pr_id": 177349,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/177349",
+  "state": "closed",
+  "title": "[PredicateInfo] Extract information from assume operand bundles",
+  "author": "philnik777",
+  "base_commit": "ee95ebe396e567fcf9c12e5843c2761fc26893d3",
+  "fix_commit": "fec6ea6c90d5c90746f99016f7277ece0026d42c",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Utils/PredicateInfo.h b/llvm/include/llvm/Transforms/Utils/PredicateInfo.h\nindex 3df3495f84470..986a64e913688 100644\n--- a/llvm/include/llvm/Transforms/Utils/PredicateInfo.h\n+++ b/llvm/include/llvm/Transforms/Utils/PredicateInfo.h\n@@ -67,7 +67,12 @@ class Value;\n class IntrinsicInst;\n class raw_ostream;\n \n-enum PredicateType { PT_Branch, PT_Assume, PT_Switch };\n+enum PredicateType {\n+  PT_Branch,\n+  PT_ConditionAssume,\n+  PT_BundleAssume,\n+  PT_Switch\n+};\n \n /// Constraint for a predicate of the form \"cmp Pred Op, OtherOp\", where Op\n /// is the value the constraint applies to (the bitcast result).\n@@ -96,8 +101,8 @@ class PredicateBase {\n   PredicateBase &operator=(const PredicateBase &) = delete;\n   PredicateBase() = delete;\n   static bool classof(const PredicateBase *PB) {\n-    return PB->Type == PT_Assume || PB->Type == PT_Branch ||\n-           PB->Type == PT_Switch;\n+    return PB->Type == PT_BundleAssume || PB->Type == PT_ConditionAssume ||\n+           PB->Type == PT_Branch || PB->Type == PT_Switch;\n   }\n \n   /// Fetch condition in the form of PredicateConstraint, if possible.\n@@ -114,11 +119,38 @@ class PredicateBase {\n class PredicateAssume : public PredicateBase {\n public:\n   IntrinsicInst *AssumeInst;\n-  PredicateAssume(Value *Op, IntrinsicInst *AssumeInst, Value *Condition)\n-      : PredicateBase(PT_Assume, Op, Condition), AssumeInst(AssumeInst) {}\n-  PredicateAssume() = delete;\n+\n+  static bool classof(const PredicateBase *PB) {\n+    return PB->Type == PT_ConditionAssume || PB->Type == PT_BundleAssume;\n+  }\n+\n+protected:\n+  PredicateAssume(PredicateType PT, Value *Op, IntrinsicInst *AssumeInst,\n+                  Value *Condition)\n+      : PredicateBase(PT, Op, Condition), AssumeInst(AssumeInst) {}\n+};\n+\n+class PredicateBundleAssume : public PredicateAssume {\n+public:\n+  Attribute::AttrKind AttrKind;\n+  PredicateBundleAssume(Value *Op, IntrinsicInst *AssumeInst,\n+                        Attribute::AttrKind AttrKind)\n+      : PredicateAssume(PT_BundleAssume, Op, AssumeInst, nullptr),\n+        AttrKind(AttrKind) {}\n+\n+  static bool classof(const PredicateBase *PB) {\n+    return PB->Type == PT_BundleAssume;\n+  }\n+};\n+\n+class PredicateConditionAssume : public PredicateAssume {\n+public:\n+  PredicateConditionAssume(Value *Op, IntrinsicInst *AssumeInst,\n+                           Value *Condition)\n+      : PredicateAssume(PT_ConditionAssume, Op, AssumeInst, Condition) {}\n+\n   static bool classof(const PredicateBase *PB) {\n-    return PB->Type == PT_Assume;\n+    return PB->Type == PT_ConditionAssume;\n   }\n };\n \ndiff --git a/llvm/lib/Transforms/Scalar/NewGVN.cpp b/llvm/lib/Transforms/Scalar/NewGVN.cpp\nindex b4528cdb56d51..2fbd2bd99fd76 100644\n--- a/llvm/lib/Transforms/Scalar/NewGVN.cpp\n+++ b/llvm/lib/Transforms/Scalar/NewGVN.cpp\n@@ -2098,7 +2098,8 @@ void NewGVN::addAdditionalUsers(ExprResult &Res, Instruction *User) const {\n   if (Res.PredDep) {\n     if (const auto *PBranch = dyn_cast<PredicateBranch>(Res.PredDep))\n       PredicateToUsers[PBranch->Condition].insert(User);\n-    else if (const auto *PAssume = dyn_cast<PredicateAssume>(Res.PredDep))\n+    else if (const auto *PAssume =\n+                 dyn_cast<PredicateConditionAssume>(Res.PredDep))\n       PredicateToUsers[PAssume->Condition].insert(User);\n   }\n   Res.PredDep = nullptr;\ndiff --git a/llvm/lib/Transforms/Utils/PredicateInfo.cpp b/llvm/lib/Transforms/Utils/PredicateInfo.cpp\nindex 27fed7340411b..df32482f948f0 100644\n--- a/llvm/lib/Transforms/Utils/PredicateInfo.cpp\n+++ b/llvm/lib/Transforms/Utils/PredicateInfo.cpp\n@@ -14,6 +14,7 @@\n #include \"llvm/ADT/DenseMap.h\"\n #include \"llvm/ADT/STLExtras.h\"\n #include \"llvm/ADT/SmallPtrSet.h\"\n+#include \"llvm/Analysis/AssumeBundleQueries.h\"\n #include \"llvm/Analysis/AssumptionCache.h\"\n #include \"llvm/IR/AssemblyAnnotationWriter.h\"\n #include \"llvm/IR/Dominators.h\"\n@@ -217,7 +218,7 @@ class PredicateInfoBuilder {\n   ValueInfo &getOrCreateValueInfo(Value *);\n   const ValueInfo &getValueInfo(Value *) const;\n \n-  void processAssume(IntrinsicInst *, BasicBlock *,\n+  void processAssume(AssumeInst *, BasicBlock *,\n                      SmallVectorImpl<Value *> &OpsToRename);\n   void processBranch(BranchInst *, BasicBlock *,\n                      SmallVectorImpl<Value *> &OpsToRename);\n@@ -359,8 +360,20 @@ void PredicateInfoBuilder::addInfoFor(SmallVectorImpl<Value *> &OpsToRename,\n // Process an assume instruction and place relevant operations we want to rename\n // into OpsToRename.\n void PredicateInfoBuilder::processAssume(\n-    IntrinsicInst *II, BasicBlock *AssumeBB,\n+    AssumeInst *II, BasicBlock *AssumeBB,\n     SmallVectorImpl<Value *> &OpsToRename) {\n+  if (II->hasOperandBundles()) {\n+    for (auto BOI : II->bundle_op_infos()) {\n+      if (RetainedKnowledge RK = getKnowledgeFromBundle(*II, BOI)) {\n+        if (RK.AttrKind == Attribute::NonNull)\n+          addInfoFor(OpsToRename, RK.WasOn,\n+                     new (Allocator) PredicateBundleAssume(RK.WasOn, II,\n+                                                           Attribute::NonNull));\n+      }\n+    }\n+    return;\n+  }\n+\n   SmallVector<Value *, 4> Worklist;\n   SmallPtrSet<Value *, 4> Visited;\n   Worklist.push_back(II->getOperand(0));\n@@ -386,7 +399,7 @@ void PredicateInfoBuilder::processAssume(\n \n     for (Value *V : Values) {\n       if (shouldRename(V)) {\n-        auto *PA = new (Allocator) PredicateAssume(V, II, Cond);\n+        auto *PA = new (Allocator) PredicateConditionAssume(V, II, Cond);\n         addInfoFor(OpsToRename, V, PA);\n       }\n     }\n@@ -489,7 +502,7 @@ void PredicateInfoBuilder::buildPredicateInfo() {\n     }\n   }\n   for (auto &Assume : AC.assumptions()) {\n-    if (auto *II = dyn_cast_or_null<IntrinsicInst>(Assume))\n+    if (auto *II = cast_or_null<AssumeInst>(Assume))\n       if (DT.isReachableFromEntry(II->getParent()))\n         processAssume(II, II->getParent(), OpsToRename);\n   }\n@@ -712,7 +725,15 @@ PredicateInfo::PredicateInfo(Function &F, DominatorTree &DT,\n \n std::optional<PredicateConstraint> PredicateBase::getConstraint() const {\n   switch (Type) {\n-  case PT_Assume:\n+  case PT_BundleAssume: {\n+    auto *BA = cast<PredicateBundleAssume>(this);\n+    assert(BA->AttrKind == Attribute::NonNull &&\n+           \"Cannot handle anything other than NonNull\");\n+    return {{CmpInst::ICMP_NE, ConstantPointerNull::get(\n+                                   cast<PointerType>(OriginalOp->getType()))}};\n+  }\n+\n+  case PT_ConditionAssume:\n   case PT_Branch: {\n     bool TrueEdge = true;\n     if (auto *PBranch = dyn_cast<PredicateBranch>(this))\n@@ -824,8 +845,13 @@ class PredicateInfoAnnotatedWriter : public AssemblyAnnotationWriter {\n         PS->To->printAsOperand(OS);\n         OS << \"]\";\n       } else if (const auto *PA = dyn_cast<PredicateAssume>(PI)) {\n-        OS << \"; assume predicate info {\"\n-           << \" Comparison:\" << *PA->Condition;\n+        OS << \"; assume predicate info {\";\n+        if (auto *PBA = dyn_cast<PredicateBundleAssume>(PA)) {\n+          OS << \" Attribute: \" << Attribute::getNameFromAttrKind(PBA->AttrKind);\n+        } else {\n+          assert(isa<PredicateConditionAssume>(PA));\n+          OS << \" Comparison:\" << *PA->Condition;\n+        }\n       }\n       OS << \", RenamedOp: \";\n       PI->RenamedOp->printAsOperand(OS, false);\n",
+  "components": [
+    "NewGVN",
+    "PredicateInfo"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SCCP/assume-operand-bundles.ll",
+      "commands": [
+        "opt %s -passes=sccp -S"
+      ],
+      "tests": [
+        {
+          "test_name": "nonnull_after_branch",
+          "test_body": "declare void @use(i1)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @nonnull_after_branch(i1 %cond1, i1 %cond2, ptr %v) {\n  %c1 = icmp eq ptr %v, null\n  call void @use(i1 %c1)\n  %c2 = icmp ne ptr %v, null\n  call void @use(i1 %c2)\n  %c3 = icmp eq ptr null, %v\n  call void @use(i1 %c3)\n  %c4 = icmp ne ptr null, %v\n  call void @use(i1 %c4)\n  br i1 %cond1, label %true1, label %false1\n\ntrue1:                                            ; preds = %0\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %v) ]\n  %ct1 = icmp eq ptr %v, null\n  call void @use(i1 %ct1)\n  %ct2 = icmp ne ptr %v, null\n  call void @use(i1 %ct2)\n  %ct3 = icmp eq ptr null, %v\n  call void @use(i1 %ct3)\n  %ct4 = icmp ne ptr null, %v\n  call void @use(i1 %ct4)\n  br i1 %cond2, label %true2, label %false2\n\ntrue2:                                            ; preds = %true1\n  %ctt1 = icmp eq ptr %v, null\n  call void @use(i1 %ctt1)\n  %ctt2 = icmp ne ptr %v, null\n  call void @use(i1 %ctt2)\n  %ctt3 = icmp eq ptr null, %v\n  call void @use(i1 %ctt3)\n  %ctt4 = icmp ne ptr null, %v\n  call void @use(i1 %ctt4)\n  ret void\n\nfalse2:                                           ; preds = %true1\n  %ctf1 = icmp eq ptr %v, null\n  call void @use(i1 %ctf1)\n  %ctf2 = icmp ne ptr %v, null\n  call void @use(i1 %ctf2)\n  %ctf3 = icmp eq ptr null, %v\n  call void @use(i1 %ctf3)\n  %ctf4 = icmp ne ptr null, %v\n  call void @use(i1 %ctf4)\n  ret void\n\nfalse1:                                           ; preds = %0\n  %cf1 = icmp eq ptr %v, null\n  call void @use(i1 %cf1)\n  %cf2 = icmp ne ptr %v, null\n  call void @use(i1 %cf2)\n  %cf3 = icmp eq ptr null, %v\n  call void @use(i1 %cf3)\n  %cf4 = icmp ne ptr null, %v\n  call void @use(i1 %cf4)\n  ret void\n\n1:                                                ; No predecessors!\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "nonnull",
+          "test_body": "declare void @use(i1)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @nonnull(ptr %v) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %v) ]\n  %c1 = icmp eq ptr %v, null\n  call void @use(i1 %c1)\n  %c2 = icmp ne ptr %v, null\n  call void @use(i1 %c2)\n  %c3 = icmp eq ptr null, %v\n  call void @use(i1 %c3)\n  %c4 = icmp ne ptr null, %v\n  call void @use(i1 %c4)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Util/PredicateInfo/assume-operand-bundles.ll",
+      "commands": [
+        "opt -S -passes=print-predicateinfo %s 2>&1 >/dev/null"
+      ],
+      "tests": [
+        {
+          "test_name": "nonnull3",
+          "test_body": "declare void @use(i1)\n\ndefine void @nonnull3(ptr %v) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %v) ]\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %v) ]\n  %c1 = icmp eq ptr %v, null\n  call void @use(i1 %c1)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "nonnull1",
+          "test_body": "declare void @use(i1)\n\ndefine void @nonnull1(ptr %v) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %v) ]\n  %c1 = icmp eq ptr %v, null\n  call void @use(i1 %c1)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "nonnull2",
+          "test_body": "declare void @use(i1)\n\ndefine void @nonnull2(ptr %v, ptr %w) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %v), \"nonnull\"(ptr %w) ]\n  %c1 = icmp eq ptr %v, null\n  call void @use(i1 %c1)\n  %c2 = icmp eq ptr %w, null\n  call void @use(i1 %c2)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "nonnull0",
+          "test_body": "define void @nonnull0(ptr %v) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %v) ]\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions cpp,h -- llvm/include/llvm/Transforms/Utils/PredicateInfo.h llvm/lib/Transforms/Scalar/NewGVN.cpp llvm/lib/Transforms/Utils/PredicateInfo.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/include/llvm/Transforms/Utils/PredicateInfo.h b/llvm/include/llvm/Transforms/Utils/PredicateInfo.h\nindex 306f512cd..986a64e91 100644\n--- a/llvm/include/llvm/Transforms/Utils/PredicateInfo.h\n+++ b/llvm/include/llvm/Transforms/Utils/PredicateInfo.h\n@@ -67,7 +67,12 @@ class Value;\n class IntrinsicInst;\n class raw_ostream;\n \n-enum PredicateType { PT_Branch, PT_ConditionAssume, PT_BundleAssume, PT_Switch };\n+enum PredicateType {\n+  PT_Branch,\n+  PT_ConditionAssume,\n+  PT_BundleAssume,\n+  PT_Switch\n+};\n \n /// Constraint for a predicate of the form \"cmp Pred Op, OtherOp\", where Op\n /// is the value the constraint applies to (the bitcast result).\ndiff --git a/llvm/lib/Transforms/Utils/PredicateInfo.cpp b/llvm/lib/Transforms/Utils/PredicateInfo.cpp\nindex d500708d1..df32482f9 100644\n--- a/llvm/lib/Transforms/Utils/PredicateInfo.cpp\n+++ b/llvm/lib/Transforms/Utils/PredicateInfo.cpp\n@@ -846,7 +846,7 @@ public:\n         OS << \"]\";\n       } else if (const auto *PA = dyn_cast<PredicateAssume>(PI)) {\n         OS << \"; assume predicate info {\";\n-        if (auto * PBA = dyn_cast<PredicateBundleAssume>(PA)) {\n+        if (auto *PBA = dyn_cast<PredicateBundleAssume>(PA)) {\n           OS << \" Attribute: \" << Attribute::getNameFromAttrKind(PBA->AttrKind);\n         } else {\n           assert(isa<PredicateConditionAssume>(PA));\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-22T12:13:25Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Utils/PredicateInfo.h": [
+      [
+        67,
+        73
+      ],
+      [
+        96,
+        103
+      ],
+      [
+        114,
+        124
+      ]
+    ],
+    "llvm/lib/Transforms/Scalar/NewGVN.cpp": [
+      [
+        2098,
+        2104
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/PredicateInfo.cpp": [
+      [
+        14,
+        19
+      ],
+      [
+        217,
+        223
+      ],
+      [
+        359,
+        366
+      ],
+      [
+        386,
+        392
+      ],
+      [
+        489,
+        495
+      ],
+      [
+        712,
+        718
+      ],
+      [
+        824,
+        831
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Transforms/Utils/PredicateInfo.h": [
+      "PredicateAssume",
+      "PredicateBase",
+      "classof"
+    ],
+    "llvm/lib/Transforms/Scalar/NewGVN.cpp": [
+      "NewGVN::addAdditionalUsers"
+    ],
+    "llvm/lib/Transforms/Utils/PredicateInfo.cpp": [
+      "PredicateBase::getConstraint",
+      "PredicateInfoBuilder::buildPredicateInfo",
+      "PredicateInfoBuilder::processAssume",
+      "emitInstructionAnnot"
+    ]
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "pr_id": 176010,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176010",
+  "state": "closed",
+  "title": "[MemCpyOpt] allow memcpy-to-memcpy optimization with smaller dest than src",
+  "author": "vtjnash",
+  "base_commit": "72b7daf82b1af90f087515ac7e79e557f603f958",
+  "fix_commit": "b9668c504c40f774c70f0eb2e24841aee0ac574f",
+  "patch": "diff --git a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\nindex f054b21f2e9dd..f7e761550f211 100644\n--- a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n+++ b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n@@ -1516,12 +1516,13 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n   // Check that copy is full with static size.\n   const DataLayout &DL = DestAlloca->getDataLayout();\n   std::optional<TypeSize> SrcSize = SrcAlloca->getAllocationSize(DL);\n-  if (!SrcSize || Size != *SrcSize) {\n-    LLVM_DEBUG(dbgs() << \"Stack Move: Source alloca size mismatch\\n\");\n-    return false;\n-  }\n   std::optional<TypeSize> DestSize = DestAlloca->getAllocationSize(DL);\n-  if (!DestSize || Size != *DestSize) {\n+  if (!SrcSize || !DestSize)\n+    return false;\n+  if (*SrcSize != *DestSize)\n+    if (!SrcSize->isFixed() || !DestSize->isFixed())\n+      return false;\n+  if (Size != *DestSize) {\n     LLVM_DEBUG(dbgs() << \"Stack Move: Destination alloca size mismatch\\n\");\n     return false;\n   }\n@@ -1680,6 +1681,16 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n   SrcAlloca->setAlignment(\n       std::max(SrcAlloca->getAlign(), DestAlloca->getAlign()));\n \n+  // Size the allocas appropriately.\n+  if (*SrcSize != *DestSize) {\n+    // Only possible if both sizes are fixed (due to earlier check)\n+    // Set Src to the type and array size of Dest if Dest was larger\n+    if (DestSize->getFixedValue() > SrcSize->getFixedValue()) {\n+      SrcAlloca->setAllocatedType(DestAlloca->getAllocatedType());\n+      SrcAlloca->setOperand(0, DestAlloca->getArraySize());\n+    }\n+  }\n+\n   // Merge the two allocas.\n   DestAlloca->replaceAllUsesWith(SrcAlloca);\n   eraseInstruction(DestAlloca);\n@@ -1707,7 +1718,7 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n     I->setMetadata(LLVMContext::MD_tbaa_struct, nullptr);\n   }\n \n-  LLVM_DEBUG(dbgs() << \"Stack Move: Performed staack-move optimization\\n\");\n+  LLVM_DEBUG(dbgs() << \"Stack Move: Performed stack-move optimization\\n\");\n   NumStackMove++;\n   return true;\n }\n",
+  "components": [
+    "MemCpyOptimizer"
+  ],
+  "description": "Resize the alloca if needed to a common size, as long as the dest was still fully initialized by the copy.\r\n\r\nExtracted from PR optimization improvement series at https://github.com/llvm/llvm-project/pull/150792 (included all tests additions from there as well)",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/MemCpyOpt/stack-move.ll",
+      "commands": [
+        "opt < %s -passes=memcpyopt -verify-memoryssa -S"
+      ],
+      "tests": [
+        {
+          "test_name": "mismatched_alloca_type_size",
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @mismatched_alloca_type_size() {\n  %src = alloca i16, i64 12, align 4\n  %dest = alloca i8, i64 12, align 4\n  call void @llvm.lifetime.start.p0(ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 12, i1 false)\n  %2 = call i32 @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr nocapture %src)\n  call void @llvm.lifetime.end.p0(ptr nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "mismatched_alloca_size",
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @mismatched_alloca_size() {\n  %src = alloca i8, i64 24, align 4\n  %dest = alloca i8, i64 12, align 4\n  call void @llvm.lifetime.start.p0(ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 12, i1 false)\n  %2 = call i32 @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr nocapture %src)\n  call void @llvm.lifetime.end.p0(ptr nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "dynamically_sized_alloca",
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @dynamically_sized_alloca(i64 %i) {\n  %src = alloca i8, i64 %i, align 4\n  %dest = alloca i8, i64 %i, align 4\n  call void @llvm.lifetime.start.p0(ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 12, i1 false)\n  %2 = call i32 @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr nocapture %src)\n  call void @llvm.lifetime.end.p0(ptr nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "incomplete_store",
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #0\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @incomplete_store() {\n  %src = alloca %struct.Foo, align 4\n  %dest = alloca %struct.Foo, align 4\n  call void @llvm.lifetime.start.p0(ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture noundef %src)\n  %2 = load i32, ptr %src, align 4\n  store i32 %2, ptr %dest, align 4\n  %3 = call i32 @use_nocapture(ptr nocapture noundef %dest)\n  call void @llvm.lifetime.end.p0(ptr nocapture %src)\n  call void @llvm.lifetime.end.p0(ptr nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "mismatched_alloca_addrspace",
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p2.p1.i64(ptr addrspace(2) noalias nocapture writeonly, ptr addrspace(1) noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p1(ptr addrspace(1) immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p1(ptr addrspace(1) immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p2(ptr addrspace(2) immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p2(ptr addrspace(2) immarg) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @mismatched_alloca_addrspace() {\n  %src = alloca i8, i64 24, align 4, addrspace(1)\n  %dest = alloca i8, i64 12, align 4, addrspace(2)\n  call void @llvm.lifetime.start.p1(ptr addrspace(1) nocapture %src)\n  call void @llvm.lifetime.start.p2(ptr addrspace(2) nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr addrspace(1) %src, align 4\n  %1 = call i32 @use_nocapture(ptr addrspace(1) nocapture %src)\n  call void @llvm.memcpy.p2.p1.i64(ptr addrspace(2) align 4 %dest, ptr addrspace(1) align 4 %src, i64 12, i1 false)\n  call void @llvm.lifetime.end.p1(ptr addrspace(1) nocapture %src)\n  %2 = call i32 @use_nocapture(ptr addrspace(2) nocapture %dest)\n  call void @llvm.lifetime.end.p2(ptr addrspace(2) nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "mismatched_alloca_type",
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @mismatched_alloca_type() {\n  %src = alloca i16, i64 6, align 4\n  %dest = alloca i8, i64 12, align 4\n  call void @llvm.lifetime.start.p0(ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 12, i1 false)\n  %2 = call i32 @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr nocapture %src)\n  call void @llvm.lifetime.end.p0(ptr nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "dynamically_sized_memcpy",
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr immarg) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr immarg) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @dynamically_sized_memcpy(i64 %size) {\n  %src = alloca %struct.Foo, align 4\n  %dest = alloca %struct.Foo, align 4\n  call void @llvm.lifetime.start.p0(ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 %size, i1 false)\n  %2 = call i32 @use_nocapture(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr nocapture %dest)\n  call void @llvm.lifetime.end.p0(ptr nocapture %src)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-01-14T19:07:14Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+      [
+        1516,
+        1527
+      ],
+      [
+        1680,
+        1685
+      ],
+      [
+        1707,
+        1713
+      ]
+    ],
+    "llvm/test/Transforms/MemCpyOpt/stack-move.ll": [
+      [
+        1022,
+        1027
+      ],
+      [
+        1085,
+        1090
+      ],
+      [
+        1178,
+        1212
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+      "MemCpyOptPass::performStackMoveOptzn"
+    ]
+  }
+}

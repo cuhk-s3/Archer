@@ -1,0 +1,216 @@
+{
+  "pr_id": 176543,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/176543",
+  "state": "closed",
+  "title": "[LLVM][Coroutines] Introduce TBAA metadata for coro frame object",
+  "author": "yonillasky",
+  "base_commit": "a97f5ec95f56987de7d4730a85d4507c4071af07",
+  "fix_commit": "082c9f803072877c7afed42e01b315c644abb00a",
+  "patch": "diff --git a/llvm/include/llvm/IR/Metadata.h b/llvm/include/llvm/IR/Metadata.h\nindex 85a7f8fd373c0..5fee796e0f6a2 100644\n--- a/llvm/include/llvm/IR/Metadata.h\n+++ b/llvm/include/llvm/IR/Metadata.h\n@@ -734,6 +734,7 @@ class MDString : public Metadata {\n   static MDString *get(LLVMContext &Context, const char *Str) {\n     return get(Context, Str ? StringRef(Str) : StringRef());\n   }\n+  LLVM_ABI static MDString *getIfExists(LLVMContext &Context, StringRef Str);\n \n   LLVM_ABI StringRef getString() const;\n \ndiff --git a/llvm/lib/IR/Metadata.cpp b/llvm/lib/IR/Metadata.cpp\nindex 326abd87ddae9..c692a621b7b81 100644\n--- a/llvm/lib/IR/Metadata.cpp\n+++ b/llvm/lib/IR/Metadata.cpp\n@@ -621,6 +621,14 @@ MDString *MDString::get(LLVMContext &Context, StringRef Str) {\n   return &MapEntry;\n }\n \n+MDString *MDString::getIfExists(LLVMContext &Context, StringRef Str) {\n+  auto &Store = Context.pImpl->MDStringCache;\n+  auto I = Store.find(Str);\n+  if (I == Store.end())\n+    return nullptr;\n+  return &I->getValue();\n+}\n+\n StringRef MDString::getString() const {\n   assert(Entry && \"Expected to find string map entry\");\n   return Entry->first();\ndiff --git a/llvm/lib/Transforms/Coroutines/CoroFrame.cpp b/llvm/lib/Transforms/Coroutines/CoroFrame.cpp\nindex 539f5178245fd..9bd7e0b48c2d3 100644\n--- a/llvm/lib/Transforms/Coroutines/CoroFrame.cpp\n+++ b/llvm/lib/Transforms/Coroutines/CoroFrame.cpp\n@@ -25,6 +25,7 @@\n #include \"llvm/IR/IRBuilder.h\"\n #include \"llvm/IR/InstIterator.h\"\n #include \"llvm/IR/IntrinsicInst.h\"\n+#include \"llvm/IR/MDBuilder.h\"\n #include \"llvm/IR/Module.h\"\n #include \"llvm/Support/Compiler.h\"\n #include \"llvm/Support/Debug.h\"\n@@ -1085,6 +1086,20 @@ static void insertSpills(const FrameDataInfo &FrameData, coro::Shape &Shape) {\n   DominatorTree DT(*F);\n   SmallDenseMap<Argument *, AllocaInst *, 4> ArgToAllocaMap;\n \n+  MDBuilder MDB(C);\n+  // Create a TBAA tag for accesses to certain coroutine frame slots, so that\n+  // subsequent alias analysis will understand they do not intersect with\n+  // user memory.\n+  // We do this only if a suitable TBAA root already exists in the module.\n+  MDNode *TBAATag = nullptr;\n+  if (auto *CppTBAAStr = MDString::getIfExists(C, \"Simple C++ TBAA\")) {\n+    auto *TBAARoot = MDNode::getIfExists(C, CppTBAAStr);\n+    // Create a \"fake\" scalar type; all other types defined in the source\n+    // language will be assumed non-aliasing with this type.\n+    MDNode *Scalar = MDB.createTBAAScalarTypeNode(\n+        (F->getName() + \".Frame Slot\").str(), TBAARoot);\n+    TBAATag = MDB.createTBAAStructTagNode(Scalar, Scalar, 0);\n+  }\n   for (auto const &E : FrameData.Spills) {\n     Value *Def = E.first;\n     Type *ByValTy = extractByvalIfArgument(Def);\n@@ -1105,13 +1120,16 @@ static void insertSpills(const FrameDataInfo &FrameData, coro::Shape &Shape) {\n \n         auto *GEP = createGEPToFramePointer(FrameData, Builder, Shape, E.first);\n         GEP->setName(E.first->getName() + Twine(\".reload.addr\"));\n-        if (ByValTy)\n+        if (ByValTy) {\n           CurrentReload = GEP;\n-        else {\n+        } else {\n           auto SpillAlignment = Align(FrameData.getAlign(Def));\n-          CurrentReload = Builder.CreateAlignedLoad(\n+          auto *LI = Builder.CreateAlignedLoad(\n               FrameTy->getElementType(FrameData.getFieldIndex(E.first)), GEP,\n               SpillAlignment, E.first->getName() + Twine(\".reload\"));\n+          if (TBAATag)\n+            LI->setMetadata(LLVMContext::MD_tbaa, TBAATag);\n+          CurrentReload = LI;\n         }\n \n         TinyPtrVector<DbgVariableRecord *> DVRs = findDVRDeclares(Def);\n",
+  "components": [
+    "Coroutines",
+    "IR"
+  ],
+  "description": "This should help the compiler determine that aliasing between frame objects and all other types is impossible.\r\nThere are cases where this AA issue can seriously harm the performance of compute intensive code running inside a coroutine, since it can break LICM and cause it to reload frame data inside tight loops over and over.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Coroutines/coro-split-tbaa-md-neg-2.ll",
+      "commands": [
+        "opt < %s -passes='cgscc(coro-split),simplifycfg,early-cse' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "; Function Attrs: presplitcoroutine\ndefine ptr @f(i32 %x) #0 {\nentry:\n  %id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)\n  %need.alloc = call i1 @llvm.coro.alloc(token %id)\n  br i1 %need.alloc, label %dyn.alloc, label %begin\n\ndyn.alloc:                                        ; preds = %entry\n  %size = call i32 @llvm.coro.size.i32()\n  %alloc = call ptr @malloc(i32 %size)\n  br label %begin\n\nbegin:                                            ; preds = %dyn.alloc, %entry\n  %phi = phi ptr [ null, %entry ], [ %alloc, %dyn.alloc ]\n  %hdl = call ptr @llvm.coro.begin(token %id, ptr %phi)\n  call void @print(i32 0)\n  %0 = call i8 @llvm.coro.suspend(token none, i1 false)\n  switch i8 %0, label %suspend [\n    i8 0, label %resume\n    i8 1, label %cleanup\n  ]\n\nresume:                                           ; preds = %begin\n  call void @print(i32 %x)\n  br label %cleanup\n\ncleanup:                                          ; preds = %resume, %begin\n  %mem = call ptr @llvm.coro.free(token %id, ptr %hdl)\n  call void @free(ptr %mem)\n  br label %suspend\n\nsuspend:                                          ; preds = %cleanup, %begin\n  call void @llvm.coro.end(ptr %hdl, i1 false, token none)\n  ret ptr %hdl\n}\n\n; Function Attrs: nounwind memory(argmem: read)\ndeclare ptr @llvm.coro.free(token, ptr nocapture readonly) #1\n\n; Function Attrs: nounwind memory(none)\ndeclare i32 @llvm.coro.size.i32() #2\n\n; Function Attrs: nounwind\ndeclare i8 @llvm.coro.suspend(token, i1) #3\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare token @llvm.coro.id(i32, ptr readnone, ptr nocapture readonly, ptr) #4\n\n; Function Attrs: nounwind\ndeclare i1 @llvm.coro.alloc(token) #3\n\n; Function Attrs: nounwind\ndeclare ptr @llvm.coro.begin(token, ptr writeonly) #3\n\n; Function Attrs: nounwind\ndeclare void @llvm.coro.end(ptr, i1, token) #3\n\n; Function Attrs: allockind(\"alloc,uninitialized\")\ndeclare noalias ptr @malloc(i32) #5\n\ndeclare void @print(i32)\n\n; Function Attrs: willreturn allockind(\"free\")\ndeclare void @free(ptr) #6\n\nattributes #0 = { presplitcoroutine }\nattributes #1 = { nounwind memory(argmem: read) }\nattributes #2 = { nounwind memory(none) }\nattributes #3 = { nounwind }\nattributes #4 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\nattributes #5 = { allockind(\"alloc,uninitialized\") \"alloc-family\"=\"malloc\" }\nattributes #6 = { willreturn allockind(\"free\") \"alloc-family\"=\"malloc\" }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Coroutines/coro-split-tbaa-md-neg.ll",
+      "commands": [
+        "opt < %s -passes='cgscc(coro-split),simplifycfg,early-cse' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "@g_x1 = external global i32\n\n; Function Attrs: presplitcoroutine\ndefine ptr @f() #0 {\nentry:\n  %promise = alloca i32, align 4\n  %buffer = alloca [128 x i8], align 1\n  %x1.1 = load i32, ptr @g_x1, align 4, !tbaa !0\n  %ref1 = getelementptr inbounds [128 x i8], ptr %buffer, i32 0, i32 %x1.1\n  store i8 42, ptr %ref1, align 1\n  %id = call token @llvm.coro.id(i32 0, ptr %promise, ptr null, ptr null)\n  %need.alloc = call i1 @llvm.coro.alloc(token %id)\n  br i1 %need.alloc, label %dyn.alloc, label %begin\n\ndyn.alloc:                                        ; preds = %entry\n  %size = call i32 @llvm.coro.size.i32()\n  %alloc = call ptr @malloc(i32 %size)\n  br label %begin\n\nbegin:                                            ; preds = %dyn.alloc, %entry\n  %phi = phi ptr [ null, %entry ], [ %alloc, %dyn.alloc ]\n  %hdl = call ptr @llvm.coro.begin(token %id, ptr %phi)\n  store i32 111, ptr %promise, align 4\n  call void @print(i32 0)\n  %0 = call i8 @llvm.coro.suspend(token none, i1 false)\n  switch i8 %0, label %suspend [\n    i8 0, label %resume\n    i8 1, label %cleanup\n  ]\n\nresume:                                           ; preds = %begin\n  %the_111_from_earlier = load i32, ptr %promise, align 4, !tbaa !0\n  call void @print(i32 %the_111_from_earlier)\n  %x1.2 = load i32, ptr @g_x1, align 4, !tbaa !0\n  %ref2 = getelementptr inbounds [128 x i8], ptr %buffer, i32 0, i32 %x1.2\n  %result = load i32, ptr %ref2, align 4, !tbaa !0\n  store i32 %result, ptr %promise, align 4, !tbaa !0\n  %1 = call i8 @llvm.coro.suspend(token none, i1 true)\n  switch i8 %1, label %suspend [\n    i8 1, label %cleanup\n  ]\n\ncleanup:                                          ; preds = %resume, %begin\n  %mem = call ptr @llvm.coro.free(token %id, ptr %hdl)\n  call void @free(ptr %mem)\n  br label %suspend\n\nsuspend:                                          ; preds = %cleanup, %resume, %begin\n  call void @llvm.coro.end(ptr %hdl, i1 false, token none)\n  ret ptr %hdl\n}\n\n; Function Attrs: nounwind memory(argmem: read)\ndeclare ptr @llvm.coro.free(token, ptr nocapture readonly) #1\n\n; Function Attrs: nounwind memory(none)\ndeclare i32 @llvm.coro.size.i32() #2\n\n; Function Attrs: nounwind\ndeclare i8 @llvm.coro.suspend(token, i1) #3\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare token @llvm.coro.id(i32, ptr readnone, ptr nocapture readonly, ptr) #4\n\n; Function Attrs: nounwind\ndeclare i1 @llvm.coro.alloc(token) #3\n\n; Function Attrs: nounwind\ndeclare ptr @llvm.coro.begin(token, ptr writeonly) #3\n\n; Function Attrs: nounwind\ndeclare void @llvm.coro.end(ptr, i1, token) #3\n\n; Function Attrs: allockind(\"alloc,uninitialized\")\ndeclare noalias ptr @malloc(i32) #5\n\ndeclare void @print(i32)\n\n; Function Attrs: willreturn allockind(\"free\")\ndeclare void @free(ptr) #6\n\nattributes #0 = { presplitcoroutine }\nattributes #1 = { nounwind memory(argmem: read) }\nattributes #2 = { nounwind memory(none) }\nattributes #3 = { nounwind }\nattributes #4 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\nattributes #5 = { allockind(\"alloc,uninitialized\") \"alloc-family\"=\"malloc\" }\nattributes #6 = { willreturn allockind(\"free\") \"alloc-family\"=\"malloc\" }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"int\", !2, i64 0}\n!2 = !{!\"omnipotent char\", !3, i64 0}\n!3 = !{!\"Simple C++ TBAA\"}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Coroutines/coro-split-tbaa-md.ll",
+      "commands": [
+        "opt < %s -passes='cgscc(coro-split),simplifycfg,early-cse' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "; Function Attrs: presplitcoroutine\ndefine ptr @f(ptr %p) #0 {\nentry:\n  %x = load i32, ptr %p, align 4, !tbaa !0\n  %id = call token @llvm.coro.id(i32 0, ptr null, ptr null, ptr null)\n  %need.alloc = call i1 @llvm.coro.alloc(token %id)\n  br i1 %need.alloc, label %dyn.alloc, label %begin\n\ndyn.alloc:                                        ; preds = %entry\n  %size = call i32 @llvm.coro.size.i32()\n  %alloc = call ptr @malloc(i32 %size)\n  br label %begin\n\nbegin:                                            ; preds = %dyn.alloc, %entry\n  %phi = phi ptr [ null, %entry ], [ %alloc, %dyn.alloc ]\n  %hdl = call ptr @llvm.coro.begin(token %id, ptr %phi)\n  call void @print(i32 0)\n  %0 = call i8 @llvm.coro.suspend(token none, i1 false)\n  switch i8 %0, label %suspend [\n    i8 0, label %resume\n    i8 1, label %cleanup\n  ]\n\nresume:                                           ; preds = %begin\n  call void @print(i32 %x)\n  br label %cleanup\n\ncleanup:                                          ; preds = %resume, %begin\n  %mem = call ptr @llvm.coro.free(token %id, ptr %hdl)\n  call void @free(ptr %mem)\n  br label %suspend\n\nsuspend:                                          ; preds = %cleanup, %begin\n  call void @llvm.coro.end(ptr %hdl, i1 false, token none)\n  ret ptr %hdl\n}\n\n; Function Attrs: nounwind memory(argmem: read)\ndeclare ptr @llvm.coro.free(token, ptr nocapture readonly) #1\n\n; Function Attrs: nounwind memory(none)\ndeclare i32 @llvm.coro.size.i32() #2\n\n; Function Attrs: nounwind\ndeclare i8 @llvm.coro.suspend(token, i1) #3\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare token @llvm.coro.id(i32, ptr readnone, ptr nocapture readonly, ptr) #4\n\n; Function Attrs: nounwind\ndeclare i1 @llvm.coro.alloc(token) #3\n\n; Function Attrs: nounwind\ndeclare ptr @llvm.coro.begin(token, ptr writeonly) #3\n\n; Function Attrs: nounwind\ndeclare void @llvm.coro.end(ptr, i1, token) #3\n\n; Function Attrs: allockind(\"alloc,uninitialized\")\ndeclare noalias ptr @malloc(i32) #5\n\ndeclare void @print(i32)\n\n; Function Attrs: willreturn allockind(\"free\")\ndeclare void @free(ptr) #6\n\nattributes #0 = { presplitcoroutine }\nattributes #1 = { nounwind memory(argmem: read) }\nattributes #2 = { nounwind memory(none) }\nattributes #3 = { nounwind }\nattributes #4 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\nattributes #5 = { allockind(\"alloc,uninitialized\") \"alloc-family\"=\"malloc\" }\nattributes #6 = { willreturn allockind(\"free\") \"alloc-family\"=\"malloc\" }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"int\", !2, i64 0}\n!2 = !{!\"omnipotent char\", !3, i64 0}\n!3 = !{!\"Simple C++ TBAA\"}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "coroutines",
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 189140 tests passed\n* 5012 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 130090 tests passed\n* 2879 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "yonillasky",
+      "body": "This change is not safe in all cases, I need to make it more cautious about which slots it annotates like this.\r\nThe data in a frame slot can be affected from user code if its address is ever taken.\r\n\r\nSwitching back to draft until it's fixed."
+    },
+    {
+      "author": "yonillasky",
+      "body": "The concern above should be taken care of now.\r\nSetting to ready."
+    },
+    {
+      "author": "NewSigma",
+      "body": "I played with it and can confirm improvements in my personal benchmarks. Here are some observations for discussion:\r\n\r\n1. Removing TBAA from StoreInst while retaining it on LoadInst seems do not impact performance in your demo. Is there a specific reason for adding TBAA on stores?\r\n2. Can we find `TBAARoot` in `Shape::analyse` to avoid traversing the function?\r\n3. Tests?\r\n"
+    },
+    {
+      "author": "yonillasky",
+      "body": "1. Right, the issue is always with loads, stores are always generated to execute upon suspending and already can't be improved further. I can change it to apply only on loads.\r\n2. I'll attempt to modify the impl to do that.\r\n3. Yes, I will add/modify LIT tests to assert the metadata gets created, and specifically that alloca and promise fields do NOT get annotated with it."
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> I played with it and can confirm improvements in my personal benchmarks. Here are some observations for discussion:\r\n\r\nCurious for your benchmark and the improvements of the PR."
+    },
+    {
+      "author": "NewSigma",
+      "body": "> Curious for your benchmark and the improvements of the PR.\r\n\r\nThanks for asking. The benchmark is adapted from [llvm-opt-benchmark](https://github.com/dtcxzyw/llvm-opt-benchmark) for my cases. With the patch applied, here are the IR differences that showed up and the redundant load is gone:\r\n\r\n``` LLVM\r\ndefine internal fastcc void @fn.resume(ptr noundef nonnull align 8 dereferenceable(72) %0) #33 personality ptr @__gxx_personality_v0 {\r\n cleanup31:\r\n   %.reload.addr = getelementptr inbounds nuw i8, ptr %0, i64 40\r\n-  %.reload = load <2 x float>, ptr %.reload.addr, align 8\r\n+  %.reload = load <2 x float>, ptr %.reload.addr, align 8, !tbaa !177\r\n   %.reload.addr39 = getelementptr inbounds nuw i8, ptr %0, i64 48\r\n-  %.reload40 = load i64, ptr %.reload.addr39, align 8\r\n+  %.reload40 = load i64, ptr %.reload.addr39, align 8, !tbaa !177\r\n   %tobool.i.not.i.i = icmp eq i64 %.reload40, 0\r\n   br i1 %tobool.i.not.i.i, label %CoroEnd, label %if.then.i.i\r\n\r\nif.then.i.i:                                      ; preds = %cleanup31\r\n  %x_.sroa.0.4.vec.extract21 = extractelement <2 x float> %.reload, i64 1\r\n  %cmp.i.i.i = fcmp reassoc nsz oeq float %x_.sroa.0.4.vec.extract21, 0.000000e+00\r\n  %1 = inttoptr i64 %.reload40 to ptr\r\n  br i1 %cmp.i.i.i, label %if.end.invoke.i.i.from.if.then4.i.i, label %if.end.invoke.i.i.from.if.end.i.i\r\n\r\nif.end.invoke.i.i.from.if.then4.i.i:              ; preds = %if.then.i.i\r\n  %2 = getelementptr inbounds nuw i8, ptr %1, i64 8\r\n  br label %if.end.invoke.i.i\r\n\r\n if.end.invoke.i.i.from.if.end.i.i:                ; preds = %if.then.i.i\r\n   %3 = getelementptr inbounds nuw i8, ptr %1, i64 16\r\n   %obj.sroa.0.0.vec.extract.i.i.i = extractelement <2 x float> %.reload, i64 0\r\n-  store float %obj.sroa.0.0.vec.extract.i.i.i, ptr %3, align 4, !tbaa !127, !noalias !671\r\n+  store float %obj.sroa.0.0.vec.extract.i.i.i, ptr %3, align 4, !tbaa !127, !noalias !673\r\n   %g.i.i.i.i = getelementptr inbounds nuw i8, ptr %1, i64 20\r\n-  store float %x_.sroa.0.4.vec.extract21, ptr %g.i.i.i.i, align 4, !tbaa !127, !noalias !676\r\n-  %.reload38.pre = load i64, ptr %.reload.addr39, align 8\r\n-  %.pre = inttoptr i64 %.reload38.pre to ptr\r\n+  store float %x_.sroa.0.4.vec.extract21, ptr %g.i.i.i.i, align 4, !tbaa !127, !noalias !678\r\n   br label %if.end.invoke.i.i\r\n \r\n if.end.invoke.i.i:                                ; preds = %if.end.invoke.i.i.from.if.end.i.i, %if.end.invoke.i.i.from.if.then4.i.i\r\n-  %.pre-phi = phi ptr [ %.pre, %if.end.invoke.i.i.from.if.end.i.i ], [ %1, %if.end.invoke.i.i.from.if.then4.i.i ]\r\n   %.in = phi ptr [ %1, %if.end.invoke.i.i.from.if.end.i.i ], [ %2, %if.end.invoke.i.i.from.if.then4.i.i ]\r\n   %4 = load ptr, ptr %.in, align 8\r\n-  invoke fastcc void %4(ptr nonnull %.pre-phi)\r\n+  invoke fastcc void %4(ptr nonnull %1)\r\n```"
+    },
+    {
+      "author": "yonillasky",
+      "body": "I tried following the CR and make the code search for exactly `Simple C/C++ TBAA` or `Simple C++ TBAA`. However, it seems like there is no index of metadata strings that can be looked up like that. AI chat/agents are claiming that the only way to reach the metadata is by traversing instructions, which is basically what I did.\r\n\r\nI will restrict my search to ignore roots with all other names, but it will still be in the \"bad\" form.\r\nDo you know if there is any way the cost of this lookup could be minimized?\r\n\r\nIf there is a way to do it once for the module and then just send the MD node pointer into `insertSpills`, I won't need to even modify coro::Shape. Any ideas?\r\n"
+    },
+    {
+      "author": "yonillasky",
+      "body": "Now that I've learned that C/C++ actually has two separate TBAA roots, I am reconsidering the implementation strategy.\r\n\r\nIt might be better to rebuild this as the following code changes:\r\n- CoroSplit generates a new kind of MD (\"CoroNoAliasSlots\", \"CoroNoAliasOffsets\") that specifies which slots are safe to assume NoAlias on against non-frame-derived memops\r\n- AA is extended to rely on this MD, when present, to prove NoAlias between a Gep/deref using a frame ptr, and unrelated memops.\r\n\r\nWDYT?"
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> I tried following the CR and make the code search for exactly `Simple C/C++ TBAA` or `Simple C++ TBAA`. However, it seems like there is no index of metadata strings that can be looked up like that. AI chat/agents are claiming that the only way to reach the metadata is by traversing instructions, which is basically what I did.\r\n> \r\n> I will restrict my search to ignore roots with all other names, but it will still be in the \"bad\" form. Do you know if there is any way the cost of this lookup could be minimized?\r\n> \r\n> If there is a way to do it once for the module and then just send the MD node pointer into `insertSpills`, I won't need to even modify coro::Shape. Any ideas?\r\n\r\nIn Metadata.h, we have `MDTuple *MDNode::getIfExists(LLVMContext &Context, ArrayRef<Metadata *> MDs);` and we have `MDString::get(LLVMContext &Context, StringRef Str)`, so I think we can write:\r\n\r\n```C++\r\nMDNode::getIfExists(C, MDString::get(C, \"Simple C++ TBAA\"));\r\n```\r\n\r\nnote that `MDString::get(LLVMContext &Context, StringRef Str)` may create the MDString if the specified string is not exist. So maybe we want to implement `MDString::getIfExists`."
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> Now that I've learned that C/C++ actually has two separate TBAA roots, I am reconsidering the implementation strategy.\r\n> \r\n> It might be better to rebuild this as the following code changes:\r\n> \r\n> * CoroSplit generates a new kind of MD (\"CoroNoAliasSlots\", \"CoroNoAliasOffsets\") that specifies which slots are safe to assume NoAlias on against non-frame-derived memops\r\n> * AA is extended to rely on this MD, when present, to prove NoAlias between a Gep/deref using a frame ptr, and unrelated memops.\r\n> \r\n> WDYT?\r\n\r\nI feel if TBAA can help us solving the problem, we don't need to reinvent the wheel."
+    },
+    {
+      "author": "Dinistro",
+      "body": "If we look at this from a more theoretical standpoint, then using TBAA for this is not the correct approach. What we are attempting to do in this draft is tricking the AA to believe that the underlying types are not the same (even though they are). While these objects can never alias, it's not type based information that guarantees this.\r\nFurthermore, this only has any impact if the frontend was actually producing TBAA for the other memory operations in the first place. While clang does do some by default, there are many projects that deal with lower level code that disable this.\r\n\r\nGiven this, I would suggest to at least attempt a different approach. The correct way to model this might be relying on alias scopes. The drawback of this is that it requires adding metadata to **all** memory instructions in the functions.\r\n"
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> If we look at this from a more theoretical standpoint, then using TBAA for this is not the correct approach. What we are attempting to do in this draft is tricking the AA to believe that the underlying types are not the same (even though they are). While these objects can never alias, it's not type based information that guarantees this. \r\n\r\nThis may not be accurate. From C++'s perspective, the type of the coroutine frame of every coroutine function is a half opaque type. We can interpret this as the type of every coroutine frame is unique."
+    },
+    {
+      "author": "yonillasky",
+      "body": "From a practical standpoint, the main problems with the current draft now are:\r\n\r\n- Relies on input program being tagged with TBAA in the first place\r\n\r\n- Even for only C/C++ as a front end, it will not suffice to produce NoAlias in all cases we want, because there are two distinct TBAA roots. You have to use one of them when you tag the slot reloads, and then it won't produce NoAlias with other memops that are using the OTHER root (the one you haven't used)\r\n\r\nI think \"teaching\" the AA itself to determine NoAlias with these slots makes more sense. It is analogous to the fact it has reasoning based on stack refs vs non-stack refs being NoAlias, regardless of types.\r\n"
+    },
+    {
+      "author": "yonillasky",
+      "body": "With that said, I'm also OK with merging this (it does provide some benefit) and then working on an alternative in another PR."
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> From a practical standpoint, the main problems with the current draft now are:\r\n> \r\n> * Relies on input program being tagged with TBAA in the first place\r\n> * Even for only C/C++ as a front end, it will not suffice to produce NoAlias in all cases we want, because there are two distinct TBAA roots. You have to use one of them when you tag the slot reloads, and then it won't produce NoAlias with other memops that are using the OTHER root (the one you haven't used)\r\n> \r\n> I think \"teaching\" the AA itself to determine NoAlias with these slots makes more sense. It is analogous to the fact it has reasoning based on stack refs vs non-stack refs being NoAlias, regardless of types.\r\n\r\nI don't think it is bad to teach AA more things. I just feel it is more complex. But as you're the author, I won't say no to that idea."
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> With that said, I'm also OK with merging this (it does provide some benefit) and then working on an alternative in another PR.\r\n\r\nThe current PR looks good to me if you can try the method I mentioned eariier to get the root by :\r\n\r\n```\r\nMDNode::getIfExists(C, MDString::get(C, \"Simple C++ TBAA\"));\r\n```"
+    },
+    {
+      "author": "yonillasky",
+      "body": "> > If we look at this from a more theoretical standpoint, then using TBAA for this is not the correct approach. What we are attempting to do in this draft is tricking the AA to believe that the underlying types are not the same (even though they are). While these objects can never alias, it's not type based information that guarantees this.\r\n> \r\n> This may not be accurate. From C++'s perspective, the type of the coroutine frame of every coroutine function is a half opaque type. We can interpret this as the type of every coroutine frame is unique.\r\n\r\nThere is a sleight of hand in here.\r\nImagine that a coroutine has captured an int x and an int *p\r\n\r\nthe coroutine has a loop where it loads x and p, then does some RMW on *p.\r\nIf we did normal C++ TBAA typing of the coroutine frame, it would consider the reload of `x` (type int) as potentially aliasing the RMW on `*p` (type is also int). AA itself also may have a hard time proving `p` and `&frame->x` (both `int*`) do not alias. so LICM will not be able to move the reload of `x` out of the loop, even though it never changes.\r\n\r\nThe fake \"scalar slot\" type in this PR makes it so we don't hit this problem, but even this hack isn't quite enough, because of the two TBAA roots problem."
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> > > If we look at this from a more theoretical standpoint, then using TBAA for this is not the correct approach. What we are attempting to do in this draft is tricking the AA to believe that the underlying types are not the same (even though they are). While these objects can never alias, it's not type based information that guarantees this.\r\n> > \r\n> > \r\n> > This may not be accurate. From C++'s perspective, the type of the coroutine frame of every coroutine function is a half opaque type. We can interpret this as the type of every coroutine frame is unique.\r\n> \r\n> There is a sleight of hand in here. Imagine that a coroutine has captured an int x and an int *p\r\n> \r\n> the coroutine has a loop where it loads x and p, then does some RMW on *p. If we did normal C++ TBAA typing of the coroutine frame, it would consider the reload of `x` (type int) as potentially aliasing the RMW on `*p` (type is also int). AA itself also may have a hard time proving `p` and `&frame->x` (both `int*`) do not alias. so LICM will not be able to move the reload of `x` out of the loop, even though it never changes.\r\n\r\nI don't understand. Why  won't  x and p alias?\r\n\r\n> \r\n> The fake \"scalar slot\" type in this PR makes it so we don't hit this problem, but even this hack isn't quite enough, because of the two TBAA roots problem.\r\n\r\nThe two TBAA roots you said is \"Simple C++ TBAA\" and \"Simple C/C++ TBAA\" ? If yes, I feel it might not be a problem.\r\n\r\n"
+    },
+    {
+      "author": "yonillasky",
+      "body": "> I don't understand. Why won't x and p alias?\r\n\r\nBecause the address of `x` is never taken (if it was, it would become an alloca slot, and we specifically exclude such slots; let's say it isn't taken in my story)\r\n\r\nAnd of course `p` could not be made to point to `frame->x` since the frame doesn't even exist before CoroSplit runs.\r\nYes, theoretically the user can clobber `frame->p` with a pointer to `frame->x` after creating the coro object, by blindly guessing the frame layout, but that code would already be broken contractually (the language makes no guarantees about the frame layout, none of the supported intrinsics allow this).\r\n\r\n> The two TBAA roots you said is \"Simple C++ TBAA\" and \"Simple C/C++ TBAA\" ? If yes, I feel it might not be a problem.\r\n\r\nYes, they are, but if let's say you put the fake scalar in \"Simple C/C++ TBAA\", and there is an unrelated store of a type under \"Simple C++ TBAA\", then AA on them will return `MayAlias` because they belong to different TBAA roots (At least that is the claim by some AI, I will check myself later to confirm)"
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> > I don't understand. Why won't x and p alias?\r\n> \r\n> Because the address of `x` is never taken (if it was, it would become an alloca slot, and we specifically exclude such slots; let's say it isn't taken in my story)\r\n\r\nAre you talking about `ByValTy`?  That works for argument only. Sorry could you elaborate on this story?\r\n\r\n> \r\n> And of course `p` could not be made to point to `frame->x` since the frame doesn't even exist before CoroSplit runs. Yes, theoretically the user can clobber `frame->p` with a pointer to `frame->x` after creating the coro object, by blindly guessing the frame layout, but that code would already be broken contractually (the language makes no guarantees about the frame layout, none of the supported intrinsics allow this).\r\n> \r\n> > The two TBAA roots you said is \"Simple C++ TBAA\" and \"Simple C/C++ TBAA\" ? If yes, I feel it might not be a problem.\r\n> \r\n> Yes, they are, but if let's say you put the fake scalar in \"Simple C/C++ TBAA\", and there is an unrelated store of a type under \"Simple C++ TBAA\", then AA on them will return `MayAlias` because they belong to different TBAA roots (At least that is the claim by some AI, I will check myself later to confirm)\r\n\r\nI guess, at least for C++, we don't need to worry for \"Simple C/C++ TBAA\"."
+    },
+    {
+      "author": "yonillasky",
+      "body": "(yes, I know SCEV might optimize out whatever I'm writing here, before the coros pass even, this example is just to illustrate)\r\n```\r\nGenerator<int> test(int n, int x, int *p) {\r\n  co_yield 0\r\n  for (int i = 0; i != n; ++i) {\r\n     // CoroSplit reloads `p` and `x` inside the loop\r\n     // If we had C++ TBAA typing for `frame`, the load/store into `frame->p` and reload of `x` (load `&frame->x`)\r\n     // are MayAlias, since they are both accessing type int.\r\n     // but of course, the address of frame->x is never taken anywhere and p is necessarily non-aliasing with it.\r\n    *p += x;\r\n  }\r\n}\r\n```\r\nRegarding the TBAA roots, yes, I am just making it always use the C++ one."
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> (yes, I know SCEV might optimize out whatever I'm writing here, before the coros pass even, this example is just to illustrate)\r\n> \r\n> ```\r\n> Generator<int> test(int n, int x, int *p) {\r\n>   co_yield 0\r\n>   for (int i = 0; i != n; ++i) {\r\n>      // CoroSplit reloads `p` and `x` inside the loop\r\n>      // If we had C++ TBAA typing for `frame`, the load/store into `frame->p` and reload of `x` (load `&frame->x`)\r\n>      // are MayAlias, since they are both accessing type int.\r\n>      // but of course, the address of frame->x is never taken anywhere and p is necessarily non-aliasing with it.\r\n>     *p += x;\r\n>   }\r\n> }\r\n> ```\r\n> \r\n> Regarding the TBAA roots, yes, I am just making it always use the C++ one.\r\n\r\nWhat if the address of x are taken somewhere and how this PR handle that? e.g.,\r\n\r\n```C++\r\nvoid take(int &);\r\nvoid take(int *&);\r\nGenerator<int> test(int n, int x, int *p) {\r\n  co_yield 0\r\n  take(x);\r\n  take(p);\r\n  for (int i = 0; i != n; ++i) {\r\n     // CoroSplit reloads `p` and `x` inside the loop\r\n     // If we had C++ TBAA typing for `frame`, the load/store into `frame->p` and reload of `x` (load `&frame->x`)\r\n     // are MayAlias, since they are both accessing type int.\r\n     // but of course, the address of frame->x is never taken anywhere and p is necessarily non-aliasing with it.\r\n    *p += x;\r\n  }\r\n}\r\n```"
+    },
+    {
+      "author": "yonillasky",
+      "body": "I think any variable that has its address taken becomes an alloca, then in CoroSplit it will be made into an \"alloca slot\" (which we don't put TBAA tags on).\r\nThat is why I don't care much about that case. Both in this PR and in the hypothetical case where we added C++-accurate TBAA for the frame structs we would get MayAlias in that case."
+    },
+    {
+      "author": "ChuanqiXu9",
+      "body": "> I think any variable that has its address taken becomes an alloca, then in CoroSplit it will be made into an \"alloca slot\" (which we don't put TBAA tags on). That is why I don't care much about that case. Both in this PR and in the hypothetical case where we added C++-accurate TBAA for the frame structs we would get MayAlias in that case.\r\n\r\nGot it. So the impact of the patch is smaller than I feel initially. But I never say no to small improvements with small changes.\r\n\r\nIt looks like there are a lot of space we can improve in this area."
+    },
+    {
+      "author": "yonillasky",
+      "body": "So, looks like it's green. How do I actually merge this? I am not a maintainer."
+    },
+    {
+      "author": "Dinistro",
+      "body": "As I'm your coworker, I can merge this for you and let you know if something starts to explode."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-17T08:37:35Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/IR/Metadata.h": [
+      [
+        734,
+        739
+      ]
+    ],
+    "llvm/lib/IR/Metadata.cpp": [
+      [
+        621,
+        626
+      ]
+    ],
+    "llvm/lib/Transforms/Coroutines/CoroFrame.cpp": [
+      [
+        25,
+        30
+      ],
+      [
+        1085,
+        1090
+      ],
+      [
+        1105,
+        1117
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/IR/Metadata.h": [
+      "getLength"
+    ],
+    "llvm/lib/IR/Metadata.cpp": [
+      "MDString::getString"
+    ],
+    "llvm/lib/Transforms/Coroutines/CoroFrame.cpp": [
+      "insertSpills"
+    ]
+  }
+}

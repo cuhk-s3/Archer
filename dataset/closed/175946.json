@@ -1,0 +1,998 @@
+{
+  "pr_id": 175946,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175946",
+  "state": "closed",
+  "title": "InstCombine: Handle fdiv in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "35efc168dd2f01babfb16cb6cba7af5c7f2e14ad",
+  "fix_commit": "abdce63afe9615c56cba71f0c3a988f29f973b33",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex b5eb24728aa01..b222bbe7bad9a 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -255,6 +255,21 @@ struct KnownFPClass {\n     return Known;\n   }\n \n+  /// Report known values for fdiv\n+  LLVM_ABI static KnownFPClass\n+  fdiv(const KnownFPClass &LHS, const KnownFPClass &RHS,\n+       DenormalMode Mode = DenormalMode::getDynamic());\n+\n+  /// Report known values for fdiv x, x\n+  LLVM_ABI static KnownFPClass\n+  fdiv_self(const KnownFPClass &Src,\n+            DenormalMode Mode = DenormalMode::getDynamic());\n+\n+  /// Report known values for frem\n+  LLVM_ABI static KnownFPClass\n+  frem_self(const KnownFPClass &Src,\n+            DenormalMode Mode = DenormalMode::getDynamic());\n+\n   /// Report known values for fma\n   LLVM_ABI static KnownFPClass\n   fma(const KnownFPClass &LHS, const KnownFPClass &RHS,\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 8641ab6f28e33..abf0bac3ee70a 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5656,13 +5656,12 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n       const fltSemantics &FltSem =\n           Op->getType()->getScalarType()->getFltSemantics();\n \n-      if (KnownSrc.isKnownNeverInfOrNaN() &&\n-          KnownSrc.isKnownNeverLogicalZero(F ? F->getDenormalMode(FltSem)\n-                                             : DenormalMode::getDynamic()))\n-        Known.knownNot(fcNan);\n-      else if (KnownSrc.isKnownNever(fcSNan))\n-        Known.knownNot(fcSNan);\n+      DenormalMode Mode =\n+          F ? F->getDenormalMode(FltSem) : DenormalMode::getDynamic();\n \n+      Known = Op->getOpcode() == Instruction::FDiv\n+                  ? KnownFPClass::fdiv_self(KnownSrc, Mode)\n+                  : KnownFPClass::frem_self(KnownSrc, Mode);\n       break;\n     }\n \n@@ -5692,39 +5691,9 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n         Op->getType()->getScalarType()->getFltSemantics();\n \n     if (Op->getOpcode() == Instruction::FDiv) {\n-      // Only 0/0, Inf/Inf produce NaN.\n-      if (KnownLHS.isKnownNeverNaN() && KnownRHS.isKnownNeverNaN() &&\n-          (KnownLHS.isKnownNeverInfinity() ||\n-           KnownRHS.isKnownNeverInfinity()) &&\n-          ((F &&\n-            KnownLHS.isKnownNeverLogicalZero(F->getDenormalMode(FltSem))) ||\n-           (F &&\n-            KnownRHS.isKnownNeverLogicalZero(F->getDenormalMode(FltSem))))) {\n-        Known.knownNot(fcNan);\n-      }\n-\n-      // xor sign bit.\n-      // X / -0.0 is -Inf (or NaN).\n-      // +X / +X is +X\n-      if ((KnownLHS.isKnownNever(fcNegative) &&\n-           KnownRHS.isKnownNever(fcNegative)) ||\n-          (KnownLHS.isKnownNever(fcPositive) &&\n-           KnownRHS.isKnownNever(fcPositive)))\n-        Known.knownNot(fcNegative);\n-\n-      if ((KnownLHS.isKnownNever(fcPositive) &&\n-           KnownRHS.isKnownNever(fcNegative)) ||\n-          (KnownLHS.isKnownNever(fcNegative) &&\n-           KnownRHS.isKnownNever(fcPositive)))\n-        Known.knownNot(fcPositive);\n-\n-      // 0 / x => 0 or nan\n-      if (KnownLHS.isKnownAlways(fcZero))\n-        Known.knownNot(fcSubnormal | fcNormal | fcInf);\n-\n-      // x / 0 => nan or inf\n-      if (KnownRHS.isKnownAlways(fcZero))\n-        Known.knownNot(fcFinite);\n+      DenormalMode Mode =\n+          F ? F->getDenormalMode(FltSem) : DenormalMode::getDynamic();\n+      Known = KnownFPClass::fdiv(KnownLHS, KnownRHS, Mode);\n     } else {\n       // Inf REM x and x REM 0 produce NaN.\n       if (KnownLHS.isKnownNeverNaN() && KnownRHS.isKnownNeverNaN() &&\ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex 4b1d7367f103d..af8a638eb4338 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -358,6 +358,68 @@ KnownFPClass KnownFPClass::fmul(const KnownFPClass &KnownLHS,\n   return Known;\n }\n \n+KnownFPClass KnownFPClass::fdiv(const KnownFPClass &KnownLHS,\n+                                const KnownFPClass &KnownRHS,\n+                                DenormalMode Mode) {\n+  KnownFPClass Known;\n+\n+  // Only 0/0, Inf/Inf produce NaN.\n+  if (KnownLHS.isKnownNeverNaN() && KnownRHS.isKnownNeverNaN() &&\n+      (KnownLHS.isKnownNeverInfinity() || KnownRHS.isKnownNeverInfinity()) &&\n+      (KnownLHS.isKnownNeverLogicalZero(Mode) ||\n+       KnownRHS.isKnownNeverLogicalZero(Mode))) {\n+    Known.knownNot(fcNan);\n+  }\n+\n+  // xor sign bit.\n+  // X / -0.0 is -Inf (or NaN).\n+  // +X / +X is +X\n+  if ((KnownLHS.isKnownNever(fcNegative) &&\n+       KnownRHS.isKnownNever(fcNegative)) ||\n+      (KnownLHS.isKnownNever(fcPositive) && KnownRHS.isKnownNever(fcPositive)))\n+    Known.knownNot(fcNegative);\n+\n+  if ((KnownLHS.isKnownNever(fcPositive) &&\n+       KnownRHS.isKnownNever(fcNegative)) ||\n+      (KnownLHS.isKnownNever(fcNegative) && KnownRHS.isKnownNever(fcPositive)))\n+    Known.knownNot(fcPositive);\n+\n+  // 0 / x => 0 or nan\n+  if (KnownLHS.isKnownAlways(fcZero))\n+    Known.knownNot(fcSubnormal | fcNormal | fcInf);\n+\n+  // x / 0 => nan or inf\n+  if (KnownRHS.isKnownAlways(fcZero))\n+    Known.knownNot(fcFinite);\n+\n+  return Known;\n+}\n+\n+KnownFPClass KnownFPClass::fdiv_self(const KnownFPClass &KnownSrc,\n+                                     DenormalMode Mode) {\n+  // X / X is always exactly 1.0 or a NaN.\n+  KnownFPClass Known(fcNan | fcPosNormal);\n+\n+  if (KnownSrc.isKnownNeverInfOrNaN() && KnownSrc.isKnownNeverLogicalZero(Mode))\n+    Known.knownNot(fcNan);\n+  else if (KnownSrc.isKnownNever(fcSNan))\n+    Known.knownNot(fcSNan);\n+\n+  return Known;\n+}\n+KnownFPClass KnownFPClass::frem_self(const KnownFPClass &KnownSrc,\n+                                     DenormalMode Mode) {\n+  // X % X is always exactly [+-]0.0 or a NaN.\n+  KnownFPClass Known(fcNan | fcZero);\n+\n+  if (KnownSrc.isKnownNeverInfOrNaN() && KnownSrc.isKnownNeverLogicalZero(Mode))\n+    Known.knownNot(fcNan);\n+  else if (KnownSrc.isKnownNever(fcSNan))\n+    Known.knownNot(fcSNan);\n+\n+  return Known;\n+}\n+\n KnownFPClass KnownFPClass::fma(const KnownFPClass &KnownLHS,\n                                const KnownFPClass &KnownRHS,\n                                const KnownFPClass &KnownAddend,\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex f7870a0b6314f..77ea1c9f8f7d8 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2513,6 +2513,136 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n \n     return nullptr;\n   }\n+  case Instruction::FDiv: {\n+    Value *X = I->getOperand(0);\n+    Value *Y = I->getOperand(1);\n+    if (X == Y && isGuaranteedNotToBeUndef(X, SQ.AC, CxtI, SQ.DT, Depth + 1)) {\n+      // If the source is 0, inf or nan, the result is a nan\n+\n+      Value *IsZeroOrNan = Builder.CreateFCmpFMF(\n+          FCmpInst::FCMP_UEQ, I->getOperand(0), ConstantFP::getZero(VTy), FMF);\n+\n+      Value *Fabs =\n+          Builder.CreateUnaryIntrinsic(Intrinsic::fabs, I->getOperand(0), FMF);\n+      Value *IsInfOrNan = Builder.CreateFCmpFMF(\n+          FCmpInst::FCMP_UEQ, Fabs, ConstantFP::getInfinity(VTy), FMF);\n+\n+      Value *IsInfOrZeroOrNan = Builder.CreateOr(IsInfOrNan, IsZeroOrNan);\n+\n+      return Builder.CreateSelectFMF(\n+          IsInfOrZeroOrNan, ConstantFP::getQNaN(VTy),\n+          ConstantFP::get(\n+              VTy, APFloat::getOne(VTy->getScalarType()->getFltSemantics())),\n+          FMF);\n+    }\n+\n+    Type *EltTy = VTy->getScalarType();\n+    DenormalMode Mode = F.getDenormalMode(EltTy->getFltSemantics());\n+\n+    // Every output class could require denormal inputs (except for the\n+    // degenerate case of only-nan results, without DAZ).\n+    FPClassTest SrcDemandedMask = (DemandedMask & fcNan) | fcSubnormal;\n+\n+    // Normal inputs may result in underflow.\n+    // x / x = 1.0 for non0/inf/nan\n+    // -x = +y / -z\n+    // -x = -y / +z\n+    if (DemandedMask & (fcSubnormal | fcNormal))\n+      SrcDemandedMask |= fcNormal;\n+\n+    if (DemandedMask & fcNan) {\n+      // 0 / 0 = nan\n+      // inf / inf = nan\n+\n+      // Subnormal is added in case of DAZ, but this isn't strictly\n+      // necessary. Every other input class implies a possible subnormal source,\n+      // so this only could matter in the degenerate case of only-nan results.\n+      SrcDemandedMask |= fcZero | fcInf;\n+    }\n+\n+    // Zero outputs may be the result of underflow.\n+    if (DemandedMask & fcZero)\n+      SrcDemandedMask |= fcNormal | fcSubnormal;\n+\n+    FPClassTest LHSDemandedMask = SrcDemandedMask;\n+    FPClassTest RHSDemandedMask = SrcDemandedMask;\n+\n+    // 0 / inf = 0\n+    if (DemandedMask & fcZero) {\n+      assert((LHSDemandedMask & fcSubnormal) &&\n+             \"should not have to worry about daz here\");\n+      LHSDemandedMask |= fcZero;\n+      RHSDemandedMask |= fcInf;\n+    }\n+\n+    // x / 0 = inf\n+    // large_normal / small_normal = inf\n+    // inf / 1 = inf\n+    // large_normal / subnormal = inf\n+    if (DemandedMask & fcInf) {\n+      LHSDemandedMask |= fcInf | fcNormal | fcSubnormal;\n+      RHSDemandedMask |= fcZero | fcSubnormal | fcNormal;\n+    }\n+\n+    KnownFPClass KnownLHS, KnownRHS;\n+    if (SimplifyDemandedFPClass(I, 0, LHSDemandedMask, KnownLHS, Depth + 1) ||\n+        SimplifyDemandedFPClass(I, 1, RHSDemandedMask, KnownRHS, Depth + 1))\n+      return I;\n+\n+    bool ResultNotNan = (DemandedMask & fcNan) == fcNone;\n+    bool ResultNotInf = (DemandedMask & fcInf) == fcNone;\n+    if (ResultNotNan) {\n+      KnownLHS.knownNot(fcNan);\n+      KnownRHS.knownNot(fcNan);\n+    }\n+\n+    // nsz [+-]0 / x -> 0\n+    if (FMF.noSignedZeros() && KnownLHS.isKnownAlways(fcZero) &&\n+        (ResultNotNan || KnownRHS.isKnownNeverNaN()))\n+      return ConstantFP::getZero(VTy);\n+\n+    if (KnownLHS.isKnownAlways(fcPosZero) &&\n+        (ResultNotNan || KnownRHS.isKnownNeverNaN())) {\n+      // nnan +0 / x -> copysign(0, rhs)\n+      // TODO: -0 / x => copysign(0, fneg(rhs))\n+      Value *Copysign = Builder.CreateCopySign(X, Y, FMF);\n+      Copysign->takeName(I);\n+      return Copysign;\n+    }\n+\n+    if (!ResultNotInf &&\n+        ((ResultNotNan || (KnownLHS.isKnownNeverNaN() &&\n+                           KnownLHS.isKnownNeverLogicalZero(Mode))) &&\n+         (KnownRHS.isKnownAlways(fcPosZero) ||\n+          (FMF.noSignedZeros() && KnownRHS.isKnownAlways(fcZero))))) {\n+      // nnan x / 0 => copysign(inf, x);\n+      // nnan nsz x / -0 => copysign(inf, x);\n+      Value *Copysign =\n+          Builder.CreateCopySign(ConstantFP::getInfinity(VTy), X, FMF);\n+      Copysign->takeName(I);\n+      return Copysign;\n+    }\n+\n+    // nnan ninf X / [-]0.0 -> poison\n+    if (ResultNotNan && ResultNotInf && KnownRHS.isKnownAlways(fcZero))\n+      return PoisonValue::get(VTy);\n+\n+    Known = KnownFPClass::fdiv(KnownLHS, KnownRHS, Mode);\n+\n+    FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n+    if (Constant *SingleVal =\n+            getFPClassConstant(VTy, ValidResults, /*IsCanonicalizing=*/true))\n+      return SingleVal;\n+\n+    FastMathFlags InferredFMF =\n+        inferFastMathValueFlagsBinOp(FMF, ValidResults, KnownLHS, KnownRHS);\n+    if (InferredFMF != FMF) {\n+      I->setFastMathFlags(InferredFMF);\n+      return I;\n+    }\n+\n+    return nullptr;\n+  }\n   case Instruction::FPTrunc:\n     return simplifyDemandedUseFPClassFPTrunc(*this, *I, DemandedMask, Known,\n                                              Depth);\n",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "description": "",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "nan_result_demands_subnorm_lhs__daz",
+          "test_body": "define nofpclass(inf zero sub norm) half @nan_result_demands_subnorm_lhs__daz(i1 %cond, half nofpclass(nan inf zero norm) %only.sub, half %unknown0, half %unknown1) #0 {\n  %select = select i1 %cond, half %unknown0, half %only.sub\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_only_negative_results_self_maybe_undef",
+          "test_body": "define nofpclass(nan pinf pzero psub pnorm) half @ret_only_negative_results_self_maybe_undef(half %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_fdiv_ninf_self",
+          "test_body": "define nofpclass(snan) half @ret_fdiv_ninf_self(half noundef %x) {\n  %div = fdiv ninf half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_zero_or_nan_results_self",
+          "test_body": "define nofpclass(inf sub norm) half @ret_only_zero_or_nan_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__not_nan_not_zero_not_sub__fdiv_nsz__zero__daz",
+          "test_body": "define nofpclass(snan) half @ret__not_nan_not_zero_not_sub__fdiv_nsz__zero__daz(half nofpclass(nan zero sub) %not.nan.or.zero.or.sub, half nofpclass(nan inf sub norm) %zero) #0 {\n  %div = fdiv nsz contract half %not.nan.or.zero.or.sub, %zero\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_src_must_be_zero_self",
+          "test_body": "define nofpclass(inf) half @ret_src_must_be_zero_self(half noundef nofpclass(nan inf sub norm) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_must_be_zero_or_nan_self__preserve_flags",
+          "test_body": "define nofpclass(inf) half @ret_src_must_be_zero_or_nan_self__preserve_flags(half noundef nofpclass(inf sub norm) %x) {\n  %div = fdiv contract half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "zero_result_demands_norm_source_lhs",
+          "test_body": "declare nofpclass(nan inf zero sub) half @returns_norm()\n\ndefine nofpclass(nan inf sub norm) half @zero_result_demands_norm_source_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %norm = call half @returns_norm()\n  %select = select i1 %cond, half %norm, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "norm_result_demands_sub_source_rhs",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(nan inf zero sub) half @norm_result_demands_sub_source_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %sub = call half @returns_sub()\n  %select = select i1 %cond, half %sub, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nopnorm_self",
+          "test_body": "define nofpclass(pnorm) half @ret_nopnorm_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_noinf_nonan__not_inf_or_nan__fdiv__known_pzero_or_nan",
+          "test_body": "define nofpclass(nan inf) half @ret_noinf_nonan__not_inf_or_nan__fdiv__known_pzero_or_nan(half nofpclass(inf nzero sub norm) %pzero.or.nan, half %unknown) {\n  %div = fdiv half %pzero.or.nan, %unknown\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan_result__known_negative_non0__fdiv__known_inf_or_nan",
+          "test_body": "define nofpclass(nan) half @ret_no_nan_result__known_negative_non0__fdiv__known_inf_or_nan(half nofpclass(pinf zero psub pnorm) %negative.non0, half nofpclass(zero sub norm) %inf.or.nan) {\n  %div = fdiv half %negative.non0, %inf.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_noinf_nonan__known_pzero_or_nan__fdiv__not_inf_or_nan",
+          "test_body": "define nofpclass(nan inf) half @ret_noinf_nonan__known_pzero_or_nan__fdiv__not_inf_or_nan(half nofpclass(inf nzero sub norm) %pzero.or.nan, half %unknown) {\n  %div = fdiv half %pzero.or.nan, %unknown\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_must_be_zero_or_nan_self",
+          "test_body": "define nofpclass(inf) half @ret_src_must_be_zero_or_nan_self(half noundef nofpclass(inf sub norm) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fdiv_pzero__unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(nan) half @ret_no_nan__fdiv_pzero__unknown(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %fdiv = fdiv half %pzero, %unknown\n  ret half %fdiv\n}\n"
+        },
+        {
+          "test_name": "ret__not_nan_not_zero__fdiv_nsz__zero__dynamic",
+          "test_body": "define nofpclass(snan) half @ret__not_nan_not_zero__fdiv_nsz__zero__dynamic(half nofpclass(nan zero) %not.nan.or.zero.or.sub, half nofpclass(nan inf sub norm) %zero) #0 {\n  %div = fdiv nsz contract half %not.nan.or.zero.or.sub, %zero\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,dynamic\" }\n"
+        },
+        {
+          "test_name": "pinf_result_demands_zero_rhs",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan ninf zero sub) half @pinf_result_demands_zero_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %zero = call half @returns_zero()\n  %select = select i1 %cond, half %zero, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fdiv__zero",
+          "test_body": "define nofpclass(nan) half @ret_nonan__unknown__fdiv__zero(half %unknown, half nofpclass(nan inf sub norm) %zero) {\n  %div = fdiv half %unknown, %zero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "zero_result_demand_inf_rhs",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan inf norm) half @zero_result_demand_inf_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %inf = call half @returns_inf()\n  %inf.or.unknown = select i1 %cond, half %inf, half %unknown0\n  %div = fdiv half %unknown1, %inf.or.unknown\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_qnan_results_fdiv",
+          "test_body": "define nofpclass(snan inf zero sub norm) half @ret_only_qnan_results_fdiv(half %x, half %y) {\n  %div = fdiv half %x, %y\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__unknown__fdiv__pzero",
+          "test_body": "define nofpclass(snan) half @ret__unknown__fdiv__pzero(half %unknown, half nofpclass(nan inf nzero sub norm) %pzero) {\n  %div = fdiv half %unknown, %pzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__not_nan_not_zero_not_sub__fdiv_nsz__zero__dynamic",
+          "test_body": "define nofpclass(snan) half @ret__not_nan_not_zero_not_sub__fdiv_nsz__zero__dynamic(half nofpclass(nan zero sub) %not.nan.or.zero.or.sub, half nofpclass(nan inf sub norm) %zero) #0 {\n  %div = fdiv nsz contract half %not.nan.or.zero.or.sub, %zero\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,dynamic\" }\n"
+        },
+        {
+          "test_name": "sub_result_demands_norm_source_rhs",
+          "test_body": "declare nofpclass(nan inf zero sub) half @returns_norm()\n\ndefine nofpclass(nan inf zero norm) half @sub_result_demands_norm_source_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %norm = call half @returns_norm()\n  %select = select i1 %cond, half %norm, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fdiv__nzero",
+          "test_body": "define nofpclass(nan) half @ret_nonan__unknown__fdiv__nzero(half %unknown, half nofpclass(nan inf pzero sub norm) %nzero) {\n  %div = fdiv half %unknown, %nzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_negative_results_or_nan_fabs_xy",
+          "test_body": "define nofpclass(pinf pzero psub pnorm) half @ret_only_negative_results_or_nan_fabs_xy(half %x, half nofpclass(ninf nzero nsub nnorm) %y.pos.or.nan) {\n  %x.fabs = call half @llvm.fabs.f16(half %x)\n  %div = fdiv half %x.fabs, %y.pos.or.nan\n  ret half %div\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_psub_lhs",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_psub_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %psub = call half @returns_psub()\n  %select = select i1 %cond, half %psub, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_nonan_self",
+          "test_body": "define nofpclass(snan) half @ret_src_nonan_self(half noundef nofpclass(nan) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_noinf__not_inf_or_nan__fdiv__nzero_or_nan",
+          "test_body": "define nofpclass(inf) half @ret_noinf__not_inf_or_nan__fdiv__nzero_or_nan(half nofpclass(nan) %not.nan, half nofpclass(inf pzero sub norm) %nzero.or.nan) {\n  %div = fdiv half %not.nan, %nzero.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__unknown__fdiv_nsz__zero",
+          "test_body": "define nofpclass(snan) half @ret__unknown__fdiv_nsz__zero(half %unknown, half nofpclass(nan inf sub norm) %zero) {\n  %div = fdiv nsz contract half %unknown, %zero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__not_nan_not_zero__fdiv_nsz__zero",
+          "test_body": "define nofpclass(snan) half @ret__not_nan_not_zero__fdiv_nsz__zero(half nofpclass(nan zero) %not.nan.or.zero, half nofpclass(nan inf sub norm) %zero) {\n  %div = fdiv nsz contract half %not.nan.or.zero, %zero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ninf_result_demands_zero_rhs",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan pinf zero sub) half @ninf_result_demands_zero_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %zero = call half @returns_zero()\n  %select = select i1 %cond, half %zero, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_subnorm_lhs__ieee",
+          "test_body": "define nofpclass(inf zero sub norm) half @nan_result_demands_subnorm_lhs__ieee(i1 %cond, half nofpclass(nan inf zero norm) %only.sub, half %unknown0, half %unknown1) {\n  %select = select i1 %cond, half %unknown0, half %only.sub\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_psub_rhs",
+          "test_body": "declare nofpclass(nan inf zero nsub norm) half @returns_psub()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_psub_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %psub = call half @returns_psub()\n  %select = select i1 %cond, half %psub, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_subnorm_lhs__dynamic",
+          "test_body": "define nofpclass(inf zero sub norm) half @nan_result_demands_subnorm_lhs__dynamic(i1 %cond, half nofpclass(nan inf zero norm) %only.sub, half %unknown0, half %unknown1) #0 {\n  %select = select i1 %cond, half %unknown0, half %only.sub\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,dynamic\" }\n"
+        },
+        {
+          "test_name": "ret_no_inf_or_nan_results__lhs_known_non_inf",
+          "test_body": "define nofpclass(nan inf) half @ret_no_inf_or_nan_results__lhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) {\n  %x.or.pinf = select i1 %cond, half %x, half 0xH7C00\n  %div = fdiv half %x.or.pinf, %y\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__noinf_or_nan__fdiv__known_pzero_or_nan",
+          "test_body": "define nofpclass(nan) half @ret_nonan__noinf_or_nan__fdiv__known_pzero_or_nan(half nofpclass(nan) %not.nan, half nofpclass(nan nzero sub norm) %pzero.or.inf) {\n  %div = fdiv half %not.nan, %pzero.or.inf\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fdiv_nsz__nzero",
+          "test_body": "define nofpclass(nan) half @ret_nonan__unknown__fdiv_nsz__nzero(half %unknown, half nofpclass(nan inf pzero sub norm) %nzero) {\n  %div = fdiv nsz contract half %unknown, %nzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fdiv_unknown__zero",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan) half @ret_no_nan__fdiv_unknown__zero(half %unknown) {\n  %zero = call half @returns_zero()\n  %fdiv = fdiv half %unknown, %zero\n  ret half %fdiv\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fdiv_nsz__pzero",
+          "test_body": "define nofpclass(nan) half @ret_nonan__unknown__fdiv_nsz__pzero(half %unknown, half nofpclass(nan inf nzero sub norm) %pzero) {\n  %div = fdiv nsz contract half %unknown, %pzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_fdiv_nnan_ninf_self",
+          "test_body": "define nofpclass(snan) half @ret_fdiv_nnan_ninf_self(half noundef %x) {\n  %div = fdiv nnan ninf half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "nnorm_result_demands_pnorm_lhs",
+          "test_body": "declare nofpclass(nan inf zero sub nnorm) half @returns_pnorm()\n\ndefine nofpclass(nan inf zero pnorm) half @nnorm_result_demands_pnorm_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %pnorm = call half @returns_pnorm()\n  %select = select i1 %cond, half %pnorm, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan_result__known_pzero__fdiv__not_inf",
+          "test_body": "define nofpclass(nan) half @ret_no_nan_result__known_pzero__fdiv__not_inf(half nofpclass(inf nzero sub norm) %pzero.or.nan, half nofpclass(nan inf) %not.inf.or.nan) {\n  %div = fdiv half %pzero.or.nan, %not.inf.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__nzero_or_nan__fdiv_nnan__not_inf_or_nan",
+          "test_body": "define nofpclass(snan) half @ret__nzero_or_nan__fdiv_nnan__not_inf_or_nan(half nofpclass(inf pzero sub norm) %nzero.or.nan, half %unknown) {\n  %div = fdiv nnan half %nzero.or.nan, %unknown\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_positive_results_or_nan_known_negative_fdiv",
+          "test_body": "define nofpclass(ninf nzero nsub nnorm) half @ret_only_positive_results_or_nan_known_negative_fdiv(half nofpclass(ninf nzero nsub nnorm) %only.positive.or.nan, half nofpclass(pinf pzero psub pnorm) %only.negative.or.nan) {\n  %div = fdiv half %only.negative.or.nan, %only.positive.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_nsub_lhs",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nsub_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %nsub = call half @returns_nsub()\n  %select = select i1 %cond, half %nsub, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_nozero_nosub_self__daz",
+          "test_body": "define nofpclass(snan) half @ret_src_nozero_nosub_self__daz(half noundef nofpclass(zero sub) %x) #0 {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_no_pinf_or_nan_results__lhs_known_non_inf",
+          "test_body": "define nofpclass(nan pinf) half @ret_no_pinf_or_nan_results__lhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) {\n  %x.or.pinf = select i1 %cond, half %x, half 0xH7C00\n  %div = fdiv half %x.or.pinf, %y\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_self",
+          "test_body": "define nofpclass(nan) half @ret_nonan_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_inf_or_nan_results__rhs_known_non_inf",
+          "test_body": "define nofpclass(nan inf) half @ret_no_inf_or_nan_results__rhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) {\n  %y.or.pinf = select i1 %cond, half %y, half 0xH7C00\n  %div = fdiv half %x, %y.or.pinf\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fdiv_nsz__zero",
+          "test_body": "define nofpclass(nan) half @ret_nonan__unknown__fdiv_nsz__zero(half %unknown, half nofpclass(nan inf sub norm) %zero) {\n  %div = fdiv nsz contract half %unknown, %zero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__unknown__fdiv_nsz__pzero",
+          "test_body": "define nofpclass(snan) half @ret__unknown__fdiv_nsz__pzero(half %unknown, half nofpclass(nan inf nzero sub norm) %pzero) {\n  %div = fdiv nsz contract half %unknown, %pzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_nnorm_rhs",
+          "test_body": "declare nofpclass(nan inf zero sub pnorm) half @returns_nnorm()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nnorm_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %nnorm = call half @returns_nnorm()\n  %select = select i1 %cond, half %nnorm, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan_result__known_inf_or_nan__fdiv__known_negative_non0",
+          "test_body": "define nofpclass(nan) half @ret_no_nan_result__known_inf_or_nan__fdiv__known_negative_non0(half nofpclass(zero sub norm) %inf.or.nan, half nofpclass(pinf zero psub pnorm) %negative.non0) {\n  %div = fdiv half %inf.or.nan, %negative.non0\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_qnan_results_self",
+          "test_body": "define nofpclass(snan inf zero sub norm) half @ret_only_qnan_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fdiv_zero__unknown",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan) half @ret_no_nan__fdiv_zero__unknown(half %unknown) {\n  %zero = call half @returns_zero()\n  %fdiv = fdiv half %zero, %unknown\n  ret half %fdiv\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__known_zero_or_nan__fdiv__not_nan",
+          "test_body": "define nofpclass(nan) half @ret_nonan__known_zero_or_nan__fdiv__not_nan(half nofpclass(nan nzero sub norm) %pzero.or.inf, half nofpclass(nan) %not.nan) {\n  %div = fdiv half %pzero.or.inf, %not.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "sub_result_demands_sub_rhs",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(nan inf zero norm) half @sub_result_demands_sub_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %sub = call half @returns_sub()\n  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n  %div = fdiv half %unknown1, %sub.or.unknown\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fdiv_unknown__nzero",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(nan) half @ret_no_nan__fdiv_unknown__nzero(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %fdiv = fdiv half %unknown, %nzero\n  ret half %fdiv\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__known_zero_or_nan__fdiv__unknown",
+          "test_body": "define nofpclass(nan) half @ret_nonan__known_zero_or_nan__fdiv__unknown(half nofpclass(inf sub norm) %zero.or.nan, half %unknown) {\n  %div = fdiv half %zero.or.nan, %unknown\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "zero_result_demands_subnorm_lhs__daz",
+          "test_body": "define nofpclass(nan inf sub norm) half @zero_result_demands_subnorm_lhs__daz(i1 %cond, half nofpclass(nan inf zero norm) %only.sub, half %unknown0, half %unknown1) #0 {\n  %select = select i1 %cond, half %unknown0, half %only.sub\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"preserve-sign,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_nopinf_self",
+          "test_body": "define nofpclass(pinf) half @ret_nopinf_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__zero_or_nan__fdiv_nsz__unknown",
+          "test_body": "define nofpclass(nan) half @ret_nonan__zero_or_nan__fdiv_nsz__unknown(half nofpclass(inf sub norm) %zero.or.nan, half %unknown) {\n  %div = fdiv nsz contract half %zero.or.nan, %unknown\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__unknown__fdiv_nsz__nzero",
+          "test_body": "define nofpclass(snan) half @ret__unknown__fdiv_nsz__nzero(half %unknown, half nofpclass(nan inf pzero sub norm) %nzero) {\n  %div = fdiv nsz contract half %unknown, %nzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_noinf__noinf_or_nan__fdiv__known_pzero_or_nan",
+          "test_body": "define nofpclass(inf) half @ret_noinf__noinf_or_nan__fdiv__known_pzero_or_nan(half nofpclass(nan) %not.nan, half nofpclass(nan nzero sub norm) %pzero.or.inf) {\n  %div = fdiv half %not.nan, %pzero.or.inf\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_fdiv_nnan_self",
+          "test_body": "define nofpclass(snan) half @ret_fdiv_nnan_self(half noundef %x) {\n  %div = fdiv nnan half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "zero_result_demands_sub_source_lhs",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(nan inf sub norm) half @zero_result_demands_sub_source_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %sub = call half @returns_sub()\n  %select = select i1 %cond, half %sub, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan_result__not_inf_or_nan__fdiv__known_pzero_or_nan",
+          "test_body": "define nofpclass(nan) half @ret_no_nan_result__not_inf_or_nan__fdiv__known_pzero_or_nan(half nofpclass(inf) %not.inf.or.nan, half nofpclass(inf nzero sub norm) %pzero.or.nan) {\n  %div = fdiv half %not.inf.or.nan, %pzero.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_must_be_zero_or_nan_self_other_use_input1",
+          "test_body": "declare void @use(half)\n\ndefine nofpclass(inf) half @ret_src_must_be_zero_or_nan_self_other_use_input1(half noundef nofpclass(inf sub norm) %x) {\n  %div = fdiv half %x, %x\n  call void @use(half %x)\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_subnorm_rhs__ieee",
+          "test_body": "define nofpclass(inf zero sub norm) half @nan_result_demands_subnorm_rhs__ieee(i1 %cond, half nofpclass(nan inf zero norm) %only.sub, half %unknown0, half %unknown1) {\n  %select = select i1 %cond, half %unknown0, half %only.sub\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nozero_self",
+          "test_body": "define nofpclass(zero) half @ret_nozero_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_must_be_nan_self",
+          "test_body": "define nofpclass(nzero) half @ret_src_must_be_nan_self(half noundef nofpclass(inf zero sub norm) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_must_be_pzero",
+          "test_body": "define nofpclass(inf) half @ret_src_must_be_pzero(half noundef nofpclass(nan inf nzero sub norm) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__unknown__fdiv__nzero",
+          "test_body": "define nofpclass(snan) half @ret__unknown__fdiv__nzero(half %unknown, half nofpclass(nan inf pzero sub norm) %nzero) {\n  %div = fdiv half %unknown, %nzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "zero_result_demands_sub_source_rhs",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(nan inf sub norm) half @zero_result_demands_sub_source_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %sub = call half @returns_sub()\n  %select = select i1 %cond, half %sub, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_snan_results_fdiv",
+          "test_body": "define nofpclass(qnan inf zero sub norm) half @ret_only_snan_results_fdiv(half %x, half %y) {\n  %div = fdiv half %x, %y\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_ninf_results_self",
+          "test_body": "define nofpclass(nan pinf zero sub norm) half @ret_only_ninf_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "zero_result_demands_norm_source_rhs",
+          "test_body": "declare nofpclass(nan inf zero sub) half @returns_norm()\n\ndefine nofpclass(nan inf sub norm) half @zero_result_demands_norm_source_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %norm = call half @returns_norm()\n  %select = select i1 %cond, half %norm, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan_noinf__unknown__fdiv__zero_or_nan",
+          "test_body": "define nofpclass(nan inf) half @ret_nonan_noinf__unknown__fdiv__zero_or_nan(half %unknown, half nofpclass(inf sub norm) %zero.or.nan) {\n  %div = fdiv half %unknown, %zero.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_nan_results_fdiv",
+          "test_body": "define nofpclass(inf zero sub norm) half @ret_only_nan_results_fdiv(half %x, half %y) {\n  %div = fdiv half %x, %y\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_nozero_nosub_self",
+          "test_body": "define nofpclass(snan) half @ret_src_nozero_nosub_self(half noundef nofpclass(zero sub) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret__not_nan__fdiv_nsz__zero",
+          "test_body": "define nofpclass(snan) half @ret__not_nan__fdiv_nsz__zero(half nofpclass(nan) %not.nan, half nofpclass(nan inf sub norm) %zero) {\n  %div = fdiv nsz contract half %not.nan, %zero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fdiv__zero_or_nan",
+          "test_body": "define nofpclass(nan) half @ret_nonan__unknown__fdiv__zero_or_nan(half %unknown, half nofpclass(inf sub norm) %zero.or.nan) {\n  %div = fdiv half %unknown, %zero.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_nozero_self",
+          "test_body": "define nofpclass(snan) half @ret_src_nozero_self(half noundef nofpclass(zero) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fdiv_nzero__unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) half @returns_nzero()\n\ndefine nofpclass(nan) half @ret_no_nan__fdiv_nzero__unknown(half %unknown) {\n  %nzero = call half @returns_nzero()\n  %fdiv = fdiv half %nzero, %unknown\n  ret half %fdiv\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__nzero_or_nan__fdiv__not_inf_or_nan",
+          "test_body": "define nofpclass(nan) half @ret_nonan__nzero_or_nan__fdiv__not_inf_or_nan(half nofpclass(inf pzero sub norm) %nzero.or.nan, half nofpclass(nan) %not.nan) {\n  %div = fdiv half %nzero.or.nan, %not.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "not_inf_or_nan__fdiv_nnan__nzero_or_nan",
+          "test_body": "define nofpclass(snan) half @not_inf_or_nan__fdiv_nnan__nzero_or_nan(half %unknown, half nofpclass(inf pzero sub norm) %nzero.or.nan) {\n  %div = fdiv nnan half %unknown, %nzero.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_nan_results_self",
+          "test_body": "define nofpclass(inf zero sub norm) half @ret_only_nan_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fdiv_unknown__pzero",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) half @returns_pzero()\n\ndefine nofpclass(nan) half @ret_no_nan__fdiv_unknown__pzero(half %unknown) {\n  %pzero = call half @returns_pzero()\n  %fdiv = fdiv half %unknown, %pzero\n  ret half %fdiv\n}\n"
+        },
+        {
+          "test_name": "ret_src_must_be_nzero",
+          "test_body": "define nofpclass(inf) half @ret_src_must_be_nzero(half noundef nofpclass(nan inf pzero sub norm) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_noinf_self",
+          "test_body": "define nofpclass(inf) half @ret_noinf_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_noninf_self",
+          "test_body": "define nofpclass(ninf) half @ret_noninf_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_not_inf_or_nan__fdiv_ninf__nzero_or_nan",
+          "test_body": "define nofpclass(snan) half @ret_not_inf_or_nan__fdiv_ninf__nzero_or_nan(half nofpclass(nan) %not.nan, half nofpclass(inf pzero sub norm) %nzero.or.nan) {\n  %div = fdiv ninf half %not.nan, %nzero.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_subnorm_rhs__dynamic",
+          "test_body": "define nofpclass(inf zero sub norm) half @nan_result_demands_subnorm_rhs__dynamic(i1 %cond, half nofpclass(nan inf zero norm) %only.sub, half %unknown0, half %unknown1) #0 {\n  %select = select i1 %cond, half %unknown0, half %only.sub\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,dynamic\" }\n"
+        },
+        {
+          "test_name": "ret_src_nozero_self__daz",
+          "test_body": "define nofpclass(snan) half @ret_src_nozero_self__daz(half noundef nofpclass(zero) %x) #0 {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "ret_only_positive_results_known_negative_fdiv",
+          "test_body": "define nofpclass(nan ninf nzero nsub nnorm) half @ret_only_positive_results_known_negative_fdiv(half nofpclass(ninf nzero nsub nnorm) %only.positive.or.nan, half nofpclass(pinf pzero psub pnorm) %only.negative.or.nan) {\n  %div = fdiv half %only.negative.or.nan, %only.positive.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__unknown__fdiv__pzero",
+          "test_body": "define nofpclass(nan) half @ret_nonan__unknown__fdiv__pzero(half %unknown, half nofpclass(nan inf nzero sub norm) %pzero) {\n  %div = fdiv half %unknown, %pzero\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_ninf_or_nan_results__lhs_known_non_inf",
+          "test_body": "define nofpclass(nan ninf) half @ret_no_ninf_or_nan_results__lhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) {\n  %x.or.pinf = select i1 %cond, half %x, half 0xH7C00\n  %div = fdiv half %x.or.pinf, %y\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "nan_result_demands_subnorm_rhs__daz",
+          "test_body": "define nofpclass(inf zero sub norm) half @nan_result_demands_subnorm_rhs__daz(i1 %cond, half nofpclass(nan inf zero norm) %only.sub, half %unknown0, half %unknown1) #0 {\n  %select = select i1 %cond, half %unknown0, half %only.sub\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"ieee,preserve-sign\" }\n"
+        },
+        {
+          "test_name": "inf_result_demands_zero_rhs",
+          "test_body": "declare nofpclass(nan inf sub norm) half @returns_zero()\n\ndefine nofpclass(nan zero sub) half @inf_result_demands_zero_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %zero = call half @returns_zero()\n  %select = select i1 %cond, half %zero, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_pinf_or_nan_results_self",
+          "test_body": "define nofpclass(ninf zero sub norm) half @ret_only_pinf_or_nan_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_must_be_zero_or_nan_self_other_use_input0",
+          "test_body": "declare void @use(half)\n\ndefine nofpclass(inf) half @ret_src_must_be_zero_or_nan_self_other_use_input0(half noundef nofpclass(inf sub norm) %x) {\n  call void @use(half %x)\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_pnorm_rhs",
+          "test_body": "declare nofpclass(nan inf zero sub nnorm) half @returns_pnorm()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_pnorm_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %pnorm = call half @returns_pnorm()\n  %select = select i1 %cond, half %pnorm, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_negative_results_or_nan_self",
+          "test_body": "define nofpclass(pinf pzero psub pnorm) half @ret_only_negative_results_or_nan_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nofpclass_inf__fdiv_unknown_or_pinf",
+          "test_body": "define nofpclass(inf) half @ret_nofpclass_inf__fdiv_unknown_or_pinf(i1 %cond, half %x, half %y) {\n  %x.or.pinf = select i1 %cond, half %x, half 0xH7C00\n  %y.or.pinf = select i1 %cond, half %y, half 0xH7C00\n  %div = fdiv half %x.or.pinf, %y.or.pinf\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_noinf_self",
+          "test_body": "define nofpclass(snan) half @ret_src_noinf_self(half noundef nofpclass(inf) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_inf_results_self",
+          "test_body": "define nofpclass(nan zero sub norm) half @ret_only_inf_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan_no_inf__fdiv_nonan_noinf__nonan_noinf",
+          "test_body": "define nofpclass(nan inf) half @ret_no_nan_no_inf__fdiv_nonan_noinf__nonan_noinf(half nofpclass(nan inf) %x, half nofpclass(nan inf) %y) {\n  %fdiv = fdiv half %x, %y\n  ret half %fdiv\n}\n"
+        },
+        {
+          "test_name": "ret_only_inf_or_nan_results_self",
+          "test_body": "define nofpclass(zero sub norm) half @ret_only_inf_or_nan_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_nonan__not_inf_or_nan__fdiv__nzero_or_nan",
+          "test_body": "define nofpclass(nan) half @ret_nonan__not_inf_or_nan__fdiv__nzero_or_nan(half nofpclass(nan) %not.nan, half nofpclass(inf pzero sub norm) %nzero.or.nan) {\n  %div = fdiv half %not.nan, %nzero.or.nan\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "sub_result_demands_sub_lhs",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(nan inf zero norm) half @sub_result_demands_sub_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %sub = call half @returns_sub()\n  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n  %div = fdiv half %sub.or.unknown, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_nsub_rhs",
+          "test_body": "declare nofpclass(nan inf zero psub norm) half @returns_nsub()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nsub_rhs(i1 %cond, half %unknown0, half %unknown1) {\n  %nsub = call half @returns_nsub()\n  %select = select i1 %cond, half %nsub, half %unknown0\n  %div = fdiv half %unknown1, %select\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "norm_result_demands_sub_source_lhs",
+          "test_body": "declare nofpclass(nan inf zero norm) half @returns_sub()\n\ndefine nofpclass(nan inf zero sub) half @norm_result_demands_sub_source_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %sub = call half @returns_sub()\n  %select = select i1 %cond, half %sub, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_pnorm_lhs",
+          "test_body": "declare nofpclass(nan inf zero sub nnorm) half @returns_pnorm()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_pnorm_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %pnorm = call half @returns_pnorm()\n  %select = select i1 %cond, half %pnorm, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_zero_results_self",
+          "test_body": "define nofpclass(nan inf sub norm) half @ret_only_zero_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "pnorm_result_demands_nnorm_lhs",
+          "test_body": "declare nofpclass(nan inf zero sub pnorm) half @returns_nnorm()\n\ndefine nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nnorm_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %nnorm = call half @returns_nnorm()\n  %select = select i1 %cond, half %nnorm, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_src_nonan_noinf_self",
+          "test_body": "define nofpclass(snan) half @ret_src_nonan_noinf_self(half noundef nofpclass(nan inf) %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "ret_only_snan_results_self",
+          "test_body": "define nofpclass(qnan inf zero sub norm) half @ret_only_snan_results_self(half noundef %x) {\n  %div = fdiv half %x, %x\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "zero_result_no_demand_inf_lhs",
+          "test_body": "declare nofpclass(nan zero sub norm) half @returns_inf()\n\ndefine nofpclass(nan inf norm) half @zero_result_no_demand_inf_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %inf = call half @returns_inf()\n  %inf.or.unknown = select i1 %cond, half %inf, half %unknown0\n  %div = fdiv half %inf.or.unknown, %unknown1\n  ret half %div\n}\n"
+        },
+        {
+          "test_name": "sub_result_demands_norm_source_lhs",
+          "test_body": "declare nofpclass(nan inf zero sub) half @returns_norm()\n\ndefine nofpclass(nan inf zero norm) half @sub_result_demands_norm_source_lhs(i1 %cond, half %unknown0, half %unknown1) {\n  %norm = call half @returns_norm()\n  %select = select i1 %cond, half %norm, half %unknown0\n  %div = fdiv half %select, %unknown1\n  ret half %div\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175946** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175946?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175946?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#175945** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175945?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\nThe build failed before running any tests. Detailed information about the build failure could not be automatically obtained.\n\nDownload the build's log file to see the details.\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 168781 tests passed\n* 3010 tests skipped\n* 1 test failed\n\n## Failed Tests\n(click on a test name to see its output)\n\n### LLVM\n<details>\n<summary>LLVM.Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll</summary>\n\n```\nExit Code: 1\n\nCommand Output (stdout):\n--\n# RUN: at line 2\n/home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/opt -S -passes=instcombine < /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll | /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/FileCheck /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll\n# executed command: /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/opt -S -passes=instcombine\n# note: command had no output on stdout or stderr\n# executed command: /home/gha/actions-runner/_work/llvm-project/llvm-project/build/bin/FileCheck /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll\n# .---command stderr------------\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:622:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[X]], [[Y]]\n# |               ^\n# | <stdin>:318:122: note: scanning from here\n# | define nofpclass(nan inf) half @ret_no_inf_or_nan_results__lhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) {\n# |                                                                                                                          ^\n# | <stdin>:318:122: note: with \"X\" equal to \"%x\"\n# | define nofpclass(nan inf) half @ret_no_inf_or_nan_results__lhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) {\n# |                                                                                                                          ^\n# | <stdin>:318:122: note: with \"Y\" equal to \"%y\"\n# | define nofpclass(nan inf) half @ret_no_inf_or_nan_results__lhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) {\n# |                                                                                                                          ^\n# | <stdin>:319:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %x, %y\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1517:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SELECT]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:738:55: note: scanning from here\n# |  %select = select i1 %cond, half %norm, half %unknown0\n# |                                                       ^\n# | <stdin>:738:55: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %norm, half %unknown0\n# |                                                       ^\n# | <stdin>:738:55: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %norm, half %unknown0\n# |                                                       ^\n# | <stdin>:739:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %select, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1531:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[UNKNOWN1]], [[SELECT]]\n# |               ^\n# | <stdin>:745:55: note: scanning from here\n# |  %select = select i1 %cond, half %norm, half %unknown0\n# |                                                       ^\n# | <stdin>:745:55: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %norm, half %unknown0\n# |                                                       ^\n# | <stdin>:745:55: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %norm, half %unknown0\n# |                                                       ^\n# | <stdin>:746:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %unknown1, %select\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1643:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SELECT]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:801:56: note: scanning from here\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:801:56: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:801:56: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:802:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %select, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1657:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SELECT]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:808:56: note: scanning from here\n# |  %select = select i1 %cond, half %nnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:808:56: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %nnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:808:56: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %nnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:809:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %select, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1671:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SELECT]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:815:55: note: scanning from here\n# |  %select = select i1 %cond, half %psub, half %unknown0\n# |                                                       ^\n# | <stdin>:815:55: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %psub, half %unknown0\n# |                                                       ^\n# | <stdin>:815:55: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %psub, half %unknown0\n# |                                                       ^\n# | <stdin>:816:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %select, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1685:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SELECT]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:822:55: note: scanning from here\n# |  %select = select i1 %cond, half %nsub, half %unknown0\n# |                                                       ^\n# | <stdin>:822:55: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %nsub, half %unknown0\n# |                                                       ^\n# | <stdin>:822:55: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %nsub, half %unknown0\n# |                                                       ^\n# | <stdin>:823:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %select, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1699:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[UNKNOWN1]], [[SELECT]]\n# |               ^\n# | <stdin>:829:56: note: scanning from here\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:829:56: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:829:56: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:830:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %unknown1, %select\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1713:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[UNKNOWN1]], [[SELECT]]\n# |               ^\n# | <stdin>:836:56: note: scanning from here\n# |  %select = select i1 %cond, half %nnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:836:56: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %nnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:836:56: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %nnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:837:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %unknown1, %select\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1727:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[UNKNOWN1]], [[SELECT]]\n# |               ^\n# | <stdin>:843:55: note: scanning from here\n# |  %select = select i1 %cond, half %psub, half %unknown0\n# |                                                       ^\n# | <stdin>:843:55: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %psub, half %unknown0\n# |                                                       ^\n# | <stdin>:843:55: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %psub, half %unknown0\n# |                                                       ^\n# | <stdin>:844:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %unknown1, %select\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1741:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[UNKNOWN1]], [[SELECT]]\n# |               ^\n# | <stdin>:850:55: note: scanning from here\n# |  %select = select i1 %cond, half %nsub, half %unknown0\n# |                                                       ^\n# | <stdin>:850:55: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %nsub, half %unknown0\n# |                                                       ^\n# | <stdin>:850:55: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %nsub, half %unknown0\n# |                                                       ^\n# | <stdin>:851:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %unknown1, %select\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1755:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SELECT]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:857:56: note: scanning from here\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:857:56: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:857:56: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %pnorm, half %unknown0\n# |                                                        ^\n# | <stdin>:858:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %select, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1855:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SELECT]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:904:54: note: scanning from here\n# |  %select = select i1 %cond, half %sub, half %unknown0\n# |                                                      ^\n# | <stdin>:904:54: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %sub, half %unknown0\n# |                                                      ^\n# | <stdin>:904:54: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %sub, half %unknown0\n# |                                                      ^\n# | <stdin>:905:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %select, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1869:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[UNKNOWN1]], [[SELECT]]\n# |               ^\n# | <stdin>:911:54: note: scanning from here\n# |  %select = select i1 %cond, half %sub, half %unknown0\n# |                                                      ^\n# | <stdin>:911:54: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %select = select i1 %cond, half %sub, half %unknown0\n# |                                                      ^\n# | <stdin>:911:54: note: with \"SELECT\" equal to \"%select\"\n# |  %select = select i1 %cond, half %sub, half %unknown0\n# |                                                      ^\n# | <stdin>:912:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %unknown1, %select\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1883:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[SUB_OR_UNKNOWN]], [[UNKNOWN1]]\n# |               ^\n# | <stdin>:918:62: note: scanning from here\n# |  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n# |                                                              ^\n# | <stdin>:918:62: note: with \"SUB_OR_UNKNOWN\" equal to \"%sub.or.unknown\"\n# |  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n# |                                                              ^\n# | <stdin>:918:62: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n# |                                                              ^\n# | <stdin>:919:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %sub.or.unknown, %unknown1\n# |  ^\n# | /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll:1897:15: error: CHECK-NEXT: expected string not found in input\n# | ; CHECK-NEXT: [[DIV:%.*]] = fdiv nnan half [[UNKNOWN1]], [[SUB_OR_UNKNOWN]]\n# |               ^\n# | <stdin>:925:62: note: scanning from here\n# |  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n# |                                                              ^\n# | <stdin>:925:62: note: with \"UNKNOWN1\" equal to \"%unknown1\"\n# |  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n# |                                                              ^\n# | <stdin>:925:62: note: with \"SUB_OR_UNKNOWN\" equal to \"%sub.or.unknown\"\n# |  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0\n# |                                                              ^\n# | <stdin>:926:2: note: possible intended match here\n# |  %div = fdiv nnan ninf half %unknown1, %sub.or.unknown\n# |  ^\n# | \n# | Input file: <stdin>\n# | Check file: /home/gha/actions-runner/_work/llvm-project/llvm-project/llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll\n# | \n# | -dump-input=help explains the following input dump.\n# | \n# | Input was:\n# | <<<<<<\n# |              .\n# |              .\n# |              .\n# |            313:  %x.or.pinf = select i1 %cond, half %x, half 0xH7C00 \n# |            314:  %div = fdiv nnan half %x.or.pinf, %y \n# |            315:  ret half %div \n# |            316: } \n# |            317:  \n# |            318: define nofpclass(nan inf) half @ret_no_inf_or_nan_results__lhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) { \n# | next:622'0                                                                                                                               X error: no match found\n# | next:622'1                                                                                                                                 with \"X\" equal to \"%x\"\n# | next:622'2                                                                                                                                 with \"Y\" equal to \"%y\"\n# |            319:  %div = fdiv nnan ninf half %x, %y \n# | next:622'0      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:622'3       ?                                  possible intended match\n# |            320:  ret half %div \n# | next:622'0      ~~~~~~~~~~~~~~~\n# |            321: } \n# | next:622'0      ~~\n# |            322:  \n# | next:622'0      ~\n# |            323: define nofpclass(nan inf) half @ret_no_inf_or_nan_results__rhs_known_non_inf(i1 %cond, half %x, half nofpclass(inf) %y) { \n# | next:622'0      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            324:  %y.or.pinf = select i1 %cond, half %y, half 0xH7C00 \n# |              .\n# |              .\n# |              .\n# |            733:  ret half %div \n# |            734: } \n# |            735:  \n# |            736: define nofpclass(nan inf zero norm) half @sub_result_demands_norm_source_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# |            737:  %norm = call half @returns_norm() \n# |            738:  %select = select i1 %cond, half %norm, half %unknown0 \n# | next:1517'0                                                           X error: no match found\n# | next:1517'1                                                             with \"SELECT\" equal to \"%select\"\n# | next:1517'2                                                             with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            739:  %div = fdiv nnan ninf half %select, %unknown1 \n# | next:1517'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1517'3      ?                                              possible intended match\n# |            740:  ret half %div \n# | next:1517'0     ~~~~~~~~~~~~~~~\n# |            741: } \n# | next:1517'0     ~~\n# |            742:  \n# | next:1517'0     ~\n# |            743: define nofpclass(nan inf zero norm) half @sub_result_demands_norm_source_rhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1517'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            744:  %norm = call half @returns_norm() \n# |            745:  %select = select i1 %cond, half %norm, half %unknown0 \n# | next:1531'0                                                           X error: no match found\n# | next:1531'1                                                             with \"UNKNOWN1\" equal to \"%unknown1\"\n# | next:1531'2                                                             with \"SELECT\" equal to \"%select\"\n# |            746:  %div = fdiv nnan ninf half %unknown1, %select \n# | next:1531'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1531'3      ?                                              possible intended match\n# |            747:  ret half %div \n# | next:1531'0     ~~~~~~~~~~~~~~~\n# |            748: } \n# | next:1531'0     ~~\n# |            749:  \n# | next:1531'0     ~\n# |            750: define nofpclass(inf zero sub) half @nan_result_demands_zero_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1531'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            751:  %zero = call half @returns_zero() \n# |              .\n# |              .\n# |              .\n# |            796:  ret half %div \n# |            797: } \n# |            798:  \n# |            799: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_pnorm_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# |            800:  %pnorm = call half @returns_pnorm() \n# |            801:  %select = select i1 %cond, half %pnorm, half %unknown0 \n# | next:1643'0                                                            X error: no match found\n# | next:1643'1                                                              with \"SELECT\" equal to \"%select\"\n# | next:1643'2                                                              with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            802:  %div = fdiv nnan ninf half %select, %unknown1 \n# | next:1643'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1643'3      ?                                              possible intended match\n# |            803:  ret half %div \n# | next:1643'0     ~~~~~~~~~~~~~~~\n# |            804: } \n# | next:1643'0     ~~\n# |            805:  \n# | next:1643'0     ~\n# |            806: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nnorm_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1643'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            807:  %nnorm = call half @returns_nnorm() \n# |            808:  %select = select i1 %cond, half %nnorm, half %unknown0 \n# | next:1657'0                                                            X error: no match found\n# | next:1657'1                                                              with \"SELECT\" equal to \"%select\"\n# | next:1657'2                                                              with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            809:  %div = fdiv nnan ninf half %select, %unknown1 \n# | next:1657'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1657'3      ?                                              possible intended match\n# |            810:  ret half %div \n# | next:1657'0     ~~~~~~~~~~~~~~~\n# |            811: } \n# | next:1657'0     ~~\n# |            812:  \n# | next:1657'0     ~\n# |            813: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_psub_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1657'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            814:  %psub = call half @returns_psub() \n# |            815:  %select = select i1 %cond, half %psub, half %unknown0 \n# | next:1671'0                                                           X error: no match found\n# | next:1671'1                                                             with \"SELECT\" equal to \"%select\"\n# | next:1671'2                                                             with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            816:  %div = fdiv nnan ninf half %select, %unknown1 \n# | next:1671'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1671'3      ?                                              possible intended match\n# |            817:  ret half %div \n# | next:1671'0     ~~~~~~~~~~~~~~~\n# |            818: } \n# | next:1671'0     ~~\n# |            819:  \n# | next:1671'0     ~\n# |            820: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nsub_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1671'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            821:  %nsub = call half @returns_nsub() \n# |            822:  %select = select i1 %cond, half %nsub, half %unknown0 \n# | next:1685'0                                                           X error: no match found\n# | next:1685'1                                                             with \"SELECT\" equal to \"%select\"\n# | next:1685'2                                                             with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            823:  %div = fdiv nnan ninf half %select, %unknown1 \n# | next:1685'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1685'3      ?                                              possible intended match\n# |            824:  ret half %div \n# | next:1685'0     ~~~~~~~~~~~~~~~\n# |            825: } \n# | next:1685'0     ~~\n# |            826:  \n# | next:1685'0     ~\n# |            827: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_pnorm_rhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1685'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            828:  %pnorm = call half @returns_pnorm() \n# |            829:  %select = select i1 %cond, half %pnorm, half %unknown0 \n# | next:1699'0                                                            X error: no match found\n# | next:1699'1                                                              with \"UNKNOWN1\" equal to \"%unknown1\"\n# | next:1699'2                                                              with \"SELECT\" equal to \"%select\"\n# |            830:  %div = fdiv nnan ninf half %unknown1, %select \n# | next:1699'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1699'3      ?                                              possible intended match\n# |            831:  ret half %div \n# | next:1699'0     ~~~~~~~~~~~~~~~\n# |            832: } \n# | next:1699'0     ~~\n# |            833:  \n# | next:1699'0     ~\n# |            834: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nnorm_rhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1699'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            835:  %nnorm = call half @returns_nnorm() \n# |            836:  %select = select i1 %cond, half %nnorm, half %unknown0 \n# | next:1713'0                                                            X error: no match found\n# | next:1713'1                                                              with \"UNKNOWN1\" equal to \"%unknown1\"\n# | next:1713'2                                                              with \"SELECT\" equal to \"%select\"\n# |            837:  %div = fdiv nnan ninf half %unknown1, %select \n# | next:1713'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1713'3      ?                                              possible intended match\n# |            838:  ret half %div \n# | next:1713'0     ~~~~~~~~~~~~~~~\n# |            839: } \n# | next:1713'0     ~~\n# |            840:  \n# | next:1713'0     ~\n# |            841: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_psub_rhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1713'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            842:  %psub = call half @returns_psub() \n# |            843:  %select = select i1 %cond, half %psub, half %unknown0 \n# | next:1727'0                                                           X error: no match found\n# | next:1727'1                                                             with \"UNKNOWN1\" equal to \"%unknown1\"\n# | next:1727'2                                                             with \"SELECT\" equal to \"%select\"\n# |            844:  %div = fdiv nnan ninf half %unknown1, %select \n# | next:1727'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1727'3      ?                                              possible intended match\n# |            845:  ret half %div \n# | next:1727'0     ~~~~~~~~~~~~~~~\n# |            846: } \n# | next:1727'0     ~~\n# |            847:  \n# | next:1727'0     ~\n# |            848: define nofpclass(nan inf zero nnorm) half @pnorm_result_demands_nsub_rhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1727'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            849:  %nsub = call half @returns_nsub() \n# |            850:  %select = select i1 %cond, half %nsub, half %unknown0 \n# | next:1741'0                                                           X error: no match found\n# | next:1741'1                                                             with \"UNKNOWN1\" equal to \"%unknown1\"\n# | next:1741'2                                                             with \"SELECT\" equal to \"%select\"\n# |            851:  %div = fdiv nnan ninf half %unknown1, %select \n# | next:1741'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1741'3      ?                                              possible intended match\n# |            852:  ret half %div \n# | next:1741'0     ~~~~~~~~~~~~~~~\n# |            853: } \n# | next:1741'0     ~~\n# |            854:  \n# | next:1741'0     ~\n# |            855: define nofpclass(nan inf zero pnorm) half @nnorm_result_demands_pnorm_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1741'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            856:  %pnorm = call half @returns_pnorm() \n# |            857:  %select = select i1 %cond, half %pnorm, half %unknown0 \n# | next:1755'0                                                            X error: no match found\n# | next:1755'1                                                              with \"SELECT\" equal to \"%select\"\n# | next:1755'2                                                              with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            858:  %div = fdiv nnan ninf half %select, %unknown1 \n# | next:1755'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1755'3      ?                                              possible intended match\n# |            859:  ret half %div \n# | next:1755'0     ~~~~~~~~~~~~~~~\n# |            860: } \n# | next:1755'0     ~~\n# |            861:  \n# | next:1755'0     ~\n# |            862: define nofpclass(inf zero norm) half @nan_result_no_demand_subnorm_sources_if_ieee(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1755'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            863:  %sub0 = call half @returns_sub() \n# |              .\n# |              .\n# |              .\n# |            899:  ret half %div \n# |            900: } \n# |            901:  \n# |            902: define nofpclass(nan inf zero sub) half @norm_result_demands_sub_source_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# |            903:  %sub = call half @returns_sub() \n# |            904:  %select = select i1 %cond, half %sub, half %unknown0 \n# | next:1855'0                                                          X error: no match found\n# | next:1855'1                                                            with \"SELECT\" equal to \"%select\"\n# | next:1855'2                                                            with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            905:  %div = fdiv nnan ninf half %select, %unknown1 \n# | next:1855'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1855'3      ?                                              possible intended match\n# |            906:  ret half %div \n# | next:1855'0     ~~~~~~~~~~~~~~~\n# |            907: } \n# | next:1855'0     ~~\n# |            908:  \n# | next:1855'0     ~\n# |            909: define nofpclass(nan inf zero sub) half @norm_result_demands_sub_source_rhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1855'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            910:  %sub = call half @returns_sub() \n# |            911:  %select = select i1 %cond, half %sub, half %unknown0 \n# | next:1869'0                                                          X error: no match found\n# | next:1869'1                                                            with \"UNKNOWN1\" equal to \"%unknown1\"\n# | next:1869'2                                                            with \"SELECT\" equal to \"%select\"\n# |            912:  %div = fdiv nnan ninf half %unknown1, %select \n# | next:1869'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1869'3      ?                                              possible intended match\n# |            913:  ret half %div \n# | next:1869'0     ~~~~~~~~~~~~~~~\n# |            914: } \n# | next:1869'0     ~~\n# |            915:  \n# | next:1869'0     ~\n# |            916: define nofpclass(nan inf zero norm) half @sub_result_demands_sub_lhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1869'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            917:  %sub = call half @returns_sub() \n# |            918:  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0 \n# | next:1883'0                                                                  X error: no match found\n# | next:1883'1                                                                    with \"SUB_OR_UNKNOWN\" equal to \"%sub.or.unknown\"\n# | next:1883'2                                                                    with \"UNKNOWN1\" equal to \"%unknown1\"\n# |            919:  %div = fdiv nnan ninf half %sub.or.unknown, %unknown1 \n# | next:1883'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1883'3      ?                                                      possible intended match\n# |            920:  ret half %div \n# | next:1883'0     ~~~~~~~~~~~~~~~\n# |            921: } \n# | next:1883'0     ~~\n# |            922:  \n# | next:1883'0     ~\n# |            923: define nofpclass(nan inf zero norm) half @sub_result_demands_sub_rhs(i1 %cond, half %unknown0, half %unknown1) { \n# | next:1883'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            924:  %sub = call half @returns_sub() \n# |            925:  %sub.or.unknown = select i1 %cond, half %sub, half %unknown0 \n# | next:1897'0                                                                  X error: no match found\n# | next:1897'1                                                                    with \"UNKNOWN1\" equal to \"%unknown1\"\n# | next:1897'2                                                                    with \"SUB_OR_UNKNOWN\" equal to \"%sub.or.unknown\"\n# |            926:  %div = fdiv nnan ninf half %unknown1, %sub.or.unknown \n# | next:1897'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# | next:1897'3      ?                                                      possible intended match\n# |            927:  ret half %div \n# | next:1897'0     ~~~~~~~~~~~~~~~\n# |            928: } \n# | next:1897'0     ~~\n# |            929:  \n# | next:1897'0     ~\n# |            930: define nofpclass(snan) half @ret__known_zero_or_nan__fdiv__not_nan(half nofpclass(inf sub norm) %zero.or.nan, half nofpclass(nan) %not.nan) { \n# | next:1897'0     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n# |            931:  %div = fdiv half %zero.or.nan, %not.nan \n# |              .\n# |              .\n# |              .\n# | >>>>>>\n# `-----------------------------\n# error: command failed with exit status: 1\n\n--\n\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-14T13:07:31Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        255,
+        260
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5656,
+        5668
+      ],
+      [
+        5692,
+        5730
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        358,
+        363
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2513,
+        2518
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll": [
+      [
+        59,
+        66
+      ],
+      [
+        80,
+        87
+      ],
+      [
+        90,
+        97
+      ],
+      [
+        109,
+        116
+      ],
+      [
+        119,
+        126
+      ],
+      [
+        129,
+        136
+      ],
+      [
+        139,
+        146
+      ],
+      [
+        158,
+        165
+      ],
+      [
+        187,
+        194
+      ],
+      [
+        197,
+        204
+      ],
+      [
+        207,
+        214
+      ],
+      [
+        217,
+        224
+      ],
+      [
+        227,
+        234
+      ],
+      [
+        238,
+        245
+      ],
+      [
+        249,
+        257
+      ],
+      [
+        261,
+        267
+      ],
+      [
+        271,
+        278
+      ],
+      [
+        281,
+        287
+      ],
+      [
+        291,
+        297
+      ],
+      [
+        301,
+        307
+      ],
+      [
+        311,
+        317
+      ],
+      [
+        321,
+        327
+      ],
+      [
+        331,
+        337
+      ],
+      [
+        341,
+        347
+      ],
+      [
+        360,
+        366
+      ],
+      [
+        379,
+        386
+      ],
+      [
+        389,
+        395
+      ],
+      [
+        399,
+        405
+      ],
+      [
+        409,
+        415
+      ],
+      [
+        474,
+        481
+      ],
+      [
+        485,
+        493
+      ],
+      [
+        594,
+        600
+      ],
+      [
+        607,
+        613
+      ],
+      [
+        619,
+        626
+      ],
+      [
+        633,
+        639
+      ],
+      [
+        645,
+        652
+      ],
+      [
+        656,
+        663
+      ],
+      [
+        821,
+        827
+      ],
+      [
+        832,
+        838
+      ],
+      [
+        843,
+        849
+      ],
+      [
+        854,
+        860
+      ],
+      [
+        865,
+        871
+      ],
+      [
+        876,
+        882
+      ],
+      [
+        909,
+        915
+      ],
+      [
+        920,
+        926
+      ],
+      [
+        1051,
+        1058
+      ],
+      [
+        1061,
+        1068
+      ],
+      [
+        1081,
+        1087
+      ],
+      [
+        1102,
+        1108
+      ],
+      [
+        1114,
+        1120
+      ],
+      [
+        1126,
+        1132
+      ],
+      [
+        1138,
+        1144
+      ],
+      [
+        1150,
+        1156
+      ],
+      [
+        1162,
+        1168
+      ],
+      [
+        1285,
+        1291
+      ],
+      [
+        1296,
+        1302
+      ],
+      [
+        1329,
+        1335
+      ],
+      [
+        1340,
+        1346
+      ],
+      [
+        1462,
+        1468
+      ],
+      [
+        1476,
+        1482
+      ],
+      [
+        1490,
+        1496
+      ],
+      [
+        1504,
+        1510
+      ],
+      [
+        1518,
+        1524
+      ],
+      [
+        1532,
+        1538
+      ],
+      [
+        1602,
+        1608
+      ],
+      [
+        1616,
+        1622
+      ],
+      [
+        1630,
+        1636
+      ],
+      [
+        1644,
+        1650
+      ],
+      [
+        1658,
+        1664
+      ],
+      [
+        1672,
+        1678
+      ],
+      [
+        1686,
+        1692
+      ],
+      [
+        1700,
+        1706
+      ],
+      [
+        1714,
+        1720
+      ],
+      [
+        1728,
+        1734
+      ],
+      [
+        1742,
+        1748
+      ],
+      [
+        1756,
+        1762
+      ],
+      [
+        1828,
+        1834
+      ],
+      [
+        1842,
+        1849
+      ],
+      [
+        1857,
+        1863
+      ],
+      [
+        1871,
+        1877
+      ],
+      [
+        1885,
+        1891
+      ],
+      [
+        1899,
+        1905
+      ],
+      [
+        1941,
+        1947
+      ],
+      [
+        1951,
+        1958
+      ],
+      [
+        2043,
+        2049
+      ],
+      [
+        2053,
+        2059
+      ],
+      [
+        2063,
+        2069
+      ],
+      [
+        2073,
+        2079
+      ],
+      [
+        2083,
+        2089
+      ],
+      [
+        2093,
+        2099
+      ],
+      [
+        2103,
+        2109
+      ],
+      [
+        2113,
+        2119
+      ],
+      [
+        2123,
+        2129
+      ],
+      [
+        2133,
+        2139
+      ],
+      [
+        2153,
+        2159
+      ],
+      [
+        2183,
+        2189
+      ],
+      [
+        2193,
+        2199
+      ],
+      [
+        2204,
+        2211
+      ],
+      [
+        2214,
+        2220
+      ],
+      [
+        2235,
+        2241
+      ],
+      [
+        2246,
+        2254
+      ],
+      [
+        2258,
+        2266
+      ],
+      [
+        2270,
+        2278
+      ],
+      [
+        2282,
+        2290
+      ],
+      [
+        2294,
+        2302
+      ],
+      [
+        2306,
+        2314
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      "square"
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClass"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::fma",
+      "KnownFPClass::fmul"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fdiv.ll": [
+      "ret_src_must_be_zero_or_nan_self_other_use_input0",
+      "ret_src_must_be_zero_or_nan_self_other_use_input1"
+    ]
+  }
+}

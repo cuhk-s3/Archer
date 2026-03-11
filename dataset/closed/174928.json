@@ -1,0 +1,521 @@
+{
+  "pr_id": 174928,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/174928",
+  "state": "closed",
+  "title": "Attributor: Set up full SimplifyQuery for nofpclass",
+  "author": "arsenm",
+  "base_commit": "8fc3f6ddb8bae266dc9bef2d19a4fb47a5b92c5b",
+  "fix_commit": "e51d419c957abea7d7677e3b0a7fd0c375faa7f8",
+  "patch": "diff --git a/llvm/lib/Transforms/IPO/AttributorAttributes.cpp b/llvm/lib/Transforms/IPO/AttributorAttributes.cpp\nindex 62546a03fb283..8b760dd8a1f96 100644\n--- a/llvm/lib/Transforms/IPO/AttributorAttributes.cpp\n+++ b/llvm/lib/Transforms/IPO/AttributorAttributes.cpp\n@@ -10486,13 +10486,32 @@ struct AANoFPClassImpl : AANoFPClass {\n       addKnownBits(Attr.getNoFPClass());\n     }\n \n-    const DataLayout &DL = A.getDataLayout();\n+    Instruction *CtxI = getCtxI();\n+\n     if (getPositionKind() != IRPosition::IRP_RETURNED) {\n-      KnownFPClass KnownFPClass = computeKnownFPClass(&V, DL);\n+      const DataLayout &DL = A.getDataLayout();\n+      InformationCache &InfoCache = A.getInfoCache();\n+\n+      const DominatorTree *DT = nullptr;\n+      AssumptionCache *AC = nullptr;\n+      const TargetLibraryInfo *TLI = nullptr;\n+      Function *F = getAssociatedFunction();\n+      if (F) {\n+        TLI = InfoCache.getTargetLibraryInfoForFunction(*F);\n+        if (!F->isDeclaration()) {\n+          DT =\n+              InfoCache.getAnalysisResultForFunction<DominatorTreeAnalysis>(*F);\n+          AC = InfoCache.getAnalysisResultForFunction<AssumptionAnalysis>(*F);\n+        }\n+      }\n+\n+      SimplifyQuery Q(DL, TLI, DT, AC, CtxI);\n+\n+      KnownFPClass KnownFPClass = computeKnownFPClass(&V, fcAllFlags, Q);\n       addKnownBits(~KnownFPClass.KnownFPClasses);\n     }\n \n-    if (Instruction *CtxI = getCtxI())\n+    if (CtxI)\n       followUsesInMBEC(*this, A, getState(), *CtxI);\n   }\n \n",
+  "components": [
+    "Attributor"
+  ],
+  "description": "This enables assumes to work. Somehow the most obvious example\nI could think of does not work (return of assumed argument).\nThe context instruction for the return seems to be off by one.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "assume_fcmp_fabs_with_other_fabs_assume_fallback",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #1\n\ndeclare void @extern.use.f16(half)\n\ndefine half @assume_fcmp_fabs_with_other_fabs_assume_fallback(half %arg) {\nentry:\n  %fabs = call half @llvm.fabs.f16(half %arg)\n  %one.inf = fcmp one half %arg, 0xH7C00\n  call void @llvm.assume(i1 %one.inf)\n  %unrelated.fabs = fcmp oeq half %fabs, 0xH0000\n  call void @llvm.assume(i1 %unrelated.fabs)\n  %is.subnormal = fcmp olt half %fabs, 0xH0400\n  call void @llvm.assume(i1 %is.subnormal)\n  call void @extern.use.f16(half %arg)\n  call void @extern.use.f16(half %fabs)\n  ret half %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_bundles",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_bundles(i1 %c, float %ret) {\nentry:\n  br i1 %c, label %A, label %B\n\nA:                                                ; preds = %entry\n  call void @llvm.assume(i1 true) [ \"nofpclass\"(float %ret, i32 3) ]\n  call void @extern.use(float %ret)\n  ret float %ret\n\nB:                                                ; preds = %entry\n  call void @llvm.assume(i1 true) [ \"nofpclass\"(float %ret, i32 12) ]\n  call void @extern.use(float %ret)\n  ret float %ret\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "call_noinf_return_1",
+          "test_body": "declare hidden float @only_nofpclass_inf_return_users(float)\n\ndefine float @call_noinf_return_1(float %arg) {\n  %result = call nofpclass(inf) float @only_nofpclass_inf_return_users(float %arg)\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "constrained_uitofp",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind strictfp willreturn memory(inaccessiblemem: readwrite)\ndeclare float @llvm.experimental.constrained.uitofp.f32.i32(i32, metadata, metadata) #0\n\n; Function Attrs: strictfp\ndefine float @constrained_uitofp(i32 %arg) #1 {\n  %val = call float @llvm.experimental.constrained.uitofp.f32.i32(i32 %arg, metadata !\"round.dynamic\", metadata !\"fpexcept.strict\")\n  ret float %val\n}\n\nattributes #0 = { nocallback nofree nosync nounwind strictfp willreturn memory(inaccessiblemem: readwrite) }\nattributes #1 = { strictfp }\n"
+        },
+        {
+          "test_name": "is_fpclass_assume_arg_return",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #1\n\ndefine float @is_fpclass_assume_arg_return(float %arg) {\nentry:\n  %class.test = call i1 @llvm.is.fpclass.f32(float %arg, i32 292)\n  call void @llvm.assume(i1 %class.test)\n  call void @extern.use(float %arg)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_fcmp_fabs_with_other_fabs_assume",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #1\n\ndeclare void @extern.use.f16(half)\n\ndefine half @assume_fcmp_fabs_with_other_fabs_assume(half %arg) {\nentry:\n  %fabs = call half @llvm.fabs.f16(half %arg)\n  %unrelated.fabs = fcmp one half %fabs, 0xH0000\n  call void @llvm.assume(i1 %unrelated.fabs)\n  %is.subnormal = fcmp olt half %fabs, 0xH0400\n  call void @llvm.assume(i1 %is.subnormal)\n  call void @extern.use.f16(half %arg)\n  call void @extern.use.f16(half %fabs)\n  ret half %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_noqnan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_noqnan(float nofpclass(qnan) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_ninf_flag_fabs",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_ninf_flag_fabs(float %x) {\n  %fabs = call ninf float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_nonsub_nopnorm_nonzero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nonsub_nopnorm_nonzero(float nofpclass(nzero nsub pnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_nosnan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_nosnan(float nofpclass(snan) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_nopos_nopzero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nopos_nopzero(float nofpclass(pinf pzero psub pnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_olt_assume_une_0_callsite_arg_return",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @fcmp_olt_assume_une_0_callsite_arg_return(float %arg) {\nentry:\n  %is.not.zero.or.nan = fcmp une float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %is.not.zero.or.nan)\n  call void @extern.use(float %arg)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "returned_fabs_noinf",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_noinf(float nofpclass(inf) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "constrained_sitofp",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind strictfp willreturn memory(inaccessiblemem: readwrite)\ndeclare float @llvm.experimental.constrained.sitofp.f32.i32(i32, metadata, metadata) #0\n\n; Function Attrs: strictfp\ndefine float @constrained_sitofp(i32 %arg) #1 {\n  %val = call float @llvm.experimental.constrained.sitofp.f32.i32(i32 %arg, metadata !\"round.dynamic\", metadata !\"fpexcept.strict\")\n  ret float %val\n}\n\nattributes #0 = { nocallback nofree nosync nounwind strictfp willreturn memory(inaccessiblemem: readwrite) }\nattributes #1 = { strictfp }\n"
+        },
+        {
+          "test_name": "returned_fabs_nonnorm_nozero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nonnorm_nozero(float nofpclass(nzero nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_select_condition_not_nan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_select_condition_not_nan(float %arg) {\n  %uno = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %uno)\n  %select = select i1 %uno, float 0.000000e+00, float %arg\n  ret float %select\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "call_noinf_return_0",
+          "test_body": "declare hidden float @only_nofpclass_inf_return_users(float)\n\ndefine float @call_noinf_return_0(float %arg) {\n  %result = call nofpclass(inf) float @only_nofpclass_inf_return_users(float %arg)\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "pass_nofpclass_inf_through_memory",
+          "test_body": "declare float @returned_load(ptr)\n\ndefine float @pass_nofpclass_inf_through_memory(float nofpclass(inf) %arg) {\n  %alloca = alloca float, align 4\n  store float %arg, ptr %alloca, align 4\n  %ret = call float @returned_load(ptr %alloca)\n  ret float %ret\n}\n"
+        },
+        {
+          "test_name": "assume_load",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_load(ptr %ptr) {\n  %val = load float, ptr %ptr, align 4\n  %ord = fcmp ord float %val, 0.000000e+00\n  call void @llvm.assume(i1 %ord)\n  ret float %val\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_noqnan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_noqnan(float nofpclass(qnan) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs(float %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_returned_arg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_returned_arg(float %arg) {\n  %ord = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %ord)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "returns_fence",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.arithmetic.fence.f32(float) #0\n\ndefine hidden float @returns_fence(float %arg) {\n  %ret = call float @llvm.arithmetic.fence.f32(float %arg)\n  ret float %ret\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "nofpclass_call_use_after_unannotated_use",
+          "test_body": "declare float @extern()\n\ndefine void @nofpclass_call_use_after_unannotated_use(float %arg) {\n  call void @extern(float %arg) #0\n  call void @extern(float nofpclass(nan inf) %arg)\n  ret void\n}\n\nattributes #0 = { nounwind willreturn }\n"
+        },
+        {
+          "test_name": "returned_fabs_nosnan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nosnan(float nofpclass(snan) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_nopos",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nopos(float nofpclass(pinf psub pnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_noneg_nonzero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_noneg_nonzero(float nofpclass(ninf nzero nsub nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "call_abs",
+          "test_body": "define double @call_abs(double noundef %__x) {\nentry:\n  %abs = tail call double @llvm.fabs.f64(double %__x)\n  ret double %abs\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.fabs.f64(double) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_nopos_nonan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nopos_nonan(float nofpclass(nan pinf psub pnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_nopos",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_nopos(float nofpclass(pinf pzero psub pnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_intersection_not_zero_and_not_nan",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @assume_intersection_not_zero_and_not_nan(float %arg) {\nentry:\n  %is.not.zero.or.nan = fcmp une float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %is.not.zero.or.nan)\n  %is.ord = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %is.ord)\n  call void @extern.use(float %arg)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "call_noinf_0",
+          "test_body": "declare hidden float @only_nofpclass_inf_callers(float)\n\ndefine float @call_noinf_0(float nofpclass(inf) %arg) {\n  %result = call float @only_nofpclass_inf_callers(float %arg)\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "call_through_memory0",
+          "test_body": "declare hidden float @through_memory0(ptr)\n\ndefine float @call_through_memory0(float nofpclass(nan) %val) {\n  %alloca = alloca float, align 4\n  store float %val, ptr %alloca, align 4\n  %through_memory = call float @through_memory0(ptr %alloca)\n  ret float %through_memory\n}\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs(float %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_ninf_flag_fneg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_ninf_flag_fneg(float %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg ninf float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_noneg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_noneg(float nofpclass(ninf nzero nsub nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "call_noinf_1",
+          "test_body": "declare hidden float @only_nofpclass_inf_callers(float)\n\ndefine float @call_noinf_1(float %arg) {\n  %result = call float @only_nofpclass_inf_callers(float nofpclass(inf) %arg)\n  ret float %result\n}\n"
+        },
+        {
+          "test_name": "sitofp_v2i17_to_v2i17",
+          "test_body": "define <2 x half> @sitofp_v2i17_to_v2i17(<2 x i17> %arg) {\n  %cvt = sitofp <2 x i17> %arg to <2 x half>\n  ret <2 x half> %cvt\n}\n"
+        },
+        {
+          "test_name": "returned_fabs_noneg_nonan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_noneg_nonan(float nofpclass(nan ninf nsub nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_nonan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nonan(float nofpclass(nan) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_ord_assume_callsite_arg_return",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @fcmp_ord_assume_callsite_arg_return(float %arg) {\nentry:\n  %is.not.nan = fcmp ord float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %is.not.nan)\n  call void @extern.use(float %arg)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "returned_fabs_noneg_nozero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_noneg_nozero(float nofpclass(ninf zero nsub nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "through_memory1",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.arithmetic.fence.f32(float) #0\n\ndefine hidden float @through_memory1(ptr %ptr.arg) {\n  %load = load float, ptr %ptr.arg, align 4\n  %call = call float @llvm.arithmetic.fence.f32(float %load)\n  ret float %call\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_assume2_callsite_arg_return",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #1\n\ndeclare void @extern.use.f16(half)\n\ndefine half @fcmp_assume2_callsite_arg_return(half %arg) {\nentry:\n  %fabs = call half @llvm.fabs.f16(half %arg)\n  %not.subnormal.or.zero = fcmp oge half %fabs, 0xH0400\n  call void @llvm.assume(i1 %not.subnormal.or.zero)\n  %not.inf = fcmp one half %arg, 0xH7C00\n  call void @llvm.assume(i1 %not.inf)\n  call void @extern.use.f16(half %arg)\n  ret half %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fcmp_olt_assume_one_0_callsite_arg_return",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine float @fcmp_olt_assume_one_0_callsite_arg_return(float %arg) {\nentry:\n  %is.not.zero.or.nan = fcmp one float %arg, 0.000000e+00\n  call void @llvm.assume(i1 %is.not.zero.or.nan)\n  call void @extern.use(float %arg)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "returned_fabs_nopos_nozero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nopos_nozero(float nofpclass(pinf zero psub pnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_nonan",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_nonan(float nofpclass(nan) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fneg_fabs_mixed",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fneg_fabs_mixed(float nofpclass(qnan ninf nzero psub nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  %fneg.fabs = fneg float %fabs\n  ret float %fneg.fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "assume_intersection_class",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #1\n\ndefine float @assume_intersection_class(float %arg) {\nentry:\n  %pos.normal.or.pos.subnormal = call i1 @llvm.is.fpclass.f32(float %arg, i32 384)\n  call void @llvm.assume(i1 %pos.normal.or.pos.subnormal)\n  %is.normal = call i1 @llvm.is.fpclass.f32(float %arg, i32 264)\n  call void @llvm.assume(i1 %is.normal)\n  call void @extern.use(float %arg)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "user",
+          "test_body": "declare hidden float @refine_callsite_attribute(float nofpclass(inf))\n\ndefine float @user(float %arg) {\n  %func1 = call float @refine_callsite_attribute(float %arg)\n  ret float %func1\n}\n"
+        },
+        {
+          "test_name": "assume_intersection_none",
+          "test_body": "declare void @extern.use(float)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #1\n\ndefine float @assume_intersection_none(float %arg) {\nentry:\n  %class1 = call i1 @llvm.is.fpclass.f32(float %arg, i32 682)\n  call void @llvm.assume(i1 %class1)\n  %class2 = call i1 @llvm.is.fpclass.f32(float %arg, i32 341)\n  call void @llvm.assume(i1 %class2)\n  call void @extern.use(float %arg)\n  ret float %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_noneg",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_noneg(float nofpclass(ninf nsub nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "returned_fabs_nopsub_nonnorm_nopzero",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @returned_fabs_nopsub_nonnorm_nopzero(float nofpclass(pzero psub nnorm) %x) {\n  %fabs = call float @llvm.fabs.f32(float %x)\n  ret float %fabs\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "call_through_memory1",
+          "test_body": "declare hidden float @through_memory1(ptr)\n\ndefine float @call_through_memory1(float nofpclass(nan) %val) {\n  %alloca = alloca float, align 4\n  store float %val, ptr %alloca, align 4\n  %through_memory = call float @through_memory1(ptr %alloca)\n  ret float %through_memory\n}\n"
+        },
+        {
+          "test_name": "fadd_double_no_zero__output_only_is_dynamic",
+          "test_body": "define float @fadd_double_no_zero__output_only_is_dynamic(float noundef nofpclass(zero) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { \"denormal-fp-math\"=\"dynamic,ieee\" }\n"
+        },
+        {
+          "test_name": "fcmp_assume_issubnormal_callsite_arg_return",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #1\n\ndeclare void @extern.use.f16(half)\n\ndefine half @fcmp_assume_issubnormal_callsite_arg_return(half %arg) {\nentry:\n  %fabs = call half @llvm.fabs.f16(half %arg)\n  %is.subnormal = fcmp olt half %fabs, 0xH0400\n  call void @llvm.assume(i1 %is.subnormal)\n  call void @extern.use.f16(half %arg)\n  ret half %arg\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ninf_arg_used_by_callsite_array",
+          "test_body": "declare void @extern.use.array([2 x [3 x float]])\n\ndefine void @ninf_arg_used_by_callsite_array([2 x [3 x float]] nofpclass(inf) %arg) {\n  call void @extern.use.array([2 x [3 x float]] %arg)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "refine_callsite_attribute",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.arithmetic.fence.f32(float) #0\n\ndeclare hidden float @returns_fence(float)\n\ndefine hidden float @refine_callsite_attribute(float nofpclass(inf) %arg) {\n  %func0 = call float @returns_fence(float nofpclass(nan) %arg)\n  %ret = call float @llvm.arithmetic.fence.f32(float %func0)\n  ret float %ret\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#174928** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174928?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174928?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    }
+  ],
+  "knowledge_cutoff": "2026-01-08T09:00:27Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/IPO/AttributorAttributes.cpp": [
+      [
+        10486,
+        10498
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass.ll": [
+      [
+        237,
+        243
+      ],
+      [
+        360,
+        366
+      ],
+      [
+        404,
+        416
+      ],
+      [
+        421,
+        433
+      ],
+      [
+        450,
+        462
+      ],
+      [
+        467,
+        479
+      ],
+      [
+        485,
+        491
+      ],
+      [
+        501,
+        507
+      ],
+      [
+        516,
+        524
+      ],
+      [
+        549,
+        563
+      ],
+      [
+        576,
+        583
+      ],
+      [
+        591,
+        605
+      ],
+      [
+        618,
+        632
+      ],
+      [
+        653,
+        659
+      ],
+      [
+        692,
+        698
+      ],
+      [
+        700,
+        706
+      ],
+      [
+        713,
+        725
+      ],
+      [
+        730,
+        742
+      ],
+      [
+        747,
+        759
+      ],
+      [
+        764,
+        776
+      ],
+      [
+        781,
+        793
+      ],
+      [
+        798,
+        810
+      ],
+      [
+        815,
+        827
+      ],
+      [
+        832,
+        844
+      ],
+      [
+        849,
+        861
+      ],
+      [
+        866,
+        878
+      ],
+      [
+        883,
+        895
+      ],
+      [
+        900,
+        912
+      ],
+      [
+        917,
+        929
+      ],
+      [
+        934,
+        946
+      ],
+      [
+        951,
+        963
+      ],
+      [
+        968,
+        980
+      ],
+      [
+        1117,
+        1130
+      ],
+      [
+        1137,
+        1150
+      ],
+      [
+        1157,
+        1170
+      ],
+      [
+        1177,
+        1190
+      ],
+      [
+        1197,
+        1210
+      ],
+      [
+        1217,
+        1230
+      ],
+      [
+        1237,
+        1250
+      ],
+      [
+        1257,
+        1270
+      ],
+      [
+        1277,
+        1290
+      ],
+      [
+        1382,
+        1395
+      ],
+      [
+        1402,
+        1415
+      ],
+      [
+        1423,
+        1436
+      ],
+      [
+        1940,
+        1946
+      ],
+      [
+        1951,
+        1957
+      ],
+      [
+        2424,
+        2436
+      ],
+      [
+        2442,
+        2456
+      ],
+      [
+        2462,
+        2474
+      ],
+      [
+        2497,
+        2503
+      ],
+      [
+        2506,
+        2512
+      ],
+      [
+        2543,
+        2549
+      ],
+      [
+        2559,
+        2565
+      ],
+      [
+        2567,
+        2573
+      ],
+      [
+        2716,
+        2729
+      ],
+      [
+        3629,
+        3634
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/IPO/AttributorAttributes.cpp": [
+      "initialize"
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass.ll": [
+      "assume_intersection_class",
+      "assume_intersection_none",
+      "assume_intersection_not_zero_and_not_nan",
+      "call_noinf_return_0",
+      "call_noinf_return_1",
+      "fcmp_olt_assume_one_0_callsite_arg_return",
+      "fcmp_olt_assume_une_0_callsite_arg_return",
+      "fcmp_ord_assume_callsite_arg_return",
+      "nofpclass_call_use_after_unannotated_use",
+      "returned_fabs"
+    ]
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "pr_id": 175299,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175299",
+  "state": "closed",
+  "title": "[VectorCombine] foldPermuteOfIntrinsic - support multiple uses of shuffled ops",
+  "author": "raventid",
+  "base_commit": "47f744ac15bfda664e11fda0b45152780948274e",
+  "fix_commit": "6da5466c8236a9a8071babba8dc92bdc0caf0a13",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 3e06f74fa5c65..55b508a301243 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -3204,7 +3204,7 @@ bool VectorCombine::foldShuffleOfIntrinsics(Instruction &I) {\n bool VectorCombine::foldPermuteOfIntrinsic(Instruction &I) {\n   Value *V0;\n   ArrayRef<int> Mask;\n-  if (!match(&I, m_Shuffle(m_OneUse(m_Value(V0)), m_Undef(), m_Mask(Mask))))\n+  if (!match(&I, m_Shuffle(m_Value(V0), m_Undef(), m_Mask(Mask))))\n     return false;\n \n   auto *II0 = dyn_cast<IntrinsicInst>(V0);\n@@ -3226,8 +3226,10 @@ bool VectorCombine::foldPermuteOfIntrinsic(Instruction &I) {\n     return false;\n \n   // Cost analysis\n+  InstructionCost IntrinsicCost =\n+      TTI.getIntrinsicInstrCost(IntrinsicCostAttributes(IID, *II0), CostKind);\n   InstructionCost OldCost =\n-      TTI.getIntrinsicInstrCost(IntrinsicCostAttributes(IID, *II0), CostKind) +\n+      IntrinsicCost +\n       TTI.getShuffleCost(TargetTransformInfo::SK_PermuteSingleSrc, ShuffleDstTy,\n                          IntrinsicSrcTy, Mask, CostKind, 0, nullptr, {V0}, &I);\n \n@@ -3249,6 +3251,11 @@ bool VectorCombine::foldPermuteOfIntrinsic(Instruction &I) {\n   IntrinsicCostAttributes NewAttr(IID, ShuffleDstTy, NewArgsTy);\n   NewCost += TTI.getIntrinsicInstrCost(NewAttr, CostKind);\n \n+  // If the intrinsic has multiple uses, we need to account for the cost of\n+  // keeping the original intrinsic around.\n+  if (!II0->hasOneUse())\n+    NewCost += IntrinsicCost;\n+\n   LLVM_DEBUG(dbgs() << \"Found a permute of intrinsic: \" << I << \"\\n  OldCost: \"\n                     << OldCost << \" vs NewCost: \" << NewCost << \"\\n\");\n \n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "Fixes https://github.com/llvm/llvm-project/issues/173039\r\n\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/shuffle-of-fma-const.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mcpu=x86-64",
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mcpu=x86-64-v3"
+      ],
+      "tests": [
+        {
+          "test_name": "interleave_fma_const_chain",
+          "test_body": "define <8 x float> @interleave_fma_const_chain(<4 x float> %a0, <4 x float> %a1) {\n  %l = tail call noundef <4 x float> @llvm.fma.v4f32(<4 x float> %a0, <4 x float> splat (float 0x3F8DE8D040000000), <4 x float> splat (float 0xBFB3715EE0000000))\n  %h = tail call noundef <4 x float> @llvm.fma.v4f32(<4 x float> %a1, <4 x float> splat (float 0x3F8DE8D040000000), <4 x float> splat (float 0xBFB3715EE0000000))\n  %res = shufflevector <4 x float> %l, <4 x float> %h, <8 x i32> <i32 0, i32 4, i32 1, i32 5, i32 2, i32 6, i32 3, i32 7>\n  ret <8 x float> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "shuffle_fma_multiuse_with_arith",
+          "test_body": "define <4 x float> @shuffle_fma_multiuse_with_arith(<4 x float> %a0, <4 x float> %b) {\n  %f = tail call noundef <4 x float> @llvm.fma.v4f32(<4 x float> %a0, <4 x float> splat (float 0x3F8DE8D040000000), <4 x float> splat (float 0xBFB3715EE0000000))\n  %shuf = shufflevector <4 x float> %f, <4 x float> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %add = fadd <4 x float> %f, %b\n  %res = fadd <4 x float> %shuf, %add\n  ret <4 x float> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "shuffle_fma_const_chain_multiuse",
+          "test_body": "define <4 x float> @shuffle_fma_const_chain_multiuse(<4 x float> %a0, ptr %p) {\n  %f = tail call noundef <4 x float> @llvm.fma.v4f32(<4 x float> %a0, <4 x float> splat (float 0x3F8DE8D040000000), <4 x float> splat (float 0xBFB3715EE0000000))\n  %res = shufflevector <4 x float> %f, <4 x float> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  store <4 x float> %f, ptr %p, align 16\n  ret <4 x float> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "raventid",
+      "body": "This PR includes an insignificant amount of clang-format changes unrelated to a primary change. Let me know if you consider this to be prohibitive I'll roll them back."
+    },
+    {
+      "author": "raventid",
+      "body": "@RKSimon for visibility"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 59411 tests passed\n* 1371 tests skipped\n\nAll executed tests passed, but another part of the build **failed**. Click on a failure below to see the details.\n\n<details>\n<summary>[code=4294967295] unittests/tools/llvm-exegesis/LLVMExegesisTests.exe</summary>\n\n```\nFAILED: [code=4294967295] unittests/tools/llvm-exegesis/LLVMExegesisTests.exe\ncmd.exe /C \"cd . && C:\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe -E vs_link_exe --intdir=unittests\\tools\\llvm-exegesis\\CMakeFiles\\LLVMExegesisTests.dir --rc=\"C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.19041.0\\x64\\rc.exe\" --mt=\"C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.19041.0\\x64\\mt.exe\" --manifests  -- C:\\clang\\clang-msvc\\bin\\lld-link.exe /nologo @CMakeFiles\\LLVMExegesisTests.rsp  /out:unittests\\tools\\llvm-exegesis\\LLVMExegesisTests.exe /implib:unittests\\tools\\llvm-exegesis\\LLVMExegesisTests.lib /pdb:unittests\\tools\\llvm-exegesis\\LLVMExegesisTests.pdb /version:0.0 /MANIFEST:NO /STACK:10000000 /INCREMENTAL:NO /subsystem:console  && cd .\"\nLINK: command \"C:\\clang\\clang-msvc\\bin\\lld-link.exe /nologo @CMakeFiles\\LLVMExegesisTests.rsp /out:unittests\\tools\\llvm-exegesis\\LLVMExegesisTests.exe /implib:unittests\\tools\\llvm-exegesis\\LLVMExegesisTests.lib /pdb:unittests\\tools\\llvm-exegesis\\LLVMExegesisTests.pdb /version:0.0 /MANIFEST:NO /STACK:10000000 /INCREMENTAL:NO /subsystem:console\" failed (exit code 1) with the following output:\nlld-link: error: undefined symbol: public: class llvm::PreservedAnalyses __cdecl llvm::LoopIdiomVectorizePass::run(class llvm::Loop &, class llvm::AnalysisManager<class llvm::Loop, struct llvm::LoopStandardAnalysisResults &> &, struct llvm::LoopStandardAnalysisResults &, class llvm::LPMUpdater &)\n\n>>> referenced by LLVMAArch64CodeGen.lib(AArch64TargetMachine.cpp.obj):(public: virtual class llvm::PreservedAnalyses __cdecl llvm::detail::PassModel<class llvm::Loop, class llvm::LoopIdiomVectorizePass, class llvm::AnalysisManager<class llvm::Loop, struct llvm::LoopStandardAnalysisResults &>, struct llvm::LoopStandardAnalysisResults &, class llvm::LPMUpdater &>::run(class llvm::Loop &, class llvm::AnalysisManager<class llvm::Loop, struct llvm::LoopStandardAnalysisResults &> &, struct llvm::LoopStandardAnalysisResults &, class llvm::LPMUpdater &))\n\n>>> referenced by LLVMRISCVCodeGen.lib(RISCVTargetMachine.cpp.obj)\n\n```\n</details>\n\nIf these failures are unrelated to your changes (for example tests are broken or flaky at HEAD), please open an issue at https://github.com/llvm/llvm-project/issues and add the `infrastructure` label."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-10T08:55:22Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        3204,
+        3210
+      ],
+      [
+        3226,
+        3233
+      ],
+      [
+        3249,
+        3254
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/X86/shuffle-of-fma-const.ll": [
+      [
+        52,
+        54
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::foldPermuteOfIntrinsic"
+    ],
+    "llvm/test/Transforms/VectorCombine/X86/shuffle-of-fma-const.ll": [
+      "float> [[A1:%.*]]) #[[ATTR0]]"
+    ]
+  }
+}

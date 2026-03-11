@@ -1,0 +1,411 @@
+{
+  "pr_id": 175421,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/175421",
+  "state": "closed",
+  "title": "InstCombine: Handle fptrunc in SimplifyDemandedFPClass",
+  "author": "arsenm",
+  "base_commit": "435589566108eab07eb516e5e722234bd74af7b8",
+  "fix_commit": "2ed6c5c282b86609a8608221658deb5629f10328",
+  "patch": "diff --git a/llvm/include/llvm/Support/KnownFPClass.h b/llvm/include/llvm/Support/KnownFPClass.h\nindex 3dd2cbad873d2..e779b61b4ca52 100644\n--- a/llvm/include/llvm/Support/KnownFPClass.h\n+++ b/llvm/include/llvm/Support/KnownFPClass.h\n@@ -332,6 +332,9 @@ struct KnownFPClass {\n                                      const fltSemantics &DstTy,\n                                      const fltSemantics &SrcTy);\n \n+  /// Propagate known class for fptrunc.\n+  static LLVM_ABI KnownFPClass fptrunc(const KnownFPClass &KnownSrc);\n+\n   /// Propagate known class for rounding intrinsics (trunc, floor, ceil, rint,\n   /// nearbyint, round, roundeven). This is trunc if \\p IsTrunc. \\p\n   /// IsMultiUnitFPType if this is for a multi-unit floating-point type.\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 171952120fc40..8b6f917e1df78 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -4938,15 +4938,7 @@ static void computeKnownFPClassForFPTrunc(const Operator *Op,\n   KnownFPClass KnownSrc;\n   computeKnownFPClass(Op->getOperand(0), DemandedElts, InterestedClasses,\n                       KnownSrc, Q, Depth + 1);\n-\n-  // Sign should be preserved\n-  // TODO: Handle cannot be ordered greater than zero\n-  if (KnownSrc.cannotBeOrderedLessThanZero())\n-    Known.knownNot(KnownFPClass::OrderedLessThanZeroMask);\n-\n-  Known.propagateNaN(KnownSrc, true);\n-\n-  // Infinity needs a range check.\n+  Known = KnownFPClass::fptrunc(KnownSrc);\n }\n \n static constexpr KnownFPClass::MinMaxKind getMinMaxKind(Intrinsic::ID IID) {\ndiff --git a/llvm/lib/Support/KnownFPClass.cpp b/llvm/lib/Support/KnownFPClass.cpp\nindex ae8c4a9133897..522557d382b90 100644\n--- a/llvm/lib/Support/KnownFPClass.cpp\n+++ b/llvm/lib/Support/KnownFPClass.cpp\n@@ -423,6 +423,20 @@ KnownFPClass KnownFPClass::fpext(const KnownFPClass &KnownSrc,\n   return Known;\n }\n \n+KnownFPClass KnownFPClass::fptrunc(const KnownFPClass &KnownSrc) {\n+  KnownFPClass Known;\n+\n+  // Sign should be preserved\n+  // TODO: Handle cannot be ordered greater than zero\n+  if (KnownSrc.cannotBeOrderedLessThanZero())\n+    Known.knownNot(KnownFPClass::OrderedLessThanZeroMask);\n+\n+  Known.propagateNaN(KnownSrc, true);\n+\n+  // Infinity needs a range check.\n+  return Known;\n+}\n+\n KnownFPClass KnownFPClass::roundToIntegral(const KnownFPClass &KnownSrc,\n                                            bool IsTrunc,\n                                            bool IsMultiUnitFPType) {\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex b83cb48b8cd8f..48dd52e6f69cb 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -2153,6 +2153,41 @@ simplifyDemandedFPClassMinMax(KnownFPClass &Known, Intrinsic::ID IID,\n                             /*IsCanonicalizing=*/true);\n }\n \n+static Value *simplifyDemandedUseFPClassFPTrunc(InstCombinerImpl &IC,\n+                                                Instruction &I,\n+                                                FPClassTest DemandedMask,\n+                                                KnownFPClass &Known,\n+                                                unsigned Depth) {\n+  FPClassTest SrcDemandedMask = DemandedMask;\n+\n+  // Zero results may have been rounded from subnormal or normal sources.\n+  if (DemandedMask & fcNegZero)\n+    SrcDemandedMask |= fcNegSubnormal | fcNegNormal;\n+  if (DemandedMask & fcPosZero)\n+    SrcDemandedMask |= fcPosSubnormal | fcPosNormal;\n+\n+  // Subnormal results may have been normal in the source type\n+  if (DemandedMask & fcNegSubnormal)\n+    SrcDemandedMask |= fcNegNormal;\n+  if (DemandedMask & fcPosSubnormal)\n+    SrcDemandedMask |= fcPosNormal;\n+\n+  if (DemandedMask & fcPosInf)\n+    SrcDemandedMask |= fcPosNormal;\n+  if (DemandedMask & fcNegInf)\n+    SrcDemandedMask |= fcNegNormal;\n+\n+  KnownFPClass KnownSrc;\n+  if (IC.SimplifyDemandedFPClass(&I, 0, SrcDemandedMask, KnownSrc, Depth + 1))\n+    return &I;\n+\n+  Known = KnownFPClass::fptrunc(KnownSrc);\n+\n+  FPClassTest ValidResults = DemandedMask & Known.KnownFPClasses;\n+  return getFPClassConstant(I.getType(), ValidResults,\n+                            /*IsCanonicalizing=*/true);\n+}\n+\n /// Try to set an inferred no-nans or no-infs in \\p FMF. \\p\n /// ValidResults is a mask of known valid results for the operator\n /// (already computed from the result, and the known operand inputs,\n@@ -2472,6 +2507,9 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n \n     return nullptr;\n   }\n+  case Instruction::FPTrunc:\n+    return simplifyDemandedUseFPClassFPTrunc(*this, *I, DemandedMask, Known,\n+                                             Depth);\n   case Instruction::FPExt: {\n     FPClassTest SrcDemandedMask = DemandedMask;\n \n@@ -2863,6 +2901,9 @@ Value *InstCombinerImpl::SimplifyDemandedUseFPClass(Instruction *I,\n \n       return nullptr;\n     }\n+    case Intrinsic::fptrunc_round:\n+      return simplifyDemandedUseFPClassFPTrunc(*this, *CI, DemandedMask, Known,\n+                                               Depth);\n     case Intrinsic::canonicalize: {\n       Type *EltTy = VTy->getScalarType();\n \n",
+  "components": [
+    "InstCombine",
+    "ValueTracking"
+  ],
+  "description": "Also handle llvm.fptrunc.round since it's the same.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fptrunc-round.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_only_qnan__fptrunc",
+          "test_body": "define nofpclass(snan inf zero sub norm) half @ret_only_qnan__fptrunc(float %x) {\n  %result = call half @llvm.fptrunc.round.f16.f32(float %x, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "nzero_demands_pnorm_source",
+          "test_body": "declare nofpclass(nan inf zero sub pnorm) float @returns_nnorm_f32()\n\ndefine nofpclass(inf pzero sub norm) half @nzero_demands_pnorm_source(i1 %cond, float %unknown) {\n  %nnorm = call float @returns_nnorm_f32()\n  %select = select i1 %cond, float %nnorm, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_nsub_nzero__fptrunc",
+          "test_body": "define nofpclass(nan inf pzero psub norm) half @ret_only_nsub_nzero__fptrunc(float %x) {\n  %result = call half @llvm.fptrunc.round.f16.f32(float %x, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nan__fptrunc__select_nan_or_unknown",
+          "test_body": "declare nofpclass(inf zero sub norm) float @returns_nan_f32()\n\ndefine nofpclass(nan) half @ret_no_nan__fptrunc__select_nan_or_unknown(i1 %cond, float %unknown) {\n  %nan = call float @returns_nan_f32()\n  %select = select i1 %cond, float %nan, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_pinf__fptrunc__inf",
+          "test_body": "declare nofpclass(nan zero sub norm) float @returns_inf_f32()\n\ndefine nofpclass(pinf) half @ret_no_pinf__fptrunc__inf() {\n  %inf = call float @returns_inf_f32()\n  %result = call half @llvm.fptrunc.round.f16.f32(float %inf, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_ninf__fptrunc__inf",
+          "test_body": "declare nofpclass(nan zero sub norm) float @returns_inf_f32()\n\ndefine nofpclass(ninf) half @ret_no_ninf__fptrunc__inf() {\n  %inf = call float @returns_inf_f32()\n  %result = call half @llvm.fptrunc.round.f16.f32(float %inf, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_positive_no_nan__fptrunc__select_positive_nan_or_unknown",
+          "test_body": "declare nofpclass(ninf nzero nsub nnorm) float @returns_positive_or_nan_f32()\n\ndefine nofpclass(nan pinf pzero psub pnorm) half @ret_no_positive_no_nan__fptrunc__select_positive_nan_or_unknown(i1 %cond, float %unknown) {\n  %positive.or.nan = call float @returns_positive_or_nan_f32()\n  %select = select i1 %cond, float %positive.or.nan, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_negative_no_nan__fptrunc__select_negative_nan_or_unknown",
+          "test_body": "declare nofpclass(pinf pzero psub pnorm) float @returns_negative_or_nan_f32()\n\ndefine nofpclass(nan ninf nzero nsub nnorm) half @ret_no_negative_no_nan__fptrunc__select_negative_nan_or_unknown(i1 %cond, float %unknown) {\n  %negative.or.nan = call float @returns_negative_or_nan_f32()\n  %select = select i1 %cond, float %negative.or.nan, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_inf_no_nan__fptrunc__select_inf_or_nan_or_unknown",
+          "test_body": "declare nofpclass(zero sub norm) float @returns_inf_or_nan_f32()\n\ndefine nofpclass(nan inf) half @ret_no_inf_no_nan__fptrunc__select_inf_or_nan_or_unknown(i1 %cond, float %unknown) {\n  %inf.or.nan = call float @returns_inf_or_nan_f32()\n  %select = select i1 %cond, float %inf.or.nan, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "pzero_demands_pnorm_source",
+          "test_body": "declare nofpclass(nan inf zero sub nnorm) float @returns_pnorm_f32()\n\ndefine nofpclass(inf nzero sub norm) half @pzero_demands_pnorm_source(i1 %cond, float %unknown) {\n  %pnorm = call float @returns_pnorm_f32()\n  %select = select i1 %cond, float %pnorm, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_inf__fptrunc__select_inf_or_unknown",
+          "test_body": "declare nofpclass(nan zero sub norm) float @returns_inf_f32()\n\ndefine nofpclass(inf) half @ret_no_inf__fptrunc__select_inf_or_unknown(i1 %cond, float %unknown) {\n  %inf = call float @returns_inf_f32()\n  %select = select i1 %cond, float %inf, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_only_nan__fptrunc",
+          "test_body": "define nofpclass(inf zero sub norm) half @ret_only_nan__fptrunc(float %x) {\n  %result = call half @llvm.fptrunc.round.f16.f32(float %x, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_pzero__fptrunc__select_pzero_or_unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) float @returns_pzero_f32()\n\ndefine nofpclass(pzero) half @ret_no_pzero__fptrunc__select_pzero_or_unknown(i1 %cond, float %unknown) {\n  %pzero = call float @returns_pzero_f32()\n  %select = select i1 %cond, float %pzero, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_nzero__fptrunc__select_nzero_or_unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) float @returns_nzero_f32()\n\ndefine nofpclass(nzero) half @ret_no_nzero__fptrunc__select_nzero_or_unknown(i1 %cond, float %unknown) {\n  %nzero = call float @returns_nzero_f32()\n  %select = select i1 %cond, float %nzero, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_ninf__fptrunc__select_ninf_or_unknown",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) float @returns_ninf_f32()\n\ndefine nofpclass(ninf) half @ret_no_ninf__fptrunc__select_ninf_or_unknown(i1 %cond, float %unknown) {\n  %ninf = call float @returns_ninf_f32()\n  %select = select i1 %cond, float %ninf, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "inf_demands_norm_source",
+          "test_body": "declare nofpclass(nan inf zero sub) float @returns_norm_f32()\n\ndefine nofpclass(sub norm) half @inf_demands_norm_source(i1 %cond, float %unknown) {\n  %norm = call float @returns_norm_f32()\n  %select = select i1 %cond, float %norm, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_negative__fptrunc__select_negative_or_unknown",
+          "test_body": "declare nofpclass(nan pinf pzero psub pnorm) float @returns_negative_f32()\n\ndefine nofpclass(ninf nzero nsub nnorm) half @ret_no_negative__fptrunc__select_negative_or_unknown(i1 %cond, float %unknown) {\n  %negative = call float @returns_negative_f32()\n  %select = select i1 %cond, float %negative, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_zero__fptrunc__select_zero_or_unknown",
+          "test_body": "declare nofpclass(nan inf sub norm) float @returns_zero_f32()\n\ndefine nofpclass(zero) half @ret_no_zero__fptrunc__select_zero_or_unknown(i1 %cond, float %unknown) {\n  %zero = call float @returns_zero_f32()\n  %select = select i1 %cond, float %zero, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_pinf__fptrunc__select_pinf_or_unknown",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) float @returns_pinf_f32()\n\ndefine nofpclass(pinf) half @ret_no_pinf__fptrunc__select_pinf_or_unknown(i1 %cond, float %unknown) {\n  %pinf = call float @returns_pinf_f32()\n  %select = select i1 %cond, float %pinf, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "zero_demands_norm_source",
+          "test_body": "declare nofpclass(nan inf zero sub) float @returns_norm_f32()\n\ndefine nofpclass(inf sub norm) half @zero_demands_norm_source(i1 %cond, float %unknown) {\n  %norm = call float @returns_norm_f32()\n  %select = select i1 %cond, float %norm, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "ret_no_positive__fptrunc__select_positive_or_unknown",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive_f32()\n\ndefine nofpclass(pinf pzero psub pnorm) half @ret_no_positive__fptrunc__select_positive_or_unknown(i1 %cond, float %unknown) {\n  %positive = call float @returns_positive_f32()\n  %select = select i1 %cond, float %positive, float %unknown\n  %result = call half @llvm.fptrunc.round.f16.f32(float %select, metadata !\"round.downward\")\n  ret half %result\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fptrunc.round.f16.f32(float, metadata) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fptrunc.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "ret_only_qnan__fptrunc",
+          "test_body": "define nofpclass(snan inf zero sub norm) half @ret_only_qnan__fptrunc(float %x) {\n  %result = fptrunc float %x to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "nzero_demands_pnorm_source",
+          "test_body": "declare nofpclass(nan inf zero sub pnorm) float @returns_nnorm_f32()\n\ndefine nofpclass(inf pzero sub norm) half @nzero_demands_pnorm_source(i1 %cond, float %unknown) {\n  %nnorm = call float @returns_nnorm_f32()\n  %select = select i1 %cond, float %nnorm, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_only_nsub_nzero__fptrunc",
+          "test_body": "define nofpclass(nan inf pzero psub norm) half @ret_only_nsub_nzero__fptrunc(float %x) {\n  %result = fptrunc float %x to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_nan__fptrunc__select_nan_or_unknown",
+          "test_body": "declare nofpclass(inf zero sub norm) float @returns_nan_f32()\n\ndefine nofpclass(nan) half @ret_no_nan__fptrunc__select_nan_or_unknown(i1 %cond, float %unknown) {\n  %nan = call float @returns_nan_f32()\n  %select = select i1 %cond, float %nan, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_pinf__fptrunc__inf",
+          "test_body": "declare nofpclass(nan zero sub norm) float @returns_inf_f32()\n\ndefine nofpclass(pinf) half @ret_no_pinf__fptrunc__inf() {\n  %inf = call float @returns_inf_f32()\n  %result = fptrunc float %inf to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_ninf__fptrunc__inf",
+          "test_body": "declare nofpclass(nan zero sub norm) float @returns_inf_f32()\n\ndefine nofpclass(ninf) half @ret_no_ninf__fptrunc__inf() {\n  %inf = call float @returns_inf_f32()\n  %result = fptrunc float %inf to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_positive_no_nan__fptrunc__select_positive_nan_or_unknown",
+          "test_body": "declare nofpclass(ninf nzero nsub nnorm) float @returns_positive_or_nan_f32()\n\ndefine nofpclass(nan pinf pzero psub pnorm) half @ret_no_positive_no_nan__fptrunc__select_positive_nan_or_unknown(i1 %cond, float %unknown) {\n  %positive.or.nan = call float @returns_positive_or_nan_f32()\n  %select = select i1 %cond, float %positive.or.nan, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_negative_no_nan__fptrunc__select_negative_nan_or_unknown",
+          "test_body": "declare nofpclass(pinf pzero psub pnorm) float @returns_negative_or_nan_f32()\n\ndefine nofpclass(nan ninf nzero nsub nnorm) half @ret_no_negative_no_nan__fptrunc__select_negative_nan_or_unknown(i1 %cond, float %unknown) {\n  %negative.or.nan = call float @returns_negative_or_nan_f32()\n  %select = select i1 %cond, float %negative.or.nan, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_inf_no_nan__fptrunc__select_inf_or_nan_or_unknown",
+          "test_body": "declare nofpclass(zero sub norm) float @returns_inf_or_nan_f32()\n\ndefine nofpclass(nan inf) half @ret_no_inf_no_nan__fptrunc__select_inf_or_nan_or_unknown(i1 %cond, float %unknown) {\n  %inf.or.nan = call float @returns_inf_or_nan_f32()\n  %select = select i1 %cond, float %inf.or.nan, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "pzero_demands_pnorm_source",
+          "test_body": "declare nofpclass(nan inf zero sub nnorm) float @returns_pnorm_f32()\n\ndefine nofpclass(inf nzero sub norm) half @pzero_demands_pnorm_source(i1 %cond, float %unknown) {\n  %pnorm = call float @returns_pnorm_f32()\n  %select = select i1 %cond, float %pnorm, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_inf__fptrunc__select_inf_or_unknown",
+          "test_body": "declare nofpclass(nan zero sub norm) float @returns_inf_f32()\n\ndefine nofpclass(inf) half @ret_no_inf__fptrunc__select_inf_or_unknown(i1 %cond, float %unknown) {\n  %inf = call float @returns_inf_f32()\n  %select = select i1 %cond, float %inf, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_only_nan__fptrunc",
+          "test_body": "define nofpclass(inf zero sub norm) half @ret_only_nan__fptrunc(float %x) {\n  %result = fptrunc float %x to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_pzero__fptrunc__select_pzero_or_unknown",
+          "test_body": "declare nofpclass(nan inf nzero sub norm) float @returns_pzero_f32()\n\ndefine nofpclass(pzero) half @ret_no_pzero__fptrunc__select_pzero_or_unknown(i1 %cond, float %unknown) {\n  %pzero = call float @returns_pzero_f32()\n  %select = select i1 %cond, float %pzero, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_nzero__fptrunc__select_nzero_or_unknown",
+          "test_body": "declare nofpclass(nan inf pzero sub norm) float @returns_nzero_f32()\n\ndefine nofpclass(nzero) half @ret_no_nzero__fptrunc__select_nzero_or_unknown(i1 %cond, float %unknown) {\n  %nzero = call float @returns_nzero_f32()\n  %select = select i1 %cond, float %nzero, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_ninf__fptrunc__select_ninf_or_unknown",
+          "test_body": "declare nofpclass(nan pinf zero sub norm) float @returns_ninf_f32()\n\ndefine nofpclass(ninf) half @ret_no_ninf__fptrunc__select_ninf_or_unknown(i1 %cond, float %unknown) {\n  %ninf = call float @returns_ninf_f32()\n  %select = select i1 %cond, float %ninf, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "inf_demands_norm_source",
+          "test_body": "declare nofpclass(nan inf zero sub) float @returns_norm_f32()\n\ndefine nofpclass(sub norm) half @inf_demands_norm_source(i1 %cond, float %unknown) {\n  %norm = call float @returns_norm_f32()\n  %select = select i1 %cond, float %norm, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_negative__fptrunc__select_negative_or_unknown",
+          "test_body": "declare nofpclass(nan pinf pzero psub pnorm) float @returns_negative_f32()\n\ndefine nofpclass(ninf nzero nsub nnorm) half @ret_no_negative__fptrunc__select_negative_or_unknown(i1 %cond, float %unknown) {\n  %negative = call float @returns_negative_f32()\n  %select = select i1 %cond, float %negative, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_zero__fptrunc__select_zero_or_unknown",
+          "test_body": "declare nofpclass(nan inf sub norm) float @returns_zero_f32()\n\ndefine nofpclass(zero) half @ret_no_zero__fptrunc__select_zero_or_unknown(i1 %cond, float %unknown) {\n  %zero = call float @returns_zero_f32()\n  %select = select i1 %cond, float %zero, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_pinf__fptrunc__select_pinf_or_unknown",
+          "test_body": "declare nofpclass(nan ninf zero sub norm) float @returns_pinf_f32()\n\ndefine nofpclass(pinf) half @ret_no_pinf__fptrunc__select_pinf_or_unknown(i1 %cond, float %unknown) {\n  %pinf = call float @returns_pinf_f32()\n  %select = select i1 %cond, float %pinf, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "zero_demands_norm_source",
+          "test_body": "declare nofpclass(nan inf zero sub) float @returns_norm_f32()\n\ndefine nofpclass(inf sub norm) half @zero_demands_norm_source(i1 %cond, float %unknown) {\n  %norm = call float @returns_norm_f32()\n  %select = select i1 %cond, float %norm, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        },
+        {
+          "test_name": "ret_no_positive__fptrunc__select_positive_or_unknown",
+          "test_body": "declare nofpclass(nan ninf nzero nsub nnorm) float @returns_positive_f32()\n\ndefine nofpclass(pinf pzero psub pnorm) half @ret_no_positive__fptrunc__select_positive_or_unknown(i1 %cond, float %unknown) {\n  %positive = call float @returns_positive_f32()\n  %select = select i1 %cond, float %positive, float %unknown\n  %result = fptrunc float %select to half\n  ret half %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:support",
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "* **#175421** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175421?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a> \ud83d\udc48 <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175421?utm_source=stack-comment-view-in-graphite\" target=\"_blank\">(View in Graphite)</a>\n* **#175420** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/175420?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174849** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174849?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* **#174848** <a href=\"https://app.graphite.com/github/pr/llvm/llvm-project/174848?utm_source=stack-comment-icon\" target=\"_blank\"><img src=\"https://static.graphite.dev/graphite-32x32-black.png\" alt=\"Graphite\" width=\"10px\" height=\"10px\"/></a>\n* `main`\n\n\n<h2></h2>\n\nThis stack of pull requests is managed by <a href=\"https://graphite.dev?utm-source=stack-comment\"><b>Graphite</b></a>. Learn more about <a href=\"https://stacking.dev/?utm_source=stack-comment\">stacking</a>.\n<!-- Current dependencies on/for this PR: -->"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 188676 tests passed\n* 5008 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 129640 tests passed\n* 2875 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-01-11T09:22:51Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Support/KnownFPClass.h": [
+      [
+        332,
+        337
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        4938,
+        4952
+      ]
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      [
+        423,
+        428
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        2153,
+        2158
+      ],
+      [
+        2472,
+        2477
+      ],
+      [
+        2863,
+        2868
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fptrunc-round.ll": [
+      [
+        50,
+        57
+      ],
+      [
+        118,
+        125
+      ],
+      [
+        133,
+        140
+      ],
+      [
+        148,
+        155
+      ],
+      [
+        163,
+        170
+      ],
+      [
+        178,
+        185
+      ],
+      [
+        235,
+        242
+      ],
+      [
+        265,
+        272
+      ],
+      [
+        280,
+        287
+      ],
+      [
+        310,
+        317
+      ],
+      [
+        428,
+        434
+      ],
+      [
+        440,
+        446
+      ],
+      [
+        452,
+        459
+      ],
+      [
+        466,
+        473
+      ],
+      [
+        480,
+        487
+      ],
+      [
+        576,
+        578
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fptrunc.ll": [
+      [
+        50,
+        57
+      ],
+      [
+        118,
+        125
+      ],
+      [
+        133,
+        140
+      ],
+      [
+        148,
+        155
+      ],
+      [
+        163,
+        170
+      ],
+      [
+        178,
+        185
+      ],
+      [
+        235,
+        242
+      ],
+      [
+        265,
+        272
+      ],
+      [
+        280,
+        287
+      ],
+      [
+        310,
+        317
+      ],
+      [
+        428,
+        435
+      ],
+      [
+        440,
+        447
+      ],
+      [
+        452,
+        459
+      ],
+      [
+        466,
+        473
+      ],
+      [
+        480,
+        487
+      ],
+      [
+        576,
+        578
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "computeKnownFPClassForFPTrunc",
+      "getMinMaxKind"
+    ],
+    "llvm/lib/Support/KnownFPClass.cpp": [
+      "KnownFPClass::fpext",
+      "KnownFPClass::roundToIntegral"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "InstCombinerImpl::SimplifyDemandedUseFPClass",
+      "simplifyDemandedFPClassMinMax"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fptrunc-round.ll": [
+      "ret_only_nan__fptrunc",
+      "ret_only_nsub_nzero__fptrunc",
+      "ret_only_nzero__fptrunc"
+    ],
+    "llvm/test/Transforms/InstCombine/simplify-demanded-fpclass-fptrunc.ll": [
+      "ret_only_nsub_nzero__fptrunc"
+    ]
+  }
+}
