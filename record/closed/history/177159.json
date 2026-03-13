@@ -1,0 +1,373 @@
+[
+  {
+    "type": "message",
+    "role": "system",
+    "content": "You are an LLVM compiler expert specializing in test case generation and bug detection. You are conducting LLVM code review now.\n\n## Context\nMaintainers provided a patch, but patches often have edge cases or introduce new issues.\n\n## Your Task\nYou will work in two phases:\n- Phase 1: Analyze the fix to identify potential issues, gaps, and edge cases. Propose test strategies.\n- Phase 2: Generate targeted test cases by modifying existing tests to target identified issues\n\n## You Will Receive\n- Original patch description and related test case(s)\n- The code region that was modified (the patch)\n- Information about the optimization pass and component involved\n\n## Tools You Can Use\n\nYou have multiple tools for each phase, but you should try to avoid using them with same inputs repeatedly to reduce redundant calls.\n\n**CRITICAL**: You MUST use tool call every action in Phase 1 and Phase 2.\n"
+  },
+  {
+    "type": "message",
+    "role": "user",
+    "content": "# Phase 1: Analyze the Fix\n\nThis is a patch for VectorCombine:\n\n[VectorCombine] Switch vector or<->umax/and<->umin in comparisons\nResolves #174500\r\n\r\nIn the transformation, we use either use one of these equivalences directly or one of the trivial inferences of their combinations.\r\n\r\n`or<->umax`\r\n\r\n1. `or(X) == 0 <=> umax(X) == 0`\r\n2. `or(X) == 1 <=> umax(X) == 1`\r\n3. `sign(or(X)) == sign(umax(X))`\r\n\r\n`and<->umin`\r\n\r\n1. `and(X) == -1 <=> umin(X) == -1`\r\n2. `and(X) == -2 <=> umin(X) == -2`\r\n3. `sign(and(X)) == sign(umin(X))`\r\n\r\n| Case | Proof |\r\n|------|-------|\r\n| a. `or(X) ==/!= 0 <-> umax(X) ==/!= 0` | [proof](https://alive2.llvm.org/ce/z/t9kER4) |\r\n| b. `or(X) s< 0 <-> umax(X) s< 0` | [proof](https://alive2.llvm.org/ce/z/q67EXU) | \r\n| c. `or(X) s> -1 <-> umax(X) s> -1` | [proof](https://alive2.llvm.org/ce/z/vY-tUd) | \r\n| d. `or(X) s< 1 <-> umax(X) s< 1` | [proof](https://alive2.llvm.org/ce/z/d5izg3) | \r\n| e. `or(X) ==/!= 1 <-> umax(X) ==/!= 1` | [proof](https://alive2.llvm.org/ce/z/gSjvpk) | \r\n| f. `or(X) s< 2 <-> umax(X) s< 2` | [proof](https://alive2.llvm.org/ce/z/sGUV6c) | \r\n| g. `and(X) ==/!= -1 <-> umin(X) ==/!= -1` | [proof](https://alive2.llvm.org/ce/z/mSAs2p) | \r\n| h. `and(X) s< 0 <-> umin(X) s< 0` | [proof](https://alive2.llvm.org/ce/z/xnZeDT) | \r\n| i. `and(X) s> -1 <-> umin(X) s> -1` | [proof](https://alive2.llvm.org/ce/z/ea_tKG) | \r\n| j. `and(X) s> -2 <-> umin(X) s> -2` | [proof](https://alive2.llvm.org/ce/z/ewhAab) | \r\n| k. `and(X) ==/!= -2 <-> umin(X) ==/!= -2` | [proof](https://alive2.llvm.org/ce/z/nBBt62) | \r\n| l. `and(X) s> -3 <-> umin(X) s> -3` | [proof](https://alive2.llvm.org/ce/z/F3dsfz) |\ndiff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 0d477a0f8a803..b86a92c0c4fa6 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -150,6 +150,7 @@ class VectorCombine {\n   bool foldCastFromReductions(Instruction &I);\n   bool foldSignBitReductionCmp(Instruction &I);\n   bool foldICmpEqZeroVectorReduce(Instruction &I);\n+  bool foldEquivalentReductionCmp(Instruction &I);\n   bool foldSelectShuffle(Instruction &I, bool FromReduction = false);\n   bool foldInterleaveIntrinsics(Instruction &I);\n   bool shrinkType(Instruction &I);\n@@ -4556,6 +4557,140 @@ bool VectorCombine::foldICmpEqZeroVectorReduce(Instruction &I) {\n   return true;\n }\n \n+/// Fold comparisons of reduce.or/reduce.and with reduce.umax/reduce.umin\n+/// based on cost, preserving the comparison semantics.\n+///\n+/// We use two fundamental properties for each pair:\n+///\n+///   1. or(X) == 0 <=> umax(X) == 0\n+///   2. or(X) == 1 <=> umax(X) == 1\n+///   3. sign(or(X)) == sign(umax(X))\n+///\n+///   1. and(X) == -1 <=> umin(X) == -1\n+///   2. and(X) == -2 <=> umin(X) == -2\n+///   3. sign(and(X)) == sign(umin(X))\n+///\n+/// From these we can infer the following transformations:\n+///   a. or(X) ==/!= 0   <-> umax(X) ==/!= 0\n+///   b. or(X) s< 0      <-> umax(X) s< 0\n+///   c. or(X) s> -1     <-> umax(X) s> -1\n+///   d. or(X) s< 1      <-> umax(X) s< 1\n+///   e. or(X) ==/!= 1   <-> umax(X) ==/!= 1\n+///   f. or(X) s< 2      <-> umax(X) s< 2\n+///   g. and(X) ==/!= -1 <-> umin(X) ==/!= -1\n+///   h. and(X) s< 0     <-> umin(X) s< 0\n+///   i. and(X) s> -1    <-> umin(X) s> -1\n+///   j. and(X) s> -2    <-> umin(X) s> -2\n+///   k. and(X) ==/!= -2 <-> umin(X) ==/!= -2\n+///   l. and(X) s> -3    <-> umin(X) s> -3\n+///\n+bool VectorCombine::foldEquivalentReductionCmp(Instruction &I) {\n+  CmpPredicate Pred;\n+  Value *ReduceOp;\n+  const APInt *CmpVal;\n+  if (!match(&I, m_ICmp(Pred, m_Value(ReduceOp), m_APInt(CmpVal))))\n+    return false;\n+\n+  auto *II = dyn_cast<IntrinsicInst>(ReduceOp);\n+  if (!II || !II->hasOneUse())\n+    return false;\n+\n+  const auto IsValidOrUmaxCmp = [&]() {\n+    // Cases a and e\n+    bool IsEquality =\n+        (CmpVal->isZero() || CmpVal->isOne()) && ICmpInst::isEquality(Pred);\n+    // Case c\n+    bool IsPositive = CmpVal->isAllOnes() && Pred == ICmpInst::ICMP_SGT;\n+    // Cases b, d, and f\n+    bool IsNegative = (CmpVal->isZero() || CmpVal->isOne() || *CmpVal == 2) &&\n+                      Pred == ICmpInst::ICMP_SLT;\n+    return IsEquality || IsPositive || IsNegative;\n+  };\n+\n+  const auto IsValidAndUminCmp = [&]() {\n+    const auto LeadingOnes = CmpVal->countl_one();\n+\n+    // Cases g and k\n+    bool IsEquality =\n+        (CmpVal->isAllOnes() || LeadingOnes + 1 == CmpVal->getBitWidth()) &&\n+        ICmpInst::isEquality(Pred);\n+    // Case h\n+    bool IsNegative = CmpVal->isZero() && Pred == ICmpInst::ICMP_SLT;\n+    // Cases i, j, and l\n+    bool IsPositive =\n+        // if the number has at least N - 2 leading ones\n+        // and the two LSBs are:\n+        //   - 1 x 1 -> -1\n+        //   - 1 x 0 -> -2\n+        //   - 0 x 1 -> -3\n+        LeadingOnes + 2 >= CmpVal->getBitWidth() &&\n+        ((*CmpVal)[0] || (*CmpVal)[1]) && Pred == ICmpInst::ICMP_SGT;\n+    return IsEquality || IsNegative || IsPositive;\n+  };\n+\n+  Intrinsic::ID OriginalIID = II->getIntrinsicID();\n+  Intrinsic::ID AlternativeIID;\n+\n+  // Check if this is a valid comparison pattern and determine the alternate\n+  // reduction intrinsic.\n+  switch (OriginalIID) {\n+  case Intrinsic::vector_reduce_or:\n+    if (!IsValidOrUmaxCmp())\n+      return false;\n+    AlternativeIID = Intrinsic::vector_reduce_umax;\n+    break;\n+  case Intrinsic::vector_reduce_umax:\n+    if (!IsValidOrUmaxCmp())\n+      return false;\n+    AlternativeIID = Intrinsic::vector_reduce_or;\n+    break;\n+  case Intrinsic::vector_reduce_and:\n+    if (!IsValidAndUminCmp())\n+      return false;\n+    AlternativeIID = Intrinsic::vector_reduce_umin;\n+    break;\n+  case Intrinsic::vector_reduce_umin:\n+    if (!IsValidAndUminCmp())\n+      return false;\n+    AlternativeIID = Intrinsic::vector_reduce_and;\n+    break;\n+  default:\n+    return false;\n+  }\n+\n+  Value *X = II->getArgOperand(0);\n+  auto *VecTy = dyn_cast<FixedVectorType>(X->getType());\n+  if (!VecTy)\n+    return false;\n+\n+  const auto GetReductionCost = [&](Intrinsic::ID IID) -> InstructionCost {\n+    unsigned ReductionOpc = getArithmeticReductionInstruction(IID);\n+    if (ReductionOpc != Instruction::ICmp)\n+      return TTI.getArithmeticReductionCost(ReductionOpc, VecTy, std::nullopt,\n+                                            CostKind);\n+    return TTI.getMinMaxReductionCost(IID, VecTy, FastMathFlags(), CostKind);\n+  };\n+\n+  InstructionCost OrigCost = GetReductionCost(OriginalIID);\n+  InstructionCost AltCost = GetReductionCost(AlternativeIID);\n+\n+  LLVM_DEBUG(dbgs() << \"Found equivalent reduction cmp: \" << I\n+                    << \"\\n  OrigCost: \" << OrigCost\n+                    << \" vs AltCost: \" << AltCost << \"\\n\");\n+\n+  if (AltCost >= OrigCost)\n+    return false;\n+\n+  Builder.SetInsertPoint(&I);\n+  Type *ScalarTy = VecTy->getScalarType();\n+  Value *NewReduce = Builder.CreateIntrinsic(ScalarTy, AlternativeIID, {X});\n+  Value *NewCmp =\n+      Builder.CreateICmp(Pred, NewReduce, ConstantInt::get(ScalarTy, *CmpVal));\n+\n+  replaceValue(I, *NewCmp);\n+  return true;\n+}\n+\n /// Returns true if this ShuffleVectorInst eventually feeds into a\n /// vector reduction intrinsic (e.g., vector_reduce_add) by only following\n /// chains of shuffles and binary operators (in any combination/order).\n@@ -5592,6 +5727,8 @@ bool VectorCombine::run() {\n           return true;\n         if (foldICmpEqZeroVectorReduce(I))\n           return true;\n+        if (foldEquivalentReductionCmp(I))\n+          return true;\n         [[fallthrough]];\n       case Instruction::FCmp:\n         if (foldExtractExtract(I))\n\n\n---\n\n## Subsystem Knowledge for VectorCombine\n\nFor reference, here are some key points about the VectorCombine you should consider (but do not limit to these) in your analysis:\n\n# Subsystem Knowledge for VectorCombine\n\n## Elements Frequently Missed\n\n* **Poison-Induced Undefined Behavior (UB) in Specific Operands**: The optimization pass frequently misses the severe consequences of introducing `poison` values into UB-sensitive operands. Specifically, feeding `poison` into the divisor of division/remainder instructions (`sdiv`, `udiv`, `srem`, `urem`) or the shift amount of shift instructions (`shl`, `lshr`, `ashr`) elevates a safely propagating `poison` value into immediate Undefined Behavior.\n* **Operand Ordering for Non-Commutative Operations**: When vectorizing scalar operations, the pass misses the strict requirement to preserve Left-Hand Side (LHS) and Right-Hand Side (RHS) operand ordering for non-commutative binary operations (like shifts), leading to swapped arguments.\n* **Target Endianness and Data Layout**: The pass misses querying the target's `datalayout` to determine endianness. It hardcodes little-endian assumptions when calculating bit offsets for vector-to-scalar packing, causing incorrect bit extractions on big-endian targets.\n* **Scalar Element Byte-Size Validation**: When scalarizing memory operations, the pass misses checking whether the individual scalar element (e.g., `i1`) is byte-sized. It incorrectly relies only on the total vector size being a multiple of bytes, which leads to clobbering adjacent bits during scalar stores.\n* **Strict Predicate Matching for Comparisons**: The pass misses enforcing exact base predicate equality when folding multiple `icmp` instructions. It incorrectly allows conditionally equivalent predicates (e.g., relying on `samesign` flags) to merge, applying assumptions from one instruction to operands that do not guarantee those conditions.\n* **Out-of-Bounds Vector Indices**: The pass misses the fact that out-of-bounds indices in `insertelement` or `extractelement` evaluate to `poison`. When scalarizing these operations, it fails to account for this `poison` generation, which corrupts downstream scalar operations.\n* **Shift Amount Bounds During Type Shrinking**: When narrowing the type of shift instructions, the pass misses validating that the shift amount remains strictly less than the new, smaller bitwidth, resulting in `poison` values when the shift amount exceeds the narrowed type's capacity.\n\n## Patterns Not Well Handled\n\n### Pattern 1: Hoisting or Scalarizing Poison-Generating Operations into UB-Sensitive Contexts\nThe pass frequently attempts to optimize code by hoisting structural operations (such as `shufflevector` with `poison` masks) above arithmetic operations, or by scalarizing vector operations involving out-of-bounds indices or narrowed types. While these transformations are structurally valid, they are not well handled because they often expose or generate `poison` values in new contexts. When these newly generated `poison` values are fed into the operands of UB-sensitive instructions\u2014such as the divisor of an integer division/remainder or the shift amount of a shift instruction\u2014the transformation incorrectly elevates a previously safe `poison` propagation into immediate Undefined Behavior.\n\n### Pattern 2: Vectorizing or Folding Instructions with Incompatible Lane Properties\nThe pass attempts to combine multiple scalar operations into a single vector operation, or fold multiple vector operations (like shuffled compares) into a unified instruction. This pattern is not well handled because the pass relies on overly permissive matching logic. It fails to strictly validate the compatibility of the combined lanes. For example, it ignores operand ordering for non-commutative operations, leading to swapped arguments in the resulting vector instruction. Similarly, it blindly applies conditional flags (like `samesign`) from one lane's predicate to other lanes where the condition does not hold. This silently corrupts the logic of the program, altering control flow and producing incorrect boolean results.\n\n### Pattern 3: Unsafe Lowering of Vector Layouts to Scalar Memory or Bitwise Arithmetic\nTo optimize vector element access, the pass often converts vector extractions/insertions into scalar memory accesses or packs the entire vector into a large integer for bitwise arithmetic. This pattern is not well handled because it makes unsafe, hardcoded assumptions about underlying memory and register layouts without respecting target or type constraints. It assumes little-endian bit offsets without querying the target's data layout, causing the wrong bits to be extracted on big-endian architectures. Furthermore, it assumes that if a whole vector is byte-sized, its individual elements are safely and independently addressable in memory. This leads to the emission of scalar memory operations for non-byte-sized elements (like `i1`), which the backend expands into full byte accesses, incorrectly clobbering adjacent vector elements during stores.\n\n**CRITICAL**: Subsystem knowledge is **ONLY** a reference for you to understand this component.\nDo NOT start your analysis from these patterns. Start from the patch semantics. Use these **ONLY** to cross-check your reasoning.\n\n## Your Task for Phase 1\n\nIn this phase, you will review and analyze the fix above carefully and identify potential issues, edge cases, or gaps that the fix might miss. According to the analysis, propose mutation strategies for exposing the issue. These strategies will be used in Phase 2 to mutate existing test cases to target the identified issues.\n\nFollow this structured workflow:\n\n### Step 1: Context Gathering\nIn this step, you should gather enough context to construct semantics model of this fix for future analysis. Your goal is to understand the complete flow of this optimization. To achieve this, you should look at the nearby code regions, or try to find similar code regions in the LLVM codebase to understand the semantics of this fix.\n\nYou can use search tools:\n- Use the `find` and `list` tools to find relevant files in the LLVM code.\n- Use the `read` and `grep` tools to understand the context of the fix.\n\n### Step 2: Fix Segmentation and Analysis\nBased on the model built for this fix, you should segment the fix into smaller parts and analyze the semantics of each part. Follow this structured workflow for segmentation and analysis:\n\n- **Segmentation**: Break down the fix into smaller segments or key changes, especially focusing on code regions related to semantics changes.\n- **Analysis**: For each segment, analyze the semantics and identify any assumptions or preconditions that the fix relies on.\n\n#### Tips for this step\n- You can use the `langref` tool to query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.\n- You can pay attention to the commit message and annotations in the code, such as comments or specific patterns that indicate important semantics or assumptions.\n\n### Step 3: Formal Semantic Modeling\n- Define the exact semantic contract that this fix claims to satisfy.\n- Explicitly list the preconditions under which the contract is assumed to hold.\n- Identify how these preconditions may be violated.\n\n### Step 4: Identify Potential Issues and Propose Test Strategies\nBased on your analysis, propose around 5 specific test strategies that can be used to expose the issue. When proposing test strategies, consider the following:\n- **Focus**: Focus on the assumptions and preconditions you identified.\n- **Scenarios**: Think about specific input characteristics or scenarios that could violate these assumptions.\n- **Mutations**: Propose mutations that can be applied to existing test cases to create new test cases targeting these scenarios.\n\nOnce you have analyzed the fix and identified potential issues or edge cases, use the `stop` tool to specify proposed test strategies along with detailed reasoning. \nFollow this structure for reasoning:\n\n### 1. Fix Understanding\n- What optimization or transformation does this fix enable or correct?\n- What are the key changes made in the patch?\n\n### 2. Formal Semantic Modeling\n- What is the exact semantic function before the fix?\n- What is the exact semantic function after the fix?\n- Under what conditions might they differ?\n- Provide at least one concrete numerical instantiation to illustrate the difference.\n\n### 3. Assumptions and Preconditions Identified\n- What assumptions does the fix make about the input?\n- What preconditions must hold for this fix to be correct?\n\n### 4. Potential Cases to Break Assumptions\nFor each assumption and precondition identified, describe specific scenarios or input characteristics that could violate them. The potential cases should only focus on the semantics related to the analysis above.\n\n### 5. Test Strategies\nFor each potential issue you identified, propose specific test strategies with the following structure:\n\n- Name: [Name]\n- Target: [What to mutate]\n- Rationale: [Why this might expose an issue]\n- Expected Issue: [What incorrect behavior might occur]\n\n---\n\n## Tools that you can use\n\n- `findN`: Search for files in the LLVM codebase related to the component or optimization pass to understand the context of the fix and find relevant tests.\n- `listN`: List files in the LLVM codebase to find relevant tests or code regions.\n- `readN`: Read the content of a file in the LLVM codebase to understand existing tests or the fix.\n- `grepN`: Search for specific patterns in the codebase to find relevant tests or code regions.\n- `langref`: Query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.\n- `stop`: End Phase 1 by submitting the identified issues and proposed test strategies.\n\n"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_v53qUh2tgH7LoGRj1KkX",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'operator\\\\[' llvm/include/llvm/ADT/APInt.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_v53qUh2tgH7LoGRj1KkX",
+    "output": "1044:  bool operator[](unsigned bitPosition) const {"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_DKePAgccSJ1ldNeHj9GR",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI -A 5 'bool operator\\\\[\\\\](unsigned bitPosition) const {' llvm/include/llvm/ADT/APInt.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_DKePAgccSJ1ldNeHj9GR",
+    "output": "1044:  bool operator[](unsigned bitPosition) const {\n1045-    assert(bitPosition < getBitWidth() && \"Bit position out of bounds!\");\n1046-    return (maskBit(bitPosition) & getWord(bitPosition)) != 0;\n1047-  }\n1048-\n1049-  /// @}"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_Rj91kxaPR11kpjEXuyiZ",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'getArithmeticReductionInstruction' llvm/include/ llvm/lib/\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_Rj91kxaPR11kpjEXuyiZ",
+    "output": "llvm/include/llvm/CodeGen/BasicTTIImpl.h:2474:          getArithmeticReductionInstruction(IID), VecOpTy, std::nullopt,\nllvm/include/llvm/CodeGen/BasicTTIImpl.h:2479:          getArithmeticReductionInstruction(IID), VecOpTy, FMF, CostKind);\nllvm/include/llvm/Transforms/Utils/LoopUtils.h:441:LLVM_ABI unsigned getArithmeticReductionInstruction(Intrinsic::ID RdxID);\nllvm/lib/CodeGen/ExpandReductions.cpp:116:      unsigned RdxOpcode = getArithmeticReductionInstruction(ID);\nllvm/lib/CodeGen/ExpandReductions.cpp:131:      unsigned RdxOpcode = getArithmeticReductionInstruction(ID);\nllvm/lib/CodeGen/ExpandReductions.cpp:144:      unsigned RdxOpcode = getArithmeticReductionInstruction(ID);\nllvm/lib/CodeGen/ExpandReductions.cpp:77:      unsigned RdxOpcode = getArithmeticReductionInstruction(ID);\nllvm/lib/CodeGen/ExpandVectorPredication.cpp:359:    unsigned Opc = getArithmeticReductionInstruction(RedID);llvm/lib/Transforms/Utils/LoopUtils.cpp:1120:unsigned llvm::getArithmeticReductionInstruction(Intrinsic::ID RdxID) {\nllvm/lib/Transforms/Utils/LoopUtils.cpp:1149:// This is the inverse to getArithmeticReductionInstruction\nllvm/lib/Transforms/Utils/LoopUtils.cpp:1405:    unsigned Opc = getArithmeticReductionInstruction(RdxID);\nllvm/lib/Transforms/Vectorize/VectorCombine.cpp:1690:      getArithmeticReductionInstruction(II.getIntrinsicID());\nllvm/lib/Transforms/Vectorize/VectorCombine.cpp:1764:      getArithmeticReductionInstruction(II0.getIntrinsicID());\nllvm/lib/Transforms/Vectorize/VectorCombine.cpp:4149:  unsigned ReductionOpc = getArithmeticReductionInstruction(IID);\nllvm/lib/Transforms/Vectorize/VectorCombine.cpp:4348:        TTI.getArithmeticReductionCost(getArithmeticReductionInstruction(Arith),\nllvm/lib/Transforms/Vectorize/VectorCombine.cpp:4517:          getArithmeticReductionInstruction(IID), FXTy, std::nullopt, CostKind);\nllvm/lib/Transforms/Vectorize/VectorCombine.cpp:4519:          getArithmeticReductionInstruction(IID), XTy, std::nullopt, CostKind);\nllvm/lib/Transforms/Vectorize/VectorCombine.cpp:4667:    unsigned ReductionOpc = getArithmeticReductionInstruction(IID);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_28ZuTjD9sipI34u4q4gp",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'getArithmeticReductionInstruction' llvm/lib/Transforms/Utils/LoopUtils.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_28ZuTjD9sipI34u4q4gp",
+    "output": "1120:unsigned llvm::getArithmeticReductionInstruction(Intrinsic::ID RdxID) {\n1149:// This is the inverse to getArithmeticReductionInstruction\n1405:    unsigned Opc = getArithmeticReductionInstruction(RdxID);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_langref_UrAdOUicFlxnCqEIYdqq",
+    "name": "langref",
+    "arguments": "{\"inst\":\"vector_reduce_and\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_langref_UrAdOUicFlxnCqEIYdqq",
+    "output": "Error: 'vector_reduce_and' is not found in the LLVM Language Reference Manual."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_X7dy9a0tjZSTKtEc9eej",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'bool operator==(uint64_t Val) const' llvm/include/llvm/ADT/APInt.h\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_X7dy9a0tjZSTKtEc9eej",
+    "output": "1070:  bool operator==(uint64_t Val) const {"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_S9bLnckzKT5IV7YJ5V2Z",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'foldEquivalentReductionCmp' llvm/test/\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_S9bLnckzKT5IV7YJ5V2Z",
+    "output": "No matches found."
+  },
+  {
+    "type": "message",
+    "role": "assistant",
+    "content": "` means signed less than.\nIf `or(X) s< 2`, it means `or(X)` is `<= 1`.\nSince `or(X)` is positive or zero or negative.\nIf `or(X) <= 1`, it can be `0`, `1`, or negative.\nIf `or(X)` is negative, its sign bit is 1.\n`umax(X)` will also have sign bit 1, because `or(X)` has sign bit 1 iff at least one element has sign bit 1, which means `umax(X)` will have sign bit 1 (since it's unsigned max, any negative number is `> 127`, so `umax` will be `>= 1"
+  },
+  {
+    "type": "message",
+    "role": "user",
+    "content": "Error: You are not calling any tool or your tool call format is incorrect. You should always continue with tool calling and correct tool call format. You must use function tool call instead of using message to respond. Please continue. If you are done, call the `stop` tool with the test strategies. If you already called the `stop` tool, please check the format and try again."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_yCZBJ13sM51N2DwtipEk",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'vector_reduce_umax' llvm/include/llvm/IR/Intrinsics.td\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_yCZBJ13sM51N2DwtipEk",
+    "output": "2728:  def int_vector_reduce_umax : DefaultAttrsIntrinsic<[LLVMVectorElementType<0>],"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_IMCu0OCGyHwATnaSHKZP",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'IsValidOrUmaxCmp' llvm/lib/Transforms/Vectorize/VectorCombine.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_IMCu0OCGyHwATnaSHKZP",
+    "output": "4598:  const auto IsValidOrUmaxCmp = [&]() {\n4638:    if (!IsValidOrUmaxCmp())\n4643:    if (!IsValidOrUmaxCmp())"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_langref_8zRMmvQ35sufIt4K6z4W",
+    "name": "langref",
+    "arguments": "{\"inst\":\"llvm.vector.reduce.and\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_langref_8zRMmvQ35sufIt4K6z4W",
+    "output": ".. _int_vector_reduce_and:\n\n'``llvm.vector.reduce.and.*``' Intrinsic\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nSyntax:\n\"\"\"\"\"\"\"\n\n::\n\n      declare i32 @llvm.vector.reduce.and.v4i32(<4 x i32> %a)\n\nOverview:\n\"\"\"\"\"\"\"\"\"\n\nThe '``llvm.vector.reduce.and.*``' intrinsics do a bitwise ``AND``\nreduction of a vector, returning the result as a scalar. The return type matches\nthe element-type of the vector input.\n\nArguments:\n\"\"\"\"\"\"\"\"\"\"\nThe argument to this intrinsic must be a vector of integer values."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_langref_XjRmrja11FzzntMv1Ryd",
+    "name": "langref",
+    "arguments": "{\"inst\":\"llvm.vector.reduce.umax\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_langref_XjRmrja11FzzntMv1Ryd",
+    "output": ".. _int_vector_reduce_umax:\n\n'``llvm.vector.reduce.umax.*``' Intrinsic\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nSyntax:\n\"\"\"\"\"\"\"\n\n::\n\n      declare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32> %a)\n\nOverview:\n\"\"\"\"\"\"\"\"\"\n\nThe '``llvm.vector.reduce.umax.*``' intrinsics do an unsigned\ninteger ``MAX`` reduction of a vector, returning the result as a scalar. The\nreturn type matches the element-type of the vector input.\n\nArguments:\n\"\"\"\"\"\"\"\"\"\"\nThe argument to this intrinsic must be a vector of integer values."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_uZd39U5dJ2oUPDrTNHVo",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'bool operator\\\\[\\\\]' llvm/include/llvm/ADT/APInt.h\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_uZd39U5dJ2oUPDrTNHVo",
+    "output": "1044:  bool operator[](unsigned bitPosition) const {"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_tjbsc8KxpK0kgNOVD4Od",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI -A 5 'bool operator==(uint64_t Val) const {' llvm/include/llvm/ADT/APInt.h\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_tjbsc8KxpK0kgNOVD4Od",
+    "output": "1070:  bool operator==(uint64_t Val) const {\n1071-    return (isSingleWord() || getActiveBits() <= 64) && getZExtValue() == Val;\n1072-  }\n1073-\n1074-  /// Equality comparison.\n1075-  ///"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_qWWiOuozWKKRlTaUgimO",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'getArithmeticReductionCost' llvm/include/llvm/Analysis/TargetTransformInfo.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_qWWiOuozWKKRlTaUgimO",
+    "output": "1695:  LLVM_ABI InstructionCost getArithmeticReductionCost(\n1704:  /// getArithmeticReductionCost of an Add/Sub reduction with multiply and\n1713:  /// getArithmeticReductionCost of a reduction with an extension."
+  },
+  {
+    "type": "message",
+    "role": "assistant",
+    "content": " %vec)\n%cmp = icmp eq i1 %reduce, 0\n```\nVectorCombine visits `%cmp`.\n`match(&I, m_ICmp(Pred, m_Value(ReduceOp), m_APInt(CmpVal)))` matches.\n`ReduceOp` is `vector_reduce_and`.\n`OriginalIID` is `Intrinsic::vector_reduce_and`.\nIt calls `IsValidAndUminCmp()`.\nInside `IsValidAndUminCmp`:\n`LeadingOnes` = `CmpVal->countl_one()`. For `0` in 1-bit, it's `0`.\n`IsEquality` = `(CmpVal->isAllOnes() || LeadingOn"
+  },
+  {
+    "type": "message",
+    "role": "user",
+    "content": "Error: You are not calling any tool or your tool call format is incorrect. You should always continue with tool calling and correct tool call format. You must use function tool call instead of using message to respond. Please continue. If you are done, call the `stop` tool with the test strategies. If you already called the `stop` tool, please check the format and try again."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_CQQDdphaDWyl7Gjn8Ak1",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI -A 15 'unsigned llvm::getArithmeticReductionInstruction' llvm/lib/Transforms/Utils/LoopUtils.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_CQQDdphaDWyl7Gjn8Ak1",
+    "output": "1120:unsigned llvm::getArithmeticReductionInstruction(Intrinsic::ID RdxID) {\n1121-  switch (RdxID) {\n1122-  case Intrinsic::vector_reduce_fadd:\n1123-    return Instruction::FAdd;\n1124-  case Intrinsic::vector_reduce_fmul:\n1125-    return Instruction::FMul;\n1126-  case Intrinsic::vector_reduce_add:\n1127-    return Instruction::Add;\n1128-  case Intrinsic::vector_reduce_mul:\n1129-    return Instruction::Mul;\n1130-  case Intrinsic::vector_reduce_and:\n1131-    return Instruction::And;\n1132-  case Intrinsic::vector_reduce_or:\n1133-    return Instruction::Or;\n1134-  case Intrinsic::vector_reduce_xor:\n1135-    return Instruction::Xor;"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_9LUGQl296mSp1QirVGud",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI -A 15 'case Intrinsic::vector_reduce_smax:' llvm/lib/Transforms/Utils/LoopUtils.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_9LUGQl296mSp1QirVGud",
+    "output": "--\n--\n--\n1136:  case Intrinsic::vector_reduce_smax:\n1137-  case Intrinsic::vector_reduce_smin:\n1138-  case Intrinsic::vector_reduce_umax:\n1139-  case Intrinsic::vector_reduce_umin:\n1140-    return Instruction::ICmp;\n1141-  case Intrinsic::vector_reduce_fmax:\n1142-  case Intrinsic::vector_reduce_fmin:\n1143-    return Instruction::FCmp;\n1144-  default:\n1145-    llvm_unreachable(\"Unexpected ID\");\n1146-  }\n1147-}\n1148-\n1149-// This is the inverse to getArithmeticReductionInstruction\n1150-Intrinsic::ID llvm::getReductionForBinop(Instruction::BinaryOps Opc) {\n1151-  switch (Opc) {\n1178:  case Intrinsic::vector_reduce_smax:\n1179-    return Intrinsic::smax;\n1180-  case Intrinsic::vector_reduce_fmin:\n1181-    return Intrinsic::minnum;\n1182-  case Intrinsic::vector_reduce_fmax:\n1183-    return Intrinsic::maxnum;\n1184-  case Intrinsic::vector_reduce_fminimum:\n1185-    return Intrinsic::minimum;\n1186-  case Intrinsic::vector_reduce_fmaximum:\n1187-    return Intrinsic::maximum;\n1188-  }\n1189-}\n1190-\n1191-Intrinsic::ID llvm::getMinMaxReductionIntrinsicOp(RecurKind RK) {\n1192-  switch (RK) {\n1193-  default:\n1222:  case Intrinsic::vector_reduce_smax:\n1223-    return RecurKind::SMax;\n1224-  case Intrinsic::vector_reduce_smin:\n1225-    return RecurKind::SMin;\n1226-  case Intrinsic::vector_reduce_umax:\n1227-    return RecurKind::UMax;\n1228-  case Intrinsic::vector_reduce_umin:\n1229-    return RecurKind::UMin;\n1230-  case Intrinsic::vector_reduce_fmax:\n1231-    return RecurKind::FMax;\n1232-  case Intrinsic::vector_reduce_fmin:\n1233-    return RecurKind::FMin;\n1234-  default:\n1235-    return RecurKind::None;\n1236-  }\n1237-}\n1412:  case Intrinsic::vector_reduce_smax: {\n1413-    Intrinsic::ID ScalarID = getMinMaxReductionIntrinsicOp(RdxID);\n1414-    return ConstantExpr::getIntrinsicIdentity(ScalarID, Ty);\n1415-  }\n1416-  case Intrinsic::vector_reduce_fmax:\n1417-  case Intrinsic::vector_reduce_fmaximum:\n1418-    Negative = true;\n1419-    [[fallthrough]];\n1420-  case Intrinsic::vector_reduce_fmin:\n1421-  case Intrinsic::vector_reduce_fminimum: {\n1422-    bool PropagatesNaN = RdxID == Intrinsic::vector_reduce_fminimum ||\n1423-                         RdxID == Intrinsic::vector_reduce_fmaximum;\n1424-    const fltSemantics &Semantics = Ty->getFltSemantics();\n1425-    return (!Flags.noNaNs() && !PropagatesNaN)\n1426-               ? ConstantFP::getQNaN(Ty, Negative)\n1427-           : !Flags.noInfs()"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_VINztFaB6oeq7343JRV8",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'getMinMaxReductionCost' llvm/include/llvm/Analysis/TargetTransformInfo.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_VINztFaB6oeq7343JRV8",
+    "output": "1699:  LLVM_ABI InstructionCost getMinMaxReductionCost("
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_Yer6C9ztFKVCxHKtEVkR",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI -A 10 'getMinMaxReductionCost' llvm/include/llvm/Analysis/TargetTransformInfo.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_Yer6C9ztFKVCxHKtEVkR",
+    "output": "1699:  LLVM_ABI InstructionCost getMinMaxReductionCost(\n1700-      Intrinsic::ID IID, VectorType *Ty, FastMathFlags FMF = FastMathFlags(),\n1701-      TTI::TargetCostKind CostKind = TTI::TCK_RecipThroughput) const;\n1702-\n1703-  /// Calculate the cost of an extended reduction pattern, similar to\n1704-  /// getArithmeticReductionCost of an Add/Sub reduction with multiply and\n1705-  /// optional extensions. This is the cost of as:\n1706-  /// * ResTy vecreduce.add/sub(mul (A, B)) or,\n1707-  /// * ResTy vecreduce.add/sub(mul(ext(Ty A), ext(Ty B)).\n1708-  LLVM_ABI InstructionCost getMulAccReductionCost(\n1709-      bool IsUnsigned, unsigned RedOpcode, Type *ResTy, VectorType *Ty,"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_paZCm7FfOgi0llORZeVz",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'getMinMaxReductionCost' llvm/lib/Analysis/TargetTransformInfo.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_paZCm7FfOgi0llORZeVz",
+    "output": "1276:InstructionCost TargetTransformInfo::getMinMaxReductionCost(\n1280:      TTIImpl->getMinMaxReductionCost(IID, Ty, FMF, CostKind);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_3XTijCt9ePvFxcItNrox",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'IsValidOrUmaxCmp' llvm/lib/Transforms/Vectorize/VectorCombine.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_3XTijCt9ePvFxcItNrox",
+    "output": "Error: You have already executed the tool 'grep250' with these exact arguments. Please change your arguments or thoughts to try a different approach. Repeating the same action will not yield new results. DO NOT repeat the same tool call!"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_read250_DRs8XnNKihKeKHQDQTXs",
+    "name": "read250",
+    "arguments": "{\"file\":\"llvm/lib/Transforms/Vectorize/VectorCombine.cpp\",\"position\":4557}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_read250_DRs8XnNKihKeKHQDQTXs",
+    "output": "file: llvm/lib/Transforms/Vectorize/VectorCombine.cpp:4557-4807\n---------------------------------------------------------------\n4557   return true;\n4558 }\n4559 \n4560 /// Fold comparisons of reduce.or/reduce.and with reduce.umax/reduce.umin\n4561 /// based on cost, preserving the comparison semantics.\n4562 ///\n4563 /// We use two fundamental properties for each pair:\n4564 ///\n4565 ///   1. or(X) == 0 <=> umax(X) == 0\n4566 ///   2. or(X) == 1 <=> umax(X) == 1\n4567 ///   3. sign(or(X)) == sign(umax(X))\n4568 ///\n4569 ///   1. and(X) == -1 <=> umin(X) == -1\n4570 ///   2. and(X) == -2 <=> umin(X) == -2\n4571 ///   3. sign(and(X)) == sign(umin(X))\n4572 ///\n4573 /// From these we can infer the following transformations:\n4574 ///   a. or(X) ==/!= 0   <-> umax(X) ==/!= 0\n4575 ///   b. or(X) s< 0      <-> umax(X) s< 0\n4576 ///   c. or(X) s> -1     <-> umax(X) s> -1\n4577 ///   d. or(X) s< 1      <-> umax(X) s< 1\n4578 ///   e. or(X) ==/!= 1   <-> umax(X) ==/!= 1\n4579 ///   f. or(X) s< 2      <-> umax(X) s< 2\n4580 ///   g. and(X) ==/!= -1 <-> umin(X) ==/!= -1\n4581 ///   h. and(X) s< 0     <-> umin(X) s< 0\n4582 ///   i. and(X) s> -1    <-> umin(X) s> -1\n4583 ///   j. and(X) s> -2    <-> umin(X) s> -2\n4584 ///   k. and(X) ==/!= -2 <-> umin(X) ==/!= -2\n4585 ///   l. and(X) s> -3    <-> umin(X) s> -3\n4586 ///\n4587 bool VectorCombine::foldEquivalentReductionCmp(Instruction &I) {\n4588   CmpPredicate Pred;\n4589   Value *ReduceOp;\n4590   const APInt *CmpVal;\n4591   if (!match(&I, m_ICmp(Pred, m_Value(ReduceOp), m_APInt(CmpVal))))\n4592     return false;\n4593 \n4594   auto *II = dyn_cast<IntrinsicInst>(ReduceOp);\n4595   if (!II || !II->hasOneUse())\n4596     return false;\n4597 \n4598   const auto IsValidOrUmaxCmp = [&]() {\n4599     // Cases a and e\n4600     bool IsEquality =\n4601         (CmpVal->isZero() || CmpVal->isOne()) && ICmpInst::isEquality(Pred);\n4602     // Case c\n4603     bool IsPositive = CmpVal->isAllOnes() && Pred == ICmpInst::ICMP_SGT;\n4604     // Cases b, d, and f\n4605     bool IsNegative = (CmpVal->isZero() || CmpVal->isOne() || *CmpVal == 2) &&\n4606                       Pred == ICmpInst::ICMP_SLT;\n4607     return IsEquality || IsPositive || IsNegative;\n4608   };\n4609 \n4610   const auto IsValidAndUminCmp = [&]() {\n4611     const auto LeadingOnes = CmpVal->countl_one();\n4612 \n4613     // Cases g and k\n4614     bool IsEquality =\n4615         (CmpVal->isAllOnes() || LeadingOnes + 1 == CmpVal->getBitWidth()) &&\n4616         ICmpInst::isEquality(Pred);\n4617     // Case h\n4618     bool IsNegative = CmpVal->isZero() && Pred == ICmpInst::ICMP_SLT;\n4619     // Cases i, j, and l\n4620     bool IsPositive =\n4621         // if the number has at least N - 2 leading ones\n4622         // and the two LSBs are:\n4623         //   - 1 x 1 -> -1\n4624         //   - 1 x 0 -> -2\n4625         //   - 0 x 1 -> -3\n4626         LeadingOnes + 2 >= CmpVal->getBitWidth() &&\n4627         ((*CmpVal)[0] || (*CmpVal)[1]) && Pred == ICmpInst::ICMP_SGT;\n4628     return IsEquality || IsNegative || IsPositive;\n4629   };\n4630 \n4631   Intrinsic::ID OriginalIID = II->getIntrinsicID();\n4632   Intrinsic::ID AlternativeIID;\n4633 \n4634   // Check if this is a valid comparison pattern and determine the alternate\n4635   // reduction intrinsic.\n4636   switch (OriginalIID) {\n4637   case Intrinsic::vector_reduce_or:\n4638     if (!IsValidOrUmaxCmp())\n4639       return false;\n4640     AlternativeIID = Intrinsic::vector_reduce_umax;\n4641     break;\n4642   case Intrinsic::vector_reduce_umax:\n4643     if (!IsValidOrUmaxCmp())\n4644       return false;\n4645     AlternativeIID = Intrinsic::vector_reduce_or;\n4646     break;\n4647   case Intrinsic::vector_reduce_and:\n4648     if (!IsValidAndUminCmp())\n4649       return false;\n4650     AlternativeIID = Intrinsic::vector_reduce_umin;\n4651     break;\n4652   case Intrinsic::vector_reduce_umin:\n4653     if (!IsValidAndUminCmp())\n4654       return false;\n4655     AlternativeIID = Intrinsic::vector_reduce_and;\n4656     break;\n4657   default:\n4658     return false;\n4659   }\n4660 \n4661   Value *X = II->getArgOperand(0);\n4662   auto *VecTy = dyn_cast<FixedVectorType>(X->getType());\n4663   if (!VecTy)\n4664     return false;\n4665 \n4666   const auto GetReductionCost = [&](Intrinsic::ID IID) -> InstructionCost {\n4667     unsigned ReductionOpc = getArithmeticReductionInstruction(IID);\n4668     if (ReductionOpc != Instruction::ICmp)\n4669       return TTI.getArithmeticReductionCost(ReductionOpc, VecTy, std::nullopt,\n4670                                             CostKind);\n4671     return TTI.getMinMaxReductionCost(IID, VecTy, FastMathFlags(), CostKind);\n4672   };\n4673 \n4674   InstructionCost OrigCost = GetReductionCost(OriginalIID);\n4675   InstructionCost AltCost = GetReductionCost(AlternativeIID);\n4676 \n4677   LLVM_DEBUG(dbgs() << \"Found equivalent reduction cmp: \" << I\n4678                     << \"\\n  OrigCost: \" << OrigCost\n4679                     << \" vs AltCost: \" << AltCost << \"\\n\");\n4680 \n4681   if (AltCost >= OrigCost)\n4682     return false;\n4683 \n4684   Builder.SetInsertPoint(&I);\n4685   Type *ScalarTy = VecTy->getScalarType();\n4686   Value *NewReduce = Builder.CreateIntrinsic(ScalarTy, AlternativeIID, {X});\n4687   Value *NewCmp =\n4688       Builder.CreateICmp(Pred, NewReduce, ConstantInt::get(ScalarTy, *CmpVal));\n4689 \n4690   replaceValue(I, *NewCmp);\n4691   return true;\n4692 }\n4693 \n4694 /// Returns true if this ShuffleVectorInst eventually feeds into a\n4695 /// vector reduction intrinsic (e.g., vector_reduce_add) by only following\n4696 /// chains of shuffles and binary operators (in any combination/order).\n4697 /// The search does not go deeper than the given Depth.\n4698 static bool feedsIntoVectorReduction(ShuffleVectorInst *SVI) {\n4699   constexpr unsigned MaxVisited = 32;\n4700   SmallPtrSet<Instruction *, 8> Visited;\n4701   SmallVector<Instruction *, 4> WorkList;\n4702   bool FoundReduction = false;\n4703 \n4704   WorkList.push_back(SVI);\n4705   while (!WorkList.empty()) {\n4706     Instruction *I = WorkList.pop_back_val();\n4707     for (User *U : I->users()) {\n4708       auto *UI = cast<Instruction>(U);\n4709       if (!UI || !Visited.insert(UI).second)\n4710         continue;\n4711       if (Visited.size() > MaxVisited)\n4712         return false;\n4713       if (auto *II = dyn_cast<IntrinsicInst>(UI)) {\n4714         // More than one reduction reached\n4715         if (FoundReduction)\n4716           return false;\n4717         switch (II->getIntrinsicID()) {\n4718         case Intrinsic::vector_reduce_add:\n4719         case Intrinsic::vector_reduce_mul:\n4720         case Intrinsic::vector_reduce_and:\n4721         case Intrinsic::vector_reduce_or:\n4722         case Intrinsic::vector_reduce_xor:\n4723         case Intrinsic::vector_reduce_smin:\n4724         case Intrinsic::vector_reduce_smax:\n4725         case Intrinsic::vector_reduce_umin:\n4726         case Intrinsic::vector_reduce_umax:\n4727           FoundReduction = true;\n4728           continue;\n4729         default:\n4730           return false;\n4731         }\n4732       }\n4733 \n4734       if (!isa<BinaryOperator>(UI) && !isa<ShuffleVectorInst>(UI))\n4735         return false;\n4736 \n4737       WorkList.emplace_back(UI);\n4738     }\n4739   }\n4740   return FoundReduction;\n4741 }\n4742 \n4743 /// This method looks for groups of shuffles acting on binops, of the form:\n4744 ///  %x = shuffle ...\n4745 ///  %y = shuffle ...\n4746 ///  %a = binop %x, %y\n4747 ///  %b = binop %x, %y\n4748 ///  shuffle %a, %b, selectmask\n4749 /// We may, especially if the shuffle is wider than legal, be able to convert\n4750 /// the shuffle to a form where only parts of a and b need to be computed. On\n4751 /// architectures with no obvious \"select\" shuffle, this can reduce the total\n4752 /// number of operations if the target reports them as cheaper.\n4753 bool VectorCombine::foldSelectShuffle(Instruction &I, bool FromReduction) {\n4754   auto *SVI = cast<ShuffleVectorInst>(&I);\n4755   auto *VT = cast<FixedVectorType>(I.getType());\n4756   auto *Op0 = dyn_cast<Instruction>(SVI->getOperand(0));\n4757   auto *Op1 = dyn_cast<Instruction>(SVI->getOperand(1));\n4758   if (!Op0 || !Op1 || Op0 == Op1 || !Op0->isBinaryOp() || !Op1->isBinaryOp() ||\n4759       VT != Op0->getType())\n4760     return false;\n4761 \n4762   auto *SVI0A = dyn_cast<Instruction>(Op0->getOperand(0));\n4763   auto *SVI0B = dyn_cast<Instruction>(Op0->getOperand(1));\n4764   auto *SVI1A = dyn_cast<Instruction>(Op1->getOperand(0));\n4765   auto *SVI1B = dyn_cast<Instruction>(Op1->getOperand(1));\n4766   SmallPtrSet<Instruction *, 4> InputShuffles({SVI0A, SVI0B, SVI1A, SVI1B});\n4767   auto checkSVNonOpUses = [&](Instruction *I) {\n4768     if (!I || I->getOperand(0)->getType() != VT)\n4769       return true;\n4770     return any_of(I->users(), [&](User *U) {\n4771       return U != Op0 && U != Op1 &&\n4772              !(isa<ShuffleVectorInst>(U) &&\n4773                (InputShuffles.contains(cast<Instruction>(U)) ||\n4774                 isInstructionTriviallyDead(cast<Instruction>(U))));\n4775     });\n4776   };\n4777   if (checkSVNonOpUses(SVI0A) || checkSVNonOpUses(SVI0B) ||\n4778       checkSVNonOpUses(SVI1A) || checkSVNonOpUses(SVI1B))\n4779     return false;\n4780 \n4781   // Collect all the uses that are shuffles that we can transform together. We\n4782   // may not have a single shuffle, but a group that can all be transformed\n4783   // together profitably.\n4784   SmallVector<ShuffleVectorInst *> Shuffles;\n4785   auto collectShuffles = [&](Instruction *I) {\n4786     for (auto *U : I->users()) {\n4787       auto *SV = dyn_cast<ShuffleVectorInst>(U);\n4788       if (!SV || SV->getType() != VT)\n4789         return false;\n4790       if ((SV->getOperand(0) != Op0 && SV->getOperand(0) != Op1) ||\n4791           (SV->getOperand(1) != Op0 && SV->getOperand(1) != Op1))\n4792         return false;\n4793       if (!llvm::is_contained(Shuffles, SV))\n4794         Shuffles.push_back(SV);\n4795     }\n4796     return true;\n4797   };\n4798   if (!collectShuffles(Op0) || !collectShuffles(Op1))\n4799     return false;\n4800   // From a reduction, we need to be processing a single shuffle, otherwise the\n4801   // other uses will not be lane-invariant.\n4802   if (FromReduction && Shuffles.size() > 1)\n4803     return false;\n4804 \n4805   // Add any shuffle uses for the shuffles we have found, to include them in our\n4806   // cost calculations.\n---------------------------------------------------------------"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_uEDvxAJ7PhHRJYzQYrTn",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'getArithmeticReductionCost' llvm/lib/Analysis/TargetTransformInfo.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_uEDvxAJ7PhHRJYzQYrTn",
+    "output": "1267:InstructionCost TargetTransformInfo::getArithmeticReductionCost(\n1271:      TTIImpl->getArithmeticReductionCost(Opcode, Ty, FMF, CostKind);"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_ITxabGm1imwCfT3EMrLs",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'countl_one' llvm/include/llvm/ADT/APInt.h\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_ITxabGm1imwCfT3EMrLs",
+    "output": "1619:  /// This function is an APInt version of std::countl_one. It counts the number\n1624:  unsigned countl_one() const {\n1628:      return llvm::countl_one(U.VAL << (APINT_BITS_PER_WORD - BitWidth));\n1633:  unsigned countLeadingOnes() const { return countl_one(); }\n1638:    return isNegative() ? countl_one() : countl_zero();455:    unsigned LO = countl_one();"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_np0JoT6HEqg5rcVKHHUk",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'isAllOnes' llvm/include/llvm/ADT/APInt.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_np0JoT6HEqg5rcVKHHUk",
+    "output": "372:  bool isAllOnes() const {\n400:  bool isMaxValue() const { return isAllOnes(); }"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_UlG3f1OahlnZiChN9Dlo",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'isZero' llvm/include/llvm/ADT/APInt.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_UlG3f1OahlnZiChN9Dlo",
+    "output": "357:  bool isStrictlyPositive() const { return isNonNegative() && !isZero(); }\n381:  bool isZero() const {\n418:  bool isMinValue() const { return isZero(); }\n472:  bool getBoolValue() const { return !isZero(); }\n610:  bool operator!() const { return isZero(); }"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_vyiSZArvQHlso2YqIR4z",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI 'isOne' llvm/include/llvm/ADT/APInt.h\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_vyiSZArvQHlso2YqIR4z",
+    "output": "367:  bool isOneBitSet(unsigned BitNo) const {\n390:  bool isOne() const {"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_bmMgGgpCqVtbQp54tpwc",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI 'isEquality' llvm/include/llvm/IR/InstrTypes.h\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_bmMgGgpCqVtbQp54tpwc",
+    "output": "912:  LLVM_ABI static bool isEquality(Predicate pred);\n915:  bool isEquality() const { return isEquality(getPredicate()); }\n923:  static bool isRelational(Predicate P) { return !isEquality(P); }\n926:  bool isRelational() const { return !isEquality(); }"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_Qk58RFnPH85Ws5LYhYET",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI -A 10 'bool isEquality(Predicate pred)' llvm/lib/IR/Instructions.cpp\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_Qk58RFnPH85Ws5LYhYET",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_lPT5fi63by2ptIB8ZVGo",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI -A 10 'bool CmpInst::isEquality' llvm/lib/IR/Instructions.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_lPT5fi63by2ptIB8ZVGo",
+    "output": "3554:bool CmpInst::isEquality(Predicate P) {\n3555-  if (ICmpInst::isIntPredicate(P))\n3556-    return ICmpInst::isEquality(P);\n3557-  if (FCmpInst::isFPPredicate(P))\n3558-    return FCmpInst::isEquality(P);\n3559-  llvm_unreachable(\"Unsupported predicate kind\");\n3560-}\n3561-\n3562-// Returns true if either operand of CmpInst is a provably non-zero\n3563-// floating-point constant.\n3564-static bool hasNonZeroFPOperands(const CmpInst *Cmp) {"
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_QbCGAqZGQDnwqWCbYw0I",
+    "name": "grep250",
+    "arguments": "{\"args\":\"-nRI -A 10 'bool ICmpInst::isEquality' llvm/lib/IR/Instructions.cpp\",\"k\":1}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_QbCGAqZGQDnwqWCbYw0I",
+    "output": "No matches found."
+  },
+  {
+    "type": "function_call",
+    "call_id": "tool_grep250_0n44Imp1XDigrvLYJUoR",
+    "name": "grep250",
+    "arguments": "{\"k\":1,\"args\":\"-nRI -A 10 'static bool isEquality(Predicate' llvm/include/llvm/IR/InstrTypes.h\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "tool_grep250_0n44Imp1XDigrvLYJUoR",
+    "output": "912:  LLVM_ABI static bool isEquality(Predicate pred);\n913-\n914-  /// Determine if this is an equals/not equals predicate.\n915-  bool isEquality() const { return isEquality(getPredicate()); }\n916-\n917-  /// Determine if one operand of this compare can always be replaced by the\n918-  /// other operand, ignoring provenance considerations. If \\p Invert, check for\n919-  /// equivalence with the inverse predicate.\n920-  LLVM_ABI bool isEquivalence(bool Invert = false) const;\n921-\n922-  /// Return true if the predicate is relational (not EQ or NE)."
+  }
+]
