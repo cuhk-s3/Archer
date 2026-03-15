@@ -124,10 +124,6 @@ def fetch_pr(pr_id, state_filter="closed"):
   if has_pgo_label:
     return False
 
-  has_debug_info_label = any(label.startswith("debuginfo") for label in label_names)
-  if has_debug_info_label:
-    return False
-
   # Check if it modifies LLVM files
   files_url = pr["url"] + "/files"
   files = session.get(files_url).json()
