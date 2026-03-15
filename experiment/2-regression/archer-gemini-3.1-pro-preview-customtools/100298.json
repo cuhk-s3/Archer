@@ -1,0 +1,82 @@
+{
+  "command": {
+    "issue": "100298",
+    "model": "google/gemini-3.1-pro-preview-customtools",
+    "driver": "openai",
+    "stats": "archer-gemini-3.1-pro-preview-customtools/100298.json",
+    "history": "archer-gemini-3.1-pro-preview-customtools/history/100298.json",
+    "review": "archer-gemini-3.1-pro-preview-customtools/review/100298.md",
+    "debug": true,
+    "force": false
+  },
+  "error": null,
+  "errmsg": null,
+  "traceback": null,
+  "input_tokens": 1171023,
+  "output_tokens": 48388,
+  "cached_tokens": 926641,
+  "total_tokens": 1219411,
+  "chat_cost": 1.2547482,
+  "chat_rounds": 39,
+  "phase1_round": 25,
+  "phase2_round": 14,
+  "total_time_sec": 650.3963162899017,
+  "tool_usage": [
+    {
+      "name": "difftest",
+      "usage": 0
+    },
+    {
+      "name": "find250",
+      "usage": 0
+    },
+    {
+      "name": "grep250",
+      "usage": 6
+    },
+    {
+      "name": "langref",
+      "usage": 0
+    },
+    {
+      "name": "list250",
+      "usage": 0
+    },
+    {
+      "name": "read250",
+      "usage": 8
+    },
+    {
+      "name": "report",
+      "usage": 1
+    },
+    {
+      "name": "stop",
+      "usage": 1
+    },
+    {
+      "name": "tests_manager",
+      "usage": 2
+    },
+    {
+      "name": "trans",
+      "usage": 3
+    },
+    {
+      "name": "verify",
+      "usage": 0
+    }
+  ],
+  "strategies": [
+    {
+      "name": "Incorrect Inversion Logic in computeKnownBitsFromCond",
+      "target": "A select instruction where the condition is a logical AND or OR, and the false arm (which uses the inverted condition) can be simplified based on the known bits of the condition.",
+      "rationale": "The patch introduces a bug in `computeKnownBitsFromCond` where the logic for handling inverted conditions is incorrect. Specifically, when `Invert` is true, the condition `match(Cond, m_LogicalOr(m_Value(), m_Value()))` is used to determine whether to union or intersect the known bits. However, by De Morgan's laws, the negation of a logical AND is a logical OR, and the negation of a logical OR is a logical AND. Therefore, if the original condition is an AND, its inversion is an OR, and we should union the known bits. If the original condition is an OR, its inversion is an AND, and we should intersect the known bits. The current code does the opposite: `Invert ? match(Cond, m_LogicalOr(...)) : match(Cond, m_LogicalAnd(...))`. If `Cond` is an AND and `Invert` is true, `match(Cond, m_LogicalOr)` is false, so it intersects the known bits instead of unioning them. This leads to overly aggressive and incorrect known bits being computed for the inverted condition.",
+      "expected_issue": "The select instruction will be incorrectly simplified to a constant, leading to a miscompilation where the false arm is evaluated with the assumption that the condition is true, or vice versa."
+    }
+  ],
+  "reason_thou": "Fix Understanding:\nThe patch aims to simplify the arms of a `select` instruction based on the `KnownBits` implied by its condition. It does this by injecting the condition into the `SimplifyQuery` context using a new `CondContext` struct. When computing known bits for a value in the select arms, it checks if the value is affected by the condition and, if so, uses `computeKnownBitsFromCond` to refine the known bits. For the true arm, the condition is assumed to be true. For the false arm, the condition is assumed to be false (inverted).\n\nFormal Semantic Modeling:\nBefore the fix: The known bits of the select arms were computed without considering the select condition.\nAfter the fix: The known bits of the select arms are refined using the select condition. For the true arm, `Cond` is true. For the false arm, `!Cond` is true.\nThe bug is in `computeKnownBitsFromCond`:\n```cpp\n    if (Invert ? match(Cond, m_LogicalOr(m_Value(), m_Value()))\n               : match(Cond, m_LogicalAnd(m_Value(), m_Value())))\n      Known2 = Known2.unionWith(Known3);\n    else\n      Known2 = Known2.intersectWith(Known3);\n```\nIf `Cond` is `A && B` and `Invert` is true, we are assuming `!(A && B)` which is `!A || !B`. Since it's an OR, we should union the known bits from `!A` and `!B`.\nHowever, `match(Cond, m_LogicalOr)` is false (because `Cond` is an AND). So it executes `Known2 = Known2.intersectWith(Known3);`. This is incorrect! It should union them.\nIf `Cond` is `A || B` and `Invert` is true, we are assuming `!(A || B)` which is `!A && !B`. Since it's an AND, we should intersect the known bits.\nHowever, `match(Cond, m_LogicalOr)` is true. So it executes `Known2 = Known2.unionWith(Known3);`. This is also incorrect! It should intersect them.\n\nAssumptions Identified:\nThe code assumes that `Invert ? match(Cond, m_LogicalOr) : match(Cond, m_LogicalAnd)` correctly identifies when to union the known bits.\n\nPotential Cases to Break Assumptions:\nA select instruction with a logical AND condition, where the false arm uses the variables from the condition. The false arm will incorrectly intersect the known bits from the inverted conditions, leading to overly specific known bits and potentially folding to a constant incorrectly.\n\nTest Strategies:\nCreate a test case with `select (A && B), TrueVal, FalseVal`.\nLet `A` be `X == 10` and `B` be `X == 20`.\nWait, `X == 10 && X == 20` is always false.\nLet `A` be `(X & 1) == 1` and `B` be `(X & 2) == 2`.\nIf `A && B` is false, `!(A && B)` is true, so `(X & 1) == 0 || (X & 2) == 0`.\nThe known bits for `X` from `!A` would be bit 0 is 0.\nThe known bits for `X` from `!B` would be bit 1 is 0.\nIf we incorrectly intersect them, we get bit 0 is 0 AND bit 1 is 0.\nThen we might simplify `X & 3` to `0` in the false arm.\nBut `X & 3` could be `1` or `2`.\nSo `select (X & 1) == 1 && (X & 2) == 2, ..., X & 3`\nIf the bug exists, `X & 3` in the false arm will be incorrectly folded to `0`.",
+  "bugs": [],
+  "test_traj": [],
+  "report": "{\n  \"test\": [\n    \"```llvm\\ndefine i8 @test(i8 %x) {\\n  %1 = and i8 %x, 3\\n  %cond = icmp eq i8 %1, 3\\n  %C = and i8 %x, 3\\n  %res = select i1 %cond, i8 3, i8 %C\\n  ret i8 %res\\n}\\n```\",\n    \"opt -passes=instcombine -S\"\n  ],\n  \"thoughts\": \"The proposed strategy \\\"Incorrect Inversion Logic in computeKnownBitsFromCond\\\" was based on a misunderstanding of how `KnownBits::unionWith` and `KnownBits::intersectWith` work.\\nIn `KnownBits`, `unionWith` takes the bitwise OR of the `Zero` and `One` masks, which means it combines the known bits (if a bit is known in either LHS or RHS, it is known in the result). This corresponds to the logical AND of the conditions (both conditions are true, so we have the information from both).\\n`intersectWith` takes the bitwise AND of the `Zero` and `One` masks, which means it intersects the known bits (a bit is known only if it is known in both LHS and RHS). This corresponds to the logical OR of the conditions (either condition is true, so we only have the information common to both).\\nThe code in `computeKnownBitsFromCond` correctly uses `unionWith` when the inverted condition is an AND (i.e., the original condition was an OR), and `intersectWith` when the inverted condition is an OR (ie., the original condition was an AND).\\nTherefore, the logic in the patch is actually correct, and the proposed bug does not exist. I will report that no bug was found.\",\n  \"force\": true\n}"
+}

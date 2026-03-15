@@ -301,6 +301,39 @@ def generate_and_verify(
   return None, None
 
 
+def save_success_issue_json(
+  issue_id: str,
+  strategy: str,
+  src_ir: str,
+  tgt_ir: str,
+  output_dir: str,
+  model: str,
+):
+  out_dir = Path(output_dir)
+  out_dir.mkdir(parents=True, exist_ok=True)
+
+  out_path = out_dir / f"{issue_id}.json"
+  payload = {
+    "issue": issue_id,
+    "analysis": strategy,
+    "examples": [
+      {
+        "original_ir": src_ir,
+        "optimized_ir": tgt_ir,
+        "status": "Reproduced",
+      }
+    ],
+    "meta": {
+      "model": model,
+    },
+  }
+
+  with open(out_path, "w") as f:
+    json.dump(payload, f, indent=2)
+
+  logger.info(f"Per-issue success JSON saved to {out_path}")
+
+
 def parse_args():
   parser = argparse.ArgumentParser(
     description="LLVM Bug Analysis and Test Case Generation"
@@ -332,6 +365,12 @@ def parse_args():
     type=str,
     default="log",
     help="Directory to save full execution logs",
+  )
+  parser.add_argument(
+    "--success-dir",
+    type=str,
+    default="success-issues",
+    help="Directory to save one JSON per successfully reproduced issue",
   )
   parser.add_argument(
     "--debug",
@@ -386,6 +425,15 @@ def main():
       if verification_success:
         stats.bugs.append(
           Bug(original_ir=src_ir, transformed_ir=tgt_ir, log="Reproduced")
+        )
+
+        save_success_issue_json(
+          issue_id=args.issue,
+          strategy=strategy,
+          src_ir=src_ir,
+          tgt_ir=tgt_ir,
+          output_dir=args.success_dir,
+          model=args.model,
         )
 
         if md_paths:
