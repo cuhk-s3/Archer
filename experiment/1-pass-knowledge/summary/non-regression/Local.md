@@ -1,0 +1,17 @@
+# Subsystem Knowledge for Local
+## Elements Frequently Missed
+
+- **Poison-Generating Flags (`nsw`, `nuw`, `exact`, etc.)**: Frequently missed or incorrectly preserved during instruction replacement. When an instruction that does not support these flags (such as `extractvalue`) is replaced by a binary operator that does, the compiler's default intersection logic fails to strip the flags, leading to unintended poison generation.
+- **Call Return Attributes (`nonnull`, `range`, `align`, etc.)**: Missed during Common Subexpression Elimination (CSE) or Global Value Numbering (GVN). When a dominated call is replaced by a dominating call, the restrictive return attributes of the dominating call are often not stripped or intersected, causing valid values to incorrectly evaluate to poison.
+- **Analysis Cache Invalidation / Deletion Callbacks**: Missed during local control flow simplifications (e.g., PHI deduplication). Instructions are deleted and their memory is freed without notifying the calling optimization pass, leaving stale pointers in analysis caches (such as memory dependence or value numbering caches).
+
+## Patterns Not Well Handled
+
+### Pattern 1: Instruction Replacement with Stricter Poison/UB Semantics
+Optimization passes frequently identify two instructions that compute the same value and replace one with the other to eliminate redundancy. However, the passes often fail to reconcile the poison or Undefined Behavior (UB) semantics between the two instructions. If the replacement instruction possesses stricter semantics—such as restrictive return attributes on a function call or poison-generating flags on a binary operator—it may evaluate to `poison` for certain inputs. When this stricter instruction replaces a more relaxed instruction, the `poison` value leaks into contexts where the original program had well-defined behavior, resulting in a miscompilation where the optimized code is more poisonous than the source.
+
+### Pattern 2: Uncoordinated Instruction Deletion Leading to Stale Caches
+Local simplification utilities (such as those performing PHI deduplication) sometimes delete instructions and free their memory directly, bypassing the standard deletion callbacks required by higher-level optimization passes. Because passes like GVN maintain internal analysis caches keyed by instruction memory addresses, this uncoordinated deletion leaves stale pointers in the cache. If the memory allocator subsequently assigns the exact same address to a newly created instruction, the optimization pass will incorrectly look up and apply the stale analysis data to the new instruction, leading to incorrect assumptions about data flow and invalid transformations.
+
+### Pattern 3: Asymmetric Flag and Attribute Intersection
+When merging or replacing instructions of different types or with differing attribute lists, the compiler's default intersection logic is often inadequate. For example, when replacing an `extractvalue` instruction (which cannot carry arithmetic flags) with an `add` instruction (which can carry `nsw`/`nuw` flags), the compiler fails to realize that the lack of flags on the source instruction means the flags on the replacement instruction must be stripped. Instead, it incorrectly assumes the flags can be preserved. A similar asymmetry occurs with function calls where one call has restrictive return attributes and the other has none; the compiler fails to conservatively drop the attributes to match the least restrictive semantics.

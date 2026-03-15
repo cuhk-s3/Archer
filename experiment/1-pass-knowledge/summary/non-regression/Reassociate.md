@@ -1,0 +1,13 @@
+# Subsystem Knowledge for Reassociate
+## Elements Frequently Missed
+
+* **Poison and Undef Lanes in Vector Constants**: The optimization pass frequently misses checking for `poison` or `undef` elements within vector constants when evaluating instructions for equivalence. It assumes that an operation with partially poisoned lanes is strictly equivalent to a fully defined operation, failing to account for the fact that reusing the poisoned operation in a broader context will incorrectly propagate `poison` to valid lanes.
+* **Poison-Generating Flags (`nsw`, `nuw`)**: The pass frequently misses clearing poison-generating flags (such as No Signed Wrap or No Unsigned Wrap) on instructions that are retained or reused after an expression tree is restructured. Because the pass only tracks a specific subset of modified expressions, it overlooks instructions that fall outside this tracked range but whose intermediate computed values have been altered by the optimization.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Unsafe Instruction Reuse and Subexpression Matching
+The Reassociate pass attempts to optimize code by finding and reusing existing, equivalent expressions (similar to Common Subexpression Elimination). However, this pattern is not well handled when dealing with vector operations that contain `poison` or `undef` lanes. The matching logic is overly aggressive and fails to verify the strict equivalence of the constant operands. When the pass replaces a fully defined computation with a previously computed partially poisoned one, it ignores the context in which the original instruction was safe (e.g., masked by a `shufflevector`). This causes `poison` or `undef` values to leak into vector lanes that require well-defined values, resulting in miscompilations.
+
+### Pattern 2: State Invalidation During Operand Weight Reduction in Associative Chains
+When the pass encounters an expression tree with repeated operands in associative operations (e.g., a long chain of integer multiplications), it applies mathematical simplifications to reduce the "weight" or occurrence count of the operand (e.g., reducing `x^5` to `x^3` in restricted bit-widths). This high-level pattern is poorly handled because the restructuring fundamentally changes the intermediate values produced at each step of the chain. The pass reuses some of the original instructions to build the new, shorter tree but fails to sanitize them by dropping their original `nsw` or `nuw` flags. Since the new intermediate values may exceed the bounds that were safe for the original operations, the retained flags incorrectly trigger overflow conditions, generating `poison` values and breaking the program's semantics.

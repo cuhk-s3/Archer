@@ -1,0 +1,26 @@
+# Subsystem Knowledge for InstructionSimplify
+## Elements Frequently Missed
+
+*   **Pointer Provenance**: The simplification logic frequently misses that pointer equality (`icmp eq`) only guarantees address equivalence, not provenance equivalence. Substituting one pointer for another based solely on address equality strips or alters provenance information, violating the memory model.
+*   **Poison vs. Undef Refinement Rules**: The distinction between `undef` and `poison` is sometimes overlooked during control flow merges (like PHI nodes). Replacing an `undef` value with a potentially `poison` value is an invalid refinement because `poison` is a stronger, more restrictive state that triggers undefined behavior.
+*   **Cross-Lane Vector Operations**: The logic often assumes vector operations are strictly per-lane. It misses that certain instructions, such as `bitcast` operations that change the number of vector lanes (e.g., `<4 x i32>` to `<2 x i64>`), mix data across lanes and break per-lane equivalence assumptions.
+*   **Partial `undef` in Vector Constants**: When matching strict logical or arithmetic identities (like bitwise NOT via XOR with all-ones), the logic misses that `undef` elements within a vector constant break the strict mathematical identity for those specific lanes.
+*   **Zero Edge-Cases in Value Tracking**: When relying on properties like "is a power of two" for bitwise simplifications (e.g., `X - 1` forming a bitmask), the logic frequently misses the `X == 0` edge case. If `X` can be zero, `X - 1` evaluates to `-1` (all ones), which completely changes the semantics of subsequent bitwise operations.
+*   **Dynamic Masking of Undefined Behavior**: The logic misses that potentially UB-inducing constants (like zero in a division) might be dynamically masked out by conditional instructions like `select`. Eagerly evaluating these operations ignores the runtime condition and incorrectly introduces unconditional `poison`.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Contextual Equivalence Substitution Violating Semantic Constraints
+The optimization pass struggles with safely applying contextual equivalence (e.g., derived from `icmp eq` conditions in `select` instructions) when the operands carry hidden semantic constraints or when the equivalence is transformed by subsequent operations. For pointers, substituting `A` for `B` based on address equality destroys provenance. For vectors, propagating a per-lane equivalence through a lane-altering `bitcast` incorrectly applies per-lane assumptions to cross-lane data mixing. The pass fails to restrict substitution when these underlying semantic boundaries (provenance or lane independence) are crossed.
+
+### Pattern 2: Eager Poison/UB Folding Over Conditional Control Flow
+When threading operations (like division or remainder) over a `select` instruction, the pass evaluates the operation against the `select`'s constant arms independently. If one arm contains a UB-inducing value (like division by zero), the pass eagerly folds that specific evaluation to `poison`. This pattern is poorly handled because it fails to recognize that the `select` condition acts as a dynamic guard. By unconditionally folding the operation to `poison` and propagating it, the compiler introduces miscompilations for control flow paths where the UB would never have dynamically occurred.
+
+### Pattern 3: Invalid Refinement in PHI Node Simplification
+The pass attempts to simplify PHI nodes by ignoring `undef` incoming values and collapsing the PHI to the remaining common incoming value `X`. This pattern is not well handled because it does not verify whether `X` is guaranteed to be free of `poison`. If `X` can evaluate to `poison` at runtime, replacing the `undef` edges with `X` constitutes an invalid refinement (upgrading `undef` to `poison`). This inadvertently poisons control flow paths that were previously only undefined, leading to aggressive and incorrect downstream optimizations.
+
+### Pattern 4: Over-Application of Scalar Logical Identities to Vectors with Undef
+The pass aggressively applies scalar logical identities (e.g., De Morgan's laws, XOR/AND/OR simplifications) to vector types. However, it handles this poorly when the vector constants involved contain `undef` lanes. A pattern like `xor X, <..., undef, ...>` is incorrectly matched as a strict bitwise NOT. Because `undef` does not behave as a strict `1` or `0`, the logical identity fails for those lanes, resulting in a simplified expression that is semantically inequivalent to the original IR.
+
+### Pattern 5: Bitwise Simplifications Relying on Incomplete Value Range Assumptions
+The pass attempts to fold complex bitwise expressions (e.g., `(X - 1) & C`) by querying analysis passes for properties of `X`, such as whether it is a power of two. This pattern is poorly handled when the analysis returns a relaxed property (e.g., "power of two *or zero*") but the simplification logic applies a strict transformation. By failing to account for the zero edge-case (where `0 - 1` yields `-1`, a full bitmask, rather than a contiguous lower-bit mask), the pass incorrectly evaluates the bitwise intersection and folds the expression to an erroneous constant (like zero).
