@@ -27,6 +27,28 @@ console = get_boxed_console(debug_mode=True)
 main_module.console = console
 
 
+def make_component_knowledge_loader(knowledge_dir: Path, enabled: bool):
+  def _loader(component):
+    if not enabled:
+      return "No specific knowledge provided for this component."
+
+    console.print(f"Retrieving knowledge for component: {component} ...")
+
+    knowledge_files = []
+    for comp_name in component:
+      candidate = knowledge_dir / f"{comp_name}.md"
+      if candidate.exists():
+        knowledge_files.append(candidate)
+
+    if not knowledge_files:
+      return "No specific knowledge provided for this component."
+
+    knowledge = [f.read_text(encoding="utf-8") for f in knowledge_files]
+    return "\n".join(knowledge)
+
+  return _loader
+
+
 class HistoryEnvironment:
   def __init__(self, issue_id, additional_cmake_args=[]):
     self.issue_id = issue_id
@@ -183,6 +205,23 @@ def parse_args():
     default=False,
     help="Force overwrite existing stats/history/review files (default: False).",
   )
+  parser.add_argument(
+    "--no-knowledge",
+    action="store_true",
+    default=False,
+    help="Disable loading subsystem knowledge for analysis prompts.",
+  )
+  parser.add_argument(
+    "--knowledge-dir",
+    type=str,
+    default=str(
+      Path(__file__).resolve().parent.parent.parent
+      / "1-pass-knowledge"
+      / "summary"
+      / "non-regression"
+    ),
+    help="Directory containing component knowledge markdown files.",
+  )
   return parser.parse_args()
 
 
@@ -191,6 +230,18 @@ def main():
     panic("The llvm-autoreview environment has not been brought up.")
 
   args = parse_args()
+
+  knowledge_enabled = not args.no_knowledge
+  knowledge_dir = Path(args.knowledge_dir)
+  if knowledge_enabled and not knowledge_dir.exists():
+    panic(f"Knowledge directory not found: {knowledge_dir}")
+  main_module.get_component_knowledge = make_component_knowledge_loader(
+    knowledge_dir=knowledge_dir,
+    enabled=knowledge_enabled,
+  )
+  console.print(
+    f"Knowledge mode: {'on' if knowledge_enabled else 'off'}, dir: {knowledge_dir}"
+  )
 
   # Set up console
   if args.debug:

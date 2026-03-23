@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     default=False,
     help="Disable passing --debug to experiment scripts.",
   )
+  parser.add_argument(
+    "--no-knowledge",
+    action="store_true",
+    default=False,
+    help="Disable passing subsystem knowledge when the experiment supports it.",
+  )
   return parser.parse_args()
 
 
@@ -78,18 +84,21 @@ def resolve_experiment_config(name: str) -> dict[str, str | bool]:
       "script": "scripts/archer.py",
       "needs_review": True,
       "output_prefix": "archer",
+      "supports_no_knowledge": True,
     }
   if name == "mswe":
     return {
       "script": "scripts/mswe.py",
       "needs_review": False,
       "output_prefix": "mswe",
+      "supports_no_knowledge": False,
     }
   if name == "direct-llm":
     return {
       "script": "scripts/direct_llm.py",
       "needs_review": False,
       "output_prefix": "direct-llm",
+      "supports_no_knowledge": False,
     }
   raise ValueError(f"Unsupported experiment: {name}")
 
@@ -119,6 +128,7 @@ def build_command(
   history_path: Path,
   review_path: Path | None,
   debug_enabled: bool,
+  no_knowledge_enabled: bool,
 ) -> list[str]:
   cmd = [
     python_bin,
@@ -136,6 +146,8 @@ def build_command(
     cmd.extend(["--review", str(review_path)])
   if debug_enabled:
     cmd.append("--debug")
+  if no_knowledge_enabled:
+    cmd.append("--no-knowledge")
   return cmd
 
 
@@ -173,6 +185,14 @@ def run() -> int:
   if args.limit is not None:
     issue_files = issue_files[: args.limit]
 
+  no_knowledge_enabled = bool(
+    args.no_knowledge and config.get("supports_no_knowledge", False)
+  )
+  if args.no_knowledge and not no_knowledge_enabled:
+    print(
+      f"Warning: --no-knowledge is not supported for experiment '{experiment}', ignoring."
+    )
+
   if not issue_files:
     print(f"No dataset files found in {dataset_dir}")
     return 0
@@ -200,6 +220,7 @@ def run() -> int:
       history_path=history_path,
       review_path=review_path,
       debug_enabled=debug_enabled,
+      no_knowledge_enabled=no_knowledge_enabled,
     )
 
     print(f"[{issue}] running...")
