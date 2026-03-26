@@ -188,6 +188,15 @@ def run() -> int:
   no_knowledge_enabled = bool(
     args.no_knowledge and config.get("supports_no_knowledge", False)
   )
+  if no_knowledge_enabled:
+    output_root = output_dir / f"{config['output_prefix']}-{model_dir}-wo-knowledge"
+    history_dir = output_root / "history"
+    review_dir = output_root / "review"
+    if not args.dry_run:
+      output_root.mkdir(parents=True, exist_ok=True)
+      history_dir.mkdir(parents=True, exist_ok=True)
+      if config["needs_review"]:
+        review_dir.mkdir(parents=True, exist_ok=True)
   if args.no_knowledge and not no_knowledge_enabled:
     print(
       f"Warning: --no-knowledge is not supported for experiment '{experiment}', ignoring."
