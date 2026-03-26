@@ -70,6 +70,16 @@ def parse_args() -> argparse.Namespace:
     help="Disable passing --debug to experiment scripts.",
   )
   parser.add_argument(
+    "--knowledge-source",
+    type=str,
+    default="summary",
+    choices=["summary", "passes"],
+    help=(
+      "Knowledge source for archer: 'summary' -> 1-pass-knowledge/summary/non-regression, "
+      "'passes' -> 1-pass-knowledge/passes-non-regression."
+    ),
+  )
+  parser.add_argument(
     "--no-knowledge",
     action="store_true",
     default=False,
@@ -127,6 +137,7 @@ def build_command(
   stats_path: Path,
   history_path: Path,
   review_path: Path | None,
+  knowledge_dir: Path | None,
   debug_enabled: bool,
   no_knowledge_enabled: bool,
 ) -> list[str]:
@@ -144,11 +155,21 @@ def build_command(
   ]
   if review_path is not None:
     cmd.extend(["--review", str(review_path)])
+  if knowledge_dir is not None:
+    cmd.extend(["--knowledge-dir", str(knowledge_dir)])
   if debug_enabled:
     cmd.append("--debug")
   if no_knowledge_enabled:
     cmd.append("--no-knowledge")
   return cmd
+
+
+def resolve_knowledge_dir(base_dir: Path, source: str) -> Path:
+  if source == "summary":
+    return base_dir.parent / "1-pass-knowledge" / "summary" / "non-regression"
+  if source == "passes":
+    return base_dir.parent / "1-pass-knowledge" / "summary" / "passes-non-regression"
+  raise ValueError(f"Unsupported knowledge source: {source}")
 
 
 def run() -> int:
@@ -213,6 +234,9 @@ def run() -> int:
 
   failed_issues: list[str] = []
   debug_enabled = not args.no_debug
+  knowledge_dir: Path | None = None
+  if experiment == "archer":
+    knowledge_dir = resolve_knowledge_dir(base_dir, args.knowledge_source)
 
   for dataset_file in issue_files:
     issue = dataset_file.stem
@@ -228,6 +252,7 @@ def run() -> int:
       stats_path=stats_path,
       history_path=history_path,
       review_path=review_path,
+      knowledge_dir=knowledge_dir,
       debug_enabled=debug_enabled,
       no_knowledge_enabled=no_knowledge_enabled,
     )
