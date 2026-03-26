@@ -184,6 +184,8 @@ def run() -> int:
 
   model = args.model
   model_dir = resolve_model_dir(model, args.model_dir)
+  if experiment == "archer" and args.knowledge_source == "passes":
+    model_dir = f"{model_dir}-all-knowledge"
   output_dir = args.output_dir
   if not output_dir.is_absolute():
     output_dir = base_dir / output_dir
