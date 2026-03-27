@@ -148,7 +148,7 @@ class SimpleOpenAIClient:
 def load_issue_data(dataset_dir: str, issue_id: str):
   # Construct path assuming the dataset structure provided
   dataset_path = Path(dataset_dir)
-  json_path = dataset_path / f"{issue_id}.json"
+  json_path = dataset_path / "issues" / f"{issue_id}.json"
 
   if not json_path.exists():
     # Fallback: check if the dataset dir contains the json files flatly
