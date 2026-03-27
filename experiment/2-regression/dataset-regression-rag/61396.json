@@ -1,0 +1,90 @@
+{
+  "base_commit": "3ddc88c38068449842b5ae31285d2a194f0dc4f9",
+  "bug_id": "61396",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        "LoopVectorizationCostModel::collectLoopUniforms"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+        [
+          4734,
+          4744
+        ],
+        [
+          4784,
+          4791
+        ]
+      ]
+    },
+    "components": [
+      "LoopVectorize"
+    ],
+    "fix_commit": "962c306a11d0a21c884c12e18825b8a41ba1bd7d"
+  },
+  "issue": {
+    "author": "reductor",
+    "body": "The code generates incorrect code in Clang 15.0.0 to the latest trunk on compiler explorer (57b78faa9eb08017d95bb4e43242648953b08c13)\r\n\r\n```cpp\r\nstruct struct_with_sentinal\r\n{\r\n\tstruct_with_sentinal()\r\n\t{\r\n         m_sentinel = &m_sentinel;\r\n\t}\r\n\t\r\n\tvoid * m_sentinel;\r\n};\r\n\r\ntemplate <typename T, int T_SIZE>\r\nstruct fixed_array\r\n{\r\n\tT m_data[T_SIZE];\r\n};\r\n\r\nfixed_array<struct_with_sentinal, 10240> my_test_array;\r\n```\r\n\r\n\r\nCurrent output (with `-std=c++20 -O3 -mavx2`)\r\n```asm\r\n_GLOBAL__sub_I_example.cpp:             # @_GLOBAL__sub_I_example.cpp\r\n        xor     eax, eax\r\n        lea     rcx, [rip + my_test_array]\r\n.LBB1_1:                                # =>This Inner Loop Header: Depth=1\r\n        lea     rdx, [rcx + rax]\r\n        vmovq   xmm0, rdx\r\n        vpbroadcastq    ymm0, xmm0\r\n        lea     rdx, [rax + rcx]\r\n        add     rdx, 32\r\n        vmovq   xmm1, rdx\r\n        vpbroadcastq    ymm1, xmm1\r\n        lea     rdx, [rax + rcx + 64]\r\n        vmovq   xmm2, rdx\r\n        vpbroadcastq    ymm2, xmm2\r\n        lea     rdx, [rax + rcx + 96]\r\n        vmovq   xmm3, rdx\r\n        vpbroadcastq    ymm3, xmm3\r\n        vmovdqu ymmword ptr [rax + rcx], ymm0\r\n        vmovdqu ymmword ptr [rax + rcx + 32], ymm1\r\n        vmovdqu ymmword ptr [rax + rcx + 64], ymm2\r\n        vmovdqu ymmword ptr [rax + rcx + 96], ymm3\r\n        sub     rax, -128\r\n        cmp     rax, 81920\r\n        jne     .LBB1_1\r\n        vzeroupper\r\n        ret\r\n```\r\n\r\nThe `vpbroadcastq` and then `movdqu` back into the array ends up generating an array with every 4 elements pointing to the first element not to themselves.\r\n\r\nThe last known good code gen appears to be in Clang 14.0.0 (Based on looking back in compiler explorer)\r\n\r\nCompiler explorer link for example code gen:\r\nhttps://godbolt.org/z/eqx5avca9",
+    "comments": [
+      {
+        "author": "topperc",
+        "body": "This looks like it might be a vectorizer issue. There's a broadcast shuffle in IR\r\n\r\nCC @fhahn @preames "
+      },
+      {
+        "author": "nikic",
+        "body": "Yeah, this is an LV miscompile. Here's a reduced test case: https://llvm.godbolt.org/z/8ffo1jx57"
+      },
+      {
+        "author": "fhahn",
+        "body": "Let me take a look"
+      }
+    ],
+    "labels": [
+      "regression",
+      "miscompilation",
+      "vectorizers"
+    ],
+    "title": "clang AVX2 codegen regression with array of self referencing values"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/61396",
+  "knowledge_cutoff": "2023-03-14T05:12:54Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "patch": "commit 962c306a11d0a21c884c12e18825b8a41ba1bd7d\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Fri Mar 17 16:26:07 2023 +0000\n\n    [LV] Don't consider pointer as uniform if it is also stored.\n    \n    Update isVectorizedMemAccessUse to also check if the pointer is stored.\n    This prevents LV to incorrectly consider a pointer as uniform if it is\n    used as both pointer and stored by the same StoreInst.\n    \n    Fixes #61396.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex cff8c8031ec4..e89eacdaa964 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -4734,11 +4734,17 @@ void LoopVectorizationCostModel::collectLoopUniforms(ElementCount VF) {\n             WideningDecision == CM_Interleave);\n   };\n \n-\n   // Returns true if Ptr is the pointer operand of a memory access instruction\n-  // I, and I is known to not require scalarization.\n+  // I, I is known to not require scalarization, and the pointer is not also\n+  // stored.\n   auto isVectorizedMemAccessUse = [&](Instruction *I, Value *Ptr) -> bool {\n-    return getLoadStorePointerOperand(I) == Ptr && isUniformDecision(I, VF);\n+    auto GetStoredValue = [I]() -> Value * {\n+      if (!isa<StoreInst>(I))\n+        return nullptr;\n+      return I->getOperand(0);\n+    };\n+    return getLoadStorePointerOperand(I) == Ptr && isUniformDecision(I, VF) &&\n+           GetStoredValue() != Ptr;\n   };\n \n   // Holds a list of values which are known to have at least one uniform use.\n@@ -4784,8 +4790,8 @@ void LoopVectorizationCostModel::collectLoopUniforms(ElementCount VF) {\n       if (isUniformMemOpUse(&I))\n         addToWorklistIfAllowed(&I);\n \n-      if (isUniformDecision(&I, VF)) {\n-        assert(isVectorizedMemAccessUse(&I, Ptr) && \"consistency check\");\n+      if (isVectorizedMemAccessUse(&I, Ptr)) {\n+        assert(isUniformDecision(&I, VF) && \"consistency check\");\n         HasUniformUse.insert(Ptr);\n       }\n     }\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt %s -passes=loop-vectorize,instcombine -force-vector-width=4 -force-vector-interleave=1 -debug-only=loop-vectorize -disable-output -print-after=instcombine 2>&1",
+        "opt %s -passes=loop-vectorize,instcombine -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses -debug-only=loop-vectorize -disable-output -print-after=instcombine 2>&1"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/consecutive-ptr-uniforms.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @pr61396_pointer_used_as_both_stored_value_and_pointer_operand_by_store(ptr %ary) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %cur.ptr = getelementptr inbounds ptr, ptr %ary, i64 %iv\n  store ptr %cur.ptr, ptr %cur.ptr, align 8\n  %iv.next = add nuw nsw i64 %iv, 1\n  %done = icmp eq i64 %iv, 10240\n  br i1 %done, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "pr61396_pointer_used_as_both_stored_value_and_pointer_operand_by_store"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S -passes=loop-vectorize -force-vector-width=2 -opaque-pointers < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/opaque-ptr.ll",
+      "tests": [
+        {
+          "test_body": "define void @store_pointer_induction(ptr %start, ptr %end) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi ptr [ %start, %entry ], [ %iv.next, %loop ]\n  store ptr %iv, ptr %iv, align 4\n  %iv.next = getelementptr inbounds ptr, ptr %iv, i32 1\n  %exitcond = icmp eq ptr %iv.next, %end\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "store_pointer_induction"
+        }
+      ]
+    }
+  ]
+}

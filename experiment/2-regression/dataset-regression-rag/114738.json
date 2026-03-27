@@ -1,0 +1,59 @@
+{
+  "base_commit": "2588b8be5624f721c56f44fd2a69f7327de8c0c1",
+  "bug_id": "114738",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        "tryToReduce"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+        [
+          19490,
+          19498
+        ]
+      ]
+    },
+    "components": [
+      "SLPVectorizer"
+    ],
+    "fix_commit": "899336735aeb2b41a48b6ac2c895da5e0f22dbf0"
+  },
+  "issue": {
+    "author": "bongjunj",
+    "body": "Alive2 report: https://alive2.llvm.org/ce/z/f8PDZj\r\n\r\n```llvm\r\n----------------------------------------\r\ndefine i1 @test1.2(i32 %x, i32 %a, i32 %b, i32 %c, i32 %d) {\r\n#0:\r\n  %cmp = icmp sgt i32 %x, 1\r\n  %cmp2 = icmp sgt i32 %b, 1\r\n  %cmp3 = icmp sgt i32 %c, 1\r\n  %cmp4 = icmp sgt i32 %d, 1\r\n  %sel2 = select i1 %cmp4, i1 1, i1 %cmp2\r\n  %sel3 = select i1 %sel2, i1 1, i1 %cmp3\r\n  %sel4 = select i1 %cmp, i1 1, i1 %cmp4\r\n  %ret = or i1 %sel3, %sel4\r\n  ret i1 %ret\r\n}\r\n=>\r\ndefine i1 @test1.2(i32 %x, i32 %a, i32 %b, i32 %c, i32 %d) {\r\n#0:\r\n  %#1 = insertelement <4 x i32> poison, i32 %d, i32 0\r\n  %#2 = insertelement <4 x i32> %#1, i32 %b, i32 1\r\n  %#3 = insertelement <4 x i32> %#2, i32 %c, i32 2\r\n  %#4 = insertelement <4 x i32> %#3, i32 %x, i32 3\r\n  %#5 = icmp sgt <4 x i32> %#4, { 1, 1, 1, 1 }\r\n  %#6 = reduce_or <4 x i1> %#5\r\n  ret i1 %#6\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Target is more poisonous than source\r\n\r\nExample:\r\ni32 %x = #x00000000 (0)\r\ni32 %a = poison\r\ni32 %b = #x00000002 (2)\r\ni32 %c = poison\r\ni32 %d = #x00000000 (0)\r\n\r\nSource:\r\ni1 %cmp = #x0 (0)\r\ni1 %cmp2 = #x1 (1)\r\ni1 %cmp3 = poison\r\ni1 %cmp4 = #x0 (0)\r\ni1 %sel2 = #x1 (1)\r\ni1 %sel3 = #x1 (1)\r\ni1 %sel4 = #x0 (0)\r\ni1 %ret = #x1 (1)\r\n\r\nTarget:\r\n<4 x i32> %#1 = < #x00000000 (0), poison, poison, poison >\r\n<4 x i32> %#2 = < #x00000000 (0), #x00000002 (2), poison, poison >\r\n<4 x i32> %#3 = < #x00000000 (0), #x00000002 (2), poison, poison >\r\n<4 x i32> %#4 = < #x00000000 (0), #x00000002 (2), poison, #x00000000 (0) >\r\n<4 x i1> %#5 = < #x0 (0), #x1 (1), poison, #x0 (0) >\r\ni1 %#6 = poison\r\nSource value: #x1 (1)\r\nTarget value: poison\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```",
+    "comments": [],
+    "labels": [
+      "miscompilation",
+      "llvm:SLPVectorizer"
+    ],
+    "title": "[SLPVectorizer] wrong vectorization to `reduce_or` due to poisonous value"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/114738",
+  "knowledge_cutoff": "2024-11-04T05:50:07Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SLPVectorizer"
+  ],
+  "patch": "commit 899336735aeb2b41a48b6ac2c895da5e0f22dbf0\nAuthor: Alexey Bataev <a.bataev@outlook.com>\nDate:   Mon Nov 4 06:02:06 2024 -0800\n\n    [SLP]Be more pessimistic about poisonous reductions\n    \n    Consider all possible reductions ops as being non-poisoning boolean\n    logical operations, which require freeze to be fully correct.\n    \n    https://alive2.llvm.org/ce/z/TKWDMP\n    \n    Fixes #114738\n\ndiff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 427b8bd0e75a..3c6daf7b9fbb 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -19490,9 +19490,7 @@ public:\n         // To prevent poison from leaking across what used to be sequential,\n         // safe, scalar boolean logic operations, the reduction operand must be\n         // frozen.\n-        if ((isBoolLogicOp(RdxRootInst) ||\n-             (AnyBoolLogicOp && VL.size() != TrackedVals.size())) &&\n-            !isGuaranteedNotToBePoison(VectorizedRoot))\n+        if (AnyBoolLogicOp && !isGuaranteedNotToBePoison(VectorizedRoot))\n           VectorizedRoot = Builder.CreateFreeze(VectorizedRoot);\n \n         // Emit code to correctly handle reused reduced values, if required.\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S --passes=slp-vectorizer < %s"
+      ],
+      "file": "llvm/test/Transforms/SLPVectorizer/reudction-or-non-poisoned.ll",
+      "tests": [
+        {
+          "test_body": "define i1 @test(i32 %x, i32 %a, i32 %b, i32 %c, i32 %d) {\n  %cmp = icmp sgt i32 %x, 1\n  %cmp2 = icmp sgt i32 %b, 1\n  %cmp3 = icmp sgt i32 %c, 1\n  %cmp4 = icmp sgt i32 %d, 1\n  %sel2 = select i1 %cmp4, i1 true, i1 %cmp2\n  %sel3 = select i1 %sel2, i1 true, i1 %cmp3\n  %sel4 = select i1 %cmp, i1 true, i1 %cmp4\n  %ret = or i1 %sel3, %sel4\n  ret i1 %ret\n}\n",
+          "test_name": "test"
+        }
+      ]
+    }
+  ]
+}

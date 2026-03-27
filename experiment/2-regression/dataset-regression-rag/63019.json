@@ -1,0 +1,78 @@
+{
+  "base_commit": "4d64ffa94170eadd79954e2a5f13d1f1d16e9e2c",
+  "bug_id": "63019",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/include/llvm/Analysis/AliasAnalysis.h": [
+        "() const",
+        "getOffset",
+        "hasOffset"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/AliasAnalysis.h": [
+        [
+          116,
+          121
+        ]
+      ]
+    },
+    "components": [],
+    "fix_commit": "97f0e7b06e6b76fd85fb81b8c12eba2255ff1742"
+  },
+  "issue": {
+    "author": "Noratrieb",
+    "body": "come from https://github.com/rust-lang/rust/issues/112061\r\n\r\nalive2 complains about an optimization in the LLVM IR: https://alive2.llvm.org/ce/z/fyzhJ3\r\n\r\nThe code is quite big and I have made attempts to minimize it, but I didn't quite figure out the tooling, so I'm not sure whether my not very good minimizations would be useful. Everything can be found on https://github.com/Nilstrieb/rlo-issue-112061 if desired.\r\n\r\nThe program prints `11` on O0/O1 and `22` on O2.\r\n\r\nThis small helper must be linked in to run the program:\r\n```c\r\n#include <stdio.h>\r\n#include <stdint.h>\r\n\r\nvoid print_var(uint8_t x) {\r\n    printf(\"%d\", x);\r\n}\r\n\r\nvoid fn12_rs();\r\n\r\nint main() {\r\n    fn12_rs();\r\n}\r\n```\r\n\r\nI can't say for sure that the IR emitted by rustc is free of UB, but I suspect that this is the case. The code is really sensitive to small changes and rustc's constant propagation pass actually masks the miscompilation and has to be disabled.\r\n\r\n@cbeuw suggested running LLVM built with ASan because they were facing crashes on similar input (#63013), but it did not show any issues.",
+    "comments": [
+      {
+        "author": "efriedma-quic",
+        "body": "You might want to try using opt-bisect-limit (https://llvm.org/docs/OptBisect.html) to reduce this."
+      },
+      {
+        "author": "nikic",
+        "body": "Reduced:\r\n```llvm\r\n; RUN: opt -S -passes=gvn < %s\r\ndefine i8 @src(i64 %offset, ptr %ptr) {\r\nstart:\r\n  %alloca = alloca [8 x i8], align 8\r\n  store i64 u0x1122334455667788, ptr %alloca, align 8\r\n  %gep.2 = getelementptr i8, ptr %alloca, i64 2\r\n  %gep.unknown = getelementptr i8, ptr %alloca, i64 %offset\r\n  br label %bb\r\n\r\nunreachable:\r\n  br label %bb\r\n\r\nbb:\r\n  %phi = phi ptr [ %gep.unknown, %start ], [ %gep.2, %unreachable ]\r\n  store i8 0, ptr %alloca, align 8\r\n  %load1 = load i64, ptr %alloca, align 8\r\n  store i64 %load1, ptr %ptr, align 8\r\n  %load2 = load i8, ptr %phi, align 1\r\n  ret i8 %load2\r\n}\r\n```\r\nProduces:\r\n```llvm\r\ndefine i8 @src(i64 %offset, ptr %ptr) {\r\nstart:\r\n  %alloca = alloca [8 x i8], align 8\r\n  store i64 1234605616436508552, ptr %alloca, align 8\r\n  %gep.2 = getelementptr i8, ptr %alloca, i64 2\r\n  %gep.unknown = getelementptr i8, ptr %alloca, i64 %offset\r\n  br label %bb\r\n\r\nunreachable:                                      ; No predecessors!\r\n  br label %bb\r\n\r\nbb:                                               ; preds = %unreachable, %start\r\n  %phi = phi ptr [ %gep.unknown, %start ], [ %gep.2, %unreachable ]\r\n  store i8 0, ptr %alloca, align 8\r\n  %load1 = load i64, ptr %alloca, align 8\r\n  store i64 %load1, ptr %ptr, align 8\r\n  %0 = lshr i64 %load1, 16\r\n  %1 = trunc i64 %0 to i8\r\n  ret i8 %1\r\n}\r\n```\r\nNote how the extract is at offset 2 rather than offset `%offset`.\r\n\r\nEdit: This also works without the unreachable predecessor. This is a slightly more natural test case:\r\n```llvm\r\ndefine i8 @src(i1 %c, i64 %offset, ptr %ptr) {\r\nstart:\r\n  %alloca = alloca [8 x i8], align 8\r\n  store i64 u0x1122334455667788, ptr %alloca, align 8\r\n  %gep.2 = getelementptr i8, ptr %alloca, i64 2\r\n  %gep.unknown = getelementptr i8, ptr %alloca, i64 %offset\r\n  br i1 %c, label %join, label %if\r\n\r\nif:\r\n  br label %join\r\n\r\njoin:\r\n  %phi = phi ptr [ %gep.unknown, %start ], [ %gep.2, %if ]\r\n  store i8 0, ptr %alloca, align 8\r\n  %load1 = load i64, ptr %alloca, align 8\r\n  store i64 %load1, ptr %ptr, align 8\r\n  %load2 = load i8, ptr %phi, align 1\r\n  ret i8 %load2\r\n}\r\n```"
+      },
+      {
+        "author": "nikic",
+        "body": "The AA trace contains this:\r\n```\r\n  End   %gep.unknown = getelementptr i8, ptr %alloca, i64 %offset @ LocationSize::precise(1),   %alloca = alloca [8 x i8], align 8 @ LocationSize::precise(8) = PartialAlias\r\n[...]\r\n  End   %gep.2 = getelementptr i8, ptr %alloca, i64 2 @ LocationSize::precise(1),   %alloca = alloca [8 x i8], align 8 @ LocationSize::precise(8) = PartialAlias (off -2)\r\nEnd   %alloca = alloca [8 x i8], align 8 @ LocationSize::precise(8),   %phi = phi ptr [ %gep.unknown, %start ], [ %gep.2, %if ] @ LocationSize::precise(1) = PartialAlias (off 2)\r\n```\r\nSo this is probably due to incorrect merging of PartialAlias with an without offsets."
+      },
+      {
+        "author": "nikic",
+        "body": "Fixes a pretty serious miscompile, so we may consider this for backport, though the timing is a bit unfortunate.\r\n\r\n/cherry-pick 4d64ffa94170eadd79954e2a5f13d1f1d16e9e2c 97f0e7b06e6b76fd85fb81b8c12eba2255ff1742"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "llvm:optimizations",
+      "release:merged"
+    ],
+    "title": "Invalid optimization around loops"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/63019",
+  "knowledge_cutoff": "2023-05-30T19:00:17Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/GVN"
+  ],
+  "patch": "commit 97f0e7b06e6b76fd85fb81b8c12eba2255ff1742\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Wed May 31 14:53:44 2023 +0200\n\n    [AA] Fix comparison of AliasResults (PR63019)\n    \n    Comparison between two AliasResults implicitly decayed to comparison\n    of AliasResult::Kind. As a result, MergeAliasResults() ended up\n    considering two PartialAlias results with different offsets as\n    equivalent.\n    \n    Fix this by adding an operator== implementation. To stay\n    compatible with extensive use of comparisons between AliasResult\n    and AliasResult::Kind, add an overload for that as well, which\n    will ignore the offset. In the future, it would probably be a\n    good idea to remove these implicit decays to AliasResult::Kind\n    and add dedicated methods to check for specific AliasResult kinds.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/63019.\n\ndiff --git a/llvm/include/llvm/Analysis/AliasAnalysis.h b/llvm/include/llvm/Analysis/AliasAnalysis.h\nindex 68956bcf388a..737aafcc3f60 100644\n--- a/llvm/include/llvm/Analysis/AliasAnalysis.h\n+++ b/llvm/include/llvm/Analysis/AliasAnalysis.h\n@@ -116,6 +116,15 @@ public:\n \n   operator Kind() const { return static_cast<Kind>(Alias); }\n \n+  bool operator==(const AliasResult &Other) const {\n+    return Alias == Other.Alias && HasOffset == Other.HasOffset &&\n+           Offset == Other.Offset;\n+  }\n+  bool operator!=(const AliasResult &Other) const { return !(*this == Other); }\n+\n+  bool operator==(Kind K) const { return Alias == K; }\n+  bool operator!=(Kind K) const { return !(*this == K); }\n+\n   constexpr bool hasOffset() const { return HasOffset; }\n   constexpr int32_t getOffset() const {\n     assert(HasOffset && \"No offset!\");\n",
+  "properties": {
+    "difficulty": "medium",
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=gvn < %s"
+      ],
+      "file": "llvm/test/Transforms/GVN/pr63019.ll",
+      "tests": [
+        {
+          "test_body": "define i8 @test(i1 %c, i64 %offset, ptr %ptr) {\nstart:\n  %alloca = alloca [8 x i8], align 8\n  store i64 1234605616436508552, ptr %alloca, align 8\n  %gep.2 = getelementptr i8, ptr %alloca, i64 2\n  %gep.unknown = getelementptr i8, ptr %alloca, i64 %offset\n  br i1 %c, label %join, label %if\n\nif:                                               ; preds = %start\n  br label %join\n\njoin:                                             ; preds = %if, %start\n  %phi = phi ptr [ %gep.unknown, %start ], [ %gep.2, %if ]\n  store i8 0, ptr %alloca, align 8\n  %load1 = load i64, ptr %alloca, align 8\n  store i64 %load1, ptr %ptr, align 8\n  %load2 = load i8, ptr %phi, align 1\n  ret i8 %load2\n}\n",
+          "test_name": "test"
+        }
+      ]
+    }
+  ]
+}

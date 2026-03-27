@@ -1,0 +1,102 @@
+{
+  "base_commit": "94df95de6bab20930c1a77bc785221ff2f670dba",
+  "bug_id": "117133",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ScalarEvolution.cpp": [
+        "ScalarEvolution::createAddRecFromPHI",
+        "ScalarEvolution::getSequentialMinMaxExpr",
+        "ScalarEvolution::isGuaranteedNotToBePoison",
+        "ScalarEvolution::isSCEVExprNeverPoison"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ScalarEvolution.h": [
+        [
+          2187,
+          2192
+        ]
+      ],
+      "llvm/lib/Analysis/ScalarEvolution.cpp": [
+        [
+          4307,
+          4321
+        ],
+        [
+          5933,
+          5950
+        ],
+        [
+          7324,
+          7329
+        ]
+      ]
+    },
+    "components": [
+      "ScalarEvolution"
+    ],
+    "fix_commit": "f7ef0721d60f85e1f699f8d1b83d4402ae19b122"
+  },
+  "issue": {
+    "author": "Nirhar",
+    "body": "Here is the problematic IR:\r\n```\r\ndefine i32 @widget() {\r\nbb:\r\n  br label %bb1\r\n\r\nbb1:                                              ; preds = %bb5, %bb\r\n  %phi = phi i32 [ 0, %bb ], [ %udiv6, %bb5 ]\r\n  %phi2 = phi i32 [ 1, %bb ], [ %add, %bb5 ]\r\n  %icmp = icmp eq i32 %phi, 0\r\n  br i1 %icmp, label %bb3, label %bb8\r\n\r\nbb3:                                              ; preds = %bb1\r\n  %udiv = udiv i32 10, %phi2\r\n  %urem = urem i32 %udiv, 10\r\n  %icmp4 = icmp eq i32 %urem, 0\r\n  br i1 %icmp4, label %bb7, label %bb5\r\n\r\nbb5:                                              ; preds = %bb3\r\n  %udiv6 = udiv i32 %phi2, 0\r\n  %add = add i32 %phi2, 1\r\n  br label %bb1\r\n\r\nbb7:                                              ; preds = %bb3\r\n  ret i32 5\r\n\r\nbb8:                                              ; preds = %bb1\r\n  ret i32 7\r\n}\r\n```\r\nproduces incorrect IR when `indvars` pass is run. I suspect this is because of the `%udiv6 = udiv i32 %phi2, 0` divide by zero operation. \r\nLook at the indvars transformation here: https://godbolt.org/z/cz1r5178h\r\nThe original IR must return 5, while the transformed IR returns 7\r\n\r\nProof of wrong transformation: https://alive2.llvm.org/ce/z/vPFhzg",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Is this a fuzzer-generated test case?"
+      },
+      {
+        "author": "Nirhar",
+        "body": "> Is this a fuzzer-generated test case?\n\nHi @nikic , yes this test was fuzzer-generated."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:SCEV"
+    ],
+    "title": "[indvars] Miscompile when loop body has an operation with Undefined Behaviour"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/117133",
+  "knowledge_cutoff": "2024-11-21T09:18:16Z",
+  "lit_test_dir": [
+    "llvm/test/Analysis/ScalarEvolution",
+    "llvm/test/Transforms/IndVarSimplify"
+  ],
+  "patch": "commit f7ef0721d60f85e1f699f8d1b83d4402ae19b122\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sun Dec 1 20:11:09 2024 +0800\n\n    [SCEV] Do not allow refinement in the rewriting of BEValue (#117152)\n    \n    See the following case:\n    ```\n    ; bin/opt -passes=\"print<scalar-evolution>\" test.ll --disable-output\n    define i32 @widget() {\n    b:\n      br label %b1\n    \n    b1:                                              ; preds = %b5, %b\n      %phi = phi i32 [ 0, %b ], [ %udiv6, %b5 ]\n      %phi2 = phi i32 [ 1, %b ], [ %add, %b5 ]\n      %icmp = icmp eq i32 %phi, 0\n      br i1 %icmp, label %b3, label %b8\n    \n    b3:                                              ; preds = %b1\n      %udiv = udiv i32 10, %phi2\n      %urem = urem i32 %udiv, 10\n      %icmp4 = icmp eq i32 %urem, 0\n      br i1 %icmp4, label %b7, label %b5\n    \n    b5:                                              ; preds = %b3\n      %udiv6 = udiv i32 %phi2, 0\n      %add = add i32 %phi2, 1\n      br label %b1\n    \n    b7:                                              ; preds = %b3\n      ret i32 5\n    \n    b8:                                              ; preds = %b1\n      ret i32 7\n    }\n    ```\n    ```\n    %phi2 = phi i32 [ 1, %b ], [ %add, %b5 ] -->  {1,+,1}<nuw><nsw><%b1>\n    %udiv6 = udiv i32 %phi2, 0 --> ({1,+,1}<nuw><nsw><%b1> /u 0)\n    %phi = phi i32 [ 0, %b ], [ %udiv6, %b5 ] --> ({0,+,1}<nuw><nsw><%b1> /u 0)\n    ```\n    `ScalarEvolution::createAddRecFromPHI` gives a wrong SCEV result for\n    `%phi`:\n    \n    https://github.com/llvm/llvm-project/blob/d7d6fb1804415b0f3e7f1cc9290bfb3d711cb707/llvm/lib/Analysis/ScalarEvolution.cpp#L5926-L5950\n    It converts `phi(0, ({1,+,1}<nuw><nsw><%b1> /u 0))` into `phi(0 / 0,\n    ({1,+,1}<nuw><nsw><%b1> /u 0))`. Then it simplifies the expr into\n    `{0,+,1}<nuw><nsw><%b1> /u 0`.\n    \n    As we did in\n    https://github.com/llvm/llvm-project/commit/acd700a24b6f767413db3d525e06d03e4245aa40,\n    this patch disallows udiv simplification if we cannot prove that the\n    denominator is a well-defined non-zero value.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/117133.\n\ndiff --git a/llvm/include/llvm/Analysis/ScalarEvolution.h b/llvm/include/llvm/Analysis/ScalarEvolution.h\nindex 885c5985f9d2..b20c6a13cb6b 100644\n--- a/llvm/include/llvm/Analysis/ScalarEvolution.h\n+++ b/llvm/include/llvm/Analysis/ScalarEvolution.h\n@@ -2187,6 +2187,9 @@ private:\n   bool isGuaranteedToTransferExecutionTo(const Instruction *A,\n                                          const Instruction *B);\n \n+  /// Returns true if \\p Op is guaranteed not to cause immediate UB.\n+  bool isGuaranteedNotToCauseUB(const SCEV *Op);\n+\n   /// Returns true if \\p Op is guaranteed to not be poison.\n   static bool isGuaranteedNotToBePoison(const SCEV *Op);\n \ndiff --git a/llvm/lib/Analysis/ScalarEvolution.cpp b/llvm/lib/Analysis/ScalarEvolution.cpp\nindex c3f296b9ff33..882e938e69c0 100644\n--- a/llvm/lib/Analysis/ScalarEvolution.cpp\n+++ b/llvm/lib/Analysis/ScalarEvolution.cpp\n@@ -4307,15 +4307,7 @@ ScalarEvolution::getSequentialMinMaxExpr(SCEVTypes Kind,\n   }\n \n   for (unsigned i = 1, e = Ops.size(); i != e; ++i) {\n-    bool MayBeUB = SCEVExprContains(Ops[i], [this](const SCEV *S) {\n-      auto *UDiv = dyn_cast<SCEVUDivExpr>(S);\n-      // The UDiv may be UB if the divisor is poison or zero. Unless the divisor\n-      // is a non-zero constant, we have to assume the UDiv may be UB.\n-      return UDiv && (!isKnownNonZero(UDiv->getOperand(1)) ||\n-                      !isGuaranteedNotToBePoison(UDiv->getOperand(1)));\n-    });\n-\n-    if (MayBeUB)\n+    if (!isGuaranteedNotToCauseUB(Ops[i]))\n       continue;\n     // We can replace %x umin_seq %y with %x umin %y if either:\n     //  * %y being poison implies %x is also poison.\n@@ -5933,18 +5925,22 @@ const SCEV *ScalarEvolution::createAddRecFromPHI(PHINode *PN) {\n     // We can generalize this saying that i is the shifted value of BEValue\n     // by one iteration:\n     //   PHI(f(0), f({1,+,1})) --> f({0,+,1})\n-    const SCEV *Shifted = SCEVShiftRewriter::rewrite(BEValue, L, *this);\n-    const SCEV *Start = SCEVInitRewriter::rewrite(Shifted, L, *this, false);\n-    if (Shifted != getCouldNotCompute() &&\n-        Start != getCouldNotCompute()) {\n-      const SCEV *StartVal = getSCEV(StartValueV);\n-      if (Start == StartVal) {\n-        // Okay, for the entire analysis of this edge we assumed the PHI\n-        // to be symbolic.  We now need to go back and purge all of the\n-        // entries for the scalars that use the symbolic expression.\n-        forgetMemoizedResults(SymbolicName);\n-        insertValueToMap(PN, Shifted);\n-        return Shifted;\n+\n+    // Do not allow refinement in rewriting of BEValue.\n+    if (isGuaranteedNotToCauseUB(BEValue)) {\n+      const SCEV *Shifted = SCEVShiftRewriter::rewrite(BEValue, L, *this);\n+      const SCEV *Start = SCEVInitRewriter::rewrite(Shifted, L, *this, false);\n+      if (Shifted != getCouldNotCompute() && Start != getCouldNotCompute() &&\n+          ::impliesPoison(BEValue, Start)) {\n+        const SCEV *StartVal = getSCEV(StartValueV);\n+        if (Start == StartVal) {\n+          // Okay, for the entire analysis of this edge we assumed the PHI\n+          // to be symbolic.  We now need to go back and purge all of the\n+          // entries for the scalars that use the symbolic expression.\n+          forgetMemoizedResults(SymbolicName);\n+          insertValueToMap(PN, Shifted);\n+          return Shifted;\n+        }\n       }\n     }\n   }\n@@ -7324,6 +7320,16 @@ bool ScalarEvolution::isGuaranteedNotToBePoison(const SCEV *Op) {\n   return PC.MaybePoison.empty();\n }\n \n+bool ScalarEvolution::isGuaranteedNotToCauseUB(const SCEV *Op) {\n+  return !SCEVExprContains(Op, [this](const SCEV *S) {\n+    auto *UDiv = dyn_cast<SCEVUDivExpr>(S);\n+    // The UDiv may be UB if the divisor is poison or zero. Unless the divisor\n+    // is a non-zero constant, we have to assume the UDiv may be UB.\n+    return UDiv && (!isKnownNonZero(UDiv->getOperand(1)) ||\n+                    !isGuaranteedNotToBePoison(UDiv->getOperand(1)));\n+  });\n+}\n+\n bool ScalarEvolution::isSCEVExprNeverPoison(const Instruction *I) {\n   // Only proceed if we can prove that I does not yield poison.\n   if (!programUndefinedIfPoison(I))\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -disable-output \"-passes=print<scalar-evolution>\" < %s 2>&1"
+      ],
+      "file": "llvm/test/Analysis/ScalarEvolution/pr117133.ll",
+      "tests": [
+        {
+          "test_body": "define i32 @widget() {\nb:\n  br label %b1\n\nb1:                                               ; preds = %b5, %b\n  %phi = phi i32 [ 0, %b ], [ %udiv6, %b5 ]\n  %phi2 = phi i32 [ 1, %b ], [ %add, %b5 ]\n  %icmp = icmp eq i32 %phi, 0\n  br i1 %icmp, label %b3, label %b8\n\nb3:                                               ; preds = %b1\n  %udiv = udiv i32 10, %phi2\n  %urem = urem i32 %udiv, 10\n  %icmp4 = icmp eq i32 %urem, 0\n  br i1 %icmp4, label %b7, label %b5\n\nb5:                                               ; preds = %b3\n  %udiv6 = udiv i32 %phi2, 0\n  %add = add i32 %phi2, 1\n  br label %b1\n\nb7:                                               ; preds = %b3\n  ret i32 5\n\nb8:                                               ; preds = %b1\n  ret i32 7\n}\n",
+          "test_name": "widget"
+        },
+        {
+          "test_body": "define i64 @test_poisonous(i64 %a, i32 %n) {\nentry:\n  br label %loop.body\n\nloop.body:                                        ; preds = %loop.body, %entry\n  %indvar1 = phi i32 [ 0, %entry ], [ %indvar1.next, %loop.body ]\n  %indvar2 = phi i64 [ 0, %entry ], [ %mul, %loop.body ]\n  %indvar1.next = add i32 %indvar1, 1\n  %ext = zext i32 %indvar1.next to i64\n  %mul = mul i64 %ext, %a\n  %exitcond = icmp sgt i32 %indvar1.next, %n\n  br i1 %exitcond, label %loop.exit, label %loop.body\n\nloop.exit:                                        ; preds = %loop.body\n  ret i64 %mul\n}\n",
+          "test_name": "test_poisonous"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S -passes=indvars < %s"
+      ],
+      "file": "llvm/test/Transforms/IndVarSimplify/pr117133.ll",
+      "tests": [
+        {
+          "test_body": "define i32 @widget() {\nb:\n  br label %b1\n\nb1:                                               ; preds = %b5, %b\n  %phi = phi i32 [ 0, %b ], [ %udiv6, %b5 ]\n  %phi2 = phi i32 [ 1, %b ], [ %add, %b5 ]\n  %icmp = icmp eq i32 %phi, 0\n  br i1 %icmp, label %b3, label %b8\n\nb3:                                               ; preds = %b1\n  %udiv = udiv i32 10, %phi2\n  %urem = urem i32 %udiv, 10\n  %icmp4 = icmp eq i32 %urem, 0\n  br i1 %icmp4, label %b7, label %b5\n\nb5:                                               ; preds = %b3\n  %udiv6 = udiv i32 %phi2, 0\n  %add = add i32 %phi2, 1\n  br label %b1\n\nb7:                                               ; preds = %b3\n  ret i32 5\n\nb8:                                               ; preds = %b1\n  ret i32 7\n}\n",
+          "test_name": "widget"
+        }
+      ]
+    }
+  ]
+}

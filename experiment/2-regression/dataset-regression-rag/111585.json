@@ -1,0 +1,86 @@
+{
+  "base_commit": "7f19b1e49c172772390a3c2e71631115da80af4b",
+  "bug_id": "111585",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/MemoryDependenceAnalysis.cpp": [
+        "MemoryDependenceResults::getNonLocalPointerDepFromBB"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/MemoryDependenceAnalysis.cpp": [
+        [
+          1066,
+          1105
+        ]
+      ]
+    },
+    "components": [
+      "MemoryDependenceAnalysis"
+    ],
+    "fix_commit": "6f68d039a5bdf11f6d7c84bed8d5a0da5950daef"
+  },
+  "issue": {
+    "author": "alinas",
+    "body": "The following miscompile was uncovered in GVN, to reproduce:\r\n`opt --passes=gvn  gvntest.ll` on [gvntest.ll.txt](https://github.com/user-attachments/files/17299256/gvntest.ll.txt)\r\n\r\nThe miscompiled output is: \r\n[testafterbad.ll.txt](https://github.com/user-attachments/files/17299260/testafterbad.ll.txt)\r\n\r\nIt appears that if the cache entry is cleared at MemoryDependenceAnalysis.cpp:1060 with `NonLocalPointerDeps.erase(CacheKey);` before the insert, the test is correct.\r\nThe resulting IR with this change: \r\n[testaftergood.ll.txt](https://github.com/user-attachments/files/17299268/testaftergood.ll.txt)\r\n",
+    "comments": [
+      {
+        "author": "aeubanks",
+        "body": "reduced:\r\n\r\n```\r\ndefine float @wombat(i1 %arg, i1 %arg1) {\r\nbb:\r\n  br label %bb3\r\n\r\nbb2:                                              ; No predecessors!\r\n  br label %bb3\r\n\r\nbb3:                                              ; preds = %bb2, %bb\r\n  %call = tail call noalias ptr @_Znwm(i64 8)\r\n  br label %bb4\r\n\r\nbb4:                                              ; preds = %bb4, %bb3\r\n  %phi = phi ptr [ null, %bb4 ], [ %call, %bb3 ]\r\n  store float 0.000000e+00, ptr %phi, align 4\r\n  br i1 %arg, label %bb5, label %bb4\r\n\r\nbb5:                                              ; preds = %bb4\r\n  br i1 %arg1, label %bb7, label %bb6\r\n\r\nbb6:                                              ; preds = %bb5\r\n  %load = load <4 x float>, ptr %call, align 4\r\n  %extractelement = extractelement <4 x float> %load, i64 0\r\n  br label %bb9\r\n\r\nbb7:                                              ; preds = %bb5\r\n  %load8 = load float, ptr %call, align 4\r\n  br label %bb9\r\n\r\nbb9:                                              ; preds = %bb7, %bb6\r\n  %phi10 = phi float [ %load8, %bb7 ], [ 1.000000e+00, %bb6 ]\r\n  ret float %phi10\r\n}\r\n\r\ndeclare ptr @_Znwm(i64)\r\n```\r\n`opt -dom-tree-reachability-max-bbs-to-explore=1 -enable-pre=0 -p gvn -S`"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:analysis"
+    ],
+    "title": "Miscompile in GVN due to MemDepAnalysis caching"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/111585",
+  "knowledge_cutoff": "2024-10-08T21:01:45Z",
+  "lit_test_dir": [
+    "llvm/test/Analysis/MemoryDependenceAnalysis",
+    "llvm/test/Transforms/GVN/PRE"
+  ],
+  "patch": "commit 6f68d039a5bdf11f6d7c84bed8d5a0da5950daef\nAuthor: Arthur Eubanks <aeubanks@google.com>\nDate:   Thu Nov 21 09:25:10 2024 -0800\n\n    [MemDepAnalysis] Don't reuse NonLocalPointerDeps cache if memory location size differs (#116936)\n    \n    As seen in #111585, we can end up using a previous cache entry where the\n    size was too large and was UB.\n    \n    Compile time impact:\n    https://llvm-compile-time-tracker.com/compare.php?from=6a863f7e2679a60f2f38ae6a920d0b6e1a2c1690&to=faccf4e1f47fcd5360a438de2a56d02b770ad498&stat=instructions:u.\n    \n    Fixes #111585.\n\ndiff --git a/llvm/lib/Analysis/MemoryDependenceAnalysis.cpp b/llvm/lib/Analysis/MemoryDependenceAnalysis.cpp\nindex c40bbd9e18e7..dec5ee5361ca 100644\n--- a/llvm/lib/Analysis/MemoryDependenceAnalysis.cpp\n+++ b/llvm/lib/Analysis/MemoryDependenceAnalysis.cpp\n@@ -1066,40 +1066,18 @@ bool MemoryDependenceResults::getNonLocalPointerDepFromBB(\n   // Invariant loads don't participate in caching. Thus no need to reconcile.\n   if (!isInvariantLoad && !Pair.second) {\n     if (CacheInfo->Size != Loc.Size) {\n-      bool ThrowOutEverything;\n-      if (CacheInfo->Size.hasValue() && Loc.Size.hasValue()) {\n-        // FIXME: We may be able to do better in the face of results with mixed\n-        // precision. We don't appear to get them in practice, though, so just\n-        // be conservative.\n-        ThrowOutEverything =\n-            CacheInfo->Size.isPrecise() != Loc.Size.isPrecise() ||\n-            !TypeSize::isKnownGE(CacheInfo->Size.getValue(),\n-                                 Loc.Size.getValue());\n-      } else {\n-        // For our purposes, unknown size > all others.\n-        ThrowOutEverything = !Loc.Size.hasValue();\n-      }\n-\n-      if (ThrowOutEverything) {\n-        // The query's Size is greater than the cached one. Throw out the\n-        // cached data and proceed with the query at the greater size.\n-        CacheInfo->Pair = BBSkipFirstBlockPair();\n-        CacheInfo->Size = Loc.Size;\n-        for (auto &Entry : CacheInfo->NonLocalDeps)\n-          if (Instruction *Inst = Entry.getResult().getInst())\n-            RemoveFromReverseMap(ReverseNonLocalPtrDeps, Inst, CacheKey);\n-        CacheInfo->NonLocalDeps.clear();\n-        // The cache is cleared (in the above line) so we will have lost\n-        // information about blocks we have already visited. We therefore must\n-        // assume that the cache information is incomplete.\n-        IsIncomplete = true;\n-      } else {\n-        // This query's Size is less than the cached one. Conservatively restart\n-        // the query using the greater size.\n-        return getNonLocalPointerDepFromBB(\n-            QueryInst, Pointer, Loc.getWithNewSize(CacheInfo->Size), isLoad,\n-            StartBB, Result, Visited, SkipFirstBlock, IsIncomplete);\n-      }\n+      // The query's Size is not equal to the cached one. Throw out the cached\n+      // data and proceed with the query with the new size.\n+      CacheInfo->Pair = BBSkipFirstBlockPair();\n+      CacheInfo->Size = Loc.Size;\n+      for (auto &Entry : CacheInfo->NonLocalDeps)\n+        if (Instruction *Inst = Entry.getResult().getInst())\n+          RemoveFromReverseMap(ReverseNonLocalPtrDeps, Inst, CacheKey);\n+      CacheInfo->NonLocalDeps.clear();\n+      // The cache is cleared (in the above line) so we will have lost\n+      // information about blocks we have already visited. We therefore must\n+      // assume that the cache information is incomplete.\n+      IsIncomplete = true;\n     }\n \n     // If the query's AATags are inconsistent with the cached one,\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=gvn -dom-tree-reachability-max-bbs-to-explore=1 -S < %s"
+      ],
+      "file": "llvm/test/Analysis/MemoryDependenceAnalysis/load-size-cache.ll",
+      "tests": [
+        {
+          "test_body": "define i8 @f(i1 %arg0, i1 %arg1, i1 %arg2) {\nbb:\n  br i1 %arg2, label %bb2, label %bb11\n\nbb11:                                             ; preds = %bb\n  br label %bb3\n\nbb2:                                              ; preds = %bb\n  br label %bb3\n\nbb3:                                              ; preds = %bb2, %bb11\n  %call = tail call noalias ptr @_Znwm(i64 2)\n  br label %bb4\n\nbb4:                                              ; preds = %bb4, %bb3\n  %phi = phi ptr [ null, %bb4 ], [ %call, %bb3 ]\n  store i8 2, ptr %phi, align 4\n  br i1 %arg0, label %bb5, label %bb4\n\nbb5:                                              ; preds = %bb4\n  br i1 %arg1, label %bb7, label %bb6\n\nbb6:                                              ; preds = %bb5\n  %load = load i64, ptr %call, align 4\n  call void @use(i64 %load)\n  br label %bb9\n\nbb7:                                              ; preds = %bb5\n  %load8 = load i8, ptr %call, align 4\n  br label %bb9\n\nbb9:                                              ; preds = %bb7, %bb6\n  %phi10 = phi i8 [ %load8, %bb7 ], [ 4, %bb6 ]\n  ret i8 %phi10\n}\n\ndeclare ptr @_Znwm(i64)\n\ndeclare void @use(i64)\n",
+          "test_name": "f"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt < %s -data-layout=\"e-p:32:32:32-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-n8:16:32\" -passes=gvn,dce -enable-split-backedge-in-load-pre -S",
+        "opt < %s -data-layout=\"E-p:32:32:32-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:64:64-n32\" -passes=gvn,dce -enable-split-backedge-in-load-pre -S"
+      ],
+      "file": "llvm/test/Transforms/GVN/PRE/rle.ll",
+      "tests": [
+        {
+          "test_body": "define void @load_load_partial_alias_loop(ptr %P) {\nentry:\n  %P.1 = getelementptr i8, ptr %P, i64 1\n  %v.1 = load i8, ptr %P.1, align 1\n  call void @use.i8(i8 %v.1)\n  %v.1.32 = load i32, ptr %P.1, align 4\n  call void @use.i32(i32 %v.1.32)\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i64 [ 1, %entry ], [ %i.inc, %loop ]\n  %P.i = getelementptr i8, ptr %P, i64 %i\n  %v.i = load i8, ptr %P.i, align 1\n  call void @use.i8(i8 %v.i)\n  %v.i.32 = load i32, ptr %P.i, align 4\n  call void @use.i32(i32 %v.i.32)\n  %i.inc = add i64 %i, 1\n  %cmp = icmp ne i64 %i.inc, 64\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\n; Function Attrs: memory(none)\ndeclare void @use.i8(i8) #0\n\n; Function Attrs: memory(none)\ndeclare void @use.i32(i32) #0\n\nattributes #0 = { memory(none) }\n",
+          "test_name": "load_load_partial_alias_loop"
+        },
+        {
+          "test_body": "; Function Attrs: memory(read)\ndeclare void @use_i32(i32) #0\n\ndefine i32 @phi_trans6(ptr noalias nocapture readonly %x, i1 %cond) {\nentry:\n  %l0 = load i32, ptr %x, align 4\n  call void @use_i32(i32 %l0)\n  br label %header\n\nheader:                                           ; preds = %latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %latch ]\n  indirectbr ptr blockaddress(@phi_trans6, %latch), [label %latch]\n\nlatch:                                            ; preds = %header\n  %gep.1 = getelementptr i32, ptr %x, i32 %iv\n  %l1 = load i32, ptr %gep.1, align 4\n  %iv.next = add i32 %iv, 1\n  br i1 %cond, label %exit, label %header\n\nexit:                                             ; preds = %latch\n  ret i32 %l1\n}\n\nattributes #0 = { memory(read) }\n",
+          "test_name": "phi_trans6"
+        },
+        {
+          "test_body": "; Function Attrs: memory(read)\ndeclare i1 @cond2() #0\n\ndefine i8 @phi_trans4(ptr %p) {\nentry:\n  %X3 = getelementptr i8, ptr %p, i32 192\n  store i8 -64, ptr %X3, align 1\n  %X = getelementptr i8, ptr %p, i32 4\n  %Y = load i8, ptr %X, align 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i32 [ 4, %entry ], [ 192, %loop ]\n  %X2 = getelementptr i8, ptr %p, i32 %i\n  %Y2 = load i8, ptr %X2, align 1\n  %cond = call i1 @cond2()\n  store i32 0, ptr %X3, align 4\n  br i1 %cond, label %loop, label %out\n\nout:                                              ; preds = %loop\n  %R = add i8 %Y, %Y2\n  ret i8 %R\n}\n\nattributes #0 = { memory(read) }\n",
+          "test_name": "phi_trans4"
+        }
+      ]
+    }
+  ]
+}

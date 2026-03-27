@@ -1,0 +1,161 @@
+{
+  "base_commit": "858e6273d938cc4d08ee053ddff3fe7b19eb302a",
+  "bug_id": "44206",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        "InstCombinerImpl::visitGEPOfGEP"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+        [
+          1969,
+          1975
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "36cbdaa163bd4250923eff0812f0e84ca129347e"
+  },
+  "issue": {
+    "author": "aqjune",
+    "body": "|  |  |\r\n| --- | --- |\r\n| Bugzilla Link | [44861](https://llvm.org/bz44861) |\r\n| Version | trunk |\r\n| OS | All |\r\n| CC | @LebedevRI,@preames,@RKSimon,@nikic,@nunoplopes,@rotateright |\r\n\r\n## Extended Description \r\n```\r\n$ cat input.ll\r\ndeclare void @g(i8*)\r\n\r\ndefine void @foo(i8* %ptr, i1 %cc1, i1 %cc2, i1 %cc3, i32 %arg) {\r\nentry:\r\n  br i1 %cc1, label %do.end, label %if.then\r\n\r\nif.then:\r\n  br i1 %cc2, label %do.body, label %do.end\r\n\r\ndo.body:\r\n  %phi = phi i32 [ %arg, %if.then ]\r\n  %phi.ext = zext i32 %phi to i64\r\n  %ptr2 = getelementptr inbounds i8, i8* %ptr, i64 %phi.ext\r\n  %ptr3 = getelementptr inbounds i8, i8* %ptr2, i64 -1\r\n  call void @g(i8* %ptr3)\r\n  br i1 %cc3, label %do.end, label %if.then\r\n\r\ndo.end:\r\n  ret void\r\n}\r\n\r\n$ opt -instcombine -S -o - input.ll\r\ndeclare void @g(i8*)\r\n\r\ndefine void @foo(i8* %ptr, i1 %cc1, i1 %cc2, i1 %cc3, i32 %arg) {\r\n  br i1 %cc1, label %do.end, label %if.then\r\n\r\nif.then:                                          ; preds = %do.body, %entry\r\n  br i1 %cc2, label %do.body, label %do.end\r\n\r\ndo.body:                                          ; preds = %if.then\r\n  %phi.ext = zext i32 %arg to i64\r\n  %ptr2 = getelementptr inbounds i8, i8* %ptr, i64 -1\r\n  %ptr3 = getelementptr inbounds i8, i8* %ptr2, i64 %phi.ext\r\n  call void @g(i8* nonnull %ptr3)\r\n  br i1 %cc3, label %do.end, label %if.then\r\n\r\ndo.end:                                           ; preds = %do.body, %if.then, %entry\r\n  ret void\r\n}\r\n```\r\n\r\nIf %arg is 1, ptr3 in the source is `gep inb (gep inb ptr, 1), -1` whereas ptr3 in the target is `gep inb (gep inb ptr, -1), 1`.\r\nThis is incorrect because ptr3 in the tgt may be poison whereas ptr3 in the source isn't.",
+    "comments": [
+      {
+        "author": "aqjune",
+        "body": "I track down reason and it was because InstCombine::visitGetElementPtrInst try to swap index operands of geps when it can exhibit more opportunities to LICM:\n\n```\n/* at InstructionCombining.cpp */\n...\n    // Try to reassociate loop invariant GEP chains to enable LICM.\n    if (LI && Src->getNumOperands() == 2 && GEP.getNumOperands() == 2 &&\n        Src->hasOneUse()) {\n...\n```\n\nptr3's gep has a constant index (-1), so InstCombine chose to swap it with ptr2's index (%phi.ext) to enable code motion of the updated ptr2.\n\nHere are a few solutions that I have:\n\n(1) do this transformation when the two indices are known to have the same sign or either of those is zero.\nFor example, if ptr3's index is 1 instead of -1, this transformation is allowed.\n(2) drop inbound flags when doing the transformation."
+      },
+      {
+        "author": "nunoplopes",
+        "body": "The test case seems to have been fixed in LLVM 12."
+      },
+      {
+        "author": "nikic",
+        "body": "This issue still exists with the right invocation: https://llvm.godbolt.org/z/j6zPoKa7E"
+      },
+      {
+        "author": "nunoplopes",
+        "body": "ouch, thank you @nikic!"
+      },
+      {
+        "author": "nikic",
+        "body": "Candidate patch: https://reviews.llvm.org/D126687"
+      }
+    ],
+    "labels": [
+      "bugzilla",
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "InstCombine incorrectly rewrites indices of gep inbounds"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/44206",
+  "knowledge_cutoff": "2020-02-10T03:14:38Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine",
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "patch": "commit 36cbdaa163bd4250923eff0812f0e84ca129347e\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Mon May 30 17:09:40 2022 +0200\n\n    [InstCombine] Fix inbounds preservation when swapping GEPs (PR44206)\n    \n    When reassociating GEPs, we can only keep inbounds if both original\n    GEPs were inbounds, and their offsets have the same sign. For the\n    sake of simplicity, I only handle the case where both offsets are\n    non-negative here.\n    \n    It would probably be fine to just not preserve inbounds at all here,\n    but as I don't see a compile-time impact for adding the\n    isKnownNonNegative() calls I went with this more conservative\n    approach.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/44206.\n    \n    Differential Revision: https://reviews.llvm.org/D126687\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 07f44036cce5..ac196ba00c2a 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -1969,7 +1969,12 @@ Instruction *InstCombinerImpl::visitGEPOfGEP(GetElementPtrInst &GEP,\n         // invariant: this breaks the dependence between GEPs and allows LICM\n         // to hoist the invariant part out of the loop.\n         if (L->isLoopInvariant(GO1) && !L->isLoopInvariant(SO1)) {\n-          bool IsInBounds = Src->isInBounds() && GEP.isInBounds();\n+          // The swapped GEPs are inbounds if both original GEPs are inbounds\n+          // and the sign of the offsets is the same. For simplicity, only\n+          // handle both offsets being non-negative.\n+          bool IsInBounds = Src->isInBounds() && GEP.isInBounds() &&\n+                            isKnownNonNegative(SO1, DL, 0, &AC, &GEP, &DT) &&\n+                            isKnownNonNegative(GO1, DL, 0, &AC, &GEP, &DT);\n           // Put NewSrc at same location as %src.\n           Builder.SetInsertPoint(cast<Instruction>(Src));\n           Value *NewSrc = Builder.CreateGEP(GEP.getSourceElementType(),\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -instcombine -S -enable-new-pm=0",
+        "opt < %s -passes='require<loops>,instcombine' -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare void @use(ptr)\n\ndefine void @both_inbounds_one_neg(ptr %ptr, i1 %c, i32 noundef %arg) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %arg.ext = zext i32 %arg to i64\n  %ptr2 = getelementptr inbounds i8, ptr %ptr, i64 %arg.ext\n  %ptr3 = getelementptr inbounds i8, ptr %ptr2, i64 -1\n  call void @use(ptr %ptr3)\n  br i1 %c, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "both_inbounds_one_neg"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare void @blackhole(<2 x ptr>)\n\ndefine void @PR51485(<2 x i64> %v) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %sl1 = shl nuw nsw <2 x i64> %v, splat (i64 7)\n  %e5 = getelementptr inbounds i8, ptr @PR51485, <2 x i64> %sl1\n  %e6 = getelementptr inbounds i8, <2 x ptr> %e5, i64 80\n  call void @blackhole(<2 x ptr> %e6)\n  br label %loop\n}\n",
+          "test_name": "PR51485"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @foo(ptr nocapture readnone %match, i32 %cur_match, i32 %best_len, i32 %scan_end, ptr nocapture readonly %prev, i32 %limit, i32 %chain_length, ptr nocapture readonly %win, i32 %wmask) {\nentry:\n  %idx.ext2 = zext i32 %cur_match to i64\n  %add.ptr4 = getelementptr inbounds i8, ptr %win, i64 %idx.ext2\n  %idx.ext1 = zext i32 %best_len to i64\n  %add.ptr25 = getelementptr inbounds i8, ptr %add.ptr4, i64 %idx.ext1\n  %add.ptr36 = getelementptr inbounds i8, ptr %add.ptr25, i64 -1\n  %0 = bitcast ptr %add.ptr36 to ptr\n  %1 = load i32, ptr %0, align 4\n  %cmp7 = icmp eq i32 %1, %scan_end\n  br i1 %cmp7, label %do.end, label %if.then.lr.ph\n\nif.then.lr.ph:                                    ; preds = %entry\n  br label %if.then\n\ndo.body:                                          ; preds = %land.lhs.true\n  %chain_length.addr.0 = phi i32 [ %dec, %land.lhs.true ]\n  %cur_match.addr.0 = phi i32 [ %4, %land.lhs.true ]\n  %idx.ext = zext i32 %cur_match.addr.0 to i64\n  %add.ptr = getelementptr inbounds i8, ptr %win, i64 %idx.ext\n  %add.ptr2 = getelementptr inbounds i8, ptr %add.ptr, i64 %idx.ext1\n  %add.ptr3 = getelementptr inbounds i8, ptr %add.ptr2, i64 -1\n  %2 = bitcast ptr %add.ptr3 to ptr\n  %3 = load i32, ptr %2, align 4\n  %cmp = icmp eq i32 %3, %scan_end\n  br i1 %cmp, label %do.end, label %if.then\n\nif.then:                                          ; preds = %do.body, %if.then.lr.ph\n  %cur_match.addr.09 = phi i32 [ %cur_match, %if.then.lr.ph ], [ %cur_match.addr.0, %do.body ]\n  %chain_length.addr.08 = phi i32 [ %chain_length, %if.then.lr.ph ], [ %chain_length.addr.0, %do.body ]\n  %and = and i32 %cur_match.addr.09, %wmask\n  %idxprom = zext i32 %and to i64\n  %arrayidx = getelementptr inbounds i32, ptr %prev, i64 %idxprom\n  %4 = load i32, ptr %arrayidx, align 4\n  %cmp4 = icmp ugt i32 %4, %limit\n  br i1 %cmp4, label %land.lhs.true, label %do.end\n\nland.lhs.true:                                    ; preds = %if.then\n  %dec = add i32 %chain_length.addr.08, -1\n  %cmp5 = icmp eq i32 %dec, 0\n  br i1 %cmp5, label %do.end, label %do.body\n\ndo.end:                                           ; preds = %land.lhs.true, %if.then, %do.body, %entry\n  %cont.0 = phi i32 [ 1, %entry ], [ 0, %if.then ], [ 0, %land.lhs.true ], [ 1, %do.body ]\n  ret i32 %cont.0\n}\n",
+          "test_name": "foo"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -loop-vectorize -instcombine -simplifycfg -simplifycfg-require-and-preserve-domtree=1 -tail-predication=enabled < %s -S -o -"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/ARM/mve-reductions.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64\"\ntarget triple = \"thumbv8.1m.main-arm-none-eabi\"\n\ndefine i32 @reduction_interleave_group(i32 %n, ptr %arr) #0 {\nentry:\n  %guard = icmp sgt i32 %n, 0\n  br i1 %guard, label %for.body, label %exit\n\nfor.body:                                         ; preds = %for.body, %entry\n  %iv = phi i32 [ %iv.next, %for.body ], [ 0, %entry ]\n  %red.phi = phi i32 [ %red.2, %for.body ], [ 0, %entry ]\n  %add = or i32 %iv, 1\n  %gep.0 = getelementptr inbounds i32, ptr %arr, i32 %add\n  %l.0 = load i32, ptr %gep.0, align 4\n  %gep.1 = getelementptr inbounds i32, ptr %arr, i32 %iv\n  %l.1 = load i32, ptr %gep.1, align 4\n  %red.1 = add i32 %l.0, %red.phi\n  %red.2 = add i32 %red.1, %l.1\n  %iv.next = add nuw nsw i32 %iv, 2\n  %cmp = icmp slt i32 %iv.next, %n\n  br i1 %cmp, label %for.body, label %exit\n\nexit:                                             ; preds = %for.body, %entry\n  %ret.lcssa = phi i32 [ 0, %entry ], [ %red.2, %for.body ]\n  ret i32 %ret.lcssa\n}\n\nattributes #0 = { \"target-features\"=\"+mve\" }\n",
+          "test_name": "reduction_interleave_group"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -mcpu=skx -S -loop-vectorize -instcombine -simplifycfg -simplifycfg-require-and-preserve-domtree=1 -force-vector-width=8 -force-vector-interleave=1 -enable-interleaved-mem-accesses < %s",
+        "opt -mcpu=skx -S -loop-vectorize -instcombine -simplifycfg -simplifycfg-require-and-preserve-domtree=1 -force-vector-width=8 -force-vector-interleave=1 -enable-interleaved-mem-accesses  -enable-masked-interleaved-mem-accesses < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-accesses-masked-group.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-p:32:32-f64:32:64-f80:32-n8:16:32-S128\"\ntarget triple = \"i386-unknown-linux-gnu\"\n\n; Function Attrs: optsize\ndefine dso_local void @unconditional_masked_strided2_unknown_tc(ptr noalias nocapture readonly %p, ptr noalias nocapture %q, i32 %n) local_unnamed_addr #0 {\nentry:\n  %cmp20 = icmp sgt i32 %n, 0\n  br i1 %cmp20, label %for.body.preheader, label %for.end\n\nfor.body.preheader:                               ; preds = %entry\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %ix.021 = phi i32 [ %inc, %for.body ], [ 0, %for.body.preheader ]\n  %mul = shl nuw nsw i32 %ix.021, 1\n  %arrayidx = getelementptr inbounds i8, ptr %p, i32 %mul\n  %0 = load i8, ptr %arrayidx, align 1\n  %add = or i32 %mul, 1\n  %arrayidx2 = getelementptr inbounds i8, ptr %p, i32 %add\n  %1 = load i8, ptr %arrayidx2, align 1\n  %cmp.i = icmp slt i8 %0, %1\n  %spec.select.i = select i1 %cmp.i, i8 %1, i8 %0\n  %arrayidx4 = getelementptr inbounds i8, ptr %q, i32 %mul\n  store i8 %spec.select.i, ptr %arrayidx4, align 1\n  %sub = sub i8 0, %spec.select.i\n  %arrayidx8 = getelementptr inbounds i8, ptr %q, i32 %add\n  store i8 %sub, ptr %arrayidx8, align 1\n  %inc = add nuw nsw i32 %ix.021, 1\n  %exitcond = icmp eq i32 %inc, %n\n  br i1 %exitcond, label %for.end.loopexit, label %for.body\n\nfor.end.loopexit:                                 ; preds = %for.body\n  br label %for.end\n\nfor.end:                                          ; preds = %for.end.loopexit, %entry\n  ret void\n}\n\nattributes #0 = { optsize }\n",
+          "test_name": "unconditional_masked_strided2_unknown_tc"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -mcpu=skx -S -loop-vectorize -instcombine -simplifycfg -licm -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses -prefer-predicate-over-epilogue=predicate-dont-vectorize < %s",
+        "opt -mcpu=skx -S -loop-vectorize -instcombine -simplifycfg -licm -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses  -enable-masked-interleaved-mem-accesses -prefer-predicate-over-epilogue=predicate-dont-vectorize < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine dso_local void @test1(ptr noalias nocapture %points, ptr noalias nocapture readonly %x, ptr noalias nocapture readonly %y) local_unnamed_addr {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i16, ptr %x, i64 %indvars.iv\n  %0 = load i16, ptr %arrayidx, align 2\n  %1 = shl nuw nsw i64 %indvars.iv, 2\n  %arrayidx2 = getelementptr inbounds i16, ptr %points, i64 %1\n  store i16 %0, ptr %arrayidx2, align 2\n  %arrayidx4 = getelementptr inbounds i16, ptr %y, i64 %indvars.iv\n  %2 = load i16, ptr %arrayidx4, align 2\n  %3 = or i64 %1, 1\n  %arrayidx7 = getelementptr inbounds i16, ptr %points, i64 %3\n  store i16 %2, ptr %arrayidx7, align 2\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, 1024\n  br i1 %exitcond.not, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n",
+          "test_name": "test1"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine dso_local void @test2(ptr noalias nocapture %points, i32 %numPoints, ptr noalias nocapture readonly %x, ptr noalias nocapture readonly %y) local_unnamed_addr {\nentry:\n  %cmp15 = icmp sgt i32 %numPoints, 0\n  br i1 %cmp15, label %for.body.preheader, label %for.end\n\nfor.body.preheader:                               ; preds = %entry\n  %wide.trip.count = zext i32 %numPoints to i64\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %indvars.iv = phi i64 [ 0, %for.body.preheader ], [ %indvars.iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i16, ptr %x, i64 %indvars.iv\n  %0 = load i16, ptr %arrayidx, align 2\n  %1 = shl nsw i64 %indvars.iv, 2\n  %arrayidx2 = getelementptr inbounds i16, ptr %points, i64 %1\n  store i16 %0, ptr %arrayidx2, align 2\n  %arrayidx4 = getelementptr inbounds i16, ptr %y, i64 %indvars.iv\n  %2 = load i16, ptr %arrayidx4, align 2\n  %3 = or i64 %1, 1\n  %arrayidx7 = getelementptr inbounds i16, ptr %points, i64 %3\n  store i16 %2, ptr %arrayidx7, align 2\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, %wide.trip.count\n  br i1 %exitcond.not, label %for.end.loopexit, label %for.body\n\nfor.end.loopexit:                                 ; preds = %for.body\n  br label %for.end\n\nfor.end:                                          ; preds = %for.end.loopexit, %entry\n  ret void\n}\n",
+          "test_name": "test2"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S -loop-vectorize -instcombine -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses=true -runtime-memory-check-threshold=24 < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/interleaved-accesses.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\n%struct.ST2 = type { i32, i32 }\n\ndefine void @test_reversed_load2_store2(ptr noalias nocapture readonly %A, ptr noalias nocapture %B) {\nentry:\n  br label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 1023, %entry ], [ %indvars.iv.next, %for.body ]\n  %x = getelementptr inbounds %struct.ST2, ptr %A, i64 %indvars.iv, i32 0\n  %tmp = load i32, ptr %x, align 4\n  %tmp1 = trunc i64 %indvars.iv to i32\n  %add = add nsw i32 %tmp, %tmp1\n  %y = getelementptr inbounds %struct.ST2, ptr %A, i64 %indvars.iv, i32 1\n  %tmp2 = load i32, ptr %y, align 4\n  %sub = sub nsw i32 %tmp2, %tmp1\n  %x5 = getelementptr inbounds %struct.ST2, ptr %B, i64 %indvars.iv, i32 0\n  store i32 %add, ptr %x5, align 4\n  %y8 = getelementptr inbounds %struct.ST2, ptr %B, i64 %indvars.iv, i32 1\n  store i32 %sub, ptr %y8, align 4\n  %indvars.iv.next = add nsw i64 %indvars.iv, -1\n  %cmp = icmp sgt i64 %indvars.iv, 0\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n}\n",
+          "test_name": "test_reversed_load2_store2"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @mixed_load3_store3(ptr nocapture %A) {\nentry:\n  br label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i.013 = phi i32 [ 0, %entry ], [ %inc, %for.body ]\n  %A.addr.012 = phi ptr [ %A, %entry ], [ %incdec.ptr3, %for.body ]\n  %incdec.ptr = getelementptr inbounds i32, ptr %A.addr.012, i64 1\n  %tmp = load i32, ptr %A.addr.012, align 4\n  %add = add i32 %tmp, %i.013\n  store i32 %add, ptr %A.addr.012, align 4\n  %incdec.ptr1 = getelementptr inbounds i32, ptr %A.addr.012, i64 2\n  %tmp1 = load i32, ptr %incdec.ptr, align 4\n  %add2 = add i32 %tmp1, %i.013\n  store i32 %add2, ptr %incdec.ptr, align 4\n  %incdec.ptr3 = getelementptr inbounds i32, ptr %A.addr.012, i64 3\n  %tmp2 = load i32, ptr %incdec.ptr1, align 4\n  %add4 = add i32 %tmp2, %i.013\n  store i32 %add4, ptr %incdec.ptr1, align 4\n  %inc = add nuw nsw i32 %i.013, 1\n  %exitcond = icmp eq i32 %inc, 1024\n  br i1 %exitcond, label %for.cond.cleanup, label %for.body\n}\n",
+          "test_name": "mixed_load3_store3"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\n%struct.ST3 = type { i32, i32, i32 }\n\n@A = external global [3072 x i32], align 4\n@S = external global [1024 x %struct.ST3], align 4\n\ndefine void @test_struct_array_load3_store3() {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %ptr.016 = phi ptr [ @A, %entry ], [ %incdec.ptr2, %for.body ]\n  %incdec.ptr = getelementptr inbounds i32, ptr %ptr.016, i64 1\n  %tmp = load i32, ptr %ptr.016, align 4\n  %incdec.ptr1 = getelementptr inbounds i32, ptr %ptr.016, i64 2\n  %tmp1 = load i32, ptr %incdec.ptr, align 4\n  %incdec.ptr2 = getelementptr inbounds i32, ptr %ptr.016, i64 3\n  %tmp2 = load i32, ptr %incdec.ptr1, align 4\n  %add = add nsw i32 %tmp, 1\n  %x = getelementptr inbounds [1024 x %struct.ST3], ptr @S, i64 0, i64 %indvars.iv, i32 0\n  store i32 %add, ptr %x, align 4\n  %add3 = add nsw i32 %tmp1, 2\n  %y = getelementptr inbounds [1024 x %struct.ST3], ptr @S, i64 0, i64 %indvars.iv, i32 1\n  store i32 %add3, ptr %y, align 4\n  %add6 = add nsw i32 %tmp2, 3\n  %z = getelementptr inbounds [1024 x %struct.ST3], ptr @S, i64 0, i64 %indvars.iv, i32 2\n  store i32 %add6, ptr %z, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond = icmp eq i64 %indvars.iv.next, 1024\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n",
+          "test_name": "test_struct_array_load3_store3"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @PR27626_4(ptr %a, i32 %x, i32 %y, i32 %z, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %i_plus_1 = add i64 %i, 1\n  %a_i = getelementptr inbounds i32, ptr %a, i64 %i\n  %a_i_plus_1 = getelementptr inbounds i32, ptr %a, i64 %i_plus_1\n  store i32 %x, ptr %a_i, align 4\n  store i32 %y, ptr %a_i, align 4\n  store i32 %z, ptr %a_i_plus_1, align 4\n  %i.next = add nuw nsw i64 %i, 2\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n",
+          "test_name": "PR27626_4"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @mixed_load2_store2(ptr noalias nocapture readonly %A, ptr noalias nocapture %B) {\nentry:\n  br label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body\n  ret void\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %A, i64 %indvars.iv\n  %tmp = load i32, ptr %arrayidx, align 4\n  %tmp1 = or i64 %indvars.iv, 1\n  %arrayidx2 = getelementptr inbounds i32, ptr %A, i64 %tmp1\n  %tmp2 = load i32, ptr %arrayidx2, align 4\n  %mul = mul nsw i32 %tmp2, %tmp\n  %arrayidx4 = getelementptr inbounds i32, ptr %B, i64 %indvars.iv\n  store i32 %mul, ptr %arrayidx4, align 4\n  %tmp3 = load i32, ptr %arrayidx, align 4\n  %tmp4 = load i32, ptr %arrayidx2, align 4\n  %add10 = add nsw i32 %tmp4, %tmp3\n  %arrayidx13 = getelementptr inbounds i32, ptr %B, i64 %tmp1\n  store i32 %add10, ptr %arrayidx13, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 2\n  %cmp = icmp ult i64 %indvars.iv.next, 1024\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n}\n",
+          "test_name": "mixed_load2_store2"
+        }
+      ]
+    }
+  ]
+}
