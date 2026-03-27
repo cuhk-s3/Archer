@@ -1,0 +1,96 @@
+{
+  "base_commit": "0f44d72e0ee74970cf696ff4c791f63e0c3fa9b4",
+  "bug_id": "115149",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp": [
+        "InstCombinerImpl::foldPHIArgGEPIntoPHI"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp": [
+        [
+          545,
+          551
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "929cbe7f596733f85cd274485acc19442dd34a80"
+  },
+  "issue": {
+    "author": "cardigan1008",
+    "body": "When I compiled this code with -O0/1/2, its output is 0. However, with -O3, it returned 143:\r\n\r\n```c\r\nint printf(const char *, ...);\r\nchar a, b;\r\nint c;\r\nchar *e = &b;\r\nint f(char *g, int *k) {\r\n  char *d = g + *k;\r\n  for (; *d && *d <= ' '; d++)\r\n    ;\r\n  if (*d)\r\n    return 0;\r\n  return 1;\r\n}\r\nint l(int g) {\r\n  char h[] = {a, a, a};\r\n  int i[] = {g};\r\n  int j = f(h, i);\r\n  return j;\r\n}\r\nlong m() {\r\n  *e = 255;\r\n  for (; l(b + 1);)\r\n    return 0;\r\n  for (;;)\r\n    ;\r\n}\r\nint main() {\r\n  m();\r\n  printf(\"%d\\n\", c);\r\n}\r\n```\r\n\r\nDetails can be found here: https://godbolt.org/z/dnvvTPror",
+    "comments": [
+      {
+        "author": "antoniofrighetto",
+        "body": "This looks like a nasty one. Getting the optimized IR via -O3 and setting noinline/optnone to main, we get: https://llvm.godbolt.org/z/vaPvs6d16. \r\n\r\nThis is the initial assembly output with -O1 (which leads to the infinite loop):\r\n\r\n```asm\r\nmain:                                   # @main\r\n        push    rax\r\n        mov     rax, qword ptr [e]\r\n        mov     byte ptr [rax], -1\r\n        movsx   rax, byte ptr [b]\r\n        mov     cl, byte ptr [a]\r\n        mov     byte ptr [rsp + 6], cl\r\n        mov     byte ptr [rsp + 7], cl\r\n        lea     rdx, [rsp + 5]\r\n        add     rdx, rax\r\n        mov     rax, rdx\r\n.LBB0_1:                                # %for.cond.i.i.i\r\n        add     rax, 1\r\n        mov     cl, byte ptr [rdx + 1]\r\n        ...\r\n```\r\nWhereas this is with -O0 (returns 0):\r\n```asm\r\nmain:                                   # @main\r\n        sub     rsp, 24\r\n        mov     rax, qword ptr [e]\r\n        mov     byte ptr [rax], -1\r\n        movsx   rcx, byte ptr [b]\r\n        mov     al, byte ptr [a]\r\n        mov     byte ptr [rsp + 22], al\r\n        mov     byte ptr [rsp + 23], al\r\n        lea     rax, [rsp + 21]\r\n        add     rax, rcx\r\n        mov     qword ptr [rsp + 8], rax        # 8-byte Spill\r\n.LBB0_1:                                # %for.cond.i.i.i\r\n        mov     rcx, qword ptr [rsp + 8]        # 8-byte Reload\r\n        mov     rax, rcx\r\n        add     rax, 1\r\n        mov     dl, byte ptr [rcx + 1]\r\n```\r\nIn the optimized one, $rdx is set to point to $rsp+0x5, part of the stack slot containing $rax (undef), later dereferenced to set the condition leading to the loop. Initially I thought some bug in regalloc, but to me it seems more something in prologepiloginserter. Function prologue / epilogue seems set up correctly with triple arm64-apple-macosx."
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "Looking at the IR better, it seems like InstCombine performs a wrong optimization immediately after inlining `l` into `m`, probably related with default argument conversion done by operator + (which should include integer promotion on types smaller than integer). Alive2 seems to confirm it: https://alive2.llvm.org/ce/z/XAzrip."
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "Reduced to:\r\n```llvm\r\n@a = global i8 0, align 1\r\n\r\ndefine i64 @src(i8 noundef %arg) {\r\nentry:\r\n  %h.i = alloca [3 x i8], align 1\r\n  %conv = sext i8 %arg to i32\r\n  %add = add nsw i32 %conv, 1\r\n  %2 = load i8, ptr @a, align 1\r\n  store i8 %2, ptr %h.i, align 1\r\n  %idx.ext.i.i = sext i32 %add to i64\r\n  %add.ptr.i.i = getelementptr inbounds i8, ptr %h.i, i64 %idx.ext.i.i\r\n  br label %for.cond.i.i\r\n\r\nfor.cond.i.i:                                     ; preds = %for.cond.i.i, %entry\r\n  %d.0.i.i = phi ptr [ %add.ptr.i.i, %entry ], [ %incdec.ptr.i.i, %for.cond.i.i ]\r\n  %3 = load i8, ptr %d.0.i.i, align 1\r\n  %tobool.not.i.i = icmp ne i8 %3, 0\r\n  %incdec.ptr.i.i = getelementptr inbounds nuw i8, ptr %d.0.i.i, i64 1\r\n  br i1 %tobool.not.i.i, label %for.cond.i.i, label %l.exit\r\n\r\nl.exit:                                           ; preds = %for.cond.i.i\r\n  ret i64 0\r\n}\r\n```\r\nWrong sext of add of sext simplified to sext leads to wrong gep offset: https://alive2.llvm.org/ce/z/JaR4j9."
+      },
+      {
+        "author": "SiliconA-Z",
+        "body": "Can we backport this to 19.x?"
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "Should be fixed in 929cbe7f596733f85cd274485acc19442dd34a80, thanks for reporting!"
+      },
+      {
+        "author": "SiliconA-Z",
+        "body": "@antoniofrighetto can we please backport this "
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "[clang] Miscompile with -O3 and -O0/1/2 since 18.1.0"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/115149",
+  "knowledge_cutoff": "2024-11-06T11:22:14Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 929cbe7f596733f85cd274485acc19442dd34a80\nAuthor: Antonio Frighetto <me@antoniofrighetto.com>\nDate:   Tue Nov 12 19:02:04 2024 +0100\n\n    [InstCombine] Intersect nowrap flags between geps while folding into phi\n    \n    A miscompilation issue has been addressed with refined checking.\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/115149.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp b/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp\nindex cb5c44730512..1fcf1c570add 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombinePHI.cpp\n@@ -545,7 +545,8 @@ Instruction *InstCombinerImpl::foldPHIArgGEPIntoPHI(PHINode &PN) {\n   // especially bad when the PHIs are in the header of a loop.\n   bool NeededPhi = false;\n \n-  GEPNoWrapFlags NW = GEPNoWrapFlags::all();\n+  // Remember flags of the first phi-operand getelementptr.\n+  GEPNoWrapFlags NW = FirstInst->getNoWrapFlags();\n \n   // Scan to see if all operands are the same opcode, and all have one user.\n   for (Value *V : drop_begin(PN.incoming_values())) {\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/opaque-ptr.ll",
+      "tests": [
+        {
+          "test_body": "define ptr @phi_of_gep_flags_1(i1 %c, ptr %p) {\n  br i1 %c, label %if, label %else\n\nif:                                               ; preds = %0\n  %gep1 = getelementptr inbounds i32, ptr %p, i64 1\n  br label %join\n\nelse:                                             ; preds = %0\n  %gep2 = getelementptr nusw nuw i32, ptr %p, i64 1\n  br label %join\n\njoin:                                             ; preds = %else, %if\n  %phi = phi ptr [ %gep1, %if ], [ %gep2, %else ]\n  ret ptr %phi\n}\n",
+          "test_name": "phi_of_gep_flags_1"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/phi.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i64 @wrong_gep_arg_into_phi(ptr noundef %ptr) {\nentry:\n  %add.ptr = getelementptr i8, ptr %ptr, i64 1\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.cond, %entry\n  %.pn = phi ptr [ %add.ptr, %entry ], [ %incdec.ptr, %for.cond ]\n  %val = load i8, ptr %.pn, align 1\n  %cond = icmp ne i8 %val, 0\n  %incdec.ptr = getelementptr inbounds nuw i8, ptr %.pn, i64 1\n  br i1 %cond, label %for.cond, label %exit\n\nexit:                                             ; preds = %for.cond\n  ret i64 0\n}\n",
+          "test_name": "wrong_gep_arg_into_phi"
+        }
+      ]
+    }
+  ]
+}

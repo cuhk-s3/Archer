@@ -1,0 +1,88 @@
+{
+  "base_commit": "7767f0d47428db66d65b07b35aa52f0507df71f9",
+  "bug_id": "95547",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+        "canEvaluateTruncated"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+        [
+          291,
+          300
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "534f8569a3c9fccfd5cbc5f632b63ad0cf711098"
+  },
+  "issue": {
+    "author": "aleks-tmb",
+    "body": "```llvm\r\ndefine void @src(i32 %0, ptr %p, i1 %cnd) {\r\nentry:\r\n  br i1 %cnd, label %header, label %exit\r\n\r\nheader:                                           ; preds = %latch, %entry\r\n  %iv = phi i32 [ %iv.next, %latch ], [ 256, %entry ]\r\n  %iv.trunc = trunc i32 %iv to i16\r\n  %div = udiv i16 11, %iv.trunc\r\n  br i1 %cnd, label %loop1, label %loop0\r\n\r\nloop0:                                            ; preds = %header\r\n  %load = load i32, ptr %p, align 4\r\n  br label %loop1\r\n\r\nloop1:                                            ; preds = %loop0, %header\r\n  %v = phi i32 [ %load, %loop0 ], [ 0, %header ]\r\n  store i32 %v, ptr %p, align 4\r\n  %guard = icmp ugt i32 %iv, 10\r\n  br i1 %guard, label %latch, label %loop2\r\n\r\nloop2:                                            ; preds = %loop1\r\n  %div.trunc = trunc i16 %div to i8\r\n  store i8 %div.trunc, ptr %p, align 1\r\n  br label %latch\r\n\r\nlatch:                                            ; preds = %loop2, %loop1\r\n  %iv.next = add nuw nsw i32 %iv, 1\r\n  %exitcond = icmp ugt i32 %iv, 300\r\n  br i1 %exitcond, label %exit, label %header\r\n\r\nexit:                                             ; preds = %latch\r\n  ret void\r\n}\r\n```\r\nIf we run `instcombine` pass on this example, it will convert `trunc i32 %iv to i16` into `trunc i32 %iv to i8` to avoid cast:\r\nhttps://godbolt.org/z/ze4E45ThT\r\n\r\nBut this transformation is wrong, because on the first iteration `%iv` is equal to 256, and the 8 bits trunc makes it equal to `0`. This give us a division by zero on the next instruction: `%div = udiv i16 11, %iv.trunc`.\r\n\r\nIt seems that the problematic patch is https://github.com/llvm/llvm-project/pull/73662\r\n\r\n@nikic Could you please take a look?",
+    "comments": [
+      {
+        "author": "antoniofrighetto",
+        "body": "May be false positive in Alive2 as well?"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "> May be false positive in Alive2 as well?\r\n\r\nYou need `-src-unroll` and `-tgt-unroll` for loops :)\r\nhttps://alive2.llvm.org/ce/z/Vh4zAU"
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "Just out of curiosity, did you fine-tune the iterations in a particular way, or some trial-and-error? (I had tried a few ones before and didn\u2019t manage to have the UB triggered)"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "> Just out of curiosity, did you fine-tune the iterations in a particular way, or some trial-and-error? (I had tried a few ones before and didn\u2019t manage to have the UB triggered)\r\n\r\nI just full unrolled the loop :)\r\n```\r\n%iv.next = add nuw nsw i32 %iv, 1\r\n%exitcond = icmp ugt i32 %iv, 300\r\n```"
+      },
+      {
+        "author": "antoniofrighetto",
+        "body": "> I just full unrolled the loop :)\r\n\r\nDefinitely makes sense, thanks!"
+      },
+      {
+        "author": "nikic",
+        "body": "Reduced test case:\r\n```llvm\r\ndefine void @src(i32 %x) {\r\n  %x.trunc = trunc i32 %x to i16\r\n  %div = udiv i16 11, %x.trunc\r\n  %cmp = icmp ult i32 %x, 256\r\n  br i1 %cmp, label %loop, label %exit\r\n\r\nloop:\r\n  %trunc = trunc i16 %div to i8\r\n  call void @use(i8 %trunc)\r\n  br label %loop\r\n\r\nexit:\r\n  ret void\r\n}\r\n\r\ndeclare void @use(i8)\r\n```\r\n\r\nThe issue is that canEvaluateTruncated() preserves context instruction across non-speculatable operations."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "[InstCombine] Wrong value truncation due to incorrect analysis of iv known bits"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/95547",
+  "knowledge_cutoff": "2024-06-14T13:54:00Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 534f8569a3c9fccfd5cbc5f632b63ad0cf711098\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Mon Jun 17 15:36:55 2024 +0200\n\n    [InstCombine] Don't preserve context across div\n    \n    We can't preserve the context across a non-speculatable instruction,\n    as this might introduce a trap. Alternatively, we could also\n    insert all the replacement instruction at the use-site, but that\n    would be a more intrusive change for the sake of this edge case.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/95547.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\nindex 1b4c319032ca..6a6bdba3fa70 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n@@ -291,10 +291,12 @@ static bool canEvaluateTruncated(Value *V, Type *Ty, InstCombinerImpl &IC,\n     uint32_t BitWidth = Ty->getScalarSizeInBits();\n     assert(BitWidth < OrigBitWidth && \"Unexpected bitwidths!\");\n     APInt Mask = APInt::getBitsSetFrom(OrigBitWidth, BitWidth);\n-    if (IC.MaskedValueIsZero(I->getOperand(0), Mask, 0, CxtI) &&\n-        IC.MaskedValueIsZero(I->getOperand(1), Mask, 0, CxtI)) {\n-      return canEvaluateTruncated(I->getOperand(0), Ty, IC, CxtI) &&\n-             canEvaluateTruncated(I->getOperand(1), Ty, IC, CxtI);\n+    // Do not preserve the original context instruction. Simplifying div/rem\n+    // based on later context may introduce a trap.\n+    if (IC.MaskedValueIsZero(I->getOperand(0), Mask, 0, I) &&\n+        IC.MaskedValueIsZero(I->getOperand(1), Mask, 0, I)) {\n+      return canEvaluateTruncated(I->getOperand(0), Ty, IC, I) &&\n+             canEvaluateTruncated(I->getOperand(1), Ty, IC, I);\n     }\n     break;\n   }\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/trunc.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndeclare void @use.i8(i8)\n\ndefine void @pr95547(i32 %x) {\n  %x.trunc = trunc i32 %x to i16\n  %div = udiv i16 11, %x.trunc\n  %cmp = icmp ult i32 %x, 256\n  br i1 %cmp, label %loop, label %exit\n\nloop:                                             ; preds = %loop, %0\n  %trunc = trunc i16 %div to i8\n  call void @use.i8(i8 %trunc)\n  br label %loop\n\nexit:                                             ; preds = %0\n  ret void\n}\n",
+          "test_name": "pr95547"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine <2 x i1> @trunc_nuw_xor_vector(<2 x i8> %x, <2 x i8> %y) {\n  %xor = xor <2 x i8> %x, %y\n  %r = trunc nuw <2 x i8> %xor to <2 x i1>\n  ret <2 x i1> %r\n}\n",
+          "test_name": "trunc_nuw_xor_vector"
+        }
+      ]
+    }
+  ]
+}

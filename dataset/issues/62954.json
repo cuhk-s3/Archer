@@ -1,0 +1,102 @@
+{
+  "base_commit": "9d30c6a721edf75d0726e07fb82cc5538fb95c16",
+  "bug_id": "62954",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        "VPRecipeBase::mayHaveSideEffects"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+        [
+          111,
+          124
+        ],
+        [
+          126,
+          132
+        ]
+      ]
+    },
+    "components": [
+      "LoopVectorize"
+    ],
+    "fix_commit": "8f781b96e201408d1fb7b49367876a54682594ed"
+  },
+  "issue": {
+    "author": "ebrevnov",
+    "body": "There is a regression caused by:\r\n\n```txt\r\ncommit 02369b75fdd7b5fc5d9b47f1b60587c225918511\r\nAuthor: Florian Hahn <flo@fhahn.com>\r\nDate:   Mon Apr 17 12:30:52 2023 +0100\r\n\r\n    [VPlan] Mark recurrence recipes as not having side-effects.\r\n```\n\r\nWhile I don't have a short test to share I will try to describe the problem.  Here is the VPlan for the problematic case before `VPlanTransforms::removeDeadRecipes()` call:\r\n\n```\r\n<x1> vector loop: {\r\n  vector.body:\r\n    EMIT vp<%2> = CANONICAL-INDUCTION\r\n    FIRST-ORDER-RECURRENCE-PHI ir<%106> = phi ir<%.promoted>, ir<%111>\r\n    WIDEN-INDUCTION %indvars.iv = phi 4, %indvars.iv.next, ir<2>\r\n    vp<%5>    = DERIVED-IV ir<4> + vp<%2> * ir<2>\r\n    vp<%6>    = SCALAR-STEPS vp<%5>, ir<2>\r\n    REPLICATE ir<%107> = or vp<%6>, ir<1>\r\n    REPLICATE ir<%108> = getelementptr ir<%74>, ir<%107>\r\n    INTERLEAVE-GROUP with factor 2 at %109, ir<%108>\r\n      ir<%109> = load from index 0\r\n    WIDEN ir<%110> = fadd ir<%75>, ir<%109>\r\n    REPLICATE store ir<%110>, ir<%108>\r\n    WIDEN ir<%111> = sub ir<0>, ir<%indvars.iv>\r\n    EMIT vp<%13> = first-order splice ir<%106> ir<%111>\r\n    EMIT vp<%14> = VF * UF +(nuw)  vp<%2>\r\n    EMIT branch-on-count  vp<%14> vp<%0>\r\n  No successors\r\n}\r\nSuccessor(s): middle.block\r\n\r\nmiddle.block:\r\nNo successors\r\n}\r\n```\n\r\nAs you can see there are a `FIRST-ORDER-RECURRENCE-PHI` recipe and `first-order splice` instruction. Both are deleted by `VPlanTransforms::removeDeadRecipes()` as there are no uses of `first-order splice` instruction (after the change).  This is incorrect because there is an implicit use of `FIRST-ORDER-RECURRENCE-PHI` in `fixFixedOrderRecurrence` which fixes resume value for scalar epilogue.\r\n\r\nPS: It doesn't seem to be correct to prevent deletion by marking `FIRST-ORDER-RECURRENCE-PHI` as side effecting... but turning implicit use to explicit doesn't seem to be easy?",
+    "comments": [
+      {
+        "author": "fhahn",
+        "body": "@ebrevnov thanks for raising the issue. Do you have a reproducer you could share? Live-outs should be added to avoid the recipes being removed, I will need to check why this is not happening in this case."
+      },
+      {
+        "author": "ebrevnov",
+        "body": "Here is a reduced test case [reduced3.txt](https://github.com/llvm/llvm-project/files/11624346/reduced3.txt)\r\n\r\nPlease note, before the change, initial value coming from %scalar.ph depends on value coming from the vector loop:\r\nscalar.ph:\r\n%scalar.recur.init = phi i64 [ %.promoted, %entry ], [ %vector.recur.extract, %middle.block ]\r\n\r\nbci_202:\r\n...\r\n%scalar.recur = phi i64 [ %scalar.recur.init, %scalar.ph ], [ %9, %bci_202 ]\r\n\r\nAfter the change, it simply %.promoted, ignoring vector loop:\r\n%.in = phi i64 [ %.promoted, %scalar.ph ], [ %8, %bci_202 ]\r\n"
+      },
+      {
+        "author": "ebrevnov",
+        "body": "@fhahn it looks like it will take a while to fix the issue... can we consider reverting the problematic change until we have a solution?"
+      },
+      {
+        "author": "fhahn",
+        "body": "@ebrevnov reverted for now, I also included some details of the issue in the commit message, thanks!"
+      },
+      {
+        "author": "ebrevnov",
+        "body": "Thanks!"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:optimizations"
+    ],
+    "title": "[LV] First order reccurences is incorrectly eliminated"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/62954",
+  "knowledge_cutoff": "2023-05-26T13:50:41Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "patch": "commit 8f781b96e201408d1fb7b49367876a54682594ed\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Tue Jun 6 11:35:25 2023 +0200\n\n    Revert \"[VPlan] Mark recurrence recipes as not having side-effects.\"\n    \n    This reverts commit 02369b75fdd7b5fc5d9b47f1b60587c225918511.\n    \n    At the moment, live-outs used *only* for the resume values in the scalar\n    loop are not modeled in VPlan yet. This means first-order recurrence\n    recipes could be removed, when a scalar epilogue is required and the\n    only use of a FOR is outside the loop.\n    \n    Keep treating recurrence recipes as having side-effects for now, to\n    avoid them being removed.\n    \n    Fixes #62954.\n\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex f4a70c5f3f39..2a5384e63cc7 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -111,14 +111,6 @@ bool VPRecipeBase::mayReadFromMemory() const {\n \n bool VPRecipeBase::mayHaveSideEffects() const {\n   switch (getVPDefID()) {\n-  case VPInstructionSC:\n-    switch (cast<VPInstruction>(this)->getOpcode()) {\n-    default:\n-      return true;\n-    case VPInstruction::FirstOrderRecurrenceSplice:\n-      return false;\n-    }\n-    llvm_unreachable(\"unhandled opcode above\");\n   case VPDerivedIVSC:\n   case VPPredInstPHISC:\n     return false;\n@@ -126,7 +118,6 @@ bool VPRecipeBase::mayHaveSideEffects() const {\n     return cast<Instruction>(getVPSingleValue()->getUnderlyingValue())\n         ->mayHaveSideEffects();\n   case VPBlendSC:\n-  case VPFirstOrderRecurrencePHISC:\n   case VPReductionSC:\n   case VPScalarIVStepsSC:\n   case VPWidenCanonicalIVSC:\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-width=16 -force-vector-interleave=2 < %s -S -o -"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/X86/fixed-order-recurrence.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-pc_linux\"\n\ndefine i64 @test_pr62954_scalar_epilogue_required(ptr %A, ptr noalias %B, ptr %C) {\nentry:\n  %gep = getelementptr i8, ptr %A, i64 872\n  %rec.start = load i64, ptr %gep, align 8\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 1, %entry ], [ %iv.next, %loop ]\n  %for = phi i64 [ %rec.start, %entry ], [ %neg.iv, %loop ]\n  %gep.B = getelementptr double, ptr %B, i64 %iv\n  %l.B = load double, ptr %gep.B, align 8\n  %neg.iv = sub nsw i64 0, %iv\n  store i64 %neg.iv, ptr %gep, align 8\n  %iv.next = add nuw nsw i64 %iv, 2\n  %ec = icmp ugt i64 %iv, 74\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %.in.lcssa = phi i64 [ %for, %loop ]\n  %.lcssa = phi double [ %l.B, %loop ]\n  store double %.lcssa, ptr %C, align 8\n  ret i64 %.in.lcssa\n}\n",
+          "test_name": "test_pr62954_scalar_epilogue_required"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt < %s -passes=loop-vectorize -force-vector-width=4 -force-vector-interleave=2 -force-widen-divrem-via-safe-divisor=0 -S",
+        "opt < %s -passes=loop-vectorize -force-vector-width=1 -force-vector-interleave=2 -force-widen-divrem-via-safe-divisor=0 -S",
+        "opt < %s -passes=loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -force-widen-divrem-via-safe-divisor=0 -S"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/first-order-recurrence.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @sink_dead_inst(ptr %a) {\nentry:\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.cond, %entry\n  %iv = phi i16 [ -27, %entry ], [ %iv.next, %for.cond ]\n  %rec.1 = phi i16 [ 0, %entry ], [ %rec.1.prev, %for.cond ]\n  %rec.2 = phi i32 [ -27, %entry ], [ %rec.2.prev, %for.cond ]\n  %use.rec.1 = sub i16 %rec.1, 10\n  %cmp = icmp eq i32 %rec.2, 15\n  %iv.next = add i16 %iv, 1\n  %rec.2.prev = zext i16 %iv.next to i32\n  %rec.1.prev = add i16 %iv.next, 5\n  %gep = getelementptr i16, ptr %a, i16 %iv\n  store i16 %use.rec.1, ptr %gep, align 2\n  br i1 %cmp, label %for.end, label %for.cond\n\nfor.end:                                          ; preds = %for.cond\n  ret void\n}\n",
+          "test_name": "sink_dead_inst"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @unused_recurrence(ptr %a) {\nentry:\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.cond, %entry\n  %iv = phi i16 [ -27, %entry ], [ %iv.next, %for.cond ]\n  %rec.1 = phi i16 [ 0, %entry ], [ %rec.1.prev, %for.cond ]\n  %use.rec.1 = sub i16 %rec.1, 10\n  %iv.next = add i16 %iv, 1\n  %rec.1.prev = add i16 %iv.next, 5\n  %cmp = icmp eq i16 %iv, 1000\n  br i1 %cmp, label %for.end, label %for.cond\n\nfor.end:                                          ; preds = %for.cond\n  ret void\n}\n",
+          "test_name": "unused_recurrence"
+        }
+      ]
+    }
+  ]
+}

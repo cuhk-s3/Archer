@@ -1,0 +1,68 @@
+{
+  "base_commit": "f7b05e055fa63e1c4b5ae5e391b654b57161a0e4",
+  "bug_id": "80289",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp": [
+        "llvm::UnrollRuntimeLoopRemainder"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp": [
+        [
+          776,
+          782
+        ]
+      ]
+    },
+    "components": [
+      "LoopUnrollRuntime"
+    ],
+    "fix_commit": "62ae7d976f494f3dbd297331b19cd1204750de6f"
+  },
+  "issue": {
+    "author": "JonPsson1",
+    "body": "This reduced (csmith) test case seems well-defined, and should print '6':\r\n\r\n```\r\nchar C = 0;\r\n__int128 IW = 0;\r\nint *IPtr1, *IPtr2;\r\n\r\nstruct S2 { int f3; };\r\nvolatile struct S2 g_1100;\r\n\r\nint main() {\r\n  for (; C <= 5; C += 1)\r\n    for (; IW <= 5; IW += 1) {\r\n      IPtr1 = IPtr2;\r\n      g_1100;\r\n    }\r\n  int crc = IW;\r\n  printf(\"checksum = %d\\n\", crc);\r\n}\r\n```\r\n```\r\n\r\nclang -target s390x-linux-gnu -march=z16 -O3  -mllvm -enable-load-pre=false -o ./a.out -mllvm -unroll-max-count=3; ./a.out\r\nchecksum = 7\r\nclang -target s390x-linux-gnu -march=z16 -O3  -mllvm -enable-load-pre=false -o ./a.out -mllvm -unroll-max-count=2; ./a.out\r\nchecksum = 6\r\n```\r\n\r\nHowever, when unrolled 3 times (not 2 or 4), the LoopUnroller creates a prologue loop, which is supposed to run extra iterations, as computed in the preheader (LoopUnrollRuntime.cpp:766):\r\n\r\n```\r\nfor.body5.preheader:                              ; preds = %for.cond2thread-pre-split\r\n  %2 = sub i128 6, %.pr121517\r\n  %3 = freeze i128 %2\r\n  %4 = add i128 %3, 18446744073709551615\r\n  %5 = urem i128 %4, 3\r\n  %6 = add i128 %5, 1\r\n  %xtraiter = urem i128 %6, 3\r\n  %lcmp.mod = icmp ne i128 %xtraiter, 0\r\n  br i1 %lcmp.mod, label %for.body5.prol.preheader, label %for.body5.prol.loopexit\r\n```\r\n\r\nThe constant used for %4 is actually is supposed to be i128 '-1', so UINT64_MAX (i64 -1) doesn't make sense.\r\n\r\ni128 <> i64, after LoopUnroller:\r\n```\r\n\r\nfor.body5.preheader:                            for.body5.preheader:                         \r\n  %2 = sub i128 6, %.pr121517                 |   %2 = sub i64 6, %.pr121517\r\n  %3 = freeze i128 %2                         |   %3 = freeze i64 %2\r\n  %4 = add i128 %3, 18446744073709551615      |   %4 = add i64 %3, -1\r\n  %5 = urem i128 %4, 3                        |   %5 = urem i64 %4, 3\r\n  %6 = add i128 %5, 1                         |   %6 = add i64 %5, 1\r\n  %xtraiter = urem i128 %6, 3                 |   %xtraiter = urem i64 %6, 3\r\n  %lcmp.mod = icmp ne i128 %xtraiter, 0       |   %lcmp.mod = icmp ne i64 %xtraiter, 0\r\n  br i1 %lcmp.mod, label %for.body5.prol.preh     br i1 %lcmp.mod, label %for.body5.prol.preh\r\n```\r\n\r\n%4 is later optimized to a sub i128 with a folded constant of 18446744073709551621, which really should be '5'.\r\n\r\n@nikic @boxu-zhang @xiangzh1 @preames @uweigand \r\n\r\n\r\n",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Classic mistake, https://github.com/llvm/llvm-project/blob/f956e7fbf161447b9236f7c4448a9d02d3564261/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp#L779 create an unsigned `-1` value."
+      },
+      {
+        "author": "nikic",
+        "body": "As this is a recurring problem, I've started working on some sanity checks for APInt to solve this once and for all: https://github.com/llvm/llvm-project/pull/80309"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "loopoptim"
+    ],
+    "title": "WRONG code: LoopUnroll / SCEVExpander with i128 induction variable."
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/80289",
+  "knowledge_cutoff": "2024-02-01T13:14:59Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopUnroll"
+  ],
+  "patch": "commit 62ae7d976f494f3dbd297331b19cd1204750de6f\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Thu Feb 1 16:06:58 2024 +0100\n\n    [LoopUnroll] Fix missing sign extension\n    \n    For integers larger than 64-bit, this would zero-extend a -1\n    value, instead of sign-extending it.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/80289.\n\ndiff --git a/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp b/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp\nindex 612f69970881..650f055356c0 100644\n--- a/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp\n+++ b/llvm/lib/Transforms/Utils/LoopUnrollRuntime.cpp\n@@ -776,7 +776,7 @@ bool llvm::UnrollRuntimeLoopRemainder(\n       !isGuaranteedNotToBeUndefOrPoison(TripCount, AC, PreHeaderBR, DT)) {\n     TripCount = B.CreateFreeze(TripCount);\n     BECount =\n-        B.CreateAdd(TripCount, ConstantInt::get(TripCount->getType(), -1));\n+        B.CreateAdd(TripCount, Constant::getAllOnesValue(TripCount->getType()));\n   } else {\n     // If we don't need to freeze, use SCEVExpander for BECount as well, to\n     // allow slightly better value reuse.\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=loop-unroll -unroll-runtime < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopUnroll/runtime-i128.ll",
+      "tests": [
+        {
+          "test_body": "declare void @foo()\n\ndefine void @test(i128 %n, i128 %m) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i128 [ 0, %entry ], [ %iv.next, %loop ]\n  call void @foo()\n  %iv.next = add i128 %iv, 1\n  %cmp = icmp ne i128 %iv.next, %n\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "test"
+        }
+      ]
+    }
+  ]
+}

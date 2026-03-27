@@ -1,0 +1,111 @@
+{
+  "base_commit": "84165864d458edce750f3a10d5dbd348970893b6",
+  "bug_id": "81793",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ConstantFolding.cpp": [
+        "FoldBitCast",
+        "llvm::ConstantFoldLoadFromConstPtr",
+        "llvm::ConstantFoldLoadFromUniformValue",
+        "llvm::ConstantFoldLoadThroughBitcast"
+      ],
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        "llvm::simplifyLoadInst"
+      ],
+      "llvm/lib/Transforms/IPO/Attributor.cpp": [
+        "AA::getInitialValueForObj",
+        "AA::isValidInScope"
+      ],
+      "llvm/lib/Transforms/IPO/GlobalOpt.cpp": [
+        "CleanupConstantGlobalUsers"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/include/llvm/Analysis/ConstantFolding.h": [
+        [
+          174,
+          180
+        ]
+      ],
+      "llvm/lib/Analysis/ConstantFolding.cpp": [
+        [
+          106,
+          112
+        ],
+        [
+          342,
+          348
+        ],
+        [
+          355,
+          361
+        ],
+        [
+          709,
+          715
+        ],
+        [
+          745,
+          751
+        ],
+        [
+          754,
+          764
+        ]
+      ],
+      "llvm/lib/Analysis/InstructionSimplify.cpp": [
+        [
+          6960,
+          6967
+        ]
+      ],
+      "llvm/lib/Transforms/IPO/Attributor.cpp": [
+        [
+          275,
+          281
+        ]
+      ],
+      "llvm/lib/Transforms/IPO/GlobalOpt.cpp": [
+        [
+          296,
+          302
+        ]
+      ]
+    },
+    "components": [
+      "Attributor",
+      "ConstantFold",
+      "GlobalOpt",
+      "InstructionSimplify"
+    ],
+    "fix_commit": "7677453886a665b37f22c77434b36a680aba6ebb"
+  },
+  "issue": {
+    "author": "bjope",
+    "body": "Consider this example with a big-endian data layout:\r\n```\r\ntarget datalayout = \"E\"\r\n\r\ndefine i8 @foo(ptr %p) {\r\nentry:\r\n  store i9 -1, ptr %p, align 1\r\n  %r0 = load i8, ptr %p, align 1\r\n  ret i8 %r0\r\n}\r\n```\r\nIf running that through instcombine the result is:\r\n```\r\ntarget datalayout = \"E\"\r\n\r\ndefine i8 @foo(ptr %p) {\r\n  store i9 -1, ptr %p, align 1\r\n  ret i8 -1\r\n}\r\n```\r\nNeither LLVM IR reference, nor the DataLayout, is describing where padding bits go when storing a non byte-sized type like that. In practice LLVM (at least the backends I know about) would (zero) extend up to the TypeStoreSize before storing the i9 to memory. So given a big-endian datalayout (and a 8-bit byte size) the above is a miscompile, as the load depends on the padding bits. Fora little-endian datalayout the optimization isn't totally wrong, but I don't think that LLVM should optimize this even for little-endian (afaik we have avioded such optimizations historically).\r\n\r\nHere is an alive2 link showing that the above transformation is invalid: https://alive2.llvm.org/ce/z/LJpiuS\r\n\r\nAssuming that we simply want to skip the transformation also for little endian, then a patch like this could solve the problem:\r\n```\r\ndiff --git a/llvm/lib/Analysis/Loads.cpp b/llvm/lib/Analysis/Loads.cpp\r\nindex f1dda97aa32d..b63c5078f88e 100644\r\n--- a/llvm/lib/Analysis/Loads.cpp\r\n+++ b/llvm/lib/Analysis/Loads.cpp\r\n@@ -534,9 +534,11 @@ static Value *getAvailableLoadStore(Instruction *Inst, const Value *Ptr,\r\n \r\n     TypeSize StoreSize = DL.getTypeSizeInBits(Val->getType());\r\n     TypeSize LoadSize = DL.getTypeSizeInBits(AccessTy);\r\n-    if (TypeSize::isKnownLE(LoadSize, StoreSize))\r\n+    if (DL.typeSizeEqualsStoreSize(Val->getType()) &&\r\n+        TypeSize::isKnownLE(LoadSize, StoreSize)) {\r\n       if (auto *C = dyn_cast<Constant>(Val))\r\n         return ConstantFoldLoadFromConst(C, AccessTy, DL);\r\n+    }\r\n   }\r\n\r\n``` \r\n",
+    "comments": [
+      {
+        "author": "bjope",
+        "body": "Notice that the fix mentioned in the bug description is based on the actual fault seen here, and that we could avoid calling ConstantFoldLoadFromConst to solve this specific problem.\r\nThere is of course a risk that there are more bugs lurking around, and that a real fix rather should go inside ConstantFolding. ConstantFoldLoadFromConst is using ConstantFoldLoadFromUniformValue, so it would be nice to check if other uses of ConstantFoldLoadFromUniformValue already are more careful considering padding/endianness. The actual fix should perhaps be related to ConstantFoldLoadFromUniformValue."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "Faulty load-store forwarding with non byte-sized types"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/81793",
+  "knowledge_cutoff": "2024-02-14T21:24:20Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstSimplify/ConstProp"
+  ],
+  "patch": "commit 7677453886a665b37f22c77434b36a680aba6ebb\nAuthor: Bj\u00f6rn Pettersson <bjorn.a.pettersson@ericsson.com>\nDate:   Thu Feb 15 15:40:21 2024 +0100\n\n    [ConstantFolding] Do not consider padded-in-memory types as uniform (#81854)\n    \n    Teaching ConstantFoldLoadFromUniformValue that types that are padded in\n    memory can't be considered as uniform.\n    \n    Using the big hammer to prevent optimizations when loading from a\n    constant for which DataLayout::typeSizeEqualsStoreSize would return\n    false.\n    \n    Main problem solved would be something like this:\n      store i17 -1, ptr %p, align 4\n      %v = load i8, ptr %p, align 1\n    If for example the i17 occupies 32 bits in memory, then LLVM IR doesn't\n    really tell where the padding goes. And even if we assume that the 15\n    most significant bits are padding, then they should be considered as\n    undefined (even if LLVM backend typically would pad with zeroes).\n    Anyway, for a big-endian target the load would read those most\n    significant bits, which aren't guaranteed to be one's. So it would be\n    wrong to constant fold the load as returning -1.\n    \n    If LLVM IR had been more explicit about the placement of padding, then\n    we could allow the constant fold of the load in the example, but only\n    for little-endian.\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/81793\n\ndiff --git a/llvm/include/llvm/Analysis/ConstantFolding.h b/llvm/include/llvm/Analysis/ConstantFolding.h\nindex 1b194b07e867..fd885a8c0ea3 100644\n--- a/llvm/include/llvm/Analysis/ConstantFolding.h\n+++ b/llvm/include/llvm/Analysis/ConstantFolding.h\n@@ -174,7 +174,8 @@ Constant *ConstantFoldLoadFromConstPtr(Constant *C, Type *Ty,\n /// ones, all undef or all poison), return the corresponding uniform value in\n /// the new type. If the value is not uniform or the result cannot be\n /// represented, return null.\n-Constant *ConstantFoldLoadFromUniformValue(Constant *C, Type *Ty);\n+Constant *ConstantFoldLoadFromUniformValue(Constant *C, Type *Ty,\n+                                           const DataLayout &DL);\n \n /// canConstantFoldCallTo - Return true if its even possible to fold a call to\n /// the specified function.\ndiff --git a/llvm/lib/Analysis/ConstantFolding.cpp b/llvm/lib/Analysis/ConstantFolding.cpp\nindex 90da3390eab3..8b7031e7fe4a 100644\n--- a/llvm/lib/Analysis/ConstantFolding.cpp\n+++ b/llvm/lib/Analysis/ConstantFolding.cpp\n@@ -106,7 +106,7 @@ Constant *FoldBitCast(Constant *C, Type *DestTy, const DataLayout &DL) {\n          \"Invalid constantexpr bitcast!\");\n \n   // Catch the obvious splat cases.\n-  if (Constant *Res = ConstantFoldLoadFromUniformValue(C, DestTy))\n+  if (Constant *Res = ConstantFoldLoadFromUniformValue(C, DestTy, DL))\n     return Res;\n \n   if (auto *VTy = dyn_cast<VectorType>(C->getType())) {\n@@ -342,7 +342,7 @@ bool llvm::IsConstantOffsetFromGlobal(Constant *C, GlobalValue *&GV,\n }\n \n Constant *llvm::ConstantFoldLoadThroughBitcast(Constant *C, Type *DestTy,\n-                                         const DataLayout &DL) {\n+                                               const DataLayout &DL) {\n   do {\n     Type *SrcTy = C->getType();\n     if (SrcTy == DestTy)\n@@ -355,7 +355,7 @@ Constant *llvm::ConstantFoldLoadThroughBitcast(Constant *C, Type *DestTy,\n \n     // Catch the obvious splat cases (since all-zeros can coerce non-integral\n     // pointers legally).\n-    if (Constant *Res = ConstantFoldLoadFromUniformValue(C, DestTy))\n+    if (Constant *Res = ConstantFoldLoadFromUniformValue(C, DestTy, DL))\n       return Res;\n \n     // If the type sizes are the same and a cast is legal, just directly\n@@ -709,7 +709,7 @@ Constant *llvm::ConstantFoldLoadFromConst(Constant *C, Type *Ty,\n     return PoisonValue::get(Ty);\n \n   // Try an offset-independent fold of a uniform value.\n-  if (Constant *Result = ConstantFoldLoadFromUniformValue(C, Ty))\n+  if (Constant *Result = ConstantFoldLoadFromUniformValue(C, Ty, DL))\n     return Result;\n \n   // Try hard to fold loads from bitcasted strange and non-type-safe things.\n@@ -745,7 +745,7 @@ Constant *llvm::ConstantFoldLoadFromConstPtr(Constant *C, Type *Ty,\n \n   // If this load comes from anywhere in a uniform constant global, the value\n   // is always the same, regardless of the loaded offset.\n-  return ConstantFoldLoadFromUniformValue(GV->getInitializer(), Ty);\n+  return ConstantFoldLoadFromUniformValue(GV->getInitializer(), Ty, DL);\n }\n \n Constant *llvm::ConstantFoldLoadFromConstPtr(Constant *C, Type *Ty,\n@@ -754,11 +754,16 @@ Constant *llvm::ConstantFoldLoadFromConstPtr(Constant *C, Type *Ty,\n   return ConstantFoldLoadFromConstPtr(C, Ty, Offset, DL);\n }\n \n-Constant *llvm::ConstantFoldLoadFromUniformValue(Constant *C, Type *Ty) {\n+Constant *llvm::ConstantFoldLoadFromUniformValue(Constant *C, Type *Ty,\n+                                                 const DataLayout &DL) {\n   if (isa<PoisonValue>(C))\n     return PoisonValue::get(Ty);\n   if (isa<UndefValue>(C))\n     return UndefValue::get(Ty);\n+  // If padding is needed when storing C to memory, then it isn't considered as\n+  // uniform.\n+  if (!DL.typeSizeEqualsStoreSize(C->getType()))\n+    return nullptr;\n   if (C->isNullValue() && !Ty->isX86_MMXTy() && !Ty->isX86_AMXTy())\n     return Constant::getNullValue(Ty);\n   if (C->isAllOnesValue() &&\ndiff --git a/llvm/lib/Analysis/InstructionSimplify.cpp b/llvm/lib/Analysis/InstructionSimplify.cpp\nindex 08050becd2df..201472a3f10c 100644\n--- a/llvm/lib/Analysis/InstructionSimplify.cpp\n+++ b/llvm/lib/Analysis/InstructionSimplify.cpp\n@@ -6960,8 +6960,8 @@ Value *llvm::simplifyLoadInst(LoadInst *LI, Value *PtrOp,\n \n   // If GlobalVariable's initializer is uniform, then return the constant\n   // regardless of its offset.\n-  if (Constant *C =\n-          ConstantFoldLoadFromUniformValue(GV->getInitializer(), LI->getType()))\n+  if (Constant *C = ConstantFoldLoadFromUniformValue(GV->getInitializer(),\n+                                                     LI->getType(), Q.DL))\n     return C;\n \n   // Try to convert operand into a constant by stripping offsets while looking\ndiff --git a/llvm/lib/Transforms/IPO/Attributor.cpp b/llvm/lib/Transforms/IPO/Attributor.cpp\nindex 5d1a783b2996..72a2aadc204b 100644\n--- a/llvm/lib/Transforms/IPO/Attributor.cpp\n+++ b/llvm/lib/Transforms/IPO/Attributor.cpp\n@@ -275,7 +275,7 @@ AA::getInitialValueForObj(Attributor &A, const AbstractAttribute &QueryingAA,\n     return ConstantFoldLoadFromConst(Initializer, &Ty, Offset, DL);\n   }\n \n-  return ConstantFoldLoadFromUniformValue(Initializer, &Ty);\n+  return ConstantFoldLoadFromUniformValue(Initializer, &Ty, DL);\n }\n \n bool AA::isValidInScope(const Value &V, const Function *Scope) {\ndiff --git a/llvm/lib/Transforms/IPO/GlobalOpt.cpp b/llvm/lib/Transforms/IPO/GlobalOpt.cpp\nindex 42828b4f4168..c92b5d82fc85 100644\n--- a/llvm/lib/Transforms/IPO/GlobalOpt.cpp\n+++ b/llvm/lib/Transforms/IPO/GlobalOpt.cpp\n@@ -296,7 +296,7 @@ static bool CleanupConstantGlobalUsers(GlobalVariable *GV,\n       // A load from a uniform value is always the same, regardless of any\n       // applied offset.\n       Type *Ty = LI->getType();\n-      if (Constant *Res = ConstantFoldLoadFromUniformValue(Init, Ty)) {\n+      if (Constant *Res = ConstantFoldLoadFromUniformValue(Init, Ty, DL)) {\n         LI->replaceAllUsesWith(Res);\n         EraseFromParent(LI);\n         continue;\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": []
+}

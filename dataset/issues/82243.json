@@ -1,0 +1,105 @@
+{
+  "base_commit": "fcd6549e5801de938935b93fd2d13020b42eebdb",
+  "bug_id": "82243",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        "SCEVExpander::hoistIVInc"
+      ],
+      "llvm/lib/Transforms/Utils/SimplifyIndVar.cpp": [
+        "WidenIV::createWideIV",
+        "WidenIV::widenIVUse"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h": [
+        [
+          258,
+          263
+        ]
+      ],
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        [
+          771,
+          776
+        ]
+      ],
+      "llvm/lib/Transforms/Utils/SimplifyIndVar.cpp": [
+        [
+          1131,
+          1137
+        ],
+        [
+          1731,
+          1737
+        ],
+        [
+          1825,
+          1835
+        ],
+        [
+          1996,
+          2006
+        ],
+        [
+          2024,
+          2030
+        ]
+      ]
+    },
+    "components": [
+      "ScalarEvolution",
+      "SimplifyIndVar"
+    ],
+    "fix_commit": "4db93e5d56440be44d8ad2036e2579208c82ad37"
+  },
+  "issue": {
+    "author": "shao-hua-li",
+    "body": "Clang at -Os produced the wrong code.\r\n\r\nBisected to dce77a357948709e335910ddc07f9c3f2eb2ac4b, which was committed by @fhahn \r\n\r\nCompiler explorer: https://godbolt.org/z/fTrenPK4h\r\n\r\n```console\r\n% cat reduced.c\r\nint printf(const char *, ...);\r\nint a, b, c, d, e;\r\nint f[9];\r\nint g(int i) {\r\n  c = 1 << i;\r\n  if (b & c)\r\n    return 4;\r\n  return 0;\r\n}\r\nint j(int i) {\r\n  int h = g(i);\r\n  return h;\r\n}\r\nint k() {\r\n  d = 6;\r\n  for (; d; d--) {\r\n    e = 0;\r\n    for (; e <= 6; e++) {\r\n      f[j(d - 1)] = f[d];\r\n      for (; e + d;)\r\n        return 0;\r\n    }\r\n  }\r\n  return 0;\r\n}\r\nint main() {\r\n  k();\r\n  printf(\"%d\\n\", a);\r\n}\r\n%\r\n% clang -O3 reduced.c && ./a.out\r\n0\r\n% clang -Os reduced.c && ./a.out\r\n\r\n%\r\n```",
+    "comments": [
+      {
+        "author": "fhahn",
+        "body": "The issue is that IndVars doesn't drop poison-generating flags when hoisting the IV to introduce a new use of the widened IV. working on a fix"
+      },
+      {
+        "author": "fhahn",
+        "body": "Should be fixed, thanks again as always @shao-hua-li "
+      },
+      {
+        "author": "shao-hua-li",
+        "body": "You're welcome @fhahn "
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:SCEV"
+    ],
+    "title": "Wrong code at -Os on x86-64_gnu-linux (recent regression)"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/82243",
+  "knowledge_cutoff": "2024-02-19T12:48:24Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/IndVarSimplify"
+  ],
+  "patch": "commit 4db93e5d56440be44d8ad2036e2579208c82ad37\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Tue Feb 20 14:03:25 2024 +0000\n\n    [IndVars] Recompute flags if needed in widenIVUse of IV increment. (#82352)\n    \n    widenIVUse may hoist a wide induction increment and introduce new uses,\n    but does not recompute the wrap flags. In some cases this can make the\n    new uses of the wide IV inc more poisonous.\n    \n    Update the code to recompute flags if needed when hoisting an IV. If\n    both the narrow and wide IV increment's flags match and we can re-use\n    the flags from the increments, there's no need to recompute the flags,\n    as the replacement won't make the new uses of the wide IV's increment\n    more poisonous.\n    \n    Note that this also updates a stale comment which claimed that the widen\n    increment is only used if it dominates the new use.\n    \n    The helper should also be used to guard the code added in da437330be,\n    which I am planning on doing separately once the helper lands.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/82243.\n\ndiff --git a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\nindex 035705b7f4b7..fa10443f14bb 100644\n--- a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n+++ b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n@@ -258,6 +258,14 @@ public:\n   bool hoistIVInc(Instruction *IncV, Instruction *InsertPos,\n                   bool RecomputePoisonFlags = false);\n \n+  /// Return true if both increments directly increment the corresponding IV PHI\n+  /// nodes and have the same opcode. It is not safe to re-use the flags from\n+  /// the original increment, if it is more complex and SCEV expansion may have\n+  /// yielded a more simplified wider increment.\n+  static bool canReuseFlagsFromOriginalIVInc(PHINode *OrigPhi, PHINode *WidePhi,\n+                                             Instruction *OrigInc,\n+                                             Instruction *WideInc);\n+\n   /// replace congruent phis with their most canonical representative. Return\n   /// the number of phis eliminated.\n   unsigned replaceCongruentIVs(Loop *L, const DominatorTree *DT,\ndiff --git a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\nindex 3a28909473d9..fbe1dba5b8d4 100644\n--- a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n+++ b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n@@ -771,6 +771,15 @@ bool SCEVExpander::hoistIVInc(Instruction *IncV, Instruction *InsertPos,\n   return true;\n }\n \n+bool SCEVExpander::canReuseFlagsFromOriginalIVInc(PHINode *OrigPhi,\n+                                                  PHINode *WidePhi,\n+                                                  Instruction *OrigInc,\n+                                                  Instruction *WideInc) {\n+  return match(OrigInc, m_c_BinOp(m_Specific(OrigPhi), m_Value())) &&\n+         match(WideInc, m_c_BinOp(m_Specific(WidePhi), m_Value())) &&\n+         OrigInc->getOpcode() == WideInc->getOpcode();\n+}\n+\n /// Determine if this cyclic phi is in a form that would have been generated by\n /// LSR. We don't care if the phi was actually expanded in this pass, as long\n /// as it is in a low-cost form, for example, no implied multiplication. This\ndiff --git a/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp b/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp\nindex 5aa6df49e7f6..66bba1ca2f1d 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyIndVar.cpp\n@@ -1131,7 +1131,8 @@ protected:\n   const SCEV *getSCEVByOpCode(const SCEV *LHS, const SCEV *RHS,\n                               unsigned OpCode) const;\n \n-  Instruction *widenIVUse(NarrowIVDefUse DU, SCEVExpander &Rewriter);\n+  Instruction *widenIVUse(NarrowIVDefUse DU, SCEVExpander &Rewriter,\n+                          PHINode *OrigPhi, PHINode *WidePhi);\n \n   bool widenLoopCompare(NarrowIVDefUse DU);\n   bool widenWithVariantUse(NarrowIVDefUse DU);\n@@ -1731,7 +1732,9 @@ bool WidenIV::widenWithVariantUse(WidenIV::NarrowIVDefUse DU) {\n \n /// Determine whether an individual user of the narrow IV can be widened. If so,\n /// return the wide clone of the user.\n-Instruction *WidenIV::widenIVUse(WidenIV::NarrowIVDefUse DU, SCEVExpander &Rewriter) {\n+Instruction *WidenIV::widenIVUse(WidenIV::NarrowIVDefUse DU,\n+                                 SCEVExpander &Rewriter, PHINode *OrigPhi,\n+                                 PHINode *WidePhi) {\n   assert(ExtendKindMap.count(DU.NarrowDef) &&\n          \"Should already know the kind of extension used to widen NarrowDef\");\n \n@@ -1825,11 +1828,18 @@ Instruction *WidenIV::widenIVUse(WidenIV::NarrowIVDefUse DU, SCEVExpander &Rewri\n     if (!WideAddRec.first)\n       return nullptr;\n \n-    // Reuse the IV increment that SCEVExpander created as long as it dominates\n-    // NarrowUse.\n+    // Reuse the IV increment that SCEVExpander created. Recompute flags, unless\n+    // the flags for both increments agree and it is safe to use the ones from\n+    // the original inc. In that case, the new use of the wide increment won't\n+    // be more poisonous.\n+    bool NeedToRecomputeFlags =\n+        !SCEVExpander::canReuseFlagsFromOriginalIVInc(OrigPhi, WidePhi,\n+                                                      DU.NarrowUse, WideInc) ||\n+        DU.NarrowUse->hasNoUnsignedWrap() != WideInc->hasNoUnsignedWrap() ||\n+        DU.NarrowUse->hasNoSignedWrap() != WideInc->hasNoSignedWrap();\n     Instruction *WideUse = nullptr;\n     if (WideAddRec.first == WideIncExpr &&\n-        Rewriter.hoistIVInc(WideInc, DU.NarrowUse))\n+        Rewriter.hoistIVInc(WideInc, DU.NarrowUse, NeedToRecomputeFlags))\n       WideUse = WideInc;\n     else {\n       WideUse = cloneIVUser(DU, WideAddRec.first);\n@@ -1996,11 +2006,9 @@ PHINode *WidenIV::createWideIV(SCEVExpander &Rewriter) {\n       // the same opcode. It is not safe to re-use the flags from the original\n       // increment, if it is more complex and SCEV expansion may have yielded a\n       // more simplified wider increment.\n-      bool MatchingOps =\n-          match(OrigInc, m_c_BinOp(m_Specific(OrigPhi), m_Value())) &&\n-          match(WideInc, m_c_BinOp(m_Specific(WidePhi), m_Value())) &&\n-          OrigInc->getOpcode() == WideInc->getOpcode();\n-      if (MatchingOps && isa<OverflowingBinaryOperator>(OrigInc) &&\n+      if (SCEVExpander::canReuseFlagsFromOriginalIVInc(OrigPhi, WidePhi,\n+                                                       OrigInc, WideInc) &&\n+          isa<OverflowingBinaryOperator>(OrigInc) &&\n           isa<OverflowingBinaryOperator>(WideInc)) {\n         WideInc->setHasNoUnsignedWrap(WideInc->hasNoUnsignedWrap() ||\n                                       OrigInc->hasNoUnsignedWrap());\n@@ -2024,7 +2032,7 @@ PHINode *WidenIV::createWideIV(SCEVExpander &Rewriter) {\n \n     // Process a def-use edge. This may replace the use, so don't hold a\n     // use_iterator across it.\n-    Instruction *WideUse = widenIVUse(DU, Rewriter);\n+    Instruction *WideUse = widenIVUse(DU, Rewriter, OrigPhi, WidePhi);\n \n     // Follow all def-use edges from the previous narrow use.\n     if (WideUse)\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -p indvars -S %s"
+      ],
+      "file": "llvm/test/Transforms/IndVarSimplify/hoist-wide-inc-for-narrow-use-recompute-flags.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\n\ndefine void @test_pr82243(ptr %f) {\nentry:\n  br label %outer.header\n\nouter.header:                                     ; preds = %outer.latch, %entry\n  %iv = phi i32 [ 1, %entry ], [ %iv.next, %outer.latch ]\n  %iv.sext = sext i32 %iv to i64\n  %gep.iv.ext = getelementptr i32, ptr %f, i64 %iv.sext\n  store i32 1, ptr %gep.iv.ext, align 4\n  %sub = add i32 %iv, -1\n  %shl = shl i32 123, %sub\n  %gep.shl = getelementptr i32, ptr %f, i32 %shl\n  br label %inner.header\n\ninner.header:                                     ; preds = %inner.latch, %outer.header\n  store i32 0, ptr %gep.shl, align 4\n  br i1 false, label %inner.latch, label %exit\n\ninner.latch:                                      ; preds = %inner.header\n  br i1 false, label %inner.header, label %outer.latch\n\nouter.latch:                                      ; preds = %inner.latch\n  %iv.next = add i32 %iv, -1\n  br label %outer.header\n\nexit:                                             ; preds = %inner.header\n  ret void\n}\n",
+          "test_name": "test_pr82243"
+        }
+      ]
+    }
+  ]
+}

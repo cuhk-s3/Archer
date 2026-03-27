@@ -1,0 +1,133 @@
+{
+  "base_commit": "90ba33099cbb17e7c159e9ebc5a512037db99d6d",
+  "bug_id": "78621",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+        "State::addInfoFor"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/ConstraintElimination.cpp": [
+        [
+          1061,
+          1071
+        ]
+      ]
+    },
+    "components": [
+      "ConstraintElimination"
+    ],
+    "fix_commit": "3d91d9613e294b242d853039209b40a0cb7853f2"
+  },
+  "issue": {
+    "author": "DaniilSuchkov",
+    "body": "The following commit: https://github.com/llvm/llvm-project/commit/71f56e49ceca75dbf82cbb9537c2545c2d2e51c9\r\nTriggered this miscompile: https://alive2.llvm.org/ce/z/oBg-u8\r\n\r\nNow `opt -passes=constraint-elimination -S` turns\r\n```\r\ndefine i1 @test(i32 %arg) {\r\n  %icmp = icmp slt i32 %arg, 0\r\n  %shl = shl nuw nsw i32 %arg, 3\r\n  %call4 = call i32 @llvm.umin.i32(i32 %shl, i32 80)\r\n  ret i1 %icmp\r\n}\r\n\r\ndeclare i32 @llvm.umin.i32(i32, i32) #0\r\n\r\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\r\n```\r\ninto\r\n```\r\ndefine i1 @test(i32 %arg) {\r\n  %shl = shl nuw nsw i32 %arg, 3\r\n  %call4 = call i32 @llvm.umin.i32(i32 %shl, i32 80)\r\n  ret i1 false\r\n}\r\n\r\ndeclare i32 @llvm.umin.i32(i32, i32) #0\r\n\r\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\r\n```\r\n\r\nGiven this debug output:\r\n```\r\nopt -passes=constraint-elimination before-constr-elim-renamed.ll -S -debug-only=constraint-elimination,constraint-system\r\nProcessing fact to add to the system: icmp ule i32 %call4, %shl\r\nAdding 'icmp ule i32 %call4, %shl'\r\n  constraint: -8 * %arg + %call4 <= 0\r\n\r\n---\r\n-1 * %arg <= 0\r\n-8 * %arg + %call4 <= 0\r\n-1 * %call4 <= 0\r\n8 * %arg <= -1\r\nunsat\r\nAdding 'icmp sge i32 %call4, 0'\r\n  constraint: -1 * %call4 <= 0\r\n\r\nAdding 'icmp sle i32 %call4, %shl'\r\n  constraint: -8 * %arg + %call4 <= 0\r\n\r\nProcessing fact to add to the system: icmp ule i32 %call4, 80\r\nAdding 'icmp ule i32 %call4, 80'\r\n  constraint: %call4 <= 80\r\n\r\nAdding 'icmp sge i32 %call4, 0'\r\n  constraint: -1 * %call4 <= 0\r\n\r\nAdding 'icmp sle i32 %call4, 80'\r\n  constraint: %call4 <= 80\r\n\r\nTop of stack : 0 1\r\nCB: 0 1\r\nProcessing condition to simplify:   %icmp = icmp slt i32 %arg, 0\r\nChecking   %icmp = icmp slt i32 %arg, 0\r\n---\r\n-1 * %call4 <= 0\r\n-8 * %arg + %call4 <= 0\r\n-1 * %call4 <= 0\r\n%call4 <= 80\r\n-1 * %arg <= 0\r\nsat\r\n---\r\n-1 * %call4 <= 0\r\n-8 * %arg + %call4 <= 0\r\n-1 * %call4 <= 0\r\n%call4 <= 80\r\n%arg <= -1\r\nunsat\r\nCondition icmp sge i32 %arg, 0 implied by dominating constraints\r\n-1 * %call4 <= 0\r\n-8 * %arg + %call4 <= 0\r\n-1 * %call4 <= 0\r\n%call4 <= 80\r\n```\r\nI'm not 100% sure if the aforementioned patch causes the miscompile, of if it merely triggers it on this specific reproducer. The fact that something like `-1 * %call4 <= 0` is reported as a \"dominating constraint\" seems suspicious to a person who's not familiar with the logic of ConstraintElimination and it doesn't look directly related to that patch. However, if I replace the `shl nuw nsw i32 %arg, 3\r\n` with `mul nuw nsw i32 %arg, 8`, the miscompile doesn't happen: https://alive2.llvm.org/ce/z/EL2bCh.",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "From the debug log, I suspect that we're using the unsigned constraint system to prove a signed fact for some reason.\r\n\r\ncc @fhahn "
+      },
+      {
+        "author": "nikic",
+        "body": "Okay, this is an interesting case.\r\n\r\nWe are adding an `icmp ule i32 %call4, %shl` fact, which get transferred as `icmp sge i32 %call4, 0` and `icmp sle i32 %call4, %shl` to the signed system, because `%shl` is known non-negative.\r\n\r\nThen we are checking whether a solution of these constraints plus `%arg <= -1` exists, which it does not.\r\n\r\nThis is \"correct\" in the sense that *if* that umin call returns a non-poison result, then `icmp slt i32 %arg, 0` is indeed known to be false. But we obviously can't actually make that assumption.\r\n\r\n@dtcxzyw @fhahn This makes me think that the way we are currently adding facts for MinMaxIntrinsic (and I guess abs as well) is pretty fundamentally incorrect, because it effectively imposes a constraint that the umin operation returns a well-defined value. Any thoughts on how to fix this without dropping support for them entirely?"
+      },
+      {
+        "author": "nikic",
+        "body": "(The difference between shl and mul in the reproducer is because ValueTracking apparently currently doesn't know that mul nuw nsw is non-negative, but knows that shl nuw nsw is.)"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "> @dtcxzyw @fhahn This makes me think that the way we are currently adding facts for MinMaxIntrinsic (and I guess abs as well) is pretty fundamentally incorrect, because it effectively imposes a constraint that the umin operation returns a well-defined value. Any thoughts on how to fix this without dropping support for them entirely?\r\n\r\nCan we conservatively check these intrinsics using `isGuaranteedNotToBePoison`?\r\n"
+      },
+      {
+        "author": "nikic",
+        "body": "If it's not too complicated, I think a better solution would be to only add the intrinsic constraints when the result variable is added to the constraint system."
+      },
+      {
+        "author": "fhahn",
+        "body": "> If it's not too complicated, I think a better solution would be to only add the intrinsic constraints when the result variable is added to the constraint system.\r\n\r\nOne way to do that would be to check the uses of the intrinsic and find all the branches that it feeds, and add it as fact for the successors."
+      },
+      {
+        "author": "nikic",
+        "body": "@dtcxzyw Do you plan to submit a PR for this issue?"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "> @dtcxzyw Do you plan to submit a PR for this issue?\r\n\r\nI will post a patch later."
+      },
+      {
+        "author": "fhahn",
+        "body": "I've pushed a fix that only adds the facts if the result is guaranteed to not be poison so the mis-compile is fixed. I also added a TODO to improve things if possible.\r\n\r\nReopening so we can pick the fix for the release branch"
+      },
+      {
+        "author": "nikic",
+        "body": "@fhahn Why does your fix only do this for min/max but not abs? Can't it have the same problem?"
+      },
+      {
+        "author": "fhahn",
+        "body": "> @fhahn Why does your fix only do this for min/max but not abs? Can't it have the same problem?\r\n\r\nI wasn't able to come up with a problematic test case so far for `abs`, but there's a few more things to try."
+      },
+      {
+        "author": "DaniilSuchkov",
+        "body": "@fhahn I'm not familiar with how this pass works, so I have a question: will this pass still use min/max/etc. to infer facts about the arguments of those intrinsics? I'm just a bit confused by the terminology: I see that it adds \"constraints\" based on things like `icmp`, which on their own don't actually constrain anything unless you branch on the result (or do something similar)."
+      },
+      {
+        "author": "nikic",
+        "body": "> @fhahn I'm not familiar with how this pass works, so I have a question: will this pass still use min/max/etc. to infer facts about the arguments of those intrinsics? I'm just a bit confused by the terminology: I see that it adds \"constraints\" based on things like `icmp`, which on their own don't actually constrain anything unless you branch on the result (or do something similar).\r\n\r\nConstraints for icmps will only be added in branches that the icmp dominates (or code that an assume with an icmp dominates). The intrinsic handling was a bit special in that constraints are added unconditionally."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "llvm:transforms"
+    ],
+    "title": "[ConstraintElimination] A miscompile in presence of `shl nuw nsw` and `llvm.umin`"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/78621",
+  "knowledge_cutoff": "2024-01-18T20:57:06Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/ConstraintElimination"
+  ],
+  "patch": "commit 3d91d9613e294b242d853039209b40a0cb7853f2\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Wed Jan 24 14:25:54 2024 +0000\n\n    [ConstraintElim] Make sure min/max intrinsic results are not poison.\n    \n    The result of umin may be poison and in that case the added constraints\n    are not be valid in contexts where poison doesn't cause UB. Only queue\n    facts for min/max intrinsics if the result is guaranteed to not be\n    poison.\n    \n    This could be improved in the future, by only adding the fact when\n    solving conditions using the result value.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/78621.\n\ndiff --git a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\nindex 8f09569d0d9c..7b672e89b67a 100644\n--- a/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n+++ b/llvm/lib/Transforms/Scalar/ConstraintElimination.cpp\n@@ -1061,11 +1061,16 @@ void State::addInfoFor(BasicBlock &BB) {\n           FactOrCheck::getCheck(DT.getNode(&BB), cast<CallInst>(&I)));\n       break;\n     // Enqueue the intrinsics to add extra info.\n-    case Intrinsic::abs:\n     case Intrinsic::umin:\n     case Intrinsic::umax:\n     case Intrinsic::smin:\n     case Intrinsic::smax:\n+      // TODO: Check if it is possible to instead only added the min/max facts\n+      // when simplifying uses of the min/max intrinsics.\n+      if (!isGuaranteedNotToBePoison(&I))\n+        break;\n+      [[fallthrough]];\n+    case Intrinsic::abs:\n       WorkList.push_back(FactOrCheck::getInstFact(DT.getNode(&BB), &I));\n       break;\n     }\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=constraint-elimination -S %s"
+      ],
+      "file": "llvm/test/Transforms/ConstraintElimination/minmax.ll",
+      "tests": [
+        {
+          "test_body": "define i1 @smin_branchless(i32 %x, i32 %y) {\nentry:\n  %min = call i32 @llvm.smin.i32(i32 %x, i32 %y)\n  %cmp1 = icmp sle i32 %min, %x\n  %cmp2 = icmp sgt i32 %min, %x\n  %ret = xor i1 %cmp1, %cmp2\n  ret i1 %ret\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "smin_branchless"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -p constraint-elimination -S %s"
+      ],
+      "file": "llvm/test/Transforms/ConstraintElimination/umin-result-may-be-poison.ll",
+      "tests": [
+        {
+          "test_body": "define i1 @umin_poison_is_UB_via_call(i32 %arg) {\n  %icmp = icmp slt i32 %arg, 0\n  %shl = shl nuw nsw i32 %arg, 3\n  %min = call i32 @llvm.umin.i32(i32 %shl, i32 80)\n  call void @noundef(i32 noundef %min)\n  %cmp2 = shl nuw nsw i32 %arg, 3\n  ret i1 %icmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndeclare void @noundef(i32 noundef)\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "umin_poison_is_UB_via_call"
+        },
+        {
+          "test_body": "define i1 @umin_poison_call_before_UB(i32 %arg) {\n  %icmp = icmp slt i32 %arg, 0\n  %shl = shl nuw nsw i32 %arg, 3\n  %min = call i32 @llvm.umin.i32(i32 %shl, i32 80)\n  call void @fn()\n  call void @noundef(i32 noundef %min)\n  %cmp2 = shl nuw nsw i32 %arg, 3\n  ret i1 %icmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\ndeclare void @noundef(i32 noundef)\n\ndeclare void @fn()\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "umin_poison_call_before_UB"
+        },
+        {
+          "test_body": "define i1 @umin_not_used(i32 %arg) {\n  %icmp = icmp slt i32 %arg, 0\n  %shl = shl nuw nsw i32 %arg, 3\n  %1 = call i32 @llvm.umin.i32(i32 %shl, i32 80)\n  %cmp2 = shl nuw nsw i32 %arg, 3\n  ret i1 %icmp\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "umin_not_used"
+        }
+      ]
+    }
+  ]
+}
