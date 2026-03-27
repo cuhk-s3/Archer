@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     default=False,
     help="Disable passing subsystem knowledge when the experiment supports it.",
   )
+  parser.add_argument(
+    "--rag",
+    action="store_true",
+    default=False,
+    help="Enable RAG mode for experiments that support it (currently archer).",
+  )
   return parser.parse_args()
 
 
@@ -140,6 +146,7 @@ def build_command(
   knowledge_dir: Path | None,
   debug_enabled: bool,
   no_knowledge_enabled: bool,
+  rag_enabled: bool,
 ) -> list[str]:
   cmd = [
     python_bin,
@@ -161,6 +168,8 @@ def build_command(
     cmd.append("--debug")
   if no_knowledge_enabled:
     cmd.append("--no-knowledge")
+  if rag_enabled:
+    cmd.append("--rag-from-issues")
   return cmd
 
 
@@ -186,6 +195,9 @@ def run() -> int:
   model_dir = resolve_model_dir(model, args.model_dir)
   if experiment == "archer" and args.knowledge_source == "passes":
     model_dir = f"{model_dir}-all-knowledge"
+  rag_enabled = bool(args.rag and experiment == "archer")
+  if rag_enabled:
+    model_dir = f"{model_dir}-rag"
   output_dir = args.output_dir
   if not output_dir.is_absolute():
     output_dir = base_dir / output_dir
@@ -224,6 +236,8 @@ def run() -> int:
     print(
       f"Warning: --no-knowledge is not supported for experiment '{experiment}', ignoring."
     )
+  if args.rag and not rag_enabled:
+    print(f"Warning: --rag is not supported for experiment '{experiment}', ignoring.")
 
   if not issue_files:
     print(f"No dataset files found in {dataset_dir}")
@@ -257,6 +271,7 @@ def run() -> int:
       knowledge_dir=knowledge_dir,
       debug_enabled=debug_enabled,
       no_knowledge_enabled=no_knowledge_enabled,
+      rag_enabled=rag_enabled,
     )
 
     print(f"[{issue}] running...")

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import time
 from argparse import ArgumentParser
@@ -10,6 +11,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent.parent))
 
 import main as main_module
+import prompts
 from base.console import get_boxed_console
 from llvm.llvm import LLVM
 from llvm.llvm_helper import get_llvm_build_dir, git_execute, reset, set_llvm_build_dir
@@ -25,6 +27,7 @@ from main import (
 
 console = get_boxed_console(debug_mode=True)
 main_module.console = console
+RAG_RETRIEVAL_LOG = {}
 
 
 def make_component_knowledge_loader(knowledge_dir: Path, enabled: bool):
@@ -47,6 +50,119 @@ def make_component_knowledge_loader(knowledge_dir: Path, enabled: bool):
     return "\n".join(knowledge)
 
   return _loader
+
+
+def _tokenize_patch(patch: str):
+  return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", patch.lower()))
+
+
+def _patch_jaccard_similarity(lhs_patch: str, rhs_patch: str) -> float:
+  lhs_tokens = _tokenize_patch(lhs_patch)
+  rhs_tokens = _tokenize_patch(rhs_patch)
+  if not lhs_tokens or not rhs_tokens:
+    return 0.0
+  return len(lhs_tokens & rhs_tokens) / len(lhs_tokens | rhs_tokens)
+
+
+def build_issue_patch_rag_knowledge(
+  current_patch: str,
+  issues_dir: Path,
+  top_k: int,
+) -> str:
+  global RAG_RETRIEVAL_LOG
+
+  if not issues_dir.exists():
+    RAG_RETRIEVAL_LOG = {"error": f"RAG issues directory not found: {issues_dir}"}
+    return f"RAG issues directory not found: {issues_dir}"
+
+  candidates = []
+  for path in sorted(issues_dir.glob("*.json")):
+    try:
+      with path.open("r", encoding="utf-8") as f:
+        item = json.load(f)
+      patch = item.get("patch", "")
+      if not patch:
+        continue
+      score = _patch_jaccard_similarity(current_patch, patch)
+      candidates.append(
+        {
+          "bug_id": str(item.get("bug_id", path.stem)),
+          "base_commit": item.get("base_commit", ""),
+          "score": score,
+          "patch": patch,
+        }
+      )
+    except Exception:
+      continue
+
+  if not candidates:
+    RAG_RETRIEVAL_LOG = {"error": "No valid issue patches found for RAG retrieval."}
+    return "No valid issue patches found for RAG retrieval."
+
+  top_items = sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_k]
+  RAG_RETRIEVAL_LOG = {
+    "issues_dir": str(issues_dir),
+    "top_k": top_k,
+    "matches": [
+      {
+        "rank": i + 1,
+        "bug_id": item["bug_id"],
+        "base_commit": item["base_commit"],
+        "score": item["score"],
+      }
+      for i, item in enumerate(top_items)
+    ],
+  }
+  lines = [
+    f"Retrieved top-{len(top_items)} similar issue patches.",
+  ]
+
+  for i, item in enumerate(top_items, start=1):
+    lines.append(f"\nTop{i}:")
+    lines.append(item["patch"])
+
+  return "\n".join(lines)
+
+
+def make_issue_patch_rag_loader(
+  enabled: bool,
+  current_patch: str,
+  issues_dir: Path,
+  top_k: int,
+):
+  cache = {"knowledge": None}
+
+  def _loader(component):
+    if not enabled:
+      return "No specific knowledge provided for this component."
+
+    if cache["knowledge"] is None:
+      console.print(
+        f"Building RAG knowledge from issue patches: dir={issues_dir}, top_k={top_k}"
+      )
+      cache["knowledge"] = build_issue_patch_rag_knowledge(
+        current_patch=current_patch,
+        issues_dir=issues_dir,
+        top_k=top_k,
+      )
+    return cache["knowledge"]
+
+  return _loader
+
+
+def override_analyze_prompt_for_rag():
+  prompts.PROMPT_ANALYZE = prompts.PROMPT_ANALYZE.replace(
+    "## Subsystem Knowledge for {component}",
+    "## Retrieved Similar Issue Patches for {component}",
+  )
+  prompts.PROMPT_ANALYZE = prompts.PROMPT_ANALYZE.replace(
+    "For reference, here are some key points about the {component} you should consider (but do not limit to these) in your analysis:\n\n{knowledge}",
+    "For reference, here are retrieved similar historical issue patches based on current patch similarity:\n\n{knowledge}",
+  )
+  prompts.PROMPT_ANALYZE = prompts.PROMPT_ANALYZE.replace(
+    "**CRITICAL**: Subsystem knowledge is **ONLY** a reference for you to understand this component.\nDo NOT start your analysis from these patterns. Start from the patch semantics. Use these **ONLY** to cross-check your reasoning.",
+    "**CRITICAL**: Retrieved patches are **ONLY** auxiliary references.\nDo NOT start from these retrieved cases. Start from current patch semantics, and use retrieved cases only to cross-check.",
+  )
 
 
 class HistoryEnvironment:
@@ -222,6 +338,24 @@ def parse_args():
     ),
     help="Directory containing component knowledge markdown files.",
   )
+  parser.add_argument(
+    "--rag-from-issues",
+    action="store_true",
+    default=False,
+    help="Use RAG knowledge from filtered issue-patch dataset instead of subsystem summaries.",
+  )
+  parser.add_argument(
+    "--rag-issues-dir",
+    type=str,
+    default=str(Path(__file__).resolve().parent.parent / "dataset-regression-rag"),
+    help="Directory of filtered issue JSON files used for RAG retrieval.",
+  )
+  parser.add_argument(
+    "--rag-top-k",
+    type=int,
+    default=3,
+    help="Top-K similar issue patches to retrieve for RAG knowledge.",
+  )
   return parser.parse_args()
 
 
@@ -235,13 +369,6 @@ def main():
   knowledge_dir = Path(args.knowledge_dir)
   if knowledge_enabled and not knowledge_dir.exists():
     panic(f"Knowledge directory not found: {knowledge_dir}")
-  main_module.get_component_knowledge = make_component_knowledge_loader(
-    knowledge_dir=knowledge_dir,
-    enabled=knowledge_enabled,
-  )
-  console.print(
-    f"Knowledge mode: {'on' if knowledge_enabled else 'off'}, dir: {knowledge_dir}"
-  )
 
   # Set up console
   if args.debug:
@@ -257,6 +384,27 @@ def main():
     panic(f"Unsupported bug type: {bug_type}")
 
   pr_info = env.to_pr_info()
+
+  if args.rag_from_issues:
+    rag_issues_dir = Path(args.rag_issues_dir)
+    override_analyze_prompt_for_rag()
+    main_module.get_component_knowledge = make_issue_patch_rag_loader(
+      enabled=knowledge_enabled,
+      current_patch=pr_info.patch,
+      issues_dir=rag_issues_dir,
+      top_k=max(1, args.rag_top_k),
+    )
+    console.print(
+      f"Knowledge mode: {'on' if knowledge_enabled else 'off'} (RAG), dir: {rag_issues_dir}, top_k={args.rag_top_k}"
+    )
+  else:
+    main_module.get_component_knowledge = make_component_knowledge_loader(
+      knowledge_dir=knowledge_dir,
+      enabled=knowledge_enabled,
+    )
+    console.print(
+      f"Knowledge mode: {'on' if knowledge_enabled else 'off'}, dir: {knowledge_dir}"
+    )
 
   console.print(f"Issue ID: {args.issue}")
   console.print(f"Issue Type: {bug_type}")
@@ -389,8 +537,11 @@ def main():
     ]
 
     if stats_path:
+      stats_json = stats.as_dict()
+      if args.rag_from_issues:
+        stats_json["rag_retrieval"] = RAG_RETRIEVAL_LOG
       with stats_path.open("w") as fout:
-        json.dump(stats.as_dict(), fout, indent=2)
+        json.dump(stats_json, fout, indent=2)
       console.print(f"Generation statistics saved to {stats_path}.")
 
     if history_path:
