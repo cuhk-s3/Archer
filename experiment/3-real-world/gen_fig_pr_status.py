@@ -79,32 +79,42 @@ custom_params = {
 sns.set_theme(style="white", rc=custom_params, font_scale=4)
 
 fig, axes = plt.subplots(2, 1, figsize=(22, 18))
-custom_blue = "#3182BD"  # Updated color from reference image
+custom_blue = "#E2EFFF"  # Updated color from reference image
+line_blue = "#1D73DD"
+custom_red = "#C55A11"
 
 # Create histograms
 plot_line = sns.histplot(
   patch_plot_values,
   kde=False,
-  bins="auto",
+  bins=range(0, PATCH_TAIL_THRESHOLD + 9, 8),
   color=custom_blue,
   alpha=1,
-  binwidth=8,
   discrete=False,
   ax=axes[0],
 )
+# Set edge color for top plot
+for patch in axes[0].patches:
+  patch.set_edgecolor(line_blue)
+  patch.set_linewidth(5)
+
 plot_branch = sns.histplot(
   test_plot_values,
   kde=False,
-  bins="auto",
+  bins=range(0, TEST_TAIL_THRESHOLD + 4, 3),
   color=custom_blue,
   alpha=1,
-  binwidth=3,
   discrete=False,
   ax=axes[1],
 )
+# Set edge color for bottom plot
+for patch in axes[1].patches:
+  patch.set_edgecolor(line_blue)
+  patch.set_linewidth(5)
 
-fig.tight_layout()
-plt.subplots_adjust(wspace=0.2, hspace=0.5, left=0.18, right=0.93, bottom=0.15)
+plt.subplots_adjust(
+  wspace=0.2, hspace=0.5, left=0.20, right=0.93, bottom=0.15, top=0.95
+)
 
 # Set labels and limits
 plot_line.set(
@@ -113,12 +123,12 @@ plot_line.set(
   xlim=[0, PATCH_TAIL_THRESHOLD + 8],
 )
 plot_line.set_xlabel("Patch changed lines per PR", fontsize=52)
-plot_line.set_ylabel("Frequency", fontsize=64)
+plot_line.set_ylabel("Frequency", fontsize=68)
 plot_branch.set(
   xlabel="Number of tests per PR", ylabel="Frequency", xlim=[0, TEST_TAIL_THRESHOLD + 6]
 )
 plot_branch.set_xlabel("Number of tests per PR", fontsize=52)
-plot_branch.set_ylabel("Frequency", fontsize=64)
+plot_branch.set_ylabel("Frequency", fontsize=68)
 axes[0].set_xticks([0, 60, 120, 180, 240, 300])
 axes[0].set_xticklabels(["0", "60", "120", "180", "240", "300+"])
 axes[1].set_xticks([0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
@@ -131,23 +141,23 @@ axes[0].grid(False)
 axes[1].grid(False)
 
 # Draw vertical average lines and labels
-axes[0].axvline(x=avg_patch, color="red", linestyle="--", linewidth=5)
+axes[0].axvline(x=avg_patch, color=custom_red, linestyle="--", linewidth=5)
 axes[0].text(
   avg_patch + 1,
   axes[0].get_ylim()[1] * 0.95,
   f"Avg: {avg_patch:.1f} lines",
-  color="red",
-  fontsize=48,
+  color=custom_red,
+  fontsize=52,
   verticalalignment="top",
 )
 
-axes[1].axvline(x=avg_tests, color="red", linestyle="--", linewidth=5)
+axes[1].axvline(x=avg_tests, color=custom_red, linestyle="--", linewidth=5)
 axes[1].text(
   avg_tests + 0.5,
   axes[1].get_ylim()[1] * 0.95,
   f"Avg: {avg_tests:.1f} tests",
-  color="red",
-  fontsize=48,
+  color=custom_red,
+  fontsize=52,
   verticalalignment="top",
 )
 
