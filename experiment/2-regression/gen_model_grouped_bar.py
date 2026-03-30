@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
 
+DISABLED_GROUPS = {"CodeRabbit", "Greptile"}
+
 
 def normalize_group_name(column: str) -> str:
   lower = column.lower().strip()
@@ -24,6 +26,8 @@ def normalize_group_name(column: str) -> str:
     return "MSWE"
   if lower.startswith("coderabbit"):
     return "CodeRabbit"
+  if lower.startswith("greptile"):
+    return "Greptile"
   return column.strip()
 
 
@@ -51,12 +55,15 @@ def compute_success_rates(
   total_issues = len(rows)
   stats = []
   for col in columns:
+    group = normalize_group_name(col)
+    if group in DISABLED_GROUPS:
+      continue
+
     found_count = 0
     for row in rows:
       if row[col].strip().lower() == "found":
         found_count += 1
     rate = (found_count / total_issues) * 100 if total_issues > 0 else 0.0
-    group = normalize_group_name(col)
     variant = short_variant_name(col, group)
     stats.append((group, variant, rate, found_count, total_issues))
   return stats, total_issues
@@ -69,32 +76,51 @@ def plot_grouped_chart(
   for group, variant, rate, found, total in stats:
     grouped.setdefault(group, []).append((variant, rate, found, total))
 
+  # Keep source order but swap Direct/MSWE display positions.
+  if "Direct" in grouped and "MSWE" in grouped:
+    ordered_groups = list(grouped.keys())
+    direct_idx = ordered_groups.index("Direct")
+    mswe_idx = ordered_groups.index("MSWE")
+    ordered_groups[direct_idx], ordered_groups[mswe_idx] = (
+      ordered_groups[mswe_idx],
+      ordered_groups[direct_idx],
+    )
+    grouped = OrderedDict((name, grouped[name]) for name in ordered_groups)
+
   variant_colors = {
-    "base": "#4C78A8",
-    "wo": "#F58518",
-    "all": "#54A24B",
-    "rag": "#E45756",
+    "base": ("#1D73DD", "#E2EFFF"),
+    "wo": ("#1D73DD", "#E2EFFF"),
+    "rag": ("#1D73DD", "#E2EFFF"),
+    "all": ("#1D73DD", "#E2EFFF"),
+  }
+  variant_hatches = {
+    "base": "",
+    "wo": "///",
+    "all": "xx",
+    "rag": "..",
   }
 
-  bar_width = 0.225
-  bar_step = 0.225
+  bar_width = 0.15
+  bar_step = 0.15
 
   custom_group_gaps = {
-    "Gemini-3.1-Pro": 0.30,
-    "DeepSeek-V3.2": 0.24,
-    "Qwen3.5-Plus": 0.30,
+    "Gemini-3.1-Pro": 0.1,
+    "DeepSeek-V3.2": 0.1,
+    "Qwen3.5-Plus": 0.1,
     "CodeRabbit": 0.5,
     "Greptile": 0.45,
-    "Optimuzz": 0.32,
-    "Direct": 0.32,
-    "MSWE": 0.24,
+    "Optimuzz": 0.15,
+    "Direct": 0.1,
+    "MSWE": 0.1,
   }
   default_group_gap = 0.24
 
   x_positions = []
   labels = []
   heights = []
-  colors = []
+  edge_colors = []
+  fill_colors = []
+  bar_hatches = []
   group_centers = []
 
   cursor = 0.0
@@ -104,22 +130,27 @@ def plot_grouped_chart(
       x_positions.append(cursor)
       labels.append(variant)
       heights.append(found)
-      colors.append(variant_colors.get(variant, "#777777"))
+      edge_color, fill_color = variant_colors.get(variant, ("#777777", "#DDDDDD"))
+      edge_colors.append(edge_color)
+      fill_colors.append(fill_color)
+      bar_hatches.append(variant_hatches.get(variant, ""))
       cursor += bar_step
     end = cursor - bar_step
     group_centers.append((group, (start + end) / 2.0))
     cursor += custom_group_gaps.get(group, default_group_gap)
 
-  fig, ax = plt.subplots(figsize=(7.8, 3.1))
+  fig, ax = plt.subplots(figsize=(5.2, 3.5))
 
-  ax.bar(
+  bars = ax.bar(
     x_positions,
     heights,
     width=bar_width,
-    color=colors,
-    edgecolor="#333333",
-    linewidth=0.4,
+    color=fill_colors,
+    edgecolor=edge_colors,
+    linewidth=1,
   )
+  for patch, hatch in zip(bars.patches, bar_hatches):
+    patch.set_hatch(hatch)
 
   max_found = max(heights) if heights else 1
   ax.set_ylabel("Found Cases (#)")
@@ -127,9 +158,9 @@ def plot_grouped_chart(
   ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
   ax.set_xticks(x_positions)
-  ax.set_xticklabels(labels, rotation=0, ha="center")
+  ax.set_xticklabels([""] * len(x_positions))
+  ax.tick_params(axis="x", length=2.5, width=0.8)
 
-  ax.grid(axis="y", linestyle="--", alpha=0.35)
   ax.set_axisbelow(True)
   ax.margins(x=0.01)
 
@@ -139,19 +170,39 @@ def plot_grouped_chart(
   for group, center in group_centers:
     ax.text(
       center,
-      -0.13,
+      -0.05,
       group,
       ha="center",
       va="top",
       transform=ax.get_xaxis_transform(),
-      fontsize=8.5,
+      fontsize=9,
     )
 
   legend_elems = [
-    Patch(facecolor=variant_colors["base"], edgecolor="#333333", label="base"),
-    Patch(facecolor=variant_colors["wo"], edgecolor="#333333", label="wo"),
-    Patch(facecolor=variant_colors["all"], edgecolor="#333333", label="all"),
-    Patch(facecolor=variant_colors["rag"], edgecolor="#333333", label="rag"),
+    Patch(
+      facecolor=variant_colors["base"][1],
+      edgecolor=variant_colors["base"][0],
+      hatch=variant_hatches["base"],
+      label="base",
+    ),
+    Patch(
+      facecolor=variant_colors["wo"][1],
+      edgecolor=variant_colors["wo"][0],
+      hatch=variant_hatches["wo"],
+      label="wo",
+    ),
+    Patch(
+      facecolor=variant_colors["all"][1],
+      edgecolor=variant_colors["all"][0],
+      hatch=variant_hatches["all"],
+      label="all",
+    ),
+    Patch(
+      facecolor=variant_colors["rag"][1],
+      edgecolor=variant_colors["rag"][0],
+      hatch=variant_hatches["rag"],
+      label="rag",
+    ),
   ]
   ax.legend(
     handles=legend_elems,
