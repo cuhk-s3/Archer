@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -133,6 +133,88 @@ def print_table(title: str, rows: list[tuple[str, Totals]]) -> None:
     )
 
 
+def print_round_summary(
+  title: str,
+  files: int,
+  phase1_total: int,
+  phase2_total: int,
+  chat_rounds_total: int,
+) -> dict[str, float | int]:
+  rows = files if files > 0 else 1
+  avg_phase1 = phase1_total / rows
+  avg_phase2 = phase2_total / rows
+  avg_chat = chat_rounds_total / rows
+
+  print(f"\n{title}")
+  print("-" * len(title))
+  print(f"files: {files}")
+  print(f"avg_analysis_rounds (phase1): {avg_phase1:.4f}")
+  print(f"avg_verification_rounds (phase2): {avg_phase2:.4f}")
+  print(f"avg_chat_rounds (total): {avg_chat:.4f}")
+
+  return {
+    "files": files,
+    "phase1_round_total": phase1_total,
+    "phase2_round_total": phase2_total,
+    "chat_rounds_total": chat_rounds_total,
+    "avg_phase1_round": avg_phase1,
+    "avg_phase2_round": avg_phase2,
+    "avg_chat_rounds": avg_chat,
+  }
+
+
+def print_tool_distribution(
+  title: str, usage_counter: Counter[str]
+) -> dict[str, dict[str, float | int]]:
+  print(f"\n{title}")
+  print("-" * len(title))
+  total_calls = sum(usage_counter.values())
+  print(f"total_tool_calls: {total_calls}")
+  if total_calls == 0:
+    print("(no tool calls)")
+    return {"total_tool_calls": 0, "tools": {}}
+
+  print(f"{'tool':28} {'calls':>10} {'share(%)':>10}")
+  print("-" * 52)
+  tools_out: dict[str, dict[str, float | int]] = {}
+  for name, count in usage_counter.most_common():
+    share = (count * 100.0) / total_calls
+    print(f"{name:28} {count:10d} {share:10.2f}")
+    tools_out[name] = {"calls": count, "share_percent": share}
+
+  return {"total_tool_calls": total_calls, "tools": tools_out}
+
+
+def print_bug_validation_summary(
+  bug_files: int,
+  verify_calls: int,
+  difftest_calls: int,
+) -> dict[str, float | int]:
+  print("\nBug Validation Methods")
+  print("-" * len("Bug Validation Methods"))
+  print(f"bug_files: {bug_files}")
+  print(f"verify_calls: {verify_calls}")
+  print(f"difftest_calls: {difftest_calls}")
+  total_relevant = verify_calls + difftest_calls
+  print(f"relevant_validation_calls (verify+difftest): {total_relevant}")
+
+  difftest_share = (
+    (difftest_calls * 100.0 / total_relevant) if total_relevant > 0 else 0.0
+  )
+  verify_share = (verify_calls * 100.0 / total_relevant) if total_relevant > 0 else 0.0
+  print(f"difftest_share_in_relevant_calls: {difftest_share:.2f}%")
+  print(f"verify_share_in_relevant_calls: {verify_share:.2f}%")
+
+  return {
+    "bug_files": bug_files,
+    "verify_calls": verify_calls,
+    "difftest_calls": difftest_calls,
+    "relevant_validation_calls": total_relevant,
+    "difftest_share_percent": difftest_share,
+    "verify_share_percent": verify_share,
+  }
+
+
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(
     description="Summarize tokens, time, and cost from results JSON files."
@@ -162,6 +244,17 @@ def main() -> None:
   by_folder: dict[str, Totals] = defaultdict(Totals)
   by_model: dict[str, Totals] = defaultdict(Totals)
   overall = Totals()
+
+  # Added for paper-level metrics.
+  parsed_with_rounds = 0
+  phase1_round_total = 0
+  phase2_round_total = 0
+  chat_rounds_total = 0
+  overall_tool_usage: Counter[str] = Counter()
+
+  bug_files = 0
+  bug_verify_calls = 0
+  bug_difftest_calls = 0
 
   parsed_files = 0
   skipped_files = 0
@@ -207,6 +300,37 @@ def main() -> None:
     overall.add(enriched_entry)
     parsed_files += 1
 
+    phase1_round_total += int(data.get("phase1_round", 0) or 0)
+    phase2_round_total += int(data.get("phase2_round", 0) or 0)
+    chat_rounds_total += int(data.get("chat_rounds", 0) or 0)
+    parsed_with_rounds += 1
+
+    tool_usage = data.get("tool_usage", [])
+    if isinstance(tool_usage, list):
+      for item in tool_usage:
+        if not isinstance(item, dict):
+          continue
+        tool_name = str(item.get("name", "") or "").strip()
+        tool_calls = int(item.get("usage", 0) or 0)
+        if not tool_name or tool_calls <= 0:
+          continue
+        overall_tool_usage[tool_name] += tool_calls
+
+    bugs = data.get("bugs", [])
+    has_bug = isinstance(bugs, list) and len(bugs) > 0
+    if has_bug:
+      bug_files += 1
+      if isinstance(tool_usage, list):
+        for item in tool_usage:
+          if not isinstance(item, dict):
+            continue
+          tool_name = str(item.get("name", "") or "").strip().lower()
+          tool_calls = int(item.get("usage", 0) or 0)
+          if tool_name == "verify":
+            bug_verify_calls += tool_calls
+          elif tool_name == "difftest":
+            bug_difftest_calls += tool_calls
+
   print(f"Results dir: {results_dir}")
   print(f"JSON files found: {len(source_files)}")
   print(f"Stats files parsed: {parsed_files}")
@@ -215,6 +339,21 @@ def main() -> None:
   print_table("Summary by Folder", list(by_folder.items()))
   print_table("Summary by Model", list(by_model.items()))
   print_table("Overall", [("all", overall)])
+  rounds_summary = print_round_summary(
+    "Round Statistics",
+    files=parsed_with_rounds,
+    phase1_total=phase1_round_total,
+    phase2_total=phase2_round_total,
+    chat_rounds_total=chat_rounds_total,
+  )
+  tool_distribution = print_tool_distribution(
+    "Tool Call Distribution", overall_tool_usage
+  )
+  bug_validation_summary = print_bug_validation_summary(
+    bug_files=bug_files,
+    verify_calls=bug_verify_calls,
+    difftest_calls=bug_difftest_calls,
+  )
 
   if args.output_json:
     output = {
@@ -225,6 +364,9 @@ def main() -> None:
       "by_folder": {k: v.to_dict() for k, v in sorted(by_folder.items())},
       "by_model": {k: v.to_dict() for k, v in sorted(by_model.items())},
       "overall": overall.to_dict(),
+      "rounds": rounds_summary,
+      "tool_call_distribution": tool_distribution,
+      "bug_validation": bug_validation_summary,
     }
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
