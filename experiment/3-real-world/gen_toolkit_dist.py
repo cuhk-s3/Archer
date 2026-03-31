@@ -338,6 +338,18 @@ def main() -> None:
   langref_value = 0
   for key in ["search", "langref"]:
     val = context_parts[key]
+    ax.barh(
+      "context",
+      val,
+      left=left,
+      color=base_face,
+      edgecolor=base_edge,
+      alpha=0.9,
+      linewidth=1.4,
+      hatch=hatch_by_label[key],
+      label=key,
+      height=0.5,
+    )
     if val > 0 and key == "search":
       ax.text(
         left + val / 2,
