@@ -171,7 +171,7 @@ conversion_map = {
   "gcc/tree-ssa-dom.cc": "CFG Transformations",
   "gcc/tree-ssa-phiopt.cc": "CFG Transformations",
   "gcc/tree-ssa-pre.cc": "Redundancy Elimination",
-  # added by shaohua:
+  # added by someone1:
   "gcc/combine.cc": "Peephole Optimizations",
   "gcc/config/i386/i386.md": "Peephole Optimizations",
   "gcc/gimple-match-head.cc": "Peephole Optimizations",
@@ -223,7 +223,7 @@ conversion_map = {
   "llvm/gvn": "Global Value Numbering",
   "llvm/backend": "Backend",
   "llvm/peephole": "Peephole Optimizations",
-  # added by yunbo
+  # added by someone2
   "gcc/cfgexpand.cc": "Backend",  # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=117426
   "gcc/expr.cc": "Backend",  # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=118684
   "gcc/tree-eh.cc": "Loop Invariant Motion",  # Loop Invariant Motion? https://github.com/gcc-mirror/gcc/commit/f1e776ce58ae4a6ae67886adb4ae806598e2c7ef
@@ -237,7 +237,7 @@ conversion_map = {
   "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": "Vectorization Optimization",
   "llvm/lib/Transforms/Vectorize/VPlanUtils.h": "Vectorization Optimization",
   "llvm/lib/CodeGen/CodeGenPrepare.cpp": "Backend",
-  # added by yunbo in archer
+  # added in archer
   "llvm/include/llvm/Analysis/PtrUseVisitor.h": "Alias Analysis",
   "llvm/include/llvm/IR/FMF.h": "Peephole Optimizations",
   "llvm/include/llvm/IR/PatternMatch.h": "Peephole Optimizations",
@@ -322,7 +322,7 @@ def print_table_and_stats(
 
 if __name__ == "__main__":
   review_stats_path = Path("review_stats.json")
-  dataset_root = Path("/data/yunboni/projects/Archer/dataset")
+  dataset_root = Path("/data/archer/projects/Archer/dataset")
   print(f"Reading {review_stats_path}...")
 
   assert review_stats_path.exists(), f"Missing {review_stats_path}"
