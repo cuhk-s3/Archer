@@ -31,17 +31,6 @@ def spawn_process(
   return subprocess.CompletedProcess(proc.args, ecode, output, err_msg)
 
 
-def check_call(cmd: str, timeout: int = 60, **kwargs):
-  proc = spawn_process(
-    shlex.split(cmd),
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    timeout=timeout,
-    **kwargs,
-  )
-  proc.check_returncode()
-
-
 def getoutput(cmd: str, timeout: int = 60, check=True, **kwargs):
   proc = spawn_process(
     shlex.split(cmd),
