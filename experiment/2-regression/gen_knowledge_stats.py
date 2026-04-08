@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 
 BLUE_EDGE = "#1D73DD"
 BLUE_FILL = "#E2EFFF"
+FONT_SIZE = 13
 
 
 def read_text_len(path: Path) -> int:
@@ -90,6 +91,15 @@ def plot_boxplot(
 ) -> None:
   out_dir.mkdir(parents=True, exist_ok=True)
 
+  plt.rcParams.update(
+    {
+      "font.size": FONT_SIZE,
+      "axes.labelsize": FONT_SIZE,
+      "xtick.labelsize": FONT_SIZE,
+      "ytick.labelsize": FONT_SIZE,
+    }
+  )
+
   fig, (ax_top, ax_bottom) = plt.subplots(
     2,
     1,
@@ -130,12 +140,12 @@ def plot_boxplot(
   ax_top.boxplot(data, **box_kwargs)
   ax_bottom.boxplot(data, **box_kwargs)
 
-  ax_bottom.set_ylabel("Knowledge Length (chars)")
+  ax_bottom.set_ylabel("Knowledge Length (chars)", fontsize=FONT_SIZE)
   ax_bottom.set_xlim(0.75, 2.45)
   ax_bottom.set_ylim(0, 30000)
   ax_top.set_ylim(80000, 140000)
-  ax_bottom.tick_params(axis="y", pad=2)
-  ax_top.tick_params(axis="y", pad=2)
+  ax_bottom.tick_params(axis="y", pad=2, labelsize=FONT_SIZE)
+  ax_top.tick_params(axis="y", pad=2, labelsize=FONT_SIZE)
 
   ax_top.spines["bottom"].set_visible(False)
   ax_top.spines["top"].set_visible(False)
@@ -145,7 +155,7 @@ def plot_boxplot(
 
   ax_top.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
   ax_bottom.set_xticks(positions)
-  ax_bottom.set_xticklabels(["Base", "RAG", "All"])
+  ax_bottom.set_xticklabels(["Base", "RAG", "All"], fontsize=FONT_SIZE)
 
   ax_top.grid(False)
   ax_bottom.grid(False)

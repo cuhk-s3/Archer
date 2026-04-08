@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
 
-DISABLED_GROUPS = {"CodeRabbit", "Greptile"}
+DISABLED_GROUPS = {}
 
 
 def normalize_group_name(column: str) -> str:
@@ -100,18 +100,18 @@ def plot_grouped_chart(
     "rag": "..",
   }
 
-  bar_width = 0.15
-  bar_step = 0.15
+  bar_width = 0.25
+  bar_step = 0.25
 
   custom_group_gaps = {
-    "Gemini-3.1-Pro": 0.1,
-    "DeepSeek-V3.2": 0.1,
-    "Qwen3.5-Plus": 0.1,
-    "CodeRabbit": 0.5,
-    "Greptile": 0.45,
-    "Optimuzz": 0.15,
-    "Direct": 0.1,
-    "MSWE": 0.1,
+    "Gemini-3.1-Pro": 0.25,
+    "DeepSeek-V3.2": 0.2,
+    "Qwen3.5-Plus": 0.2,
+    "CodeRabbit": 0.25,
+    "Greptile": 0.25,
+    "Optimuzz": 0.25,
+    "Direct": 0.2,
+    "MSWE": 0.2,
   }
   default_group_gap = 0.24
 
@@ -170,10 +170,12 @@ def plot_grouped_chart(
   for group, center in group_centers:
     ax.text(
       center,
-      -0.05,
+      -0.06,
       group,
-      ha="center",
+      ha="right",
       va="top",
+      rotation=23,
+      rotation_mode="anchor",
       transform=ax.get_xaxis_transform(),
       fontsize=9,
     )
@@ -214,7 +216,7 @@ def plot_grouped_chart(
   )
 
   fig.tight_layout()
-  fig.subplots_adjust(bottom=0.26, top=0.88, left=0.09, right=0.98)
+  fig.subplots_adjust(bottom=0.33, top=0.88, left=0.09, right=0.98)
 
   out_png.parent.mkdir(parents=True, exist_ok=True)
   fig.savefig(out_png, dpi=300, bbox_inches="tight")
