@@ -19,7 +19,8 @@ The final review is structed into minimal comments with a reproducible PoC and p
 ## Quality
 
 Archer has been deployed on 398 LLVM PRs in two months (December 31st, 2025 - February 28th, 2026) and found 51 semantic bugs, with 15 bugs in open PRs and 36 in closed PRs.
-Archer's findings that *21%* of open PRs and *11%* of closed PRs are buggy expose a critical gap in the capacity for critical review in large compiler projects and demonstrate the practical value of Archer as an additional reviewer.
+Archer's findings that *21%* of open PRs and *11%* of closed PRs are buggy expose **a critical gap in the capacity for code review** in large compiler projects and demonstrate **the practical value** of Archer as an additional reviewer.
+
 Archer is also evaluated on a set of 47 bisected LLVM bugs, where it found 18 bugs successfully.
 The false positive rate is relatively low, due to strict validation requirements.
 
