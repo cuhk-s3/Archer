@@ -31,7 +31,7 @@ fi
 
 mkdir ${DEP_LLVM_DIR}
 git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
-git -C ${DEP_LLVM_SOURCE_DIR} checkout ${DEP_LLVM_VERSION}
+git -C ${DEP_LLVM_SOURCE_DIR} checkout 5ec1fb2217c07ee3b610abcf0e40f6b701e6d7f1
 cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_RTTI=ON \
@@ -42,6 +42,7 @@ cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DLLVM_ENABLE_PROJECTS="llvm;clang"
 ninja -C ${DEP_LLVM_BUILD_DIR}
 sudo ninja -C ${DEP_LLVM_BUILD_DIR} install
+sudo ldconfig
 
 #-================================
 # alive2
@@ -82,18 +83,11 @@ sudo ninja -C ${DEP_ALIVE2_BUILD_DIR} install
 
 mkdir -p ${DEP_LLUBI_DIR}
 git clone https://github.com/dtcxzyw/llvm-ub-aware-interpreter ${DEP_LLUBI_SOURCE_DIR}
-cmake -S ${DEP_LLUBI_SOURCE_DIR} -B ${DEP_LLUBI_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cd ${DEP_LLUBI_SOURCE_DIR}
+mkdir -p ${DEP_LLUBI_BUILD_DIR} && cd ${DEP_LLUBI_BUILD_DIR}
+cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_DIR=${DEP_LLVM_BUILD_DIR}/lib/cmake/llvm
-ninja -C ${DEP_LLUBI_BUILD_DIR}
-
-# ccache
-
-mkdir -p ${DEP_CCACHE_DIR}
-wget https://github.com/ccache/ccache/releases/download/v${DEP_CCACHE_VERSION}/ccache-${DEP_CCACHE_VERSION}.tar.gz -O ${DEP_CCACHE_DIR}/ccache-${DEP_CCACHE_VERSION}.tar.gz
-tar -xavf ${DEP_CCACHE_DIR}/ccache-${DEP_CCACHE_VERSION}.tar.gz --directory ${DEP_CCACHE_DIR}
-cmake -S ${DEP_CCACHE_SOURCE_DIR} -B ${DEP_CCACHE_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C ${DEP_CCACHE_BUILD_DIR}
-sudo ninja -C ${DEP_CCACHE_BUILD_DIR} install
+cmake --build . -j
 
 #-================================
 # Python dependencies
@@ -107,13 +101,11 @@ if ! command -v ${PYTHON3} > /dev/null 2>&1; then
 fi
 ${PYTHON3} -m venv ${DEP_PY3_VENV_DIR}
 
-
 #-================================
 # Cleanup dependencies
 #-================================
 
 rm -rf ${DEP_LLVM_BUILD_DIR} \
   ${DEP_Z3_DIR} \
-  ${DEP_RE2C_DIR} \
-  ${DEP_CCACHE_DIR}
+  ${DEP_RE2C_DIR} 
 git -C ${DEP_LLVM_SOURCE_DIR} checkout main

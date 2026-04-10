@@ -21,7 +21,6 @@ fi
 #-================================
 
 DEP_LLVM_DIR=${LLVM_AUTOREVIEW_DEPS_DIR}/llvm
-DEP_LLVM_VERSION=llvmorg-21.1.0
 DEP_LLVM_SOURCE_DIR=${DEP_LLVM_DIR}/llvm
 DEP_LLVM_BUILD_DIR=${DEP_LLVM_DIR}/build
 
