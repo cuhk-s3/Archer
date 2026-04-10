@@ -55,7 +55,7 @@ cp environments.example environments
 Set the dependency installation directory:
 
 ```bash
-export LLVM_AUTOREVIEW_DEPS_DIR=$HOME/archer-deps
+export LLVM_AUTOREVIEW_DEPS_DIR=$PWD/deps
 ```
 
 ### 2) Install dependencies
