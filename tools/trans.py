@@ -18,7 +18,14 @@ def is_opt_crash(error_message: str) -> bool:
     "does not dominate all uses",
     "PLEASE submit a bug report",
   ]
-  return any(indicator in error_message for indicator in crash_indicators)
+  crash_false_positives = [
+    "PHI nodes not grouped at top of basic block!",
+    "immarg operand has non-immediate parameter",
+    "fpmath requires a floating point result!",
+  ]
+  return any(indicator in error_message for indicator in crash_indicators) and not any(
+    false_positive in error_message for false_positive in crash_false_positives
+  )
 
 
 def transform(orig_ir: str, args: str, build_dir: str) -> str:

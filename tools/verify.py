@@ -6,20 +6,8 @@ from tempfile import TemporaryDirectory
 
 from llvm.llvm_helper import strip_llvm_fence
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
+from tools.trans import is_opt_crash
 from utils import cmdline
-
-
-def is_opt_crash(error_message: str) -> bool:
-  """Detect if the error is an opt crash (which indicates a bug)."""
-  crash_indicators = [
-    "LLVM ERROR",
-    "compilation aborted",
-    "Stack dump:",
-    "Broken module found",
-    "does not dominate all uses",
-    "PLEASE submit a bug report",
-  ]
-  return any(indicator in error_message for indicator in crash_indicators)
 
 
 class VerifyTool(FuncToolBase):
