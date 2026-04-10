@@ -46,6 +46,13 @@ Archer requires LLVM, Alive2, llubi, and Python on Linux.
 
 ### 1) Configure the environment
 
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/cuhk-s3/Archer.git
+cd Archer
+```
+
 Copy the example file and fill in your model service configuration:
 
 ```bash
