@@ -580,25 +580,28 @@ def generate_test_for_pr(
 
     return True, res  # Continue the process for other tools
 
-  ret = agent.run(
-    [
-      f"list{MAX_ROLS_PER_TC}",
-      f"read{MAX_ROLS_PER_TC}",
-      f"find{MAX_ROLS_PER_TC}",
-      f"grep{MAX_ROLS_PER_TC}",
-      "langref",
-      "trans",
-      "verify",
-      "difftest",
-      "tests_manager",
-      "report",
-    ],
-    response_handler=response_handler,
-    tool_call_handler=tool_call_handler,
-    round_limit=MAX_CHAT_ROUNDS,
-  )
-  stats.phase2_round = agent.chat_stats["chat_rounds"] - stats.phase1_round
-  return ret
+  try:
+    return agent.run(
+      [
+        f"list{MAX_ROLS_PER_TC}",
+        f"read{MAX_ROLS_PER_TC}",
+        f"find{MAX_ROLS_PER_TC}",
+        f"grep{MAX_ROLS_PER_TC}",
+        "langref",
+        "trans",
+        "verify",
+        "difftest",
+        "tests_manager",
+        "report",
+      ],
+      response_handler=response_handler,
+      tool_call_handler=tool_call_handler,
+      round_limit=MAX_CHAT_ROUNDS,
+    )
+  finally:
+    # Ensure phase 2 rounds are recorded even if agent.run exits via exception
+    # (e.g. ReachTokenLimit / ReachRoundLimit).
+    stats.phase2_round = max(0, agent.chat_stats["chat_rounds"] - stats.phase1_round)
 
 
 def run_pr_agent(
