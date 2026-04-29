@@ -11,17 +11,15 @@ from utils import cmdline
 def is_opt_crash(error_message: str) -> bool:
   """Detect if the error is an opt crash (which indicates a bug)."""
   crash_indicators = [
-    "LLVM ERROR",
     "compilation aborted",
     "Stack dump:",
-    "Broken module found",
-    "does not dominate all uses",
     "PLEASE submit a bug report",
   ]
   crash_false_positives = [
     "PHI nodes not grouped at top of basic block!",
     "immarg operand has non-immediate parameter",
     "fpmath requires a floating point result!",
+    "did not reach a fixpoint",
   ]
   return any(indicator in error_message for indicator in crash_indicators) and not any(
     false_positive in error_message for false_positive in crash_false_positives
