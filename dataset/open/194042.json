@@ -1,0 +1,129 @@
+{
+  "pr_id": 194042,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/194042",
+  "state": "open",
+  "title": "[InstCombine] narrow vector stores with undef/poison suffix",
+  "author": "YonahGoldberg",
+  "base_commit": "5064b936bec6677445b0c856371bba7c1d8af352",
+  "fix_commit": "5a3b20f07a53c7dce848836ec1e45b2d972ef9c7",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\nindex 0fe44d615acea..f3b78a400ed6c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\n@@ -666,6 +666,40 @@ static StoreInst *combineStoreToNewValue(InstCombinerImpl &IC, StoreInst &SI,\n   return NewStore;\n }\n \n+/// Return the scalar or shorter vector formed by the non-empty defined prefix\n+/// of\n+/// \\p C if the remaining lanes are all undef/poison.\n+static Constant *getDefinedPrefix(Constant *C, FixedVectorType *VTy) {\n+  unsigned NumElts = VTy->getNumElements();\n+  SmallVector<Constant *, 8> PrefixElts;\n+  PrefixElts.reserve(NumElts);\n+  bool SawUndef = false;\n+\n+  for (unsigned I = 0; I != NumElts; ++I) {\n+    Constant *Elt = C->getAggregateElement(I);\n+    if (!Elt)\n+      return nullptr;\n+\n+    if (isa<UndefValue>(Elt)) {\n+      SawUndef = true;\n+      continue;\n+    }\n+\n+    if (SawUndef)\n+      return nullptr;\n+\n+    PrefixElts.push_back(Elt);\n+  }\n+\n+  if (!SawUndef || PrefixElts.empty())\n+    return nullptr;\n+\n+  if (PrefixElts.size() == 1)\n+    return PrefixElts.front();\n+\n+  return ConstantVector::get(PrefixElts);\n+}\n+\n /// Combine loads to match the type of their uses' value after looking\n /// through intervening bitcasts.\n ///\n@@ -1578,6 +1612,24 @@ Instruction *InstCombinerImpl::visitStoreInst(StoreInst &SI) {\n   if (isa<UndefValue>(Val))\n     return eraseInstFromFunction(SI);\n \n+  // Narrow a store of a constant vector with a non-empty defined prefix\n+  // followed by undef/poison:\n+  //   store <N x T> <V0, ..., V(K-1), undef, ..., undef>, ptr P, align A\n+  // becomes\n+  //   store <K x T> <V0, ..., V(K-1)>, ptr P, align A    (K >  1)\n+  //   store T V0,                    ptr P, align A    (K == 1)\n+  // FIXME: This is also technically incorrect because it might overwrite a\n+  // poison value. Change to PoisonValue once #52930 is resolved.\n+  if (SI.isSimple()) {\n+    auto *VTy = dyn_cast<FixedVectorType>(Val->getType());\n+    auto *C = dyn_cast<Constant>(Val);\n+    if (VTy && C)\n+      if (Constant *NarrowVal = getDefinedPrefix(C, VTy)) {\n+        combineStoreToNewValue(*this, SI, NarrowVal);\n+        return eraseInstFromFunction(SI);\n+      }\n+  }\n+\n   if (!NullPointerIsDefined(SI.getFunction(), SI.getPointerAddressSpace()))\n     if (Value *V = simplifyNonNullOperand(Ptr, /*HasDereferenceable=*/true))\n       return replaceOperand(SI, 1, V);\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Narrow a store of a constant vector with a non-empty defined prefix\r\nfollowed by undef/poison:\r\n```\r\nstore <N x T> <V0, ..., V(K-1), undef, ..., undef>, ptr P, align A\r\n```\r\nbecomes\r\n```\r\nstore <K x T> <V0, ..., V(K-1)>, ptr P, align A    (K >  1)\r\n\r\nstore T V0,                    ptr P, align A      (K == 1)\r\n```\r\n\r\nThis is motivated by the following SROA test case from this PR: https://github.com/llvm/llvm-project/pull/165159\r\n\r\n```\r\n%class.aiMatrix4x4t = type { float, float, float, float, float, float, float, float, float, float, float, float, float, float, float, float }\r\n\r\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg)\r\n\r\ndefine void @store_only_fp_tail(ptr noalias %dst) {\r\n  %1 = alloca %class.aiMatrix4x4t, align 4\r\n  %2 = alloca %class.aiMatrix4x4t, align 4\r\n  %3 = getelementptr i8, ptr %2, i64 16\r\n  store float 0.000000e+00, ptr %3, align 4\r\n  call void @llvm.memcpy.p0.p0.i64(ptr %1, ptr %2, i64 64, i1 false)\r\n  store float 0.000000e+00, ptr %1, align 4\r\n  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %1, i64 64, i1 false)\r\n  ret void\r\n}\r\n```\r\n\r\nFor the `%2 = alloca %class.aiMatrix4x4t, align 4` alloca, there is a partition [0,16), which contains part of the slice [0,64) `@llvm.memcpy.p0.p0.i64(ptr %1, ptr %2, i64 64, i1 false)`. This is caused by the non-splitable slice [16,20) `store float 0.000000e+00, ptr %3, align 4`. Note that this partition [0,16) is initialized at [0,4) by `store float 0.000000e+00, ptr %1, align 4`, but everything else is undefined (really poison). We would like to eliminate this alloca partition, so we tried promoting it as `<4 x float>`.\r\n\r\nAfter all is said and done and instcombine runs, you get:\r\n```\r\ndefine void @store_only_fp_tail(ptr noalias %dst) {\r\n  store <4 x float> <float 0.000000e+00, float undef, float undef, float undef>, ptr %dst, align 1\r\n  %.sroa.3.0.dst.sroa_idx = getelementptr inbounds nuw i8, ptr %dst, i64 16\r\n  store float 0.000000e+00, ptr %.sroa.3.0.dst.sroa_idx, align 1\r\n  ret void\r\n}\r\n```\r\n\r\nAnd then memcpy opt runs and combines these two stores and you get:\r\n\r\n```\r\ndefine void @store_only_fp_tail(ptr noalias writeonly captures(none) initializes((0, 20)) %dst) local_unnamed_addr #0 {\r\n  call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(20) %dst, i8 0, i64 20, i1 false)\r\n  ret void\r\n}\r\n```\r\n\r\nWhich initializes previously uninitialized memory and leads to a regression. Memcpyopt would've done better if we just left the alloca and memcpys and didn't promote because the memcpys preserve the uninitialized memory.\r\n\r\nThis PR adds an instcombine transform to prevent this.\r\n\r\nNOTE: as shown in the FIXME, this transformation is technically not legal because uninitialized memory is poison, so initializing with undef actually is a real initialization. However, there is a similar transformation already in instcombine aware of this limitation:\r\n\r\n```\r\n  // store undef, Ptr -> noop\r\n  // FIXME: This is technically incorrect because it might overwrite a poison\r\n  // value. Change to PoisonValue once #52930 is resolved.\r\n```\r\n\r\nwhich led me to this issue: https://github.com/llvm/llvm-project/issues/52930, where I see that we should be treating loads of uninitialized memory as poison, not undef. However, I think it would be fine to include this transform for now because we haven't patched this across LLVM yet. There hasn't been an update to this issue for a while.\r\n\r\nShould SROA instead be generating this?\r\n\r\n```\r\nstore <4 x float> <float 0.000000e+00, float poison, float poison, float poison>, ptr %dst, align 1\r\n```\r\n\r\nIf so, I can try to patch this as well.\r\n\r\nTODO: should we also narrow:\r\n\r\n```\r\nstore <4 x float> <float undef, float undef, float undef, float 0.000000e+00>, ptr %dst, align 1\r\n```\r\n\r\nIt would require an extra gep.\r\n\r\nTODO: should we also narrow:\r\n\r\n```\r\n%v = insertelement <4 x float> undef, float %x, i32 0\r\nstore <4 x float> %v, ptr %p, align 16\r\nret void\r\n```\r\n\r\nAssisted by AI, but this description and analysis is written by me and I reviewed and edited the code AI wrote.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/store-narrow-undef-suffix.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "narrow_v4i32_three_defined_prefix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v4i32_three_defined_prefix(ptr %p) {\n  store <4 x i32> <i32 1, i32 2, i32 3, i32 undef>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "narrow_v4i32_two_defined_prefix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v4i32_two_defined_prefix(ptr %p) {\n  store <4 x i32> <i32 1, i32 2, i32 undef, i32 undef>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "all_defined",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @all_defined(ptr %p) {\n  store <4 x i32> <i32 1, i32 2, i32 3, i32 4>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "narrow_v4i32_with_tbaa",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v4i32_with_tbaa(ptr %p) {\n  store <4 x i32> <i32 7, i32 undef, i32 undef, i32 undef>, ptr %p, align 16, !tbaa !0\n  ret void\n}\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"int\", !2, i64 0}\n!2 = !{!\"omnipotent char\", !3, i64 0}\n!3 = !{!\"Simple C/C++ TBAA\"}\n"
+        },
+        {
+          "test_name": "narrow_v4i32_poison_suffix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v4i32_poison_suffix(ptr %p) {\n  store <4 x i32> <i32 7, i32 poison, i32 poison, i32 poison>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "undef_prefix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @undef_prefix(ptr %p) {\n  store <4 x i32> <i32 undef, i32 undef, i32 undef, i32 7>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "defined_in_middle",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @defined_in_middle(ptr %p) {\n  store <4 x i32> <i32 undef, i32 7, i32 undef, i32 undef>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "volatile",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @volatile(ptr %p) {\n  store volatile <4 x i32> <i32 7, i32 undef, i32 undef, i32 undef>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "narrow_v4i32_underaligned",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v4i32_underaligned(ptr %p) {\n  store <4 x i32> <i32 7, i32 undef, i32 undef, i32 undef>, ptr %p, align 1\n  ret void\n}\n"
+        },
+        {
+          "test_name": "narrow_v8i8_one_defined_prefix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v8i8_one_defined_prefix(ptr %p) {\n  store <8 x i8> <i8 9, i8 undef, i8 undef, i8 undef, i8 undef, i8 undef, i8 undef, i8 undef>, ptr %p, align 8\n  ret void\n}\n"
+        },
+        {
+          "test_name": "narrow_v4f32_one_defined_prefix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v4f32_one_defined_prefix(ptr %p) {\n  store <4 x float> <float 1.000000e+00, float undef, float undef, float undef>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "_atomic",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @_atomic(ptr %p) {\n  store atomic <4 x i32> <i32 7, i32 undef, i32 undef, i32 undef>, ptr %p monotonic, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "undef_in_middle",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @undef_in_middle(ptr %p) {\n  store <4 x i32> <i32 1, i32 undef, i32 3, i32 undef>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "narrow_v2i64_one_defined_prefix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v2i64_one_defined_prefix(ptr %p) {\n  store <2 x i64> <i64 42, i64 undef>, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "nonconstant_insertelement",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @nonconstant_insertelement(ptr %p, float %x) {\n  %v = insertelement <4 x float> undef, float %x, i32 0\n  store <4 x float> %v, ptr %p, align 16\n  ret void\n}\n"
+        },
+        {
+          "test_name": "narrow_v4i32_one_defined_prefix",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @narrow_v4i32_one_defined_prefix(ptr %p) {\n  store <4 x i32> <i32 7, i32 undef, i32 undef, i32 undef>, ptr %p, align 16\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {undef deprecator}-->\n\n\n:warning: undef deprecator found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff -U0 --pickaxe-regex -S '([^a-zA-Z0-9#_-]undef([^a-zA-Z0-9_-]|$)|UndefValue::get)' 'HEAD~1' HEAD llvm/test/Transforms/InstCombine/store-narrow-undef-suffix.ll llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp\n``````````\n\n</details>\n\n\nThe following files introduce new uses of undef:\n - llvm/test/Transforms/InstCombine/store-narrow-undef-suffix.ll\n\n[Undef](https://llvm.org/docs/LangRef.html#undefined-values) is now deprecated and should only be used in the rare cases where no replacement is possible. For example, a load of uninitialized memory yields `undef`. You should use `poison` values for placeholders instead.\n\nIn tests, avoid using `undef` and having tests that trigger undefined behavior. If you need an operand with some unimportant value, you can add a new argument to the function and use that instead.\n\nFor example, this is considered a bad practice:\n```llvm\ndefine void @fn() {\n  ...\n  br i1 undef, ...\n}\n```\n\nPlease use the following instead:\n```llvm\ndefine void @fn(i1 %cond) {\n  ...\n  br i1 %cond, ...\n}\n```\n\nPlease refer to the [Undefined Behavior Manual](https://llvm.org/docs/UndefinedBehavior.html) for more information.\n\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 194301 tests passed\n* 5141 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 133899 tests passed\n* 3162 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-04-24T20:13:10Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp": [
+      [
+        666,
+        671
+      ],
+      [
+        1578,
+        1583
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineLoadStoreAlloca.cpp": [
+      "InstCombinerImpl::visitStoreInst",
+      "combineStoreToNewValue"
+    ]
+  }
+}

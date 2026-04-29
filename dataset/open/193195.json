@@ -1,0 +1,487 @@
+{
+  "pr_id": 193195,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/193195",
+  "state": "open",
+  "title": "[InstCombine] Enable factorizeMinMaxTree for floating-point values",
+  "author": "thofry",
+  "base_commit": "347dc1321ed50578bb09da6fa10ccec581d8a2b6",
+  "fix_commit": "adcebf04d0ce78d75d4ee839def6337215f36442",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex d97c66025cee7..9233d16c76397 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -1481,7 +1481,23 @@ static Instruction *factorizeMinMaxTree(IntrinsicInst *II) {\n   Module *Mod = II->getModule();\n   Function *MinMax =\n       Intrinsic::getOrInsertDeclaration(Mod, MinMaxID, II->getType());\n-  return CallInst::Create(MinMax, { MinMaxOp, ThirdOp });\n+  Instruction *RetI = CallInst::Create(MinMax, {MinMaxOp, ThirdOp});\n+  if (isa<FPMathOperator>(II)) {\n+    FastMathFlags IIFMF = II->getFastMathFlags();\n+    FastMathFlags FoldedOpFMF =\n+        (MinMaxOp == LHS ? RHS : LHS)->getFastMathFlags();\n+    FastMathFlags RetFMF = IIFMF & FoldedOpFMF;\n+    // Different intrinsics handle NaN propagation differently. For maximum and\n+    // minimum, nnan does not rely on the folded instruction's flags. For\n+    // maximumnum and minimumnum, it does not rely on II's flags. maxnum and\n+    // minnum rely on both so there is no special handling\n+    if (MinMaxID == Intrinsic::maximum || MinMaxID == Intrinsic::minimum)\n+      RetFMF.setNoNaNs(IIFMF.noNaNs());\n+    if (MinMaxID == Intrinsic::maximumnum || MinMaxID == Intrinsic::minimumnum)\n+      RetFMF.setNoNaNs(FoldedOpFMF.noNaNs());\n+    RetI->setFastMathFlags(RetFMF);\n+  }\n+  return RetI;\n }\n \n /// If all arguments of the intrinsic are unary shuffles with the same mask,\n@@ -2861,6 +2877,9 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n       return FNeg;\n     }\n \n+    if (Instruction *NewMinMax = factorizeMinMaxTree(II))\n+      return NewMinMax;\n+\n     // m(m(X, C2), C1) -> m(X, C)\n     const APFloat *C1, *C2;\n     if (auto *M = dyn_cast<IntrinsicInst>(Arg0)) {\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This patch extends `factorizeMinMaxTree` to floating point types by introducing handling for fast math flags.\r\n\r\nThe test coverage was copied from the integer case with additional tests for the handling of fast math flags\r\n\r\n## Proofs\r\nProof of base case (times out but runs in <5 mins locally): https://alive2.llvm.org/ce/z/vt-Kxf\r\nFMF proofs timed out after 12 hours\r\n\r\nManual proof for the `nnan` fast math flag special handling:\r\nAssume WLOG the optimisation is `m1(m2(a, b), m3(c, b)) -> m4(m2(a, b), c)`\r\n\r\n-  `minimum/maximum`\r\n\r\n`m1` is marked `nnan`\r\n=> results of `m2` and `m3 ` are not `NaN` \r\n=> `a`, `b`, and `c` are not `NaN` as minimum and maximum return `NaN` when either argument is  `NaN`\r\n=> neither of the arguments to `m4` nor the result can be `NaN`\r\n=> `m4` can be marked `nnan`\r\n\r\nTherefore `m4` can safely copy `nnan` from `m1`\r\n\r\n- `minnum/minimumnum/maxnum/maximumnum`\r\n\r\n`m3` is marked `nnan`\r\n=> `b` and `c` are not `NaN`\r\n=> the result of `m2` is not `NaN` as it has at least one non-`NaN` argument\r\n=> neither of the arguments to `m4` nor the result can be `NaN`\r\n=> `m4` can be marked `nnan`\r\n\r\nTherefore `m4` can safely copy `nnan` from `m3`",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/maximum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "maximum_reuse_lhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maximum_reuse_lhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maximum.f32(float %z, float %x)\n  %m3 = call float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "neg_neg",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x float> @llvm.maximum.v2f32(<2 x float>, <2 x float>) #0\n\ndefine <2 x float> @neg_neg(<2 x float> %x, <2 x float> %y) {\n  %negx = fsub <2 x float> splat (float -0.000000e+00), %x\n  %negy = fsub <2 x float> splat (float -0.000000e+00), %y\n  %r = call <2 x float> @llvm.maximum.v2f32(<2 x float> %negx, <2 x float> %negy)\n  ret <2 x float> %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum_reuse_lhs_fmf_intersection",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maximum_reuse_lhs_fmf_intersection(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call ninf afn float @llvm.maximum.f32(float %z, float %x)\n  %m3 = call ninf arcp float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "constant_fold_maximum_f32",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndefine float @constant_fold_maximum_f32() {\n  %x = call float @llvm.maximum.f32(float 1.000000e+00, float 2.000000e+00)\n  ret float %x\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum4",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndefine float @maximum4(float %x, float %y, float %z, float %w) {\n  %a = call float @llvm.maximum.f32(float %x, float %y)\n  %b = call float @llvm.maximum.f32(float %z, float %w)\n  %c = call float @llvm.maximum.f32(float %a, float %b)\n  ret float %c\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum_common_op_uses",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maximum_common_op_uses(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maximum.f32(float %x, float %z)\n  call void @use(float %m2)\n  %m3 = call float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "unary_neg_neg_vec_fmf",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndefine float @unary_neg_neg_vec_fmf(float %x, float %y) {\n  %negx = fneg arcp float %x\n  %negy = fneg afn float %y\n  %r = call fast float @llvm.maximum.f32(float %negx, float %negy)\n  ret float %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum_reuse_lhs_nnan_folded_only",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maximum_reuse_lhs_nnan_folded_only(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call nnan float @llvm.maximum.f32(float %z, float %x)\n  %m3 = call float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum_no_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndefine float @maximum_no_common_op(float %x, float %y, float %z, float %w) {\n  %m1 = call float @llvm.maximum.f32(float %x, float %y)\n  %m2 = call float @llvm.maximum.f32(float %w, float %z)\n  %m3 = call float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum_reuse_lhs_nnan",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maximum_reuse_lhs_nnan(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maximum.f32(float %z, float %x)\n  %m3 = call nnan float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum_reuse_rhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maximum_reuse_rhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximum.f32(float %y, float %x)\n  %m2 = call float @llvm.maximum.f32(float %z, float %x)\n  call void @use(float %m2)\n  %m3 = call float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximum_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndefine float @maximum_common_op(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximum.f32(float %x, float %y)\n  %m2 = call float @llvm.maximum.f32(float %x, float %z)\n  %m3 = call float @llvm.maximum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "neg_neg_extra_use_x",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @neg_neg_extra_use_x(float %x, float %y) {\n  %negx = fsub float -0.000000e+00, %x\n  %negy = fsub float -0.000000e+00, %y\n  %r = call float @llvm.maximum.f32(float %negx, float %negy)\n  call void @use(float %negx)\n  ret float %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/maximumnum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "maximumnum_f32_1_maximumnum_val_p0",
+          "test_body": "define float @maximumnum_f32_1_maximumnum_val_p0(float %x) {\n  %y = call float @llvm.maximumnum.f32(float %x, float 0.000000e+00)\n  %z = call float @llvm.maximumnum.f32(float %y, float 1.000000e+00)\n  ret float %z\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_common_op",
+          "test_body": "define float @maximumnum_common_op(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximumnum.f32(float %x, float %y)\n  %m2 = call float @llvm.maximumnum.f32(float %x, float %z)\n  %m3 = call float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_no_common_op",
+          "test_body": "define float @maximumnum_no_common_op(float %x, float %y, float %z, float %w) {\n  %m1 = call float @llvm.maximumnum.f32(float %x, float %y)\n  %m2 = call float @llvm.maximumnum.f32(float %w, float %z)\n  %m3 = call float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_reuse_lhs",
+          "test_body": "declare void @use(float)\n\ndefine float @maximumnum_reuse_lhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximumnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maximumnum.f32(float %z, float %x)\n  %m3 = call float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_reuse_lhs_nnan_folded_only",
+          "test_body": "declare void @use(float)\n\ndefine float @maximumnum_reuse_lhs_nnan_folded_only(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximumnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call nnan float @llvm.maximumnum.f32(float %z, float %x)\n  %m3 = call float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_reuse_lhs_nnan",
+          "test_body": "declare void @use(float)\n\ndefine float @maximumnum_reuse_lhs_nnan(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximumnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maximumnum.f32(float %z, float %x)\n  %m3 = call nnan float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_neg_neg_extra_use_x",
+          "test_body": "declare void @use(float)\n\ndefine float @maximumnum_neg_neg_extra_use_x(float %x, float %y) {\n  %negx = fsub float -0.000000e+00, %x\n  %negy = fsub float -0.000000e+00, %y\n  %r = call float @llvm.maximumnum.f32(float %negx, float %negy)\n  call void @use(float %negx)\n  ret float %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum4",
+          "test_body": "define float @maximumnum4(float %x, float %y, float %z, float %w) {\n  %a = call float @llvm.maximumnum.f32(float %x, float %y)\n  %b = call float @llvm.maximumnum.f32(float %z, float %w)\n  %c = call float @llvm.maximumnum.f32(float %a, float %b)\n  ret float %c\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_reuse_rhs",
+          "test_body": "declare void @use(float)\n\ndefine float @maximumnum_reuse_rhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximumnum.f32(float %y, float %x)\n  %m2 = call float @llvm.maximumnum.f32(float %z, float %x)\n  call void @use(float %m2)\n  %m3 = call float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_neg_neg",
+          "test_body": "define <2 x float> @maximumnum_neg_neg(<2 x float> %x, <2 x float> %y) {\n  %negx = fsub <2 x float> splat (float -0.000000e+00), %x\n  %negy = fsub <2 x float> splat (float -0.000000e+00), %y\n  %r = call <2 x float> @llvm.maximumnum.v2f32(<2 x float> %negx, <2 x float> %negy)\n  ret <2 x float> %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x float> @llvm.maximumnum.v2f32(<2 x float>, <2 x float>) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_common_op_uses",
+          "test_body": "declare void @use(float)\n\ndefine float @maximumnum_common_op_uses(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximumnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maximumnum.f32(float %x, float %z)\n  call void @use(float %m2)\n  %m3 = call float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_unary_neg_neg_vec_fmf",
+          "test_body": "define float @maximumnum_unary_neg_neg_vec_fmf(float %x, float %y) {\n  %negx = fneg arcp float %x\n  %negy = fneg afn float %y\n  %r = call fast float @llvm.maximumnum.f32(float %negx, float %negy)\n  ret float %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maximumnum_reuse_lhs_fmf_intersection",
+          "test_body": "declare void @use(float)\n\ndefine float @maximumnum_reuse_lhs_fmf_intersection(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maximumnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call ninf afn float @llvm.maximumnum.f32(float %z, float %x)\n  %m3 = call ninf arcp float @llvm.maximumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/maxnum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "maxnum_reuse_lhs_fmf_intersection",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maxnum_reuse_lhs_fmf_intersection(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maxnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call ninf afn float @llvm.maxnum.f32(float %z, float %x)\n  %m3 = call ninf arcp float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum_reuse_rhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maxnum_reuse_rhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maxnum.f32(float %y, float %x)\n  %m2 = call float @llvm.maxnum.f32(float %z, float %x)\n  call void @use(float %m2)\n  %m3 = call float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "neg_neg",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x float> @llvm.maxnum.v2f32(<2 x float>, <2 x float>) #0\n\ndefine <2 x float> @neg_neg(<2 x float> %x, <2 x float> %y) {\n  %negx = fsub <2 x float> splat (float -0.000000e+00), %x\n  %negy = fsub <2 x float> splat (float -0.000000e+00), %y\n  %r = call <2 x float> @llvm.maxnum.v2f32(<2 x float> %negx, <2 x float> %negy)\n  ret <2 x float> %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum_reuse_lhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maxnum_reuse_lhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maxnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maxnum.f32(float %z, float %x)\n  %m3 = call float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum_no_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndefine float @maxnum_no_common_op(float %x, float %y, float %z, float %w) {\n  %m1 = call float @llvm.maxnum.f32(float %x, float %y)\n  %m2 = call float @llvm.maxnum.f32(float %w, float %z)\n  %m3 = call float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum_reuse_lhs_nnan_folded_only",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maxnum_reuse_lhs_nnan_folded_only(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maxnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call nnan float @llvm.maxnum.f32(float %z, float %x)\n  %m3 = call float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "unary_neg_neg_vec_fmf",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndefine float @unary_neg_neg_vec_fmf(float %x, float %y) {\n  %negx = fneg arcp float %x\n  %negy = fneg afn float %y\n  %r = call fast float @llvm.maxnum.f32(float %negx, float %negy)\n  ret float %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum_reuse_lhs_nnan",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maxnum_reuse_lhs_nnan(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maxnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maxnum.f32(float %z, float %x)\n  %m3 = call nnan float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum4",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndefine float @maxnum4(float %x, float %y, float %z, float %w) {\n  %a = call float @llvm.maxnum.f32(float %x, float %y)\n  %b = call float @llvm.maxnum.f32(float %z, float %w)\n  %c = call float @llvm.maxnum.f32(float %a, float %b)\n  ret float %c\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndefine float @maxnum_common_op(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maxnum.f32(float %x, float %y)\n  %m2 = call float @llvm.maxnum.f32(float %x, float %z)\n  %m3 = call float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "constant_fold_maxnum_f32",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndefine float @constant_fold_maxnum_f32() {\n  %x = call float @llvm.maxnum.f32(float 1.000000e+00, float 2.000000e+00)\n  ret float %x\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "maxnum_common_op_uses",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @maxnum_common_op_uses(float %x, float %y, float %z) {\n  %m1 = call float @llvm.maxnum.f32(float %x, float %y)\n  call void @use(float %m1)\n  %m2 = call float @llvm.maxnum.f32(float %x, float %z)\n  call void @use(float %m2)\n  %m3 = call float @llvm.maxnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "neg_neg_extra_use_x",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndeclare void @use(float)\n\ndefine float @neg_neg_extra_use_x(float %x, float %y) {\n  %negx = fsub float -0.000000e+00, %x\n  %negy = fsub float -0.000000e+00, %y\n  %r = call float @llvm.maxnum.f32(float %negx, float %negy)\n  call void @use(float %negx)\n  ret float %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/minimum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "minimum_common_op_uses",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minimum_common_op_uses(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minimum.f32(float %x, float %z)\n  call void @use.f32(float %m2)\n  %m3 = call float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_reuse_lhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minimum_reuse_lhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minimum.f32(float %z, float %x)\n  %m3 = call float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_reuse_lhs_nnan",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minimum_reuse_lhs_nnan(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minimum.f32(float %z, float %x)\n  %m3 = call nnan float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_reuse_lhs_fmf_intersection",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minimum_reuse_lhs_fmf_intersection(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call ninf afn float @llvm.minimum.f32(float %z, float %x)\n  %m3 = call ninf arcp float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_no_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndefine float @minimum_no_common_op(float %x, float %y, float %z, float %w) {\n  %m1 = call float @llvm.minimum.f32(float %x, float %y)\n  %m2 = call float @llvm.minimum.f32(float %w, float %z)\n  %m3 = call float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_reuse_rhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minimum_reuse_rhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimum.f32(float %y, float %x)\n  %m2 = call float @llvm.minimum.f32(float %z, float %x)\n  call void @use.f32(float %m2)\n  %m3 = call float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndefine float @minimum_common_op(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimum.f32(float %x, float %y)\n  %m2 = call float @llvm.minimum.f32(float %x, float %z)\n  %m3 = call float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum4",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndefine float @minimum4(float %x, float %y, float %z, float %w) {\n  %a = call float @llvm.minimum.f32(float %x, float %y)\n  %b = call float @llvm.minimum.f32(float %z, float %w)\n  %c = call float @llvm.minimum.f32(float %a, float %b)\n  ret float %c\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "constant_fold_minimum_f32",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndefine float @constant_fold_minimum_f32() {\n  %x = call float @llvm.minimum.f32(float 1.000000e+00, float 2.000000e+00)\n  ret float %x\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_x_maximum_x_y",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximum.f32(float, float) #0\n\ndefine float @minimum_x_maximum_x_y(float %x, float %y) {\n  %a = call float @llvm.maximum.f32(float %x, float %y)\n  %b = call float @llvm.minimum.f32(float %x, float %a)\n  ret float %b\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimum_reuse_lhs_nnan_folded_only",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minimum_reuse_lhs_nnan_folded_only(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call nnan float @llvm.minimum.f32(float %z, float %x)\n  %m3 = call float @llvm.minimum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/minimumnum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "minimumnum_common_op",
+          "test_body": "define float @minimumnum_common_op(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimumnum.f32(float %x, float %y)\n  %m2 = call float @llvm.minimumnum.f32(float %x, float %z)\n  %m3 = call float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_reuse_lhs_nnan",
+          "test_body": "declare void @use.f32(float)\n\ndefine float @minimumnum_reuse_lhs_nnan(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimumnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minimumnum.f32(float %z, float %x)\n  %m3 = call nnan float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_f32_1_minimumnum_val_p0",
+          "test_body": "define float @minimumnum_f32_1_minimumnum_val_p0(float %x) {\n  %y = call float @llvm.minimumnum.f32(float %x, float 0.000000e+00)\n  %z = call float @llvm.minimumnum.f32(float %y, float 1.000000e+00)\n  ret float %z\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_reuse_lhs_nnan_folded_only",
+          "test_body": "declare void @use.f32(float)\n\ndefine float @minimumnum_reuse_lhs_nnan_folded_only(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimumnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call nnan float @llvm.minimumnum.f32(float %z, float %x)\n  %m3 = call float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_reuse_rhs",
+          "test_body": "declare void @use.f32(float)\n\ndefine float @minimumnum_reuse_rhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimumnum.f32(float %y, float %x)\n  %m2 = call float @llvm.minimumnum.f32(float %z, float %x)\n  call void @use.f32(float %m2)\n  %m3 = call float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_common_op_uses",
+          "test_body": "declare void @use.f32(float)\n\ndefine float @minimumnum_common_op_uses(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimumnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minimumnum.f32(float %x, float %z)\n  call void @use.f32(float %m2)\n  %m3 = call float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_reuse_lhs",
+          "test_body": "declare void @use.f32(float)\n\ndefine float @minimumnum_reuse_lhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimumnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minimumnum.f32(float %z, float %x)\n  %m3 = call float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_x_maximumnum_x_y",
+          "test_body": "define float @minimumnum_x_maximumnum_x_y(float %x, float %y) {\n  %a = call float @llvm.maximumnum.f32(float %x, float %y)\n  %b = call float @llvm.minimumnum.f32(float %x, float %a)\n  ret float %b\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maximumnum.f32(float, float) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum4",
+          "test_body": "define float @minimumnum4(float %x, float %y, float %z, float %w) {\n  %a = call float @llvm.minimumnum.f32(float %x, float %y)\n  %b = call float @llvm.minimumnum.f32(float %z, float %w)\n  %c = call float @llvm.minimumnum.f32(float %a, float %b)\n  ret float %c\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_no_common_op",
+          "test_body": "define float @minimumnum_no_common_op(float %x, float %y, float %z, float %w) {\n  %m1 = call float @llvm.minimumnum.f32(float %x, float %y)\n  %m2 = call float @llvm.minimumnum.f32(float %w, float %z)\n  %m3 = call float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minimumnum_reuse_lhs_fmf_intersection",
+          "test_body": "declare void @use.f32(float)\n\ndefine float @minimumnum_reuse_lhs_fmf_intersection(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minimumnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call ninf afn float @llvm.minimumnum.f32(float %z, float %x)\n  %m3 = call ninf arcp float @llvm.minimumnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minimumnum.f32(float, float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/minnum.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "minnum_common_op_uses",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minnum_common_op_uses(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minnum.f32(float %x, float %z)\n  call void @use.f32(float %m2)\n  %m3 = call float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_reuse_lhs_nnan_folded_only",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minnum_reuse_lhs_nnan_folded_only(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call nnan float @llvm.minnum.f32(float %z, float %x)\n  %m3 = call float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "constant_fold_minnum_f32",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndefine float @constant_fold_minnum_f32() {\n  %x = call float @llvm.minnum.f32(float 1.000000e+00, float 2.000000e+00)\n  ret float %x\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_no_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndefine float @minnum_no_common_op(float %x, float %y, float %z, float %w) {\n  %m1 = call float @llvm.minnum.f32(float %x, float %y)\n  %m2 = call float @llvm.minnum.f32(float %w, float %z)\n  %m3 = call float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_x_maxnum_x_y",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.maxnum.f32(float, float) #0\n\ndefine float @minnum_x_maxnum_x_y(float %x, float %y) {\n  %a = call float @llvm.maxnum.f32(float %x, float %y)\n  %b = call float @llvm.minnum.f32(float %x, float %a)\n  ret float %b\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum4",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndefine float @minnum4(float %x, float %y, float %z, float %w) {\n  %a = call float @llvm.minnum.f32(float %x, float %y)\n  %b = call float @llvm.minnum.f32(float %z, float %w)\n  %c = call float @llvm.minnum.f32(float %a, float %b)\n  ret float %c\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_common_op",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndefine float @minnum_common_op(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minnum.f32(float %x, float %y)\n  %m2 = call float @llvm.minnum.f32(float %x, float %z)\n  %m3 = call float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_reuse_lhs_fmf_intersection",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minnum_reuse_lhs_fmf_intersection(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call ninf afn float @llvm.minnum.f32(float %z, float %x)\n  %m3 = call ninf arcp float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_reuse_rhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minnum_reuse_rhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minnum.f32(float %y, float %x)\n  %m2 = call float @llvm.minnum.f32(float %z, float %x)\n  call void @use.f32(float %m2)\n  %m3 = call float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_reuse_lhs",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minnum_reuse_lhs(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minnum.f32(float %z, float %x)\n  %m3 = call float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "minnum_reuse_lhs_nnan",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.minnum.f32(float, float) #0\n\ndeclare void @use.f32(float)\n\ndefine float @minnum_reuse_lhs_nnan(float %x, float %y, float %z) {\n  %m1 = call float @llvm.minnum.f32(float %x, float %y)\n  call void @use.f32(float %m1)\n  %m2 = call float @llvm.minnum.f32(float %z, float %x)\n  %m3 = call nnan float @llvm.minnum.f32(float %m1, float %m2)\n  ret float %m3\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "thofry",
+      "body": "@nikic @dtcxzyw "
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "thofry",
+      "body": "> I'm confused by the description. The patch is only attempting to set the nnan flag, but it seems like this fold was already triggering for all the min/max intrinsics?\r\n\r\n@arsenm \r\n\r\nThe change on lines 2880-2882 call `factorizeMinMaxTree` on the floating point intrinsics. Before that, this was only used for integer min/max"
+    }
+  ],
+  "knowledge_cutoff": "2026-04-21T11:21:18Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        1481,
+        1487
+      ],
+      [
+        2861,
+        2866
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/maximum.ll": [
+      [
+        8,
+        13
+      ],
+      [
+        238,
+        243
+      ],
+      [
+        293,
+        299
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/maximumnum.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        103,
+        108
+      ],
+      [
+        149,
+        155
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/maxnum.ll": [
+      [
+        8,
+        13
+      ],
+      [
+        238,
+        243
+      ],
+      [
+        281,
+        287
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minimum.ll": [
+      [
+        9,
+        14
+      ],
+      [
+        240,
+        245
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minimumnum.ll": [
+      [
+        1,
+        6
+      ],
+      [
+        103,
+        108
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/minnum.ll": [
+      [
+        9,
+        14
+      ],
+      [
+        240,
+        245
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst",
+      "factorizeMinMaxTree"
+    ],
+    "llvm/test/Transforms/InstCombine/maximum.ll": [
+      "constant_fold_maximum_f32",
+      "neg_neg_extra_use_x"
+    ],
+    "llvm/test/Transforms/InstCombine/maximumnum.ll": [
+      "maximumnum_neg_neg_extra_use_x"
+    ],
+    "llvm/test/Transforms/InstCombine/maxnum.ll": [
+      "constant_fold_maxnum_f32",
+      "neg_neg_extra_use_x"
+    ],
+    "llvm/test/Transforms/InstCombine/minimum.ll": [
+      "constant_fold_minimum_f32",
+      "minimum4",
+      "minimum_x_maximum_x_y"
+    ],
+    "llvm/test/Transforms/InstCombine/minnum.ll": [
+      "constant_fold_minnum_f32",
+      "minnum4",
+      "minnum_x_maxnum_x_y"
+    ]
+  }
+}

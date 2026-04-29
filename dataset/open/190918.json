@@ -1,0 +1,247 @@
+{
+  "pr_id": 190918,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/190918",
+  "state": "open",
+  "title": "[InstCombine] Reland #165975: Fix #163110: Support peeling off matching shifts from icmp operands via canEvaluateShifted",
+  "author": "Michael-Chen-NJU",
+  "base_commit": "f26470aeb7668f437c4d669e4a72c614ba775bb4",
+  "fix_commit": "a33115392145fcffd483b9e2fecde7efaa76c546",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 33eee8e059486..747b8cb80db9c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -7629,6 +7629,34 @@ Instruction *InstCombinerImpl::foldICmpCommutative(CmpPredicate Pred,\n     }\n   }\n \n+  // icmp (shl nsw/nuw X, L), (add nsw/nuw (shl nsw/nuw Y, L), K)\n+  //   -> icmp X, (add nsw/nuw Y, K >> L)\n+  // We use AShr for nsw and LShr for nuw to safely peel off the shift.\n+  Value *X;\n+  uint64_t ShAmt;\n+  if (match(Op0, m_NUWShl(m_Value(X), m_ConstantInt(ShAmt))) &&\n+      !CxtI.isSigned()) {\n+    if (ShAmt >= X->getType()->getScalarSizeInBits())\n+      return nullptr;\n+    if (canEvaluateShifted(Op1, ShAmt, /*IsLeftShift=*/false,\n+                           ShiftSemantics::Unsigned, &CxtI)) {\n+      Value *NewOp1 = getShiftedValue(Op1, ShAmt, /*IsLeftShift=*/false,\n+                                      ShiftSemantics::Unsigned);\n+      return new ICmpInst(Pred, X, NewOp1);\n+    }\n+  }\n+\n+  if (match(Op0, m_NSWShl(m_Value(X), m_ConstantInt(ShAmt))) &&\n+      !CxtI.isUnsigned()) {\n+    if (ShAmt >= X->getType()->getScalarSizeInBits())\n+      return nullptr;\n+    if (canEvaluateShifted(Op1, ShAmt, /*IsLeftShift=*/false,\n+                           ShiftSemantics::Signed, &CxtI)) {\n+      Value *NewOp1 = getShiftedValue(Op1, ShAmt, /*IsLeftShift=*/false,\n+                                      ShiftSemantics::Signed);\n+      return new ICmpInst(Pred, X, NewOp1);\n+    }\n+  }\n   return nullptr;\n }\n \ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 9bdd8cb71f7f3..05874c3de69b2 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -58,6 +58,15 @@ class ProfileSummaryInfo;\n class TargetLibraryInfo;\n class User;\n \n+/// Enum to specify how shift operations should be evaluated in\n+/// canEvaluateShifted.\n+/// Lossy: Allows lossy transformations\n+/// Signed: Requires lossless transformation, using ashr to restore for shl,\n+///         or represents ashr handling for right shifts\n+/// Unsigned: Requires lossless transformation, using lshr to restore for shl,\n+///           or represents lshr handling for right shifts\n+enum class ShiftSemantics { Lossy, Signed, Unsigned };\n+\n class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n     : public InstCombiner,\n       public InstVisitor<InstCombinerImpl, Instruction *> {\n@@ -448,6 +457,11 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n                               bool InvertFalseVal = false);\n   Value *getSelectCondition(Value *A, Value *B, bool ABIsTheSame);\n \n+  bool canEvaluateShifted(Value *V, unsigned NumBits, bool IsLeftShift,\n+                          ShiftSemantics Semantics, Instruction *CxtI);\n+  Value *getShiftedValue(Value *V, unsigned NumBits, bool IsLeftShift,\n+                         ShiftSemantics Semantics);\n+\n   Instruction *foldLShrOverflowBit(BinaryOperator &I);\n   Instruction *foldExtractOfOverflowIntrinsic(ExtractValueInst &EV);\n   Instruction *foldIntrinsicWithOverflowCommon(IntrinsicInst *II);\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\nindex 899a3c16554c9..72ece9936bc2d 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp\n@@ -533,6 +533,7 @@ Instruction *InstCombinerImpl::commonShiftTransforms(BinaryOperator &I) {\n /// Return true if we can simplify two logical (either left or right) shifts\n /// that have constant shift amounts: OuterShift (InnerShift X, C1), C2.\n static bool canEvaluateShiftedShift(unsigned OuterShAmt, bool IsOuterShl,\n+                                    ShiftSemantics Semantics,\n                                     Instruction *InnerShift,\n                                     InstCombinerImpl &IC, Instruction *CxtI) {\n   assert(InnerShift->isLogicalShift() && \"Unexpected instruction type\");\n@@ -546,8 +547,12 @@ static bool canEvaluateShiftedShift(unsigned OuterShAmt, bool IsOuterShl,\n   // shl (shl X, C1), C2 -->  shl X, C1 + C2\n   // lshr (lshr X, C1), C2 --> lshr X, C1 + C2\n   bool IsInnerShl = InnerShift->getOpcode() == Instruction::Shl;\n+\n+  if (!IsOuterShl && Semantics == ShiftSemantics::Signed)\n+    return IsInnerShl && cast<BinaryOperator>(InnerShift)->hasNoSignedWrap() &&\n+           *InnerShiftConst == OuterShAmt;\n   if (IsInnerShl == IsOuterShl)\n-    return true;\n+    return Semantics == ShiftSemantics::Lossy;\n \n   // Equal shift amounts in opposite directions become bitwise 'and':\n   // lshr (shl X, C), C --> and X, C'\n@@ -575,20 +580,30 @@ static bool canEvaluateShiftedShift(unsigned OuterShAmt, bool IsOuterShl,\n }\n \n /// See if we can compute the specified value, but shifted logically to the left\n-/// or right by some number of bits. This should return true if the expression\n-/// can be computed for the same cost as the current expression tree. This is\n-/// used to eliminate extraneous shifting from things like:\n+/// or right by some number of bits. This should return true if the\n+/// transformation is valid. If the Semantics is not lossy,\n+/// we must get the same value when we shift this value and then shift back.\n+/// This is used to eliminate extraneous shifting from things like:\n ///      %C = shl i128 %A, 64\n ///      %D = shl i128 %B, 96\n ///      %E = or i128 %C, %D\n ///      %F = lshr i128 %E, 64\n /// where the client will ask if E can be computed shifted right by 64-bits. If\n /// this succeeds, getShiftedValue() will be called to produce the value.\n-static bool canEvaluateShifted(Value *V, unsigned NumBits, bool IsLeftShift,\n-                               InstCombinerImpl &IC, Instruction *CxtI) {\n-  // We can always evaluate immediate constants.\n-  if (match(V, m_ImmConstant()))\n-    return true;\n+bool InstCombinerImpl::canEvaluateShifted(Value *V, unsigned NumBits,\n+                                          bool IsLeftShift,\n+                                          ShiftSemantics Semantics,\n+                                          Instruction *CxtI) {\n+  // We can always evaluate immediate constants shifted left. For right shifts,\n+  // the constant must be a multiple of 2^NumBits to avoid losing information.\n+  if (match(V, m_ImmConstant())) {\n+    if (Semantics == ShiftSemantics::Lossy)\n+      return true;\n+    const APInt *C;\n+    if (match(V, m_APIntAllowPoison(C)) && !IsLeftShift)\n+      return C->countr_zero() >= NumBits;\n+    return false;\n+  }\n \n   Instruction *I = dyn_cast<Instruction>(V);\n   if (!I) return false;\n@@ -603,19 +618,22 @@ static bool canEvaluateShifted(Value *V, unsigned NumBits, bool IsLeftShift,\n   case Instruction::Or:\n   case Instruction::Xor:\n     // Bitwise operators can all arbitrarily be arbitrarily evaluated shifted.\n-    return canEvaluateShifted(I->getOperand(0), NumBits, IsLeftShift, IC, I) &&\n-           canEvaluateShifted(I->getOperand(1), NumBits, IsLeftShift, IC, I);\n+    return canEvaluateShifted(I->getOperand(0), NumBits, IsLeftShift, Semantics,\n+                              I) &&\n+           canEvaluateShifted(I->getOperand(1), NumBits, IsLeftShift, Semantics,\n+                              I);\n \n   case Instruction::Shl:\n   case Instruction::LShr:\n-    return canEvaluateShiftedShift(NumBits, IsLeftShift, I, IC, CxtI);\n+    return canEvaluateShiftedShift(NumBits, IsLeftShift, Semantics, I, *this,\n+                                   CxtI);\n \n   case Instruction::Select: {\n     SelectInst *SI = cast<SelectInst>(I);\n     Value *TrueVal = SI->getTrueValue();\n     Value *FalseVal = SI->getFalseValue();\n-    return canEvaluateShifted(TrueVal, NumBits, IsLeftShift, IC, SI) &&\n-           canEvaluateShifted(FalseVal, NumBits, IsLeftShift, IC, SI);\n+    return canEvaluateShifted(TrueVal, NumBits, IsLeftShift, Semantics, SI) &&\n+           canEvaluateShifted(FalseVal, NumBits, IsLeftShift, Semantics, SI);\n   }\n   case Instruction::PHI: {\n     // We can change a phi if we can change all operands.  Note that we never\n@@ -623,23 +641,48 @@ static bool canEvaluateShifted(Value *V, unsigned NumBits, bool IsLeftShift,\n     // instructions with a single use.\n     PHINode *PN = cast<PHINode>(I);\n     for (Value *IncValue : PN->incoming_values())\n-      if (!canEvaluateShifted(IncValue, NumBits, IsLeftShift, IC, PN))\n+      if (!canEvaluateShifted(IncValue, NumBits, IsLeftShift, Semantics, PN))\n         return false;\n     return true;\n   }\n   case Instruction::Mul: {\n     const APInt *MulConst;\n     // We can fold (shr (mul X, -(1 << C)), C) -> (and (neg X), C`)\n-    return !IsLeftShift && match(I->getOperand(1), m_APInt(MulConst)) &&\n+    return !IsLeftShift && Semantics == ShiftSemantics::Unsigned &&\n+           match(I->getOperand(1), m_APInt(MulConst)) &&\n            MulConst->isNegatedPowerOf2() && MulConst->countr_zero() == NumBits;\n   }\n+  case Instruction::Add: {\n+    auto *BinOp = cast<BinaryOperator>(I);\n+    // Left shift case\n+    if (IsLeftShift) {\n+      if (Semantics == ShiftSemantics::Lossy)\n+        return canEvaluateShifted(I->getOperand(0), NumBits, IsLeftShift,\n+                                  Semantics, I) &&\n+               canEvaluateShifted(I->getOperand(1), NumBits, IsLeftShift,\n+                                  Semantics, I);\n+\n+      return false;\n+    }\n+\n+    if (Semantics == ShiftSemantics::Lossy)\n+      return false;\n+    bool WrapRequired =\n+        (Semantics == ShiftSemantics::Signed && BinOp->hasNoSignedWrap()) ||\n+        (Semantics == ShiftSemantics::Unsigned && BinOp->hasNoUnsignedWrap());\n+    return WrapRequired &&\n+           canEvaluateShifted(I->getOperand(0), NumBits, IsLeftShift, Semantics,\n+                              I) &&\n+           canEvaluateShifted(I->getOperand(1), NumBits, IsLeftShift, Semantics,\n+                              I);\n+  }\n   }\n }\n \n /// Fold OuterShift (InnerShift X, C1), C2.\n /// See canEvaluateShiftedShift() for the constraints on these instructions.\n static Value *foldShiftedShift(BinaryOperator *InnerShift, unsigned OuterShAmt,\n-                               bool IsOuterShl,\n+                               bool IsOuterShl, ShiftSemantics Semantics,\n                                InstCombiner::BuilderTy &Builder) {\n   bool IsInnerShl = InnerShift->getOpcode() == Instruction::Shl;\n   Type *ShType = InnerShift->getType();\n@@ -677,6 +720,16 @@ static Value *foldShiftedShift(BinaryOperator *InnerShift, unsigned OuterShAmt,\n   // lshr (shl X, C), C --> and X, C'\n   // shl (lshr X, C), C --> and X, C'\n   if (InnerShAmt == OuterShAmt) {\n+    if (!IsOuterShl && Semantics == ShiftSemantics::Signed) {\n+      assert(IsInnerShl && InnerShift->hasNoSignedWrap() &&\n+             \"Signed Semantics should have nsw and inner shl per \"\n+             \"canEvaluateShiftedShift\");\n+      return InnerShift->getOperand(0);\n+    }\n+    if (!IsOuterShl && Semantics == ShiftSemantics::Unsigned && IsInnerShl &&\n+        InnerShift->hasNoUnsignedWrap())\n+      return InnerShift->getOperand(0);\n+\n     APInt Mask = IsInnerShl\n                      ? APInt::getLowBitsSet(TypeWidth, TypeWidth - OuterShAmt)\n                      : APInt::getHighBitsSet(TypeWidth, TypeWidth - OuterShAmt);\n@@ -701,18 +754,21 @@ static Value *foldShiftedShift(BinaryOperator *InnerShift, unsigned OuterShAmt,\n \n /// When canEvaluateShifted() returns true for an expression, this function\n /// inserts the new computation that produces the shifted value.\n-static Value *getShiftedValue(Value *V, unsigned NumBits, bool isLeftShift,\n-                              InstCombinerImpl &IC, const DataLayout &DL) {\n+Value *InstCombinerImpl::getShiftedValue(Value *V, unsigned NumBits,\n+                                         bool IsLeftShift,\n+                                         ShiftSemantics Semantics) {\n   // We can always evaluate constants shifted.\n   if (Constant *C = dyn_cast<Constant>(V)) {\n-    if (isLeftShift)\n-      return IC.Builder.CreateShl(C, NumBits);\n-    else\n-      return IC.Builder.CreateLShr(C, NumBits);\n+    Instruction::BinaryOps ShiftOp =\n+        IsLeftShift ? Instruction::Shl\n+                    : (Semantics == ShiftSemantics::Signed ? Instruction::AShr\n+                                                           : Instruction::LShr);\n+    return Builder.CreateBinOp(ShiftOp, C,\n+                               ConstantInt::get(C->getType(), NumBits));\n   }\n \n   Instruction *I = cast<Instruction>(V);\n-  IC.addToWorklist(I);\n+  addToWorklist(I);\n \n   switch (I->getOpcode()) {\n   default: llvm_unreachable(\"Inconsistency with CanEvaluateShifted\");\n@@ -721,21 +777,21 @@ static Value *getShiftedValue(Value *V, unsigned NumBits, bool isLeftShift,\n   case Instruction::Xor:\n     // Bitwise operators can all arbitrarily be arbitrarily evaluated shifted.\n     I->setOperand(\n-        0, getShiftedValue(I->getOperand(0), NumBits, isLeftShift, IC, DL));\n+        0, getShiftedValue(I->getOperand(0), NumBits, IsLeftShift, Semantics));\n     I->setOperand(\n-        1, getShiftedValue(I->getOperand(1), NumBits, isLeftShift, IC, DL));\n+        1, getShiftedValue(I->getOperand(1), NumBits, IsLeftShift, Semantics));\n     return I;\n \n   case Instruction::Shl:\n   case Instruction::LShr:\n-    return foldShiftedShift(cast<BinaryOperator>(I), NumBits, isLeftShift,\n-                            IC.Builder);\n+    return foldShiftedShift(cast<BinaryOperator>(I), NumBits, IsLeftShift,\n+                            Semantics, Builder);\n \n   case Instruction::Select:\n     I->setOperand(\n-        1, getShiftedValue(I->getOperand(1), NumBits, isLeftShift, IC, DL));\n+        1, getShiftedValue(I->getOperand(1), NumBits, IsLeftShift, Semantics));\n     I->setOperand(\n-        2, getShiftedValue(I->getOperand(2), NumBits, isLeftShift, IC, DL));\n+        2, getShiftedValue(I->getOperand(2), NumBits, IsLeftShift, Semantics));\n     return I;\n   case Instruction::PHI: {\n     // We can change a phi if we can change all operands.  Note that we never\n@@ -744,19 +800,28 @@ static Value *getShiftedValue(Value *V, unsigned NumBits, bool isLeftShift,\n     PHINode *PN = cast<PHINode>(I);\n     for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)\n       PN->setIncomingValue(i, getShiftedValue(PN->getIncomingValue(i), NumBits,\n-                                              isLeftShift, IC, DL));\n+                                              IsLeftShift, Semantics));\n     return PN;\n   }\n   case Instruction::Mul: {\n-    assert(!isLeftShift && \"Unexpected shift direction!\");\n+    assert(!IsLeftShift && \"Unexpected shift direction!\");\n     auto *Neg = BinaryOperator::CreateNeg(I->getOperand(0));\n-    IC.InsertNewInstWith(Neg, I->getIterator());\n+    InsertNewInstWith(Neg, I->getIterator());\n     unsigned TypeWidth = I->getType()->getScalarSizeInBits();\n     APInt Mask = APInt::getLowBitsSet(TypeWidth, TypeWidth - NumBits);\n     auto *And = BinaryOperator::CreateAnd(Neg,\n                                           ConstantInt::get(I->getType(), Mask));\n     And->takeName(I);\n-    return IC.InsertNewInstWith(And, I->getIterator());\n+    return InsertNewInstWith(And, I->getIterator());\n+  }\n+  case Instruction::Add: {\n+    if (IsLeftShift)\n+      I->dropPoisonGeneratingFlags();\n+    I->setOperand(\n+        0, getShiftedValue(I->getOperand(0), NumBits, IsLeftShift, Semantics));\n+    I->setOperand(\n+        1, getShiftedValue(I->getOperand(1), NumBits, IsLeftShift, Semantics));\n+    return I;\n   }\n   }\n }\n@@ -827,15 +892,20 @@ Instruction *InstCombinerImpl::FoldShiftByConstant(Value *Op0, Constant *C1,\n \n   // See if we can propagate this shift into the input, this covers the trivial\n   // cast of lshr(shl(x,c1),c2) as well as other more complex cases.\n-  if (I.getOpcode() != Instruction::AShr &&\n-      canEvaluateShifted(Op0, Op1C->getZExtValue(), IsLeftShift, *this, &I)) {\n-    LLVM_DEBUG(\n-        dbgs() << \"ICE: GetShiftedValue propagating shift through expression\"\n-                  \" to eliminate shift:\\n  IN: \"\n-               << *Op0 << \"\\n  SH: \" << I << \"\\n\");\n-\n-    return replaceInstUsesWith(\n-        I, getShiftedValue(Op0, Op1C->getZExtValue(), IsLeftShift, *this, DL));\n+  if (I.getOpcode() != Instruction::AShr) {\n+    bool IsLeftShift = I.getOpcode() == Instruction::Shl;\n+    ShiftSemantics Semantics =\n+        IsLeftShift ? ShiftSemantics::Lossy : ShiftSemantics::Unsigned;\n+    if (canEvaluateShifted(Op0, Op1C->getZExtValue(), IsLeftShift, Semantics,\n+                           &I)) {\n+      LLVM_DEBUG(\n+          dbgs() << \"ICE: GetShiftedValue propagating shift through expression\"\n+                    \" to eliminate shift:\\n  IN: \"\n+                 << *Op0 << \"\\n  SH: \" << I << \"\\n\");\n+\n+      return replaceInstUsesWith(I, getShiftedValue(Op0, Op1C->getZExtValue(),\n+                                                    IsLeftShift, Semantics));\n+    }\n   }\n \n   if (Instruction *FoldedShift = foldBinOpIntoSelectOrPhi(I))\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This relanding of #165975 fixes the bug that caused the bootstrap-asan buildbot failure (https://lab.llvm.org/buildbot/#/builders/52/builds/16329).\r\n\r\n## Original optimization\r\n\r\nConsider a pattern like: `icmp (shl nsw/nuw X, L), (add nsw/nuw (shl nsw/nuw Y, L), K)`\r\n\r\nWhen K is a multiple of 2^L, this can be simplified to: `icmp X, (add nsw/nuw Y, K >> L)`\r\n\r\nThis patch extends `canEvaluateShifted` to support `Instruction::Add` and refactors its signature to accept a `ShiftSemantics` enum (`Lossy` / `Unsigned` / `Signed`) instead of a bare opcode. This allows the function to enforce losslessness requirements according to the overflow flags (nsw/nuw) of the operands. The logic is wired into `foldICmpCommutative` to fold `icmp (shl nuw/nsw X, C), Op1` into `icmp X, (Op1 >> C)` when Op1 can be right-shifted losslessly by C bits.\r\n\r\n## Bug fixed since #165975\r\n\r\n`canEvaluateShiftedShift` unconditionally returned `true` for same-direction logical shifts, ignoring the `ShiftSemantics` parameter. This caused `foldICmpCommutative` to incorrectly transform:\r\n\r\n  `icmp uge (shl nuw X, 4), (lshr Y, 1)  \u2192  icmp uge X, (lshr Y, 5)  \u2190 WRONG`\r\n\r\n**Fix:** `canEvaluateShiftedShift` now returns `true` for same-direction shifts only when `Semantics == ShiftSemantics::Lossy`, blocking the unsafe fold for `Unsigned`/`Signed` semantics. Regression test added in `Transforms/InstCombine/icmp_shl_lshr_fold.ll`.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/apint-shift.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test25",
+          "test_body": "define i37 @test25(i37 %AA, i37 %BB) {\n  %C = lshr i37 %BB, 17\n  %D = lshr i37 %AA, 17\n  %E = add i37 %D, %C\n  %F = shl i37 %E, 17\n  ret i37 %F\n}\n"
+        },
+        {
+          "test_name": "lshr_shl_eq_amt_multi_use_splat_vec",
+          "test_body": "define <2 x i43> @lshr_shl_eq_amt_multi_use_splat_vec(<2 x i43> %A) {\n  %B = lshr <2 x i43> %A, splat (i43 23)\n  %C = shl <2 x i43> %B, splat (i43 23)\n  %D = mul <2 x i43> %B, %C\n  ret <2 x i43> %D\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-select.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "shl_nuw_ne",
+          "test_body": "define i1 @shl_nuw_ne(i8 %a, i8 %b, i8 %c, i1 %cond) {\n  %shl_a = shl nuw i8 %a, 3\n  %shl_b = shl nuw i8 %b, 3\n  %sel = select i1 %cond, i8 %shl_b, i8 32\n  %cmp = icmp ne i8 %sel, %shl_a\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "shl_failed_to_simplify",
+          "test_body": "define i1 @shl_failed_to_simplify(i8 %a, i1 %cond) {\n  %shl = shl i8 %a, 3\n  %sel = select i1 %cond, i8 8, i8 32\n  %cmp = icmp eq i8 %shl, %sel\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/icmp-shl-add-to-add.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_shl_nuw_ugt",
+          "test_body": "define i1 @icmp_shl_nuw_ugt(i32 %x, i32 %y) {\n  %shlx = shl nuw i32 %x, 5\n  %shly = shl nuw i32 %y, 5\n  %add = add nuw i32 %shly, 32\n  %cmp = icmp ugt i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_no_nsw_on_v1",
+          "test_body": "define i1 @shl_add_const_eq_no_nsw_on_v1(i64 %v0, i64 %v3) {\n  %v1 = shl i64 %v0, 5\n  %v4 = shl nsw i64 %v3, 5\n  %v5 = add nsw i64 %v4, 32\n  %v6 = icmp eq i64 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_multi_use",
+          "test_body": "declare void @use_i64(i64)\n\ndefine i1 @shl_add_const_eq_multi_use(i64 %v0, i64 %v3) {\n  %v1 = shl nsw i64 %v0, 5\n  call void @use_i64(i64 %v1)\n  %v4 = shl nsw i64 %v3, 5\n  %v5 = add nsw i64 %v4, 32\n  %v6 = icmp eq i64 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "icmp_shl_var_amount_nuw",
+          "test_body": "define i1 @icmp_shl_var_amount_nuw(i32 %x, i32 %y) {\n  %shlx = shl nuw i32 %x, 5\n  %shly = shl nuw i32 %y, 5\n  %add = add nuw i32 %shly, 32\n  %cmp = icmp eq i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_shl_nuw_ult",
+          "test_body": "define i1 @icmp_shl_nuw_ult(i32 %x, i32 %y) {\n  %shlx = shl nuw i32 %x, 5\n  %shly = shl nuw i32 %y, 5\n  %add = add nuw i32 %shly, 32\n  %cmp = icmp ult i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_i8",
+          "test_body": "define i1 @shl_add_const_eq_i8(i8 %v0, i8 %v3) {\n  %v1 = shl nsw i8 %v0, 3\n  %v4 = shl nsw i8 %v3, 3\n  %v5 = add nsw i8 %v4, 8\n  %v6 = icmp eq i8 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_vec_non_splat",
+          "test_body": "define <2 x i1> @shl_add_const_eq_vec_non_splat(<2 x i64> %v0, <2 x i64> %v3) {\n  %v1 = shl nsw <2 x i64> %v0, <i64 5, i64 6>\n  %v4 = shl nsw <2 x i64> %v3, <i64 5, i64 6>\n  %v5 = add nsw <2 x i64> %v4, <i64 32, i64 64>\n  %v6 = icmp eq <2 x i64> %v1, %v5\n  ret <2 x i1> %v6\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_i32",
+          "test_body": "define i1 @shl_add_const_eq_i32(i32 %v0, i32 %v3) {\n  %v1 = shl nsw i32 %v0, 10\n  %v4 = shl nsw i32 %v3, 10\n  %v5 = add nsw i32 %v4, 1024\n  %v6 = icmp eq i32 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_mismatch_shl_amt",
+          "test_body": "define i1 @shl_add_const_eq_mismatch_shl_amt(i64 %v0, i64 %v3) {\n  %v1 = shl nsw i64 %v0, 5\n  %v4 = shl nsw i64 %v3, 4\n  %v5 = add nsw i64 %v4, 16\n  %v6 = icmp eq i64 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_k_multiple_of_pow2",
+          "test_body": "define i1 @shl_add_const_eq_k_multiple_of_pow2(i64 %v0, i64 %v3) {\n  %v1 = shl nsw i64 %v0, 5\n  %v4 = shl nsw i64 %v3, 5\n  %v5 = add nsw i64 %v4, 64\n  %v6 = icmp eq i64 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "icmp_shl_nsw_slt",
+          "test_body": "define i1 @icmp_shl_nsw_slt(i32 %x, i32 %y) {\n  %shlx = shl nsw i32 %x, 5\n  %shly = shl nsw i32 %y, 5\n  %add = add nsw i32 %shly, 32\n  %cmp = icmp slt i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_vec_splat",
+          "test_body": "define <2 x i1> @shl_add_const_eq_vec_splat(<2 x i64> %v0, <2 x i64> %v3) {\n  %v1 = shl nsw <2 x i64> %v0, splat (i64 5)\n  %v4 = shl nsw <2 x i64> %v3, splat (i64 5)\n  %v5 = add nsw <2 x i64> %v4, splat (i64 32)\n  %v6 = icmp eq <2 x i64> %v1, %v5\n  ret <2 x i1> %v6\n}\n"
+        },
+        {
+          "test_name": "test_eq_shl_nuw_lshr",
+          "test_body": "define i1 @test_eq_shl_nuw_lshr(i64 %x, i64 %y) {\n  %shl = shl nuw i64 %x, 4\n  %lshr = lshr i64 %y, 1\n  %cmp = icmp eq i64 %shl, %lshr\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_base",
+          "test_body": "define i1 @shl_add_const_eq_base(i64 %v0, i64 %v3) {\n  %v1 = shl nsw i64 %v0, 5\n  %v4 = shl nsw i64 %v3, 5\n  %v5 = add nsw i64 %v4, 32\n  %v6 = icmp eq i64 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_commutative",
+          "test_body": "define i1 @shl_add_const_eq_commutative(i64 %v0, i64 %v3) {\n  %v1 = shl nsw i64 %v0, 5\n  %v4 = shl nsw i64 %v3, 5\n  %v5 = add nsw i64 %v4, 32\n  %v6 = icmp eq i64 %v5, %v1\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_eq_vec_splat_poison",
+          "test_body": "define <2 x i1> @shl_add_const_eq_vec_splat_poison(<2 x i64> %v0, <2 x i64> %v3) {\n  %v1 = shl nsw <2 x i64> %v0, splat (i64 5)\n  %v4 = shl nsw <2 x i64> %v3, splat (i64 5)\n  %v5 = add nsw <2 x i64> %v4, <i64 32, i64 poison>\n  %v6 = icmp eq <2 x i64> %v1, %v5\n  ret <2 x i1> %v6\n}\n"
+        },
+        {
+          "test_name": "icmp_shl_nsw_sgt",
+          "test_body": "define i1 @icmp_shl_nsw_sgt(i32 %x, i32 %y) {\n  %shlx = shl nsw i32 %x, 5\n  %shly = shl nsw i32 %y, 5\n  %add = add nsw i32 %shly, 32\n  %cmp = icmp sgt i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_ult_shl_nuw_lshr",
+          "test_body": "define i1 @test_ult_shl_nuw_lshr(i64 %x, i64 %y) {\n  %shl = shl nuw i64 %x, 4\n  %lshr = lshr i64 %y, 1\n  %cmp = icmp ult i64 %shl, %lshr\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_shl_nuw_add_nsw_fuzz",
+          "test_body": "define i1 @icmp_ugt_shl_nuw_add_nsw_fuzz(i32 %x, i32 %y) {\n  %shlx = shl nuw i32 %x, 5\n  %shly = shl nsw i32 %y, 5\n  %add = add nsw i32 %shly, 32\n  %cmp = icmp ugt i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "shl_add_const_ne",
+          "test_body": "define i1 @shl_add_const_ne(i64 %v0, i64 %v3) {\n  %v1 = shl nsw i64 %v0, 5\n  %v4 = shl nsw i64 %v3, 5\n  %v5 = add nsw i64 %v4, 32\n  %v6 = icmp ne i64 %v1, %v5\n  ret i1 %v6\n}\n"
+        },
+        {
+          "test_name": "icmp_shl_var_amount_nsw",
+          "test_body": "define i1 @icmp_shl_var_amount_nsw(i32 %x, i32 %y) {\n  %shlx = shl nsw i32 %x, 5\n  %shly = shl nsw i32 %y, 5\n  %add = add nsw i32 %shly, 32\n  %cmp = icmp eq i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_shl_nsw_sle",
+          "test_body": "define i1 @icmp_shl_nsw_sle(i32 %x, i32 %y) {\n  %shlx = shl nsw i32 %x, 5\n  %shly = shl nsw i32 %y, 5\n  %add = add nsw i32 %shly, 32\n  %cmp = icmp sle i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_shl_nsw_add_nsw_fuzz",
+          "test_body": "define i1 @icmp_slt_shl_nsw_add_nsw_fuzz(i32 %x, i32 %y) {\n  %shlx = shl nsw i32 %x, 5\n  %shly = shl nuw i32 %y, 5\n  %add = add nsw i32 32, %shly\n  %cmp = icmp slt i32 %shlx, %add\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_uge_shl_nuw_lshr",
+          "test_body": "define i1 @test_uge_shl_nuw_lshr(i64 %x, i64 %y) {\n  %shl = shl nuw i64 %x, 4\n  %lshr = lshr i64 %y, 1\n  %cmp = icmp uge i64 %shl, %lshr\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "Michael-Chen-NJU",
+      "body": "ping."
+    }
+  ],
+  "knowledge_cutoff": "2026-04-08T06:44:43Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      [
+        7629,
+        7634
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+      [
+        58,
+        63
+      ],
+      [
+        448,
+        453
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp": [
+      [
+        533,
+        538
+      ],
+      [
+        546,
+        553
+      ],
+      [
+        575,
+        594
+      ],
+      [
+        603,
+        621
+      ],
+      [
+        623,
+        645
+      ],
+      [
+        677,
+        682
+      ],
+      [
+        701,
+        718
+      ],
+      [
+        721,
+        741
+      ],
+      [
+        744,
+        762
+      ],
+      [
+        827,
+        841
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/apint-shift.ll": [
+      [
+        538,
+        546
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/icmp-select.ll": [
+      [
+        914,
+        920
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      "InstCombinerImpl::foldICmpCommutative"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineShifts.cpp": [
+      "InstCombinerImpl::FoldShiftByConstant",
+      "InstCombinerImpl::commonShiftTransforms",
+      "canEvaluateShiftedShift",
+      "foldShiftedShift",
+      "getShiftedValue"
+    ]
+  }
+}
