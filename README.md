@@ -1,5 +1,9 @@
 # Archer
 
+> [!Note]
+> Archer is actively reviewing new InstCombine and InstSimplify PRs in LLVM.
+> You can follow its progress in the [deploy directory](https://github.com/cuhk-s3/Archer/tree/deploy/deploy) of the [deploy branch](https://github.com/cuhk-s3/Archer/tree/deploy).
+
 Archer is an agentic code review tool for LLVM PRs, designed to deliver **precise, evidence-backed** reviews that minimize developers’ time spent reading, validating, and triaging comments.
 It currently focuses on patches related to middle-end optimizations and reports only issues that come with **a reproducible proof of concept**. Archer is fully self-contained and can be paired with any LLM.
 
