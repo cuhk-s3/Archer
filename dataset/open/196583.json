@@ -1,0 +1,215 @@
+{
+  "pr_id": 196583,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/196583",
+  "state": "open",
+  "title": "[InstCombine] Fold binop into multi-use select when one select arm and the other operand are constant",
+  "author": "el-ev",
+  "base_commit": "62fd4ff3a361deaa85bb51d2ff25ae3b49accee8",
+  "fix_commit": "ebf4b1469291a59642f96c1da9cfff25cbc0c817",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex a09f881e06595..27ff708521385 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2309,8 +2309,16 @@ Instruction *InstCombinerImpl::foldBinopWithPhiOperands(BinaryOperator &BO) {\n Instruction *InstCombinerImpl::foldBinOpIntoSelectOrPhi(BinaryOperator &I) {\n   auto TryFoldOperand = [&](unsigned OpIdx,\n                             bool IsOtherParamConst) -> Instruction * {\n-    if (auto *Sel = dyn_cast<SelectInst>(I.getOperand(OpIdx)))\n-      return FoldOpIntoSelect(I, Sel, false, !IsOtherParamConst);\n+    if (auto *Sel = dyn_cast<SelectInst>(I.getOperand(OpIdx))) {\n+      // Fold binop(select(c, C, x), C2) => select(c, C3, binop(x, C2))\n+      // when the select has multiple uses, as long as at least one\n+      // arm and the binop operand are both constants.\n+      bool MultiUse = IsOtherParamConst && !Sel->hasOneUser() &&\n+                      (isa<Constant>(Sel->getTrueValue()) ||\n+                       isa<Constant>(Sel->getFalseValue()));\n+      return FoldOpIntoSelect(I, Sel, /*FoldWithMultiUse=*/MultiUse,\n+                              !IsOtherParamConst);\n+    }\n     if (auto *PN = dyn_cast<PHINode>(I.getOperand(OpIdx)))\n       return foldOpIntoPhi(I, PN);\n     return nullptr;\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Downstream issue: https://github.com/rust-lang/rust/issues/155985\r\n\r\nFold `binop(select(c, C, x), C2) => select(c, C3, binop(x, C2))` when one arm and the binop operand are both constants, even if the select has multiple uses.\r\nIt is a common pattern in Rust for tagged unions like `Result<bool, X>`, where `size_of::<X>() == 4`, to be packed into one `i64`, with the tags stored in the lower half and the value in the higher.\r\n\r\nhttps://godbolt.org/z/aG9G6o7Ee shows a regression where LLVM failed to recognize the pattern of accessing the value of a known discriminant (`Err(x)` in this case), resulting in huge constant loads like `0x00000001_00000001`. This PR adds support for that.\r\n\r\nAlive2: https://alive2.llvm.org/ce/z/Sg-5Lj",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/binop-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "and_sel_op0_use",
+          "test_body": "declare void @use(i32)\n\ndefine i32 @and_sel_op0_use(i1 %b) {\n  %s = select i1 %b, i32 25, i32 0\n  call void @use(i32 %s)\n  %r = and i32 %s, 1\n  ret i32 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/extractelement.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S -data-layout=\"e-n64\"",
+        "opt < %s -passes=instcombine -S -data-layout=\"e-n128\"",
+        "opt < %s -passes=instcombine -S -data-layout=\"E-n64\"",
+        "opt < %s -passes=instcombine -S -data-layout=\"E-n128\"",
+        "opt < %s -passes=instcombine -S -data-layout=\"e-n64\" -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat",
+        "opt < %s -passes=instcombine -S -data-layout=\"e-n128\" -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat",
+        "opt < %s -passes=instcombine -S -data-layout=\"E-n64\" -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat",
+        "opt < %s -passes=instcombine -S -data-layout=\"E-n128\" -use-constant-fp-for-fixed-length-splat -use-constant-int-for-fixed-length-splat"
+      ],
+      "tests": [
+        {
+          "test_name": "extelt_select_const_operand_extractelt_use",
+          "test_body": "define i32 @extelt_select_const_operand_extractelt_use(i1 %c) {\n  %s = select i1 %c, <3 x i32> <i32 2, i32 3, i32 4>, <3 x i32> <i32 5, i32 6, i32 7>\n  %e = extractelement <3 x i32> %s, i32 2\n  %m = mul i32 %e, 2\n  %m.2 = mul i32 %e, 4\n  %r = mul i32 %m, %m.2\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "extelt_vecselect_const_operand_vector",
+          "test_body": "define i32 @extelt_vecselect_const_operand_vector(<3 x i1> %c) {\n  %s = select <3 x i1> %c, <3 x i32> <i32 2, i32 3, i32 4>, <3 x i32> <i32 5, i32 6, i32 7>\n  %r = extractelement <3 x i32> %s, i32 2\n  ret i32 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fold-multi-use-select-packed-constants.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "rust_155985",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine noundef i32 @rust_155985(i32 noundef %n, i1 noundef zeroext %b) {\nstart:\n  %eq = icmp eq i32 %n, 0\n  %inner = select i1 %eq, i64 4294967297, i64 8589934593\n  %outer = select i1 %b, i64 0, i64 %inner\n  %tag = trunc i64 %outer to i1\n  %shift = lshr i64 %outer, 32\n  %payload = trunc i64 %shift to i32\n  %final = select i1 %tag, i32 %payload, i32 0\n  ret i32 %final\n}\n"
+        },
+        {
+          "test_name": "lshr_through_multi_use_nested_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @lshr_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n  %inner = select i1 %c1, i64 4294967297, i64 8589934593\n  %outer = select i1 %c2, i64 0, i64 %inner\n  store i64 %outer, ptr %sink, align 8\n  %s = lshr i64 %outer, 32\n  %t = trunc i64 %s to i32\n  ret i32 %t\n}\n"
+        },
+        {
+          "test_name": "binop_both_arms_constant_multi_use",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @binop_both_arms_constant_multi_use(i1 %c, ptr %sink) {\n  %sel = select i1 %c, i64 100, i64 200\n  store i64 %sel, ptr %sink, align 8\n  %m = add i64 %sel, 5\n  ret i64 %m\n}\n"
+        },
+        {
+          "test_name": "neg_variable_arm_not_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @neg_variable_arm_not_select(i1 %c, i64 %x, ptr %sink) {\n  %outer = select i1 %c, i64 0, i64 %x\n  store i64 %outer, ptr %sink, align 8\n  %m = add i64 %outer, 42\n  ret i64 %m\n}\n"
+        },
+        {
+          "test_name": "neg_binop_other_operand_not_const",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @neg_binop_other_operand_not_const(i1 %c1, i1 %c2, i64 %x, ptr %sink) {\n  %inner = select i1 %c1, i64 100, i64 200\n  %outer = select i1 %c2, i64 0, i64 %inner\n  store i64 %outer, ptr %sink, align 8\n  %m = add i64 %outer, %x\n  ret i64 %m\n}\n"
+        },
+        {
+          "test_name": "add_through_multi_use_nested_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @add_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n  %inner = select i1 %c1, i64 100, i64 200\n  %outer = select i1 %c2, i64 0, i64 %inner\n  store i64 %outer, ptr %sink, align 8\n  %m = add i64 %outer, 42\n  ret i64 %m\n}\n"
+        },
+        {
+          "test_name": "neg_no_const_arm",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @neg_no_const_arm(i1 %c, i64 %x, i64 %y, ptr %sink) {\n  %sel = select i1 %c, i64 %x, i64 %y\n  store i64 %sel, ptr %sink, align 8\n  %m = add i64 %sel, 42\n  ret i64 %m\n}\n"
+        },
+        {
+          "test_name": "lshr_const_on_true_arm",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i32 @lshr_const_on_true_arm(i1 %c1, i1 %c2, ptr %sink) {\n  %inner = select i1 %c1, i64 4294967297, i64 8589934593\n  %outer = select i1 %c2, i64 %inner, i64 0\n  store i64 %outer, ptr %sink, align 8\n  %s = lshr i64 %outer, 32\n  %t = trunc i64 %s to i32\n  ret i32 %t\n}\n"
+        },
+        {
+          "test_name": "nested3_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @nested3_select(i1 %c1, i1 %c2, i1 %c3, ptr %sink) {\n  %s1 = select i1 %c1, i64 10, i64 20\n  %s2 = select i1 %c2, i64 0, i64 %s1\n  %s3 = select i1 %c3, i64 0, i64 %s2\n  store i64 %s3, ptr %sink, align 8\n  %m = and i64 %s3, 255\n  ret i64 %m\n}\n"
+        },
+        {
+          "test_name": "and_through_multi_use_nested_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @and_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n  %inner = select i1 %c1, i64 4294967297, i64 8589934595\n  %outer = select i1 %c2, i64 0, i64 %inner\n  store i64 %outer, ptr %sink, align 8\n  %m = and i64 %outer, 4294967295\n  ret i64 %m\n}\n"
+        },
+        {
+          "test_name": "or_through_multi_use_nested_select",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine i64 @or_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n  %inner = select i1 %c1, i64 10, i64 20\n  %outer = select i1 %c2, i64 0, i64 %inner\n  store i64 %outer, ptr %sink, align 8\n  %m = or i64 %outer, 3\n  ret i64 %m\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/pr63791.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "y",
+          "test_body": "@j = external hidden constant i32\n\ndefine void @y() {\nentry:\n  br label %for.cond.i\n\nfor.cond.i:                                       ; preds = %for.cond1.loopexit.i, %for.cond.i, %entry\n  %phi1 = phi ptr [ @j, %entry ], [ @j, %for.cond.i ], [ null, %for.cond1.loopexit.i ]\n  %load1 = load i32, ptr %phi1, align 4\n  br i1 false, label %for.cond.i, label %for.cond5.preheader.i\n\nfor.cond1.loopexit.i:                             ; preds = %for.inc19.i, %for.cond5.preheader.i\n  %load2 = load i32, ptr null, align 4\n  %conv.i = sext i32 %load2 to i64\n  %tobool4.not.i = icmp eq i64 0, %conv.i\n  br i1 %tobool4.not.i, label %for.cond.i, label %for.cond5.preheader.i\n\nfor.cond5.preheader.i:                            ; preds = %for.cond1.loopexit.i, %for.cond.i\n  %phi = phi i32 [ 0, %for.cond1.loopexit.i ], [ %load1, %for.cond.i ]\n  %sub6.i = or i32 %load1, 1\n  %cmp5.i.i = icmp sgt i32 %load1, 41\n  %a.1.3.i.i = select i1 %cmp5.i.i, i32 %sub6.i, i32 0\n  %add.4.i.i = add i32 %a.1.3.i.i, 1\n  %cmp8.4.i.i = icmp sgt i32 %a.1.3.i.i, 0\n  %spec.select.4.i.i1 = select i1 %cmp8.4.i.i, i32 %add.4.i.i, i32 0\n  %cmp11.4.i.i = icmp eq i32 %add.4.i.i, 0\n  %add.5.i.i = or i32 %add.4.i.i, %sub6.i\n  %cmp8.5.i.i = icmp sgt i32 %add.5.i.i, 0\n  %sel = select i1 %cmp5.i.i, i1 %cmp8.5.i.i, i1 false\n  %i.1.5.i.i = select i1 %sel, i32 0, i32 %spec.select.4.i.i1\n  %spec.select = select i1 %cmp11.4.i.i, i32 0, i32 %i.1.5.i.i\n  %add8.i = or i32 %spec.select, -1020499714\n  %cmp.i3 = icmp sgt i32 %add8.i, -1020499638\n  br i1 %cmp.i3, label %for.inc19.i, label %for.cond1.loopexit.i\n\nfor.inc19.i:                                      ; preds = %for.inc19.i, %for.cond5.preheader.i\n  br i1 %sel, label %for.inc19.i, label %for.cond1.loopexit.i\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/pr72433.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "widget",
+          "test_body": "define i32 @widget(i32 %arg, i32 %arg1) {\nbb:\n  %icmp = icmp eq i32 %arg, 0\n  %zext = zext i1 %icmp to i32\n  %sub = sub i32 2, %zext\n  %mul = mul i32 20, %sub\n  %zext8 = zext i1 %icmp to i32\n  %xor = xor i32 %zext8, 1\n  %add9 = add i32 %mul, %xor\n  %mul2 = mul i32 %add9, %sub\n  ret i32 %mul2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/pr80597.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "pr80597",
+          "test_body": "define i64 @pr80597(i1 %cond) {\nentry:\n  %add = select i1 %cond, i64 0, i64 4294967293\n  %add8 = shl i64 %add, 32\n  %sext1 = add i64 %add8, 8836839514384105472\n  %cmp = icmp ult i64 %sext1, -34359738368\n  br i1 %cmp, label %if.then, label %if.else\n\nif.else:                                          ; preds = %entry\n  %sext2 = or i64 %add8, 8836839522974040064\n  %ashr = ashr i64 %sext2, 1\n  ret i64 %ashr\n\nif.then:                                          ; preds = %entry\n  ret i64 0\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/shift.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine -use-constant-int-for-fixed-length-splat -S"
+      ],
+      "tests": [
+        {
+          "test_name": "ashr_out_of_range_1",
+          "test_body": "define void @ashr_out_of_range_1(ptr %A) {\n  %L = load i177, ptr %A, align 4\n  %B5 = udiv i177 %L, -1\n  %B4 = add i177 %B5, -1\n  %B = and i177 %B4, %L\n  %B2 = add i177 %B, -1\n  %G11 = getelementptr i177, ptr %A, i177 %B2\n  %B6 = mul i177 %B5, %B2\n  %B24 = ashr i177 %L, %B6\n  %C17 = icmp sgt i177 %B, %B24\n  %G62 = getelementptr i177, ptr %G11, i1 %C17\n  %B28 = urem i177 %B24, %B6\n  store i177 %B28, ptr %G62, align 4\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Iris Shi (el-ev)\n\n<details>\n<summary>Changes</summary>\n\nDownstream issue: https://github.com/rust-lang/rust/issues/155985\r\n\r\nFold `binop(select(c, C, x), C2) =&gt; select(c, C3, binop(x, C2))` when one arm and the binop operand are both constants, even if the select has multiple uses.\r\nIt is a common pattern in Rust for tagged unions like `Result&lt;bool, X&gt;`, where `size_of::&lt;X&gt;() == 4`, to be packed into one `i64`, with the tags stored in the lower half and the value in the higher.\r\n\r\nhttps://godbolt.org/z/aG9G6o7Ee shows a regression where LLVM failed to recognize the pattern of accessing the value of a known discriminant (`Err(x)` in this case), resulting in huge constant loads like `0x00000001_00000001`. This PR adds support for that.\r\n\r\nAlive2: https://alive2.llvm.org/ce/z/Sg-5Lj\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/196583.diff\n\n\n8 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstructionCombining.cpp (+10-2) \n- (modified) llvm/test/Transforms/InstCombine/binop-select.ll (+1-1) \n- (modified) llvm/test/Transforms/InstCombine/extractelement.ll (+1-4) \n- (added) llvm/test/Transforms/InstCombine/fold-multi-use-select-packed-constants.ll (+182) \n- (modified) llvm/test/Transforms/InstCombine/pr63791.ll (+1-1) \n- (modified) llvm/test/Transforms/InstCombine/pr72433.ll (+2-7) \n- (modified) llvm/test/Transforms/InstCombine/pr80597.ll (+2-7) \n- (modified) llvm/test/Transforms/InstCombine/shift.ll (+3-3) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex a09f881e06595..27ff708521385 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -2309,8 +2309,16 @@ Instruction *InstCombinerImpl::foldBinopWithPhiOperands(BinaryOperator &BO) {\n Instruction *InstCombinerImpl::foldBinOpIntoSelectOrPhi(BinaryOperator &I) {\n   auto TryFoldOperand = [&](unsigned OpIdx,\n                             bool IsOtherParamConst) -> Instruction * {\n-    if (auto *Sel = dyn_cast<SelectInst>(I.getOperand(OpIdx)))\n-      return FoldOpIntoSelect(I, Sel, false, !IsOtherParamConst);\n+    if (auto *Sel = dyn_cast<SelectInst>(I.getOperand(OpIdx))) {\n+      // Fold binop(select(c, C, x), C2) => select(c, C3, binop(x, C2))\n+      // when the select has multiple uses, as long as at least one\n+      // arm and the binop operand are both constants.\n+      bool MultiUse = IsOtherParamConst && !Sel->hasOneUser() &&\n+                      (isa<Constant>(Sel->getTrueValue()) ||\n+                       isa<Constant>(Sel->getFalseValue()));\n+      return FoldOpIntoSelect(I, Sel, /*FoldWithMultiUse=*/MultiUse,\n+                              !IsOtherParamConst);\n+    }\n     if (auto *PN = dyn_cast<PHINode>(I.getOperand(OpIdx)))\n       return foldOpIntoPhi(I, PN);\n     return nullptr;\ndiff --git a/llvm/test/Transforms/InstCombine/binop-select.ll b/llvm/test/Transforms/InstCombine/binop-select.ll\nindex 3265ea54a831e..3efeba83d12ef 100644\n--- a/llvm/test/Transforms/InstCombine/binop-select.ll\n+++ b/llvm/test/Transforms/InstCombine/binop-select.ll\n@@ -274,7 +274,7 @@ define i32 @and_sel_op0_use(i1 %b) {\n ; CHECK-LABEL: @and_sel_op0_use(\n ; CHECK-NEXT:    [[S:%.*]] = select i1 [[B:%.*]], i32 25, i32 0\n ; CHECK-NEXT:    call void @use(i32 [[S]])\n-; CHECK-NEXT:    [[R:%.*]] = and i32 [[S]], 1\n+; CHECK-NEXT:    [[R:%.*]] = zext i1 [[B]] to i32\n ; CHECK-NEXT:    ret i32 [[R]]\n ;\n   %s = select i1 %b, i32 25, i32 0\ndiff --git a/llvm/test/Transforms/InstCombine/extractelement.ll b/llvm/test/Transforms/InstCombine/extractelement.ll\nindex 04a35e19fb0bb..6a5a1ab7e98a2 100644\n--- a/llvm/test/Transforms/InstCombine/extractelement.ll\n+++ b/llvm/test/Transforms/InstCombine/extractelement.ll\n@@ -799,10 +799,7 @@ define i32 @extelt_vecselect_const_operand_vector(<3 x i1> %c) {\n \n define i32 @extelt_select_const_operand_extractelt_use(i1 %c) {\n ; ANY-LABEL: @extelt_select_const_operand_extractelt_use(\n-; ANY-NEXT:    [[E:%.*]] = select i1 [[C:%.*]], i32 4, i32 7\n-; ANY-NEXT:    [[M:%.*]] = shl nuw nsw i32 [[E]], 1\n-; ANY-NEXT:    [[M_2:%.*]] = shl nuw nsw i32 [[E]], 2\n-; ANY-NEXT:    [[R:%.*]] = mul nuw nsw i32 [[M]], [[M_2]]\n+; ANY-NEXT:    [[R:%.*]] = select i1 [[C:%.*]], i32 128, i32 392\n ; ANY-NEXT:    ret i32 [[R]]\n ;\n   %s = select i1 %c, <3 x i32> <i32 2, i32 3, i32 4>, <3 x i32> <i32 5, i32 6, i32 7>\ndiff --git a/llvm/test/Transforms/InstCombine/fold-multi-use-select-packed-constants.ll b/llvm/test/Transforms/InstCombine/fold-multi-use-select-packed-constants.ll\nnew file mode 100644\nindex 0000000000000..3256ad67b0768\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/fold-multi-use-select-packed-constants.ll\n@@ -0,0 +1,182 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+\n+target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n+target triple = \"x86_64-unknown-linux-gnu\"\n+\n+define noundef i32 @rust_155985(i32 noundef %n, i1 noundef zeroext %b) {\n+; CHECK-LABEL: @rust_155985(\n+; CHECK-NEXT:  start:\n+; CHECK-NEXT:    [[EQ:%.*]] = icmp eq i32 [[N:%.*]], 0\n+; CHECK-NEXT:    [[TMP0:%.*]] = select i1 [[EQ]], i32 1, i32 2\n+; CHECK-NEXT:    [[FINAL:%.*]] = select i1 [[B:%.*]], i32 0, i32 [[TMP0]]\n+; CHECK-NEXT:    ret i32 [[FINAL]]\n+;\n+start:\n+  %eq = icmp eq i32 %n, 0\n+  ; Err(X::_1) -> 0x00000001_00000001, Err(X::_2) -> 0x00000002_00000001\n+  %inner = select i1 %eq, i64 4294967297, i64 8589934593\n+  ; Ok(()) -> 0\n+  %outer = select i1 %b, i64 0, i64 %inner\n+  %tag = trunc i64 %outer to i1\n+  %shift = lshr i64 %outer, 32\n+  %payload = trunc i64 %shift to i32\n+  %final = select i1 %tag, i32 %payload, i32 0\n+  ret i32 %final\n+}\n+\n+define i32 @lshr_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n+; CHECK-LABEL: @lshr_through_multi_use_nested_select(\n+; CHECK-NEXT:    [[INNER:%.*]] = select i1 [[C1:%.*]], i64 4294967297, i64 8589934593\n+; CHECK-NEXT:    [[OUTER:%.*]] = select i1 [[C2:%.*]], i64 0, i64 [[INNER]]\n+; CHECK-NEXT:    store i64 [[OUTER]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[C1]], i32 1, i32 2\n+; CHECK-NEXT:    [[T:%.*]] = select i1 [[C2]], i32 0, i32 [[TMP1]]\n+; CHECK-NEXT:    ret i32 [[T]]\n+;\n+  %inner = select i1 %c1, i64 4294967297, i64 8589934593\n+  %outer = select i1 %c2, i64 0, i64 %inner\n+  store i64 %outer, ptr %sink\n+  %s = lshr i64 %outer, 32\n+  %t = trunc i64 %s to i32\n+  ret i32 %t\n+}\n+\n+define i64 @and_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n+; CHECK-LABEL: @and_through_multi_use_nested_select(\n+; CHECK-NEXT:    [[INNER:%.*]] = select i1 [[C1:%.*]], i64 4294967297, i64 8589934595\n+; CHECK-NEXT:    [[OUTER:%.*]] = select i1 [[C2:%.*]], i64 0, i64 [[INNER]]\n+; CHECK-NEXT:    store i64 [[OUTER]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[C1]], i64 1, i64 3\n+; CHECK-NEXT:    [[M:%.*]] = select i1 [[C2]], i64 0, i64 [[TMP1]]\n+; CHECK-NEXT:    ret i64 [[M]]\n+;\n+  %inner = select i1 %c1, i64 4294967297, i64 8589934595\n+  %outer = select i1 %c2, i64 0, i64 %inner\n+  store i64 %outer, ptr %sink\n+  %m = and i64 %outer, 4294967295\n+  ret i64 %m\n+}\n+\n+define i64 @or_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n+; CHECK-LABEL: @or_through_multi_use_nested_select(\n+; CHECK-NEXT:    [[INNER:%.*]] = select i1 [[C1:%.*]], i64 10, i64 20\n+; CHECK-NEXT:    [[OUTER:%.*]] = select i1 [[C2:%.*]], i64 0, i64 [[INNER]]\n+; CHECK-NEXT:    store i64 [[OUTER]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[C1]], i64 11, i64 23\n+; CHECK-NEXT:    [[M:%.*]] = select i1 [[C2]], i64 3, i64 [[TMP1]]\n+; CHECK-NEXT:    ret i64 [[M]]\n+;\n+  %inner = select i1 %c1, i64 10, i64 20\n+  %outer = select i1 %c2, i64 0, i64 %inner\n+  store i64 %outer, ptr %sink\n+  %m = or i64 %outer, 3\n+  ret i64 %m\n+}\n+\n+define i64 @add_through_multi_use_nested_select(i1 %c1, i1 %c2, ptr %sink) {\n+; CHECK-LABEL: @add_through_multi_use_nested_select(\n+; CHECK-NEXT:    [[INNER:%.*]] = select i1 [[C1:%.*]], i64 100, i64 200\n+; CHECK-NEXT:    [[OUTER:%.*]] = select i1 [[C2:%.*]], i64 0, i64 [[INNER]]\n+; CHECK-NEXT:    store i64 [[OUTER]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[C1]], i64 142, i64 242\n+; CHECK-NEXT:    [[M:%.*]] = select i1 [[C2]], i64 42, i64 [[TMP1]]\n+; CHECK-NEXT:    ret i64 [[M]]\n+;\n+  %inner = select i1 %c1, i64 100, i64 200\n+  %outer = select i1 %c2, i64 0, i64 %inner\n+  store i64 %outer, ptr %sink\n+  %m = add i64 %outer, 42\n+  ret i64 %m\n+}\n+\n+define i32 @lshr_const_on_true_arm(i1 %c1, i1 %c2, ptr %sink) {\n+; CHECK-LABEL: @lshr_const_on_true_arm(\n+; CHECK-NEXT:    [[INNER:%.*]] = select i1 [[C1:%.*]], i64 4294967297, i64 8589934593\n+; CHECK-NEXT:    [[OUTER:%.*]] = select i1 [[C2:%.*]], i64 [[INNER]], i64 0\n+; CHECK-NEXT:    store i64 [[OUTER]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[C1]], i32 1, i32 2\n+; CHECK-NEXT:    [[T:%.*]] = select i1 [[C2]], i32 [[TMP1]], i32 0\n+; CHECK-NEXT:    ret i32 [[T]]\n+;\n+  %inner = select i1 %c1, i64 4294967297, i64 8589934593\n+  %outer = select i1 %c2, i64 %inner, i64 0\n+  store i64 %outer, ptr %sink\n+  %s = lshr i64 %outer, 32\n+  %t = trunc i64 %s to i32\n+  ret i32 %t\n+}\n+\n+define i64 @binop_both_arms_constant_multi_use(i1 %c, ptr %sink) {\n+; CHECK-LABEL: @binop_both_arms_constant_multi_use(\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[C:%.*]], i64 100, i64 200\n+; CHECK-NEXT:    store i64 [[SEL]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[M:%.*]] = select i1 [[C]], i64 105, i64 205\n+; CHECK-NEXT:    ret i64 [[M]]\n+;\n+  %sel = select i1 %c, i64 100, i64 200\n+  store i64 %sel, ptr %sink\n+  %m = add i64 %sel, 5\n+  ret i64 %m\n+}\n+\n+define i64 @nested3_select(i1 %c1, i1 %c2, i1 %c3, ptr %sink) {\n+; CHECK-LABEL: @nested3_select(\n+; CHECK-NEXT:    [[S1:%.*]] = select i1 [[C1:%.*]], i64 10, i64 20\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[C3:%.*]], i1 true, i1 [[C2:%.*]]\n+; CHECK-NEXT:    [[S3:%.*]] = select i1 [[TMP1]], i64 0, i64 [[S1]]\n+; CHECK-NEXT:    store i64 [[S3]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    ret i64 [[S3]]\n+;\n+  %s1 = select i1 %c1, i64 10, i64 20\n+  %s2 = select i1 %c2, i64 0, i64 %s1\n+  %s3 = select i1 %c3, i64 0, i64 %s2\n+  store i64 %s3, ptr %sink\n+  %m = and i64 %s3, 255\n+  ret i64 %m\n+}\n+\n+; Negative: binop other operand is not a constant\n+define i64 @neg_binop_other_operand_not_const(i1 %c1, i1 %c2, i64 %x, ptr %sink) {\n+; CHECK-LABEL: @neg_binop_other_operand_not_const(\n+; CHECK-NEXT:    [[INNER:%.*]] = select i1 [[C1:%.*]], i64 100, i64 200\n+; CHECK-NEXT:    [[OUTER:%.*]] = select i1 [[C2:%.*]], i64 0, i64 [[INNER]]\n+; CHECK-NEXT:    store i64 [[OUTER]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[M:%.*]] = add i64 [[OUTER]], [[X:%.*]]\n+; CHECK-NEXT:    ret i64 [[M]]\n+;\n+  %inner = select i1 %c1, i64 100, i64 200\n+  %outer = select i1 %c2, i64 0, i64 %inner\n+  store i64 %outer, ptr %sink\n+  %m = add i64 %outer, %x\n+  ret i64 %m\n+}\n+\n+; Negative: neither arm of the multi-use select is a constant\n+define i64 @neg_no_const_arm(i1 %c, i64 %x, i64 %y, ptr %sink) {\n+; CHECK-LABEL: @neg_no_const_arm(\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[C:%.*]], i64 [[X:%.*]], i64 [[Y:%.*]]\n+; CHECK-NEXT:    store i64 [[SEL]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[M:%.*]] = add i64 [[SEL]], 42\n+; CHECK-NEXT:    ret i64 [[M]]\n+;\n+  %sel = select i1 %c, i64 %x, i64 %y\n+  store i64 %sel, ptr %sink\n+  %m = add i64 %sel, 42\n+  ret i64 %m\n+}\n+\n+; Negative: variable arm of outer select is not a const-select\n+define i64 @neg_variable_arm_not_select(i1 %c, i64 %x, ptr %sink) {\n+; CHECK-LABEL: @neg_variable_arm_not_select(\n+; CHECK-NEXT:    [[OUTER:%.*]] = select i1 [[C:%.*]], i64 0, i64 [[X:%.*]]\n+; CHECK-NEXT:    store i64 [[OUTER]], ptr [[SINK:%.*]], align 8\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i64 [[X]], 42\n+; CHECK-NEXT:    [[M:%.*]] = select i1 [[C]], i64 42, i64 [[TMP1]]\n+; CHECK-NEXT:    ret i64 [[M]]\n+;\n+  %outer = select i1 %c, i64 0, i64 %x\n+  store i64 %outer, ptr %sink\n+  %m = add i64 %outer, 42\n+  ret i64 %m\n+}\ndiff --git a/llvm/test/Transforms/InstCombine/pr63791.ll b/llvm/test/Transforms/InstCombine/pr63791.ll\nindex 73a559f989261..6f1fb02fb12cb 100644\n--- a/llvm/test/Transforms/InstCombine/pr63791.ll\n+++ b/llvm/test/Transforms/InstCombine/pr63791.ll\n@@ -17,7 +17,7 @@ define void @y() {\n ; CHECK:       for.cond5.preheader.i:\n ; CHECK-NEXT:    br i1 true, label [[FOR_COND1_LOOPEXIT_I:%.*]], label [[FOR_INC19_I:%.*]]\n ; CHECK:       for.inc19.i:\n-; CHECK-NEXT:    br i1 poison, label [[FOR_INC19_I]], label [[FOR_COND1_LOOPEXIT_I]]\n+; CHECK-NEXT:    br i1 false, label [[FOR_INC19_I]], label [[FOR_COND1_LOOPEXIT_I]]\n ;\n entry:\n   br label %for.cond.i\ndiff --git a/llvm/test/Transforms/InstCombine/pr72433.ll b/llvm/test/Transforms/InstCombine/pr72433.ll\nindex c6e74582a13d3..b5eafb7fed86f 100644\n--- a/llvm/test/Transforms/InstCombine/pr72433.ll\n+++ b/llvm/test/Transforms/InstCombine/pr72433.ll\n@@ -5,13 +5,8 @@ define i32 @widget(i32 %arg, i32 %arg1) {\n ; CHECK-LABEL: define i32 @widget(\n ; CHECK-SAME: i32 [[ARG:%.*]], i32 [[ARG1:%.*]]) {\n ; CHECK-NEXT:  bb:\n-; CHECK-NEXT:    [[ICMP:%.*]] = icmp ne i32 [[ARG]], 0\n-; CHECK-NEXT:    [[TMP0:%.*]] = zext i1 [[ICMP]] to i32\n-; CHECK-NEXT:    [[MUL:%.*]] = shl nuw nsw i32 20, [[TMP0]]\n-; CHECK-NEXT:    [[XOR:%.*]] = zext i1 [[ICMP]] to i32\n-; CHECK-NEXT:    [[ADD9:%.*]] = or disjoint i32 [[MUL]], [[XOR]]\n-; CHECK-NEXT:    [[TMP1:%.*]] = zext i1 [[ICMP]] to i32\n-; CHECK-NEXT:    [[MUL2:%.*]] = shl nuw nsw i32 [[ADD9]], [[TMP1]]\n+; CHECK-NEXT:    [[ICMP_NOT:%.*]] = icmp eq i32 [[ARG]], 0\n+; CHECK-NEXT:    [[MUL2:%.*]] = select i1 [[ICMP_NOT]], i32 20, i32 82\n ; CHECK-NEXT:    ret i32 [[MUL2]]\n ;\n bb:\ndiff --git a/llvm/test/Transforms/InstCombine/pr80597.ll b/llvm/test/Transforms/InstCombine/pr80597.ll\nindex 148da056486f9..bf536b9ecd133 100644\n--- a/llvm/test/Transforms/InstCombine/pr80597.ll\n+++ b/llvm/test/Transforms/InstCombine/pr80597.ll\n@@ -5,14 +5,9 @@ define i64 @pr80597(i1 %cond) {\n ; CHECK-LABEL: define i64 @pr80597(\n ; CHECK-SAME: i1 [[COND:%.*]]) {\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[ADD:%.*]] = select i1 [[COND]], i64 0, i64 -12884901888\n-; CHECK-NEXT:    [[SEXT1:%.*]] = add nsw i64 [[ADD]], 8836839514384105472\n-; CHECK-NEXT:    [[CMP:%.*]] = icmp ult i64 [[SEXT1]], -34359738368\n-; CHECK-NEXT:    br i1 [[CMP]], label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n+; CHECK-NEXT:    br i1 true, label [[IF_THEN:%.*]], label [[IF_ELSE:%.*]]\n ; CHECK:       if.else:\n-; CHECK-NEXT:    [[SEXT2:%.*]] = ashr exact i64 [[ADD]], 1\n-; CHECK-NEXT:    [[ASHR:%.*]] = or disjoint i64 [[SEXT2]], 4418419761487020032\n-; CHECK-NEXT:    ret i64 [[ASHR]]\n+; CHECK-NEXT:    ret i64 poison\n ; CHECK:       if.then:\n ; CHECK-NEXT:    ret i64 0\n ;\ndiff --git a/llvm/test/Transforms/InstCombine/shift.ll b/llvm/test/Transforms/InstCombine/shift.ll\nindex 3a9e756bafc36..f9be88a5b2f93 100644\n--- a/llvm/test/Transforms/InstCombine/shift.ll\n+++ b/llvm/test/Transforms/InstCombine/shift.ll\n@@ -1779,11 +1779,11 @@ define void @ashr_out_of_range_1(ptr %A) {\n ; CHECK-NEXT:    [[L_FROZEN:%.*]] = freeze i177 [[L]]\n ; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i177 [[L_FROZEN]], -1\n ; CHECK-NEXT:    [[TMP2:%.*]] = trunc i177 [[L_FROZEN]] to i64\n-; CHECK-NEXT:    [[TMP3:%.*]] = select i1 [[TMP1]], i64 0, i64 [[TMP2]]\n+; CHECK-NEXT:    [[TMP7:%.*]] = add i64 [[TMP2]], -1\n+; CHECK-NEXT:    [[TMP3:%.*]] = select i1 [[TMP1]], i64 -1, i64 [[TMP7]]\n ; CHECK-NEXT:    [[TMP4:%.*]] = getelementptr [24 x i8], ptr [[A]], i64 [[TMP3]]\n-; CHECK-NEXT:    [[G11:%.*]] = getelementptr i8, ptr [[TMP4]], i64 -24\n ; CHECK-NEXT:    [[TMP5:%.*]] = sext i1 [[TMP1]] to i64\n-; CHECK-NEXT:    [[G62:%.*]] = getelementptr [24 x i8], ptr [[G11]], i64 [[TMP5]]\n+; CHECK-NEXT:    [[G62:%.*]] = getelementptr [24 x i8], ptr [[TMP4]], i64 [[TMP5]]\n ; CHECK-NEXT:    [[TMP6:%.*]] = icmp eq i177 [[L_FROZEN]], -1\n ; CHECK-NEXT:    [[B28:%.*]] = select i1 [[TMP6]], i177 0, i177 [[L_FROZEN]]\n ; CHECK-NEXT:    store i177 [[B28]], ptr [[G62]], align 4\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-08T17:05:28Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        2309,
+        2316
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/binop-select.ll": [
+      [
+        274,
+        280
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/extractelement.ll": [
+      [
+        799,
+        808
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/pr63791.ll": [
+      [
+        17,
+        23
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/pr72433.ll": [
+      [
+        5,
+        17
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/pr80597.ll": [
+      [
+        5,
+        18
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/shift.ll": [
+      [
+        1779,
+        1789
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "InstCombinerImpl::foldBinOpIntoSelectOrPhi"
+    ],
+    "llvm/test/Transforms/InstCombine/pr63791.ll": [
+      "y"
+    ]
+  }
+}
