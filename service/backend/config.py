@@ -11,9 +11,7 @@ class ServiceConfig:
     self.runs_dir = self.data_dir / "runs"
     self.state_file = self.data_dir / "state.json"
 
-    self.model = os.environ.get(
-      "ARCHER_MODEL", "google/gemini-3.1-pro-preview-customtools"
-    )
+    self.model = os.environ.get("ARCHER_MODEL", "packyai-gpt-5.5")
     self.driver = os.environ.get("ARCHER_DRIVER", "openai")
     self.executor = os.environ.get("ARCHER_EXECUTOR", "local").strip().lower()
     self.scan_interval_sec = int(os.environ.get("ARCHER_SCAN_INTERVAL_SEC", "300"))
