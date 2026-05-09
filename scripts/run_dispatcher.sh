@@ -13,7 +13,6 @@ fi
 export ARCHER_EXECUTOR="${ARCHER_EXECUTOR:-github-actions}"
 export ARCHER_SERVICE_HOST="${ARCHER_SERVICE_HOST:-0.0.0.0}"
 export ARCHER_SERVICE_PORT="${ARCHER_SERVICE_PORT:-8080}"
-export ARCHER_CORS_ORIGINS="${ARCHER_CORS_ORIGINS:-*}"
 
 export ARCHER_ACTIONS_REPO="${ARCHER_ACTIONS_REPO:-cuhk-s3/Archer}"
 export ARCHER_ACTIONS_WORKFLOW="${ARCHER_ACTIONS_WORKFLOW:-archer-review-dispatch.yml}"
@@ -24,7 +23,21 @@ export ARCHER_DRIVER="${ARCHER_DRIVER:-openai}"
 
 export FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 export FRONTEND_PORT="${FRONTEND_PORT:-8090}"
-export BACKEND_BASE_URL="${BACKEND_BASE_URL:-http://127.0.0.1:${ARCHER_SERVICE_PORT}}"
+
+# Set domain (default to archer.top)
+export ARCHER_DOMAIN="${ARCHER_DOMAIN:-archer.top}"
+
+# Auto-configure domain-based variables
+if [[ -n "${ARCHER_DOMAIN}" ]]; then
+  # Use domain with Nginx reverse proxy
+  export BACKEND_BASE_URL="https://${ARCHER_DOMAIN}"
+  export ARCHER_CORS_ORIGINS="https://${ARCHER_DOMAIN}"
+  echo "Domain config: ${ARCHER_DOMAIN}"
+else
+  # Local development mode
+  export BACKEND_BASE_URL="http://127.0.0.1:${ARCHER_SERVICE_PORT}"
+  export ARCHER_CORS_ORIGINS="*"
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Error: python3 is required to serve dispatcher frontend static files." >&2

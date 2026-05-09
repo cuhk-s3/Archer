@@ -20,6 +20,37 @@ service = ArcherService(config)
 
 app = FastAPI()
 
+
+def _resolve_run_file(run_id: str, file_path: str) -> Path:
+  runs_path = config.runs_dir / run_id
+  if not runs_path.exists() or not runs_path.is_dir():
+    raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+  target_name = Path(file_path).name
+  candidates: list[Path] = []
+
+  # Support both layouts:
+  # 1) runs/<run_id>/<subdir>/<file>
+  # 2) runs/<run_id>/<file>
+  direct = (runs_path / file_path).resolve()
+  candidates.append(direct)
+
+  for child in runs_path.iterdir():
+    if child.is_dir():
+      candidates.append((child / file_path).resolve())
+      if file_path == target_name:
+        candidates.append((child / target_name).resolve())
+
+  allowed_root = config.data_dir.resolve()
+  for target in candidates:
+    if (
+      str(target).startswith(str(allowed_root)) and target.exists() and target.is_file()
+    ):
+      return target
+
+  raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+
+
 app.add_middleware(
   CORSMiddleware,
   allow_origins=config.cors_origins,
@@ -110,3 +141,34 @@ def artifact_viewer(path: str) -> str:
   if not target.exists():
     raise HTTPException(status_code=404, detail="Not found")
   return render_artifact_viewer(target)
+
+
+@app.get("/artifact/", response_class=HTMLResponse, include_in_schema=False)
+def artifact_viewer_slash(path: str) -> str:
+  return artifact_viewer(path)
+
+
+@app.get("/artifact/run/{run_id}/{file_path:path}", response_class=HTMLResponse)
+def artifact_viewer_path(run_id: str, file_path: str) -> str:
+  target = _resolve_run_file(run_id, file_path)
+  return render_artifact_viewer(target)
+
+
+@app.get(
+  "/artifact/run/{run_id}/{file_path:path}/",
+  response_class=HTMLResponse,
+  include_in_schema=False,
+)
+def artifact_viewer_path_slash(run_id: str, file_path: str) -> str:
+  return artifact_viewer_path(run_id, file_path)
+
+
+@app.get("/api/artifacts/run/{run_id}/{file_path:path}")
+def api_artifact_path(run_id: str, file_path: str):
+  target = _resolve_run_file(run_id, file_path)
+  return PlainTextResponse(target.read_text())
+
+
+@app.get("/api/artifacts/run/{run_id}/{file_path:path}/", include_in_schema=False)
+def api_artifact_path_slash(run_id: str, file_path: str):
+  return api_artifact_path(run_id, file_path)
