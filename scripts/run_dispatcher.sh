@@ -38,7 +38,15 @@ EOF
 echo "Frontend runtime config written: ${FRONTEND_DIR}/runtime-config.js"
 
 echo "Starting dispatcher backend on ${ARCHER_SERVICE_HOST}:${ARCHER_SERVICE_PORT}"
-bash "${ROOT_DIR}/scripts/run_service.sh" &
+if [[ -x "${ROOT_DIR}/deps/py3_venv/bin/python" ]]; then
+  BACKEND_PYTHON="${ROOT_DIR}/deps/py3_venv/bin/python"
+else
+  BACKEND_PYTHON="${PYTHON_BIN:-python3}"
+fi
+
+"${BACKEND_PYTHON}" -m uvicorn service.backend.app:app \
+  --host "${ARCHER_SERVICE_HOST}" \
+  --port "${ARCHER_SERVICE_PORT}" &
 BACKEND_PID=$!
 
 cleanup() {
