@@ -109,10 +109,12 @@ class ArcherService:
     self.stop_flag = False
     self.worker_thread: Optional[threading.Thread] = None
     self.scanner_thread: Optional[threading.Thread] = None
+    self.remote_thread: Optional[threading.Thread] = None
     self._last_scan_at: Optional[str] = None
     self._load_state()
 
   def _load_state(self) -> None:
+    queued_jobs: List[str] = []
     if self.config.state_file.exists():
       with open(self.config.state_file) as f:
         state = json.load(f)
@@ -120,6 +122,7 @@ class ArcherService:
         j = Job(
           id=job_data["id"],
           pr_id=job_data["pr_id"],
+          executor=job_data.get("executor", "local"),
           status=job_data.get("status", "queued"),
           phase=job_data.get("phase", "queued"),
           error=job_data.get("error"),
@@ -135,16 +138,31 @@ class ArcherService:
           title=job_data.get("title", ""),
           author=job_data.get("author", ""),
           components=job_data.get("components", []),
+          remote_run_id=job_data.get("remote_run_id"),
+          remote_run_url=job_data.get("remote_run_url"),
+          remote_run_status=job_data.get("remote_run_status"),
+          remote_run_conclusion=job_data.get("remote_run_conclusion"),
         )
         if not j.components:
           pr_info = self._get_pr_info(j.pr_id)
           if isinstance(pr_info, dict):
             j.components = pr_info.get("components", []) or []
         if j.status == "running":
-          j.status = "failed"
-          j.error = "Service interrupted"
+          if j.executor == "github-actions":
+            j.status = "running"
+            j.phase = j.remote_run_status or "running"
+          else:
+            j.status = "failed"
+            j.error = "Service interrupted"
+        if j.status == "queued":
+          queued_jobs.append(j.id)
         self.jobs[j.id] = j
         self.jobs_by_pr[j.pr_id] = j.id
+      for job_id in queued_jobs:
+        try:
+          self.queue.put(job_id, block=False)
+        except queue.Full:
+          break
       self._save_state()
 
   def _save_state(self) -> None:
@@ -178,6 +196,7 @@ class ArcherService:
       job = Job(
         id=job_id,
         pr_id=pr_id,
+        executor=self.config.executor,
         status="queued",
         created_at=utc_now_iso(),
         updated_at=utc_now_iso(),
@@ -281,6 +300,157 @@ class ArcherService:
       page += 1
     return files
 
+  def _actions_api_path(self, suffix: str) -> str:
+    return (
+      f"https://api.github.com/repos/{self.config.actions_repo}/{suffix.lstrip('/')}"
+    )
+
+  def _match_remote_run(self, run: dict, job: Job) -> bool:
+    if not isinstance(run, dict):
+      return False
+    haystack = " ".join(
+      str(run.get(key, "")) for key in ["display_title", "name", "path"]
+    ).lower()
+    return job.id.lower() in haystack
+
+  def _find_remote_run(self, session: requests.Session, job: Job) -> Optional[dict]:
+    response = session.get(
+      self._actions_api_path(f"actions/workflows/{self.config.actions_workflow}/runs"),
+      params={
+        "event": "workflow_dispatch",
+        "per_page": 30,
+      },
+      timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    runs = payload.get("workflow_runs", []) if isinstance(payload, dict) else []
+    for run in runs:
+      if self._match_remote_run(run, job):
+        return run
+    return None
+
+  def _wait_for_remote_run(
+    self, session: requests.Session, job: Job, timeout_sec: int = 90
+  ) -> Optional[dict]:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+      run = self._find_remote_run(session, job)
+      if run:
+        return run
+      time.sleep(3)
+    return None
+
+  def _apply_remote_run_state(self, job: Job, run: dict) -> None:
+    run_id = run.get("id")
+    job.remote_run_id = int(run_id) if run_id is not None else None
+    job.remote_run_url = str(run.get("html_url") or "") or None
+    job.remote_run_status = str(run.get("status") or "") or None
+    job.remote_run_conclusion = str(run.get("conclusion") or "") or None
+
+    if job.remote_run_status == "completed":
+      if job.remote_run_conclusion == "success":
+        job.status = "succeeded"
+        job.phase = "done"
+      else:
+        job.status = "failed"
+        job.phase = job.remote_run_conclusion or "failed"
+        if not job.error and job.remote_run_conclusion:
+          job.error = f"GitHub Actions concluded with {job.remote_run_conclusion}"
+      job.finished_at = utc_now_iso()
+    elif job.remote_run_status:
+      if job.remote_run_status in {"queued", "requested", "waiting", "pending"}:
+        job.status = "queued"
+      else:
+        job.status = "running"
+      job.phase = job.remote_run_status
+    job.updated_at = utc_now_iso()
+
+  def _dispatch_job_via_github_actions(self, job: Job) -> None:
+    if not self.config.github_token:
+      job.status = "failed"
+      job.phase = "failed"
+      job.error = "Missing GitHub token for Actions dispatch"
+      job.updated_at = utc_now_iso()
+      self._save_state()
+      return
+
+    job.status = "running"
+    job.phase = "dispatching"
+    job.started_at = utc_now_iso()
+    job.updated_at = utc_now_iso()
+    self._save_state()
+
+    session = self._github_session()
+    try:
+      response = session.post(
+        self._actions_api_path(
+          f"actions/workflows/{self.config.actions_workflow}/dispatches"
+        ),
+        json={
+          "ref": self.config.actions_ref,
+          "inputs": {
+            "service_job_id": job.id,
+            "pr_id": str(job.pr_id),
+            "model": self.config.model,
+            "driver": self.config.driver,
+            "archer_ref": self.config.actions_ref,
+          },
+        },
+        timeout=30,
+      )
+      response.raise_for_status()
+      run = self._wait_for_remote_run(session, job)
+      if run:
+        self._apply_remote_run_state(job, run)
+      else:
+        job.status = "queued"
+        job.phase = "dispatched"
+        job.updated_at = utc_now_iso()
+      self._save_state()
+    except Exception as e:
+      job.status = "failed"
+      job.phase = "failed"
+      job.error = str(e)
+      job.finished_at = utc_now_iso()
+      job.updated_at = utc_now_iso()
+      self._save_state()
+    finally:
+      session.close()
+
+  def _sync_remote_job(self, session: requests.Session, job: Job) -> None:
+    if job.remote_run_id is None:
+      run = self._find_remote_run(session, job)
+      if run:
+        self._apply_remote_run_state(job, run)
+        self._save_state()
+      return
+
+    response = session.get(
+      self._actions_api_path(f"actions/runs/{job.remote_run_id}"),
+      timeout=30,
+    )
+    response.raise_for_status()
+    run = response.json()
+    if isinstance(run, dict):
+      before = (
+        job.status,
+        job.phase,
+        job.error,
+        job.remote_run_status,
+        job.remote_run_conclusion,
+      )
+      self._apply_remote_run_state(job, run)
+      after = (
+        job.status,
+        job.phase,
+        job.error,
+        job.remote_run_status,
+        job.remote_run_conclusion,
+      )
+      if before != after:
+        self._save_state()
+
   def _enqueue_new_reviews(self) -> dict:
     if not self.config.github_token:
       return {"ok": False, "reason": "No GitHub token"}
@@ -339,7 +509,7 @@ class ArcherService:
       "last_scan_at": self._last_scan_at,
     }
 
-  def _run_job(self, job: Job) -> None:
+  def _run_job_local(self, job: Job) -> None:
     job.status = "running"
     job.started_at = utc_now_iso()
     job.updated_at = utc_now_iso()
@@ -440,6 +610,12 @@ class ArcherService:
     job.updated_at = utc_now_iso()
     self._save_state()
 
+  def _run_job(self, job: Job) -> None:
+    if job.executor == "github-actions":
+      self._dispatch_job_via_github_actions(job)
+      return
+    self._run_job_local(job)
+
   def _worker(self) -> None:
     while not self.stop_flag:
       try:
@@ -468,6 +644,35 @@ class ArcherService:
           return
         time.sleep(1)
 
+  def _remote_status_poller(self) -> None:
+    while not self.stop_flag:
+      if self.config.executor != "github-actions":
+        time.sleep(1)
+        continue
+
+      jobs = [
+        job
+        for job in self.jobs.values()
+        if job.executor == "github-actions" and job.status in {"queued", "running"}
+      ]
+      if not jobs:
+        time.sleep(max(self.config.actions_poll_interval_sec, 1))
+        continue
+
+      session = self._github_session()
+      try:
+        for job in jobs:
+          self._sync_remote_job(session, job)
+      except Exception as e:
+        print(f"Remote poll error: {e}", file=sys.stderr)
+      finally:
+        session.close()
+
+      for _ in range(max(self.config.actions_poll_interval_sec, 1)):
+        if self.stop_flag:
+          return
+        time.sleep(1)
+
   def start(self) -> None:
     if self.worker_thread is None or not self.worker_thread.is_alive():
       self.worker_thread = threading.Thread(target=self._worker, daemon=True)
@@ -477,6 +682,13 @@ class ArcherService:
     ):
       self.scanner_thread = threading.Thread(target=self._scanner, daemon=True)
       self.scanner_thread.start()
+    if self.config.executor == "github-actions" and (
+      self.remote_thread is None or not self.remote_thread.is_alive()
+    ):
+      self.remote_thread = threading.Thread(
+        target=self._remote_status_poller, daemon=True
+      )
+      self.remote_thread.start()
 
   def stop(self) -> None:
     self.stop_flag = True

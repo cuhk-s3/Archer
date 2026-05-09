@@ -13,6 +13,7 @@ def utc_now_iso() -> str:
 class Job:
   id: str
   pr_id: int
+  executor: str = "local"
   status: str = "queued"
   phase: str = "queued"
   error: Optional[str] = None
@@ -28,6 +29,10 @@ class Job:
   title: str = ""
   author: str = ""
   components: List[str] = field(default_factory=list)
+  remote_run_id: Optional[int] = None
+  remote_run_url: Optional[str] = None
+  remote_run_status: Optional[str] = None
+  remote_run_conclusion: Optional[str] = None
 
   def append_log(self, line: str, max_logs: int = 400) -> None:
     self.logs.append(line)

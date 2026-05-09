@@ -15,6 +15,7 @@ class ServiceConfig:
       "ARCHER_MODEL", "google/gemini-3.1-pro-preview-customtools"
     )
     self.driver = os.environ.get("ARCHER_DRIVER", "openai")
+    self.executor = os.environ.get("ARCHER_EXECUTOR", "local").strip().lower()
     self.scan_interval_sec = int(os.environ.get("ARCHER_SCAN_INTERVAL_SEC", "300"))
     self.auto_scan = os.environ.get("ARCHER_AUTO_SCAN", "true").lower() == "true"
     self.include_draft = (
@@ -28,5 +29,18 @@ class ServiceConfig:
     self.github_token = os.environ.get("ARCHER_GITHUB_TOKEN") or os.environ.get(
       "LAB_GITHUB_TOKEN"
     )
+    self.actions_repo = os.environ.get("ARCHER_ACTIONS_REPO", "cuhk-s3/Archer")
+    self.actions_workflow = os.environ.get(
+      "ARCHER_ACTIONS_WORKFLOW", "archer-review-dispatch.yml"
+    )
+    self.actions_ref = os.environ.get("ARCHER_ACTIONS_REF", "main")
+    self.actions_poll_interval_sec = int(
+      os.environ.get("ARCHER_ACTIONS_POLL_INTERVAL_SEC", "20")
+    )
+
+    raw_cors_origins = os.environ.get("ARCHER_CORS_ORIGINS", "*")
+    self.cors_origins = [
+      item.strip() for item in raw_cors_origins.split(",") if item.strip()
+    ] or ["*"]
 
     self.runs_dir.mkdir(parents=True, exist_ok=True)

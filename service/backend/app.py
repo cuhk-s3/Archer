@@ -6,6 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from .config import ServiceConfig
@@ -18,6 +19,14 @@ config = ServiceConfig()
 service = ArcherService(config)
 
 app = FastAPI()
+
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=config.cors_origins,
+  allow_credentials=False,
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
 
 
 @app.on_event("startup")

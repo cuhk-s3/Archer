@@ -251,7 +251,9 @@ def build_dashboard_html() -> str:
           : (j.bug_found === false
             ? '<span class="bug-pill bug-no">none</span>'
             : '<span class="bug-pill bug-unknown">unknown</span>');
-        const reviewLink = j.review_path ? '<a href="/artifact?path=' + encodeURIComponent(j.review_path) + '" target="_blank">view</a>' : '—';
+        const reviewLink = j.review_path
+          ? '<a href="/artifact?path=' + encodeURIComponent(j.review_path) + '" target="_blank">view</a>'
+          : (j.remote_run_url ? '<a href="' + esc(j.remote_run_url) + '" target="_blank">run</a>' : '—');
         const historyLink = j.history_path ? '<a href="/artifact?path=' + encodeURIComponent(j.history_path) + '" target="_blank">view</a>' : '—';
         const dateStr = formatDate(j.updated_at);
         return '<tr><td>' + prCell + '</td><td class="state-col">' + stateCell + '</td><td>' + bugCell + '</td><td>' + reviewLink + '</td><td>' + historyLink + '</td><td><span class="date-chip">' + dateStr + '</span></td></tr>';
