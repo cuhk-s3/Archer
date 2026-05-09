@@ -40,16 +40,18 @@ def build_dashboard_html() -> str:
     .sub { margin-top: 8px; color: var(--sub); font-size: 13px; }
     .toolbar { padding: 8px 12px; }
     .query-wrap { width: 100%; overflow-x: auto; }
-    .query-row { display: grid; grid-template-columns: auto minmax(360px, 1fr); gap: 8px; align-items: center; min-width: 750px; }
-    .search-box { display: flex; align-items: center; border: 1px solid #e6eef7; border-radius: 0; background: #f7fbff; height: 34px; overflow: hidden; }
+    .query-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: center; min-width: 980px; }
+    .filter-stack { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; white-space: nowrap; }
+    .search-box { display: flex; align-items: center; border: 1px solid #e6eef7; border-radius: 0; background: #f7fbff; height: 34px; overflow: hidden; min-width: 240px; }
     .search-input { min-width: 0; width: 100%; border: none; height: 32px; padding: 0 10px; background: transparent; font-size: 14px; color: var(--ink); }
     .search-input:focus { outline: none; }
     .input-clear { border: none; border-left: 1px solid #e6eef7; background: #f7fbff; width: 34px; height: 100%; padding: 0; color: #5e7388; font-size: 16px; line-height: 1; cursor: pointer; }
     .input-clear:hover { background: #eef6ff; }
-    .status-tabs { display: inline-flex; border: 1px solid #e6eef7; border-radius: 0; overflow: hidden; background: #f7fbff; height: 34px; }
+    .status-tabs { display: inline-flex; border: 1px solid #e6eef7; border-radius: 0; overflow: hidden; background: #f7fbff; height: 34px; flex: 0 0 auto; }
     .status-tab { border: none; border-right: 1px solid #e6eef7; background: transparent; color: #4f667d; padding: 0 12px; font-size: 12px; font-weight: 600; height: 100%; cursor: pointer; }
     .status-tab:last-child { border-right: none; }
     .status-tab.active { background: #eaf3fd; color: #2c5071; }
+    #bugTabs .status-tab.active { background: #eaf3fd; color: #2c5071; }
     .status { color: var(--sub); min-height: 20px; font-size: 12px; padding: 4px 12px; }
     .table-wrap { overflow: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 750px; table-layout: fixed; }
@@ -105,12 +107,18 @@ def build_dashboard_html() -> str:
     <div class="toolbar">
       <div class="query-wrap">
         <div class="query-row">
-          <div id="statusTabs" class="status-tabs">
-            <button class="status-tab active" data-status="all">All</button>
-            <button class="status-tab" data-status="running">Running</button>
-            <button class="status-tab" data-status="queued">Queued</button>
-            <button class="status-tab" data-status="succeeded">Done</button>
-            <button class="status-tab" data-status="failed">Failed</button>
+          <div class="filter-stack">
+            <div id="statusTabs" class="status-tabs">
+              <button class="status-tab" data-status="running">Running</button>
+              <button class="status-tab" data-status="queued">Queued</button>
+              <button class="status-tab" data-status="succeeded">Done</button>
+              <button class="status-tab" data-status="failed">Failed</button>
+            </div>
+            <div id="bugTabs" class="status-tabs">
+              <button class="status-tab" data-bug="found">Found</button>
+              <button class="status-tab" data-bug="none">None</button>
+              <button class="status-tab" data-bug="unknown">Unknown</button>
+            </div>
           </div>
           <div class="search-box">
             <input id="searchInput" class="search-input" type="text" placeholder="Search PR, title, components..." />
@@ -147,7 +155,8 @@ def build_dashboard_html() -> str:
 
   <script>
     let allJobs = [];
-    let currentStatus = 'all';
+    let currentStatus = '';
+    let currentBug = '';
     let currentPage = 1;
     const ITEMS_PER_PAGE = 15;
     let currentFiltered = [];
@@ -176,11 +185,20 @@ def build_dashboard_html() -> str:
       return { label: 'unknown', cls: 'queued' };
     }
 
+    function matchesBugFilter(job) {
+      if (!currentBug) return true;
+      if (currentBug === 'found') return job.bug_found === true;
+      if (currentBug === 'none') return job.bug_found === false;
+      if (currentBug === 'unknown') return job.bug_found == null;
+      return true;
+    }
+
     function applyFilters(options = {}) {
       const resetPage = options.resetPage !== false;
       const query = (document.getElementById('searchInput').value || '').trim().toLowerCase();
       currentFiltered = allJobs.filter(j => {
-        if (currentStatus !== 'all' && (j.status || '') !== currentStatus) return false;
+        if (currentStatus && (j.status || '') !== currentStatus) return false;
+        if (!matchesBugFilter(j)) return false;
         if (!query) return true;
         const bugText = j.bug_found === true ? 'bug yes found' : (j.bug_found === false ? 'bug no not found' : 'bug unknown');
         const hay = [String(j.pr_id || ''), j.title || '', (j.components || []).join(' '), bugText].join(' ').toLowerCase();
@@ -197,8 +215,14 @@ def build_dashboard_html() -> str:
     }
 
     function setStatusFilter(status) {
-      currentStatus = status;
-      document.querySelectorAll('.status-tab').forEach(el => el.classList.toggle('active', el.dataset.status === status));
+      currentStatus = currentStatus === status ? '' : status;
+      document.querySelectorAll('#statusTabs .status-tab').forEach(el => el.classList.toggle('active', el.dataset.status === currentStatus));
+      applyFilters({ resetPage: true });
+    }
+
+    function setBugFilter(bug) {
+      currentBug = currentBug === bug ? '' : bug;
+      document.querySelectorAll('#bugTabs .status-tab').forEach(el => el.classList.toggle('active', el.dataset.bug === currentBug));
       applyFilters({ resetPage: true });
     }
 
@@ -253,11 +277,18 @@ def build_dashboard_html() -> str:
 
     document.getElementById('searchInput').addEventListener('input', () => applyFilters({ resetPage: true }));
     document.getElementById('statusTabs').addEventListener('click', ev => {
-      if (ev.target.classList.contains('status-tab')) setStatusFilter(ev.target.dataset.status || 'all');
+      if (ev.target.classList.contains('status-tab')) setStatusFilter(ev.target.dataset.status || '');
+    });
+    document.getElementById('bugTabs').addEventListener('click', ev => {
+      if (ev.target.classList.contains('status-tab')) setBugFilter(ev.target.dataset.bug || '');
     });
     document.getElementById('clearBtn').addEventListener('click', () => {
       document.getElementById('searchInput').value = '';
-      setStatusFilter('all');
+      currentStatus = '';
+      currentBug = '';
+      document.querySelectorAll('#statusTabs .status-tab').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('#bugTabs .status-tab').forEach(el => el.classList.remove('active'));
+      applyFilters({ resetPage: true });
       document.getElementById('searchInput').focus();
     });
     document.getElementById('firstBtn').addEventListener('click', () => {

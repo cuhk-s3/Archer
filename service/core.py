@@ -58,6 +58,42 @@ _SOURCE_PATH_PREFIXES: list[str] = [
 
 ALL_KEYWORDS: list[str] = _TEST_PATH_PREFIXES + _SOURCE_PATH_PREFIXES
 
+_EXCLUDED_TITLE_KEYWORDS: list[str] = [
+  "NFC",
+  "[DAG]",
+  "[GISEL]",
+  "GLOBALISEL",
+  "SELECTIONDAG",
+  "CODEGEN",
+]
+
+_EXCLUDED_FILE_SEGMENTS: list[str] = [
+  "/AsmParser/",
+  "/Bitcode/",
+  "/CodeGen/",
+  "/GlobalISel/",
+  "/SelectionDAG/",
+  "/Target/",
+]
+
+
+def is_excluded_pr_title(title: str) -> bool:
+  upper_title = title.upper()
+  return any(keyword in upper_title for keyword in _EXCLUDED_TITLE_KEYWORDS)
+
+
+def is_excluded_pr_file(pr_file_path: str) -> bool:
+  return any(segment in pr_file_path for segment in _EXCLUDED_FILE_SEGMENTS)
+
+
+def has_excluded_pr_label(label_names: List[str]) -> bool:
+  lowered = [label.lower() for label in label_names]
+  return (
+    any(label.startswith("backend:") for label in lowered)
+    or any(label.startswith("compiler-rt:") for label in lowered)
+    or any(label.startswith("pgo") for label in lowered)
+  )
+
 
 def is_relevant_pr_file(pr_file_path: str) -> bool:
   return any(pr_file_path.startswith(keyword) for keyword in ALL_KEYWORDS)
@@ -100,6 +136,10 @@ class ArcherService:
           author=job_data.get("author", ""),
           components=job_data.get("components", []),
         )
+        if not j.components:
+          pr_info = self._get_pr_info(j.pr_id)
+          if isinstance(pr_info, dict):
+            j.components = pr_info.get("components", []) or []
         if j.status == "running":
           j.status = "failed"
           j.error = "Service interrupted"
@@ -168,7 +208,14 @@ class ArcherService:
       return False
 
     title = str(pr_data.get("title", ""))
-    if "NFC" in title:
+    if is_excluded_pr_title(title):
+      return False
+
+    labels = pr_data.get("labels", [])
+    label_names = [
+      str(label.get("name", "")) for label in labels if isinstance(label, dict)
+    ]
+    if has_excluded_pr_label(label_names):
       return False
 
     base = pr_data.get("base")
@@ -176,6 +223,8 @@ class ArcherService:
       return False
 
     if not files:
+      return False
+    if any(is_excluded_pr_file(path) for path in files):
       return False
     return any(is_relevant_pr_file(path) for path in files)
 
