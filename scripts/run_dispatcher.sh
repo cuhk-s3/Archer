@@ -19,6 +19,8 @@ export ARCHER_ACTIONS_REPO="${ARCHER_ACTIONS_REPO:-cuhk-s3/Archer}"
 export ARCHER_ACTIONS_WORKFLOW="${ARCHER_ACTIONS_WORKFLOW:-archer-review-dispatch.yml}"
 export ARCHER_ACTIONS_REF="${ARCHER_ACTIONS_REF:-main}"
 export ARCHER_ACTIONS_POLL_INTERVAL_SEC="${ARCHER_ACTIONS_POLL_INTERVAL_SEC:-20}"
+export ARCHER_MODEL="${ARCHER_MODEL:-packyai-gpt-5.5}"
+export ARCHER_DRIVER="${ARCHER_DRIVER:-openai}"
 
 export FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 export FRONTEND_PORT="${FRONTEND_PORT:-8090}"
@@ -34,6 +36,7 @@ window.ARCHER_BACKEND_BASE_URL = "${BACKEND_BASE_URL}";
 EOF
 
 echo "Frontend runtime config written: ${FRONTEND_DIR}/runtime-config.js"
+echo "Dispatcher model=${ARCHER_MODEL}, driver=${ARCHER_DRIVER}, ref=${ARCHER_ACTIONS_REF}"
 
 echo "Starting dispatcher backend on ${ARCHER_SERVICE_HOST}:${ARCHER_SERVICE_PORT}"
 if [[ -x "${ROOT_DIR}/deps/py3_venv/bin/python" ]]; then
