@@ -369,11 +369,11 @@ class ArcherService:
       str(review_path),
     ]
 
-    env = dict(
+    env = {
       **subprocess.os.environ,
-      ARCHER_MODEL=self.config.model,
-      ARCHER_DRIVER=self.config.driver,
-    )
+      "ARCHER_MODEL": self.config.model,
+      "ARCHER_DRIVER": self.config.driver,
+    }
 
     try:
       with open(log_path, "w") as log_file:

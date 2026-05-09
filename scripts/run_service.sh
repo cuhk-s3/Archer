@@ -5,6 +5,8 @@ VENV_PYTHON="${ROOT_DIR}/deps/py3_venv/bin/python"
 
 cd "${ROOT_DIR}"
 
+export LLVM_AUTOREVIEW_DEPS_DIR=$PWD/deps
+
 if [[ -f "${ROOT_DIR}/scripts/upenv.sh" ]]; then
   # shellcheck disable=SC1091
   source "${ROOT_DIR}/scripts/upenv.sh"

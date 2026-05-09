@@ -33,11 +33,13 @@ def build_dashboard_html() -> str:
     }
     .shell { max-width: 900px; margin: 0 auto; }
     .brand-strip { height: 4px; background: linear-gradient(90deg, var(--brand-1), var(--brand-2)); border-radius: 0; margin-bottom: 8px; }
-    .head { padding: 10px 12px; display: flex; justify-content: space-between; align-items: flex-end; gap: 10px; }
+    .head { padding: 12px 12px 10px; display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; border-bottom: 1px solid var(--line); }
     .head-main { min-width: 0; }
-    .head-badge { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #35516c; background: #eef5fc; padding: 4px 8px; border-radius: 0; }
+    .head-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+    .head-link { color: #5b7086; font-size: 12px; font-weight: 500; line-height: 1.35; }
+    .head-link strong { color: #1f2d3d; font-weight: 700; margin-right: 4px; }
     .title { margin: 0; font-size: clamp(24px, 3vw, 36px); font-weight: 700; line-height: 1; }
-    .sub { margin-top: 8px; color: var(--sub); font-size: 13px; }
+    .sub { margin-top: 8px; color: var(--sub); font-size: 13px; max-width: 520px; }
     .toolbar { padding: 8px 12px; }
     .query-wrap { width: 100%; overflow-x: auto; }
     .query-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: center; min-width: 980px; }
@@ -90,7 +92,11 @@ def build_dashboard_html() -> str:
     .pr-link { color: #1750a6; font-size: 13px; font-weight: 700; display: inline; margin-right: 8px; }
     a { color: #1750a6; text-decoration: none; font-weight: 700; }
     a:hover { text-decoration: underline; }
-    @media (max-width: 750px) { .query-row { min-width: 750px; } }
+    @media (max-width: 750px) {
+      .head { align-items: flex-start; flex-direction: column; }
+      .head-side { align-items: flex-start; }
+      .query-row { min-width: 750px; }
+    }
   </style>
 </head>
 <body>
@@ -101,7 +107,10 @@ def build_dashboard_html() -> str:
         <h1 class="title">Archer Review Board</h1>
         <div class="sub">Live tracking for PR review progress.</div>
       </div>
-      <div class="head-badge">Archer</div>
+      <div class="head-side">
+        <a class="head-link" href="https://github.com/cuhk-s3/Archer" target="_blank" rel="noreferrer"><strong>GitHub:</strong> cuhk-s3/Archer</a>
+        <a class="head-link" href="https://cardigan1008.github.io" target="_blank" rel="noreferrer"><strong>Developed by:</strong> Yunbo Ni</a>
+      </div>
     </div>
 
     <div class="toolbar">
