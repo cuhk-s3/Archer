@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -366,6 +367,64 @@ class ArcherService:
       job.phase = job.remote_run_status
     job.updated_at = utc_now_iso()
 
+  def _download_remote_artifacts(
+    self, session: requests.Session, job: Job, run_id: int
+  ) -> bool:
+    """Download uploaded GitHub Actions artifacts and map local file paths."""
+    response = session.get(
+      self._actions_api_path(f"actions/runs/{run_id}/artifacts"),
+      timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    artifacts = payload.get("artifacts", []) if isinstance(payload, dict) else []
+    if not isinstance(artifacts, list) or not artifacts:
+      return False
+
+    run_dir = self.config.runs_dir / str(job.pr_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    extracted = False
+
+    for artifact in artifacts:
+      if not isinstance(artifact, dict):
+        continue
+      if artifact.get("expired"):
+        continue
+      archive_url = artifact.get("archive_download_url")
+      if not archive_url:
+        continue
+
+      artifact_name = str(artifact.get("name") or f"run-{run_id}")
+      zip_path = run_dir / f"{artifact_name}.zip"
+      extract_dir = run_dir / artifact_name
+      extract_dir.mkdir(parents=True, exist_ok=True)
+
+      download_resp = session.get(str(archive_url), timeout=120, stream=True)
+      download_resp.raise_for_status()
+      with open(zip_path, "wb") as f:
+        for chunk in download_resp.iter_content(chunk_size=8192):
+          if chunk:
+            f.write(chunk)
+
+      with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+      zip_path.unlink(missing_ok=True)
+      extracted = True
+
+    if not extracted:
+      return False
+
+    def pick_file(filename: str) -> Optional[str]:
+      candidates = sorted(run_dir.rglob(filename), key=lambda p: p.stat().st_mtime)
+      if not candidates:
+        return None
+      return str(candidates[-1])
+
+    job.stats_path = pick_file("run.stats.json")
+    job.history_path = pick_file("run.history.json")
+    job.review_path = pick_file("run.review.md")
+    return bool(job.stats_path or job.history_path or job.review_path)
+
   def _dispatch_job_via_github_actions(self, job: Job) -> None:
     if not self.config.github_token:
       job.status = "failed"
@@ -403,6 +462,11 @@ class ArcherService:
       run = self._wait_for_remote_run(session, job)
       if run:
         self._apply_remote_run_state(job, run)
+        if job.remote_run_id and job.remote_run_status == "completed":
+          try:
+            self._download_remote_artifacts(session, job, job.remote_run_id)
+          except Exception as e:
+            print(f"Artifact download error for {job.id}: {e}", file=sys.stderr)
       else:
         job.status = "queued"
         job.phase = "dispatched"
@@ -441,6 +505,15 @@ class ArcherService:
         job.remote_run_conclusion,
       )
       self._apply_remote_run_state(job, run)
+      if (
+        job.remote_run_id
+        and job.remote_run_status == "completed"
+        and not (job.stats_path or job.history_path or job.review_path)
+      ):
+        try:
+          self._download_remote_artifacts(session, job, job.remote_run_id)
+        except Exception as e:
+          print(f"Artifact sync download error for {job.id}: {e}", file=sys.stderr)
       after = (
         job.status,
         job.phase,
