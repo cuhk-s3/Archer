@@ -8,16 +8,73 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+_TEST_PATH_PREFIXES: list[str] = [
+  "llvm/test/Transforms/InstCombine",
+  "llvm/test/Transforms/InstSimplify",
+  "llvm/test/Analysis/ValueTracking",
+  "llvm/test/Transforms/ConstraintElimination",
+  "llvm/test/Transforms/EarlyCSE",
+  "llvm/test/Transforms/GVN",
+  "llvm/test/Transforms/NewGVN",
+  "llvm/test/Transforms/Reassociate",
+  "llvm/test/Transforms/SCCP",
+  "llvm/test/Transforms/CorrelatedValuePropagation",
+  "llvm/test/Transforms/SimplifyCFG",
+  "llvm/test/Transforms/VectorCombine",
+  "llvm/test/Transforms/AggressiveInstCombine",
+]
+
+_O3_PATH_PREFIXES: list[str] = [
+  "llvm/test/Transforms/PhaseOrdering",
+]
+
+_SOURCE_PATH_PREFIXES: list[str] = [
+  "llvm/lib/Transforms/InstCombine",
+  "llvm/lib/Analysis/InstructionSimplify",
+  "llvm/lib/Analysis/ValueTracking",
+  "llvm/lib/Analysis/ConstantFolding",
+  "llvm/lib/IR/ConstantFold",
+  "llvm/lib/IR/ConstantRange",
+  "llvm/lib/IR/ConstantFPRange",
+  "llvm/lib/Support/KnownBits",
+  "llvm/lib/Support/KnownFPClass",
+  "llvm/include/llvm/Analysis/InstructionSimplify.h",
+  "llvm/include/llvm/Analysis/ValueTracking.h",
+  "llvm/include/llvm/Analysis/ConstantFolding.h",
+  "llvm/include/llvm/Support/KnownBits.h",
+  "llvm/include/llvm/Support/KnownFPClass.h",
+  "llvm/lib/Transforms/ConstraintElimination",
+  "llvm/lib/Transforms/Scalar/EarlyCSE",
+  "llvm/lib/Transforms/Scalar/GVN",
+  "llvm/lib/Transforms/Scalar/NewGVN",
+  "llvm/lib/Transforms/Scalar/Reassociate",
+  "llvm/lib/Transforms/Scalar/SCCP",
+  "llvm/lib/Transforms/Scalar/CorrelatedValuePropagation",
+  "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
+  "llvm/lib/Transforms/Vectorize/VectorCombine",
+  "llvm/lib/Transforms/AggressiveInstCombine",
+]
+
+ALL_KEYWORDS: list[str] = (
+  _TEST_PATH_PREFIXES + _O3_PATH_PREFIXES + _SOURCE_PATH_PREFIXES
+)
+
+
+def is_relevant_pr_file(pr_file_path: str) -> bool:
+  return any(pr_file_path.startswith(keyword) for keyword in ALL_KEYWORDS)
 
 
 def utc_now_iso() -> str:
@@ -98,6 +155,9 @@ class ArcherService:
     self.queue: "queue.Queue[str]" = queue.Queue(maxsize=config.max_queue_size)
     self.lock = threading.Lock()
     self.stop_flag = False
+    self.worker_thread: Optional[threading.Thread] = None
+    self.scanner_thread: Optional[threading.Thread] = None
+    self._last_scan_at: Optional[str] = None
     self._load_state()
 
   def _load_state(self) -> None:
@@ -159,6 +219,147 @@ class ArcherService:
       self.queue.put(job_id, block=False)
       self._save_state()
       return job
+
+  def _github_session(self) -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+      {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "archer-review-service",
+      }
+    )
+    if self.config.github_token:
+      session.headers["Authorization"] = f"Bearer {self.config.github_token}"
+    return session
+
+  def _is_review_candidate(self, pr_data: dict, files: List[str]) -> bool:
+    if not isinstance(pr_data, dict):
+      return False
+    if pr_data.get("draft", False):
+      return False
+
+    title = str(pr_data.get("title", ""))
+    if "NFC" in title:
+      return False
+
+    base = pr_data.get("base")
+    if not (isinstance(base, dict) and base.get("ref") == "main"):
+      return False
+
+    if not files:
+      return False
+    return any(is_relevant_pr_file(path) for path in files)
+
+  def _fetch_open_pr_candidates(self) -> List[dict]:
+    session = self._github_session()
+    candidates: List[dict] = []
+    page = 1
+    while len(candidates) < self.config.open_pr_limit:
+      response = session.get(
+        f"https://api.github.com/repos/{self.config.github_repo}/pulls",
+        params={
+          "state": "open",
+          "sort": "updated",
+          "direction": "desc",
+          "per_page": 100,
+          "page": page,
+        },
+        timeout=30,
+      )
+      response.raise_for_status()
+      payload = response.json()
+      if not isinstance(payload, list) or not payload:
+        break
+      for item in payload:
+        if not isinstance(item, dict):
+          continue
+        candidates.append(item)
+        if len(candidates) >= self.config.open_pr_limit:
+          break
+      if len(payload) < 100:
+        break
+      page += 1
+    session.close()
+    return candidates
+
+  def _fetch_pull_files(self, session: requests.Session, pr_number: int) -> List[str]:
+    files: List[str] = []
+    page = 1
+    while True:
+      response = session.get(
+        f"https://api.github.com/repos/{self.config.github_repo}/pulls/{pr_number}/files",
+        params={"per_page": 100, "page": page},
+        timeout=30,
+      )
+      response.raise_for_status()
+      payload = response.json()
+      if not isinstance(payload, list) or not payload:
+        break
+      for item in payload:
+        if isinstance(item, dict) and item.get("filename"):
+          files.append(str(item["filename"]))
+      if len(payload) < 100:
+        break
+      page += 1
+    return files
+
+  def _enqueue_new_reviews(self) -> dict:
+    if not self.config.github_token:
+      return {"ok": False, "reason": "No GitHub token"}
+
+    session = self._github_session()
+    created = 0
+    skipped_existing = 0
+    skipped_filtered = 0
+    errors = 0
+    prs: List[dict] = []
+
+    try:
+      prs = self._fetch_open_pr_candidates()
+      for pr in prs:
+        pr_number = int(pr.get("number", 0))
+        if pr_number <= 0:
+          continue
+        with self.lock:
+          if pr_number in self.jobs_by_pr:
+            skipped_existing += 1
+            continue
+        try:
+          files = self._fetch_pull_files(session, pr_number)
+        except Exception:
+          errors += 1
+          continue
+        if not self._is_review_candidate(pr, files):
+          skipped_filtered += 1
+          continue
+        try:
+          job = self.enqueue_pr(pr_number, source="auto")
+        except queue.Full:
+          errors += 1
+          break
+        job.title = str(pr.get("title", ""))
+        user = pr.get("user")
+        job.author = str(user.get("login", "")) if isinstance(user, dict) else ""
+        job.components = []
+        job.updated_at = utc_now_iso()
+        self._save_state()
+        created += 1
+    except Exception as e:
+      return {"ok": False, "reason": str(e)}
+    finally:
+      session.close()
+
+    self._last_scan_at = utc_now_iso()
+    return {
+      "ok": True,
+      "scanned": len(prs),
+      "created": created,
+      "skipped_existing": skipped_existing,
+      "skipped_filtered": skipped_filtered,
+      "errors": errors,
+      "last_scan_at": self._last_scan_at,
+    }
 
   def _run_job(self, job: Job) -> None:
     job.status = "running"
@@ -246,18 +447,37 @@ class ArcherService:
       except Exception as e:
         print(f"Worker error: {e}", file=sys.stderr)
 
+  def _scanner(self) -> None:
+    while not self.stop_flag:
+      if self.config.auto_scan:
+        try:
+          result = self._enqueue_new_reviews()
+          if not result.get("ok"):
+            print(
+              f"Auto scan failed: {result.get('reason', 'failed')}", file=sys.stderr
+            )
+        except Exception as e:
+          print(f"Auto scan error: {e}", file=sys.stderr)
+      for _ in range(max(self.config.scan_interval_sec, 1)):
+        if self.stop_flag:
+          return
+        time.sleep(1)
+
   def start(self) -> None:
-    worker_thread = threading.Thread(target=self._worker, daemon=True)
-    worker_thread.start()
+    if self.worker_thread is None or not self.worker_thread.is_alive():
+      self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+      self.worker_thread.start()
+    if self.config.auto_scan and (
+      self.scanner_thread is None or not self.scanner_thread.is_alive()
+    ):
+      self.scanner_thread = threading.Thread(target=self._scanner, daemon=True)
+      self.scanner_thread.start()
 
   def stop(self) -> None:
     self.stop_flag = True
 
   def scan_open_prs(self) -> dict:
-    if not self.config.github_token:
-      return {"ok": False, "reason": "No GitHub token"}
-    # Placeholder for GitHub scanning
-    return {"ok": True, "scanned": 0}
+    return self._enqueue_new_reviews()
 
 
 def build_dashboard_html() -> str:
