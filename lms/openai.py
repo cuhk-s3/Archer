@@ -123,7 +123,7 @@ class OpenAIAgent(AgentBase):
         ),
       )
 
-      if completion.usage:
+      if not isinstance(completion, str) and completion.usage:
         self.chat_stats["input_tokens"] += completion.usage.prompt_tokens
         if completion.usage.prompt_tokens_details:
           self.chat_stats["cached_tokens"] += (
@@ -135,6 +135,15 @@ class OpenAIAgent(AgentBase):
         cost = getattr(completion.usage, "cost", None)
         if cost is not None:
           self.chat_stats["total_cost"] += cost
+
+      if isinstance(completion, str):
+        self.append_assistant_message(completion)
+        flag, content = response_handler(completion)
+        if flag:
+          self.append_user_message(content)
+          continue
+        else:
+          return content
 
       response = completion.choices[0].message
 
