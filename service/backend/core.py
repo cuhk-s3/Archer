@@ -425,6 +425,13 @@ class ArcherService:
     job.review_path = pick_file("run.review.md")
     return bool(job.stats_path or job.history_path or job.review_path)
 
+  def _needs_remote_artifact_sync(self, job: Job) -> bool:
+    return (
+      job.executor == "github-actions"
+      and job.remote_run_status == "completed"
+      and not (job.stats_path and job.history_path and job.review_path)
+    )
+
   def _dispatch_job_via_github_actions(self, job: Job) -> None:
     if not self.config.github_token:
       job.status = "failed"
@@ -464,7 +471,11 @@ class ArcherService:
         self._apply_remote_run_state(job, run)
         if job.remote_run_id and job.remote_run_status == "completed":
           try:
-            self._download_remote_artifacts(session, job, job.remote_run_id)
+            downloaded = self._download_remote_artifacts(
+              session, job, job.remote_run_id
+            )
+            if downloaded:
+              self._save_state()
           except Exception as e:
             print(f"Artifact download error for {job.id}: {e}", file=sys.stderr)
       else:
@@ -505,13 +516,14 @@ class ArcherService:
         job.remote_run_conclusion,
       )
       self._apply_remote_run_state(job, run)
+      downloaded = False
       if (
         job.remote_run_id
         and job.remote_run_status == "completed"
         and not (job.stats_path or job.history_path or job.review_path)
       ):
         try:
-          self._download_remote_artifacts(session, job, job.remote_run_id)
+          downloaded = self._download_remote_artifacts(session, job, job.remote_run_id)
         except Exception as e:
           print(f"Artifact sync download error for {job.id}: {e}", file=sys.stderr)
       after = (
@@ -521,7 +533,7 @@ class ArcherService:
         job.remote_run_status,
         job.remote_run_conclusion,
       )
-      if before != after:
+      if before != after or downloaded:
         self._save_state()
 
   def _enqueue_new_reviews(self) -> dict:
@@ -726,7 +738,10 @@ class ArcherService:
       jobs = [
         job
         for job in self.jobs.values()
-        if job.executor == "github-actions" and job.status in {"queued", "running"}
+        if job.executor == "github-actions"
+        and (
+          job.status in {"queued", "running"} or self._needs_remote_artifact_sync(job)
+        )
       ]
       if not jobs:
         time.sleep(max(self.config.actions_poll_interval_sec, 1))
