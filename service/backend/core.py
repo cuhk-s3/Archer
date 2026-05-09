@@ -156,7 +156,16 @@ class ArcherService:
             j.status = "failed"
             j.error = "Service interrupted"
         if j.status == "queued":
-          queued_jobs.append(j.id)
+          # For remote executor, "dispatched" jobs should be tracked by poller,
+          # not re-enqueued for a second workflow dispatch after restart.
+          if (
+            j.executor == "github-actions"
+            and j.phase in {"dispatching", "dispatched"}
+            and j.started_at
+          ):
+            pass
+          else:
+            queued_jobs.append(j.id)
         self.jobs[j.id] = j
         self.jobs_by_pr[j.pr_id] = j.id
       for job_id in queued_jobs:
@@ -193,7 +202,8 @@ class ArcherService:
       existing_id = self.jobs_by_pr.get(pr_id)
       if existing_id and not force:
         return self.jobs[existing_id]
-      job_id = f"{source}-{pr_id}"
+      ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+      job_id = f"{source}-{pr_id}-{ts}"
       job = Job(
         id=job_id,
         pr_id=pr_id,
@@ -312,23 +322,37 @@ class ArcherService:
     haystack = " ".join(
       str(run.get(key, "")) for key in ["display_title", "name", "path"]
     ).lower()
+    # Use exact service_job_id matching to avoid binding multiple jobs
+    # to the same workflow run when many runs exist.
     return job.id.lower() in haystack
 
   def _find_remote_run(self, session: requests.Session, job: Job) -> Optional[dict]:
-    response = session.get(
-      self._actions_api_path(f"actions/workflows/{self.config.actions_workflow}/runs"),
-      params={
-        "event": "workflow_dispatch",
-        "per_page": 30,
-      },
-      timeout=30,
+    workflow_path = self._actions_api_path(
+      f"actions/workflows/{self.config.actions_workflow}/runs"
     )
-    response.raise_for_status()
-    payload = response.json()
-    runs = payload.get("workflow_runs", []) if isinstance(payload, dict) else []
-    for run in runs:
-      if self._match_remote_run(run, job):
-        return run
+
+    for page in range(1, 6):
+      response = session.get(
+        workflow_path,
+        params={
+          "event": "workflow_dispatch",
+          "per_page": 100,
+          "page": page,
+        },
+        timeout=30,
+      )
+      response.raise_for_status()
+      payload = response.json()
+      runs = payload.get("workflow_runs", []) if isinstance(payload, dict) else []
+      if not isinstance(runs, list) or not runs:
+        break
+
+      for run in runs:
+        if self._match_remote_run(run, job):
+          return run
+
+      if len(runs) < 100:
+        break
     return None
 
   def _wait_for_remote_run(
@@ -432,6 +456,23 @@ class ArcherService:
       and not (job.stats_path and job.history_path and job.review_path)
     )
 
+  def _has_inflight_remote_job(self, exclude_job_id: Optional[str] = None) -> bool:
+    for j in self.jobs.values():
+      if j.executor != "github-actions":
+        continue
+      if exclude_job_id and j.id == exclude_job_id:
+        continue
+      if j.status == "running":
+        return True
+      if (
+        j.status == "queued"
+        and j.phase in {"dispatching", "dispatched"}
+        and j.started_at
+        and not j.finished_at
+      ):
+        return True
+    return False
+
   def _dispatch_job_via_github_actions(self, job: Job) -> None:
     if not self.config.github_token:
       job.status = "failed"
@@ -520,7 +561,7 @@ class ArcherService:
       if (
         job.remote_run_id
         and job.remote_run_status == "completed"
-        and not (job.stats_path or job.history_path or job.review_path)
+        and not (job.stats_path and job.history_path and job.review_path)
       ):
         try:
           downloaded = self._download_remote_artifacts(session, job, job.remote_run_id)
@@ -697,6 +738,15 @@ class ArcherService:
 
   def _run_job(self, job: Job) -> None:
     if job.executor == "github-actions":
+      while not self.stop_flag and self._has_inflight_remote_job(exclude_job_id=job.id):
+        if job.status != "queued" or job.phase != "waiting-slot":
+          job.status = "queued"
+          job.phase = "waiting-slot"
+          job.updated_at = utc_now_iso()
+          self._save_state()
+        time.sleep(2)
+      if self.stop_flag:
+        return
       self._dispatch_job_via_github_actions(job)
       return
     self._run_job_local(job)

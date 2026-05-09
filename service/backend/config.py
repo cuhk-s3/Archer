@@ -19,7 +19,7 @@ class ServiceConfig:
     self.include_draft = (
       os.environ.get("ARCHER_INCLUDE_DRAFT", "false").lower() == "true"
     )
-    self.open_pr_limit = int(os.environ.get("ARCHER_OPEN_PR_LIMIT", "20"))
+    self.open_pr_limit = int(os.environ.get("ARCHER_OPEN_PR_LIMIT", "50"))
     self.max_logs_per_job = int(os.environ.get("ARCHER_MAX_LOGS_PER_JOB", "400"))
     self.max_queue_size = int(os.environ.get("ARCHER_MAX_QUEUE_SIZE", "200"))
 
