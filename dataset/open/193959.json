@@ -1,0 +1,102 @@
+{
+  "pr_id": 193959,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/193959",
+  "state": "open",
+  "title": "[InstCombine] Fold umax/umin with NUW-shifted operand and constant",
+  "author": "ameliajochna",
+  "base_commit": "d3f4fc750db91378aaf6e2170ceea45af022f3e7",
+  "fix_commit": "18334f93bcdc99f47c49d0b651cbed2ac167c5c1",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex b414a7ed4fe66..5e2465a0f2b1f 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -1775,6 +1775,54 @@ static bool rightDistributesOverLeft(Instruction::BinaryOps LOp, bool HasNUW,\n   }\n }\n \n+/// Folds a min/max intrinsic when one operand is a NUW shift-by-constant.\n+///\n+/// Handles patterns like:\n+///   umax(x << K, C) --> umax(x, C >> K) << K\n+static Value *foldMinMaxWithShiftedOperand(IntrinsicInst *MinMax,\n+                                           InstCombiner::BuilderTy &Builder) {\n+  Intrinsic::ID IID = MinMax->getIntrinsicID();\n+  if (IID != Intrinsic::umax && IID != Intrinsic::umin)\n+    return nullptr;\n+\n+  Value *LHS = MinMax->getOperand(0), *RHS = MinMax->getOperand(1);\n+\n+  const APInt *ConstOperand;\n+  BinaryOperator *BinOp;\n+\n+  bool Matched =\n+      (match(LHS, m_BinOp(BinOp)) && match(RHS, m_APInt(ConstOperand))) ||\n+      (match(RHS, m_BinOp(BinOp)) && match(LHS, m_APInt(ConstOperand)));\n+\n+  if (!Matched)\n+    return nullptr;\n+\n+  if (!BinOp->hasOneUse())\n+    return nullptr;\n+\n+  if (BinOp->getOpcode() != Instruction::Shl || !BinOp->hasNoUnsignedWrap())\n+    return nullptr;\n+\n+  Value *ShiftBase = BinOp->getOperand(0);\n+  Value *ShiftAmount = BinOp->getOperand(1);\n+\n+  const APInt *ShiftAmountConst;\n+  if (!match(ShiftAmount, m_APInt(ShiftAmountConst)))\n+    return nullptr;\n+\n+  uint64_t K = ShiftAmountConst->getZExtValue();\n+  if (ConstOperand->countTrailingZeros() < K)\n+    return nullptr;\n+\n+  APInt HoistedConst = ConstOperand->lshr(K);\n+  Value *NewConstant = ConstantInt::get(MinMax->getType(), HoistedConst);\n+\n+  Value *NarrowedMinMax =\n+      Builder.CreateBinaryIntrinsic(IID, ShiftBase, NewConstant);\n+\n+  return Builder.CreateShl(NarrowedMinMax, ShiftAmount, \"\", /*NUW=*/true);\n+}\n+\n // Attempts to factorise a common term\n // in an instruction that has the form \"(A op' B) op (C op' D)\n // where op is an intrinsic and op' is a binop\n@@ -2150,6 +2198,9 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n         return I;\n     }\n \n+    if (Value *V = foldMinMaxWithShiftedOperand(II, Builder))\n+      return replaceInstUsesWith(*II, V);\n+\n     // If both operands of unsigned min/max are sign-extended, it is still ok\n     // to narrow the operation.\n     [[fallthrough]];\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Adds a new fold in InstCombineInst for patterns of the form:\r\n  umax(x nuw<< K, C) --> umax(x, C >> K) nuw<< K\r\n  umin(x nuw<< K, C) --> umin(x, C >> K) nuw<< K\r\n\r\nThe fold is valid when C has at least K trailing zeros (ensuring C >> K is exact) and the shift is marked NUW (preserving unsigned ordering). Signed variants (smax/smin) are explicitly excluded because arithmetic right-shift of a signed constant does not preserve the signed ordering.\r\n\r\nFixes #139786",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/minmax-nuw-shl.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "umax_const_shl",
+          "test_body": "define i32 @umax_const_shl(i32 %x) {\n  %shl = shl nuw i32 %x, 2\n  %r = call i32 @llvm.umax.i32(i32 16, i32 %shl)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_add_no_fold",
+          "test_body": "define i32 @umax_add_no_fold(i32 %x) {\n  %add = add nuw i32 %x, 4\n  %r = call i32 @llvm.umax.i32(i32 %add, i32 16)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_shl_i8",
+          "test_body": "define i8 @umax_shl_i8(i8 %x) {\n  %shl = shl nuw i8 %x, 1\n  %r = call i8 @llvm.umax.i8(i8 %shl, i8 4)\n  ret i8 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "smax_shl_no_fold",
+          "test_body": "define i32 @smax_shl_no_fold(i32 %x) {\n  %shl = shl nuw i32 %x, 2\n  %r = call i32 @llvm.smax.i32(i32 %shl, i32 16)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_shl_variable_shamt",
+          "test_body": "define i32 @umax_shl_variable_shamt(i32 %x, i32 %k) {\n  %shl = shl nuw i32 %x, %k\n  %r = call i32 @llvm.umax.i32(i32 %shl, i32 16)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_both_variable",
+          "test_body": "define i32 @umax_both_variable(i32 %x, i32 %y) {\n  %r = call i32 @llvm.umax.i32(i32 %x, i32 %y)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_shl_multiuse",
+          "test_body": "define i32 @umax_shl_multiuse(i32 %x, ptr %p) {\n  %shl = shl nuw i32 %x, 2\n  store i32 %shl, ptr %p, align 4\n  %r = call i32 @llvm.umax.i32(i32 %shl, i32 16)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "smin_shl_no_fold",
+          "test_body": "define i32 @smin_shl_no_fold(i32 %x) {\n  %shl = shl nuw i32 %x, 2\n  %r = call i32 @llvm.smin.i32(i32 %shl, i32 16)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.smin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umin_shl_const",
+          "test_body": "define i32 @umin_shl_const(i32 %x) {\n  %shl = shl nuw i32 %x, 3\n  %r = call i32 @llvm.umin.i32(i32 %shl, i32 24)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umin.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_shl_const",
+          "test_body": "define i32 @umax_shl_const(i32 %x) {\n  %shl = shl nuw i32 %x, 2\n  %r = call i32 @llvm.umax.i32(i32 %shl, i32 16)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_shl_no_nuw",
+          "test_body": "define i32 @umax_shl_no_nuw(i32 %x) {\n  %shl = shl i32 %x, 2\n  %r = call i32 @llvm.umax.i32(i32 %shl, i32 16)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "umax_shl_insufficient_trailing_zeros",
+          "test_body": "define i32 @umax_shl_insufficient_trailing_zeros(i32 %x) {\n  %shl = shl nuw i32 %x, 3\n  %r = call i32 @llvm.umax.i32(i32 %shl, i32 12)\n  ret i32 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.umax.i32(i32, i32) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    }
+  ],
+  "knowledge_cutoff": "2026-04-24T12:50:21Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        1775,
+        1780
+      ],
+      [
+        2150,
+        2155
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst",
+      "foldIntrinsicUsingDistributiveLaws",
+      "rightDistributesOverLeft"
+    ]
+  }
+}

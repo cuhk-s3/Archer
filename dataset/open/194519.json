@@ -1,0 +1,135 @@
+{
+  "pr_id": 194519,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/194519",
+  "state": "open",
+  "title": "[InstCombine] Fold `A == MIN_INT ? MAX_INT : 0 - A` to `ssub_sat 0, A`",
+  "author": "NexMing",
+  "base_commit": "26493fc9c3d61333c1cf265889ff2fe03d2f180d",
+  "fix_commit": "f4ade443fe99de6048a1b61b907ee164757ab34a",
+  "patch": "diff --git a/llvm/include/llvm/IR/PatternMatch.h b/llvm/include/llvm/IR/PatternMatch.h\nindex de24f4da336c2..8305f4dda7aff 100644\n--- a/llvm/include/llvm/IR/PatternMatch.h\n+++ b/llvm/include/llvm/IR/PatternMatch.h\n@@ -510,6 +510,19 @@ inline api_pred_ty<is_maxsignedvalue> m_MaxSignedValue(const APInt *&V) {\n   return V;\n }\n \n+struct is_minsignedvalue {\n+  bool isValue(const APInt &C) const { return C.isMinSignedValue(); }\n+};\n+/// Match an integer or vector with values having only the high bit set and\n+/// all other bits cleared (0x80...).\n+/// For vectors, this includes constants with undefined elements.\n+inline cst_pred_ty<is_minsignedvalue> m_MinSignedValue() {\n+  return cst_pred_ty<is_minsignedvalue>();\n+}\n+inline api_pred_ty<is_minsignedvalue> m_MinSignedValue(const APInt *&V) {\n+  return V;\n+}\n+\n struct is_negative {\n   bool isValue(const APInt &C) const { return C.isNegative(); }\n };\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex bffc887d93535..56f51bc67cfaa 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -2154,6 +2154,15 @@ static Instruction *foldSelectICmpEq(SelectInst &SI, ICmpInst *ICI,\n   if (Pred == ICmpInst::ICMP_NE)\n     std::swap(TrueVal, FalseVal);\n \n+  /// `A == MIN_INT ? MAX_INT : 0 - A` --> `ssub_sat 0, A`\n+  if (match(CmpRHS, m_MinSignedValue()) && match(TrueVal, m_MaxSignedValue()) &&\n+      match(FalseVal, m_Sub(m_ZeroInt(), m_Specific(CmpLHS)))) {\n+    return IC.replaceInstUsesWith(\n+        SI, IC.Builder.CreateBinaryIntrinsic(\n+                Intrinsic::ssub_sat,\n+                ConstantInt::getNullValue(CmpLHS->getType()), CmpLHS));\n+  }\n+\n   if (Instruction *Res =\n           foldSelectWithExtremeEqCond(CmpLHS, CmpRHS, TrueVal, FalseVal))\n     return Res;\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This PR fold:\r\n`A == MIN_INT ? MAX_INT : 0 - A` to `ssub_sat 0, A`",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/saturating-add-sub.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fold_icmpne_to_ssub_sat_vec",
+          "test_body": "define <4 x i8> @fold_icmpne_to_ssub_sat_vec(<4 x i8> %a) {\n  %cmp = icmp ne <4 x i8> %a, splat (i8 -128)\n  %sub = sub <4 x i8> zeroinitializer, %a\n  %sel = select <4 x i1> %cmp, <4 x i8> %sub, <4 x i8> splat (i8 127)\n  ret <4 x i8> %sel\n}\n"
+        },
+        {
+          "test_name": "fold_icmpeq_to_ssub_sat_vec",
+          "test_body": "define <4 x i8> @fold_icmpeq_to_ssub_sat_vec(<4 x i8> %a) {\n  %cmp = icmp eq <4 x i8> %a, splat (i8 -128)\n  %sub = sub <4 x i8> zeroinitializer, %a\n  %sel = select <4 x i1> %cmp, <4 x i8> splat (i8 127), <4 x i8> %sub\n  ret <4 x i8> %sel\n}\n"
+        },
+        {
+          "test_name": "fold_icmpne_to_ssub_sat",
+          "test_body": "define i8 @fold_icmpne_to_ssub_sat(i8 %a) {\n  %cmp = icmp ne i8 %a, -128\n  %sub = sub i8 0, %a\n  %sel = select i1 %cmp, i8 %sub, i8 127\n  ret i8 %sel\n}\n"
+        },
+        {
+          "test_name": "fold_icmpeq_to_ssub_sat",
+          "test_body": "define i8 @fold_icmpeq_to_ssub_sat(i8 %a) {\n  %cmp = icmp eq i8 %a, -128\n  %sub = sub i8 0, %a\n  %sel = select i1 %cmp, i8 127, i8 %sub\n  ret i8 %sel\n}\n"
+        },
+        {
+          "test_name": "no_fold_umin_to_uadd_sat_if_not_zero",
+          "test_body": "define i8 @no_fold_umin_to_uadd_sat_if_not_zero(i8 %a, i8 %b) {\n  %za = zext i8 %a to i16\n  %zb = zext i8 %b to i16\n  %zsub = sub nsw i16 %za, %zb\n  %cmp = call i16 @llvm.smax.i16(i16 %zsub, i16 2)\n  %r = trunc nuw i16 %cmp to i8\n  ret i8 %r\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.smax.i16(i16, i16) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/ARM/mve-qabs.ll",
+      "commands": [
+        "opt -passes=loop-vectorize,instcombine,simplifycfg -simplifycfg-require-and-preserve-domtree=1 < %s -S -o -"
+      ],
+      "tests": [
+        {
+          "test_name": "arm_abs_q15",
+          "test_body": "target datalayout = \"e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64\"\ntarget triple = \"thumbv8.1m.main-arm-none-eabi\"\n\ndefine void @arm_abs_q15(ptr readonly captures(none) %pSrc, ptr captures(none) %pDst, i32 %blockSize) #0 {\nentry:\n  %cmp.not20 = icmp eq i32 %blockSize, 0\n  br i1 %cmp.not20, label %while.end, label %while.body.preheader\n\nwhile.body.preheader:                             ; preds = %entry\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %while.body.preheader\n  %pSrc.addr.023 = phi ptr [ %incdec.ptr, %while.body ], [ %pSrc, %while.body.preheader ]\n  %blkCnt.022 = phi i32 [ %dec, %while.body ], [ %blockSize, %while.body.preheader ]\n  %pDst.addr.021 = phi ptr [ %incdec.ptr13, %while.body ], [ %pDst, %while.body.preheader ]\n  %incdec.ptr = getelementptr inbounds i16, ptr %pSrc.addr.023, i32 1\n  %0 = load i16, ptr %pSrc.addr.023, align 2\n  %cmp1 = icmp sgt i16 %0, 0\n  %cmp5 = icmp eq i16 %0, -32768\n  %sub = sub i16 0, %0\n  %cond = select i1 %cmp5, i16 32767, i16 %sub\n  %cond11 = select i1 %cmp1, i16 %0, i16 %cond\n  %incdec.ptr13 = getelementptr inbounds i16, ptr %pDst.addr.021, i32 1\n  store i16 %cond11, ptr %pDst.addr.021, align 2\n  %dec = add i32 %blkCnt.022, -1\n  %cmp.not = icmp eq i32 %dec, 0\n  br i1 %cmp.not, label %while.end.loopexit, label %while.body\n\nwhile.end.loopexit:                               ; preds = %while.body\n  br label %while.end\n\nwhile.end:                                        ; preds = %while.end.loopexit, %entry\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+mve\" }\n"
+        },
+        {
+          "test_name": "arm_abs_q31",
+          "test_body": "target datalayout = \"e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64\"\ntarget triple = \"thumbv8.1m.main-arm-none-eabi\"\n\ndefine void @arm_abs_q31(ptr readonly captures(none) %pSrc, ptr captures(none) %pDst, i32 %blockSize) #0 {\nentry:\n  %cmp.not14 = icmp eq i32 %blockSize, 0\n  br i1 %cmp.not14, label %while.end, label %while.body.preheader\n\nwhile.body.preheader:                             ; preds = %entry\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %while.body.preheader\n  %pSrc.addr.017 = phi ptr [ %incdec.ptr, %while.body ], [ %pSrc, %while.body.preheader ]\n  %blkCnt.016 = phi i32 [ %dec, %while.body ], [ %blockSize, %while.body.preheader ]\n  %pDst.addr.015 = phi ptr [ %incdec.ptr7, %while.body ], [ %pDst, %while.body.preheader ]\n  %incdec.ptr = getelementptr inbounds i32, ptr %pSrc.addr.017, i32 1\n  %0 = load i32, ptr %pSrc.addr.017, align 4\n  %cmp1 = icmp sgt i32 %0, 0\n  %cmp2 = icmp eq i32 %0, -2147483648\n  %sub = sub nsw i32 0, %0\n  %cond = select i1 %cmp2, i32 2147483647, i32 %sub\n  %cond6 = select i1 %cmp1, i32 %0, i32 %cond\n  %incdec.ptr7 = getelementptr inbounds i32, ptr %pDst.addr.015, i32 1\n  store i32 %cond6, ptr %pDst.addr.015, align 4\n  %dec = add i32 %blkCnt.016, -1\n  %cmp.not = icmp eq i32 %dec, 0\n  br i1 %cmp.not, label %while.end.loopexit, label %while.body\n\nwhile.end.loopexit:                               ; preds = %while.body\n  br label %while.end\n\nwhile.end:                                        ; preds = %while.end.loopexit, %entry\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+mve\" }\n"
+        },
+        {
+          "test_name": "arm_abs_q7",
+          "test_body": "target datalayout = \"e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64\"\ntarget triple = \"thumbv8.1m.main-arm-none-eabi\"\n\ndefine void @arm_abs_q7(ptr readonly captures(none) %pSrc, ptr captures(none) %pDst, i32 %blockSize) #0 {\nentry:\n  %cmp.not19 = icmp eq i32 %blockSize, 0\n  br i1 %cmp.not19, label %while.end, label %while.body.preheader\n\nwhile.body.preheader:                             ; preds = %entry\n  br label %while.body\n\nwhile.body:                                       ; preds = %while.body, %while.body.preheader\n  %pSrc.addr.022 = phi ptr [ %incdec.ptr, %while.body ], [ %pSrc, %while.body.preheader ]\n  %blkCnt.021 = phi i32 [ %dec, %while.body ], [ %blockSize, %while.body.preheader ]\n  %pDst.addr.020 = phi ptr [ %incdec.ptr13, %while.body ], [ %pDst, %while.body.preheader ]\n  %incdec.ptr = getelementptr inbounds i8, ptr %pSrc.addr.022, i32 1\n  %0 = load i8, ptr %pSrc.addr.022, align 1\n  %cmp1 = icmp sgt i8 %0, 0\n  %cmp5 = icmp eq i8 %0, -128\n  %sub = sub i8 0, %0\n  %cond = select i1 %cmp5, i8 127, i8 %sub\n  %cond11 = select i1 %cmp1, i8 %0, i8 %cond\n  %incdec.ptr13 = getelementptr inbounds i8, ptr %pDst.addr.020, i32 1\n  store i8 %cond11, ptr %pDst.addr.020, align 1\n  %dec = add i32 %blkCnt.021, -1\n  %cmp.not = icmp eq i32 %dec, 0\n  br i1 %cmp.not, label %while.end.loopexit, label %while.body\n\nwhile.end.loopexit:                               ; preds = %while.body\n  br label %while.end\n\nwhile.end:                                        ; preds = %while.end.loopexit, %entry\n  ret void\n}\n\nattributes #0 = { \"target-features\"=\"+mve\" }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 194468 tests passed\n* 5159 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 133993 tests passed\n* 3176 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-04-28T03:07:55Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/IR/PatternMatch.h": [
+      [
+        510,
+        515
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        2154,
+        2159
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/saturating-add-sub.ll": [
+      [
+        3087,
+        3089
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/ARM/mve-qabs.ll": [
+      [
+        29,
+        37
+      ],
+      [
+        52,
+        60
+      ],
+      [
+        124,
+        132
+      ],
+      [
+        147,
+        155
+      ],
+      [
+        219,
+        227
+      ],
+      [
+        242,
+        250
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/IR/PatternMatch.h": [
+      "isValue",
+      "m_MaxSignedValue"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "foldSelectICmpEq"
+    ]
+  }
+}

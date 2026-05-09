@@ -1,0 +1,82 @@
+{
+  "pr_id": 194734,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/194734",
+  "state": "open",
+  "title": "[InstCombine] Fold constant-mask bitfield clear pattern",
+  "author": "glaziermag",
+  "base_commit": "95f7a04812986cfd698fd05c762e2cee9ff5187b",
+  "fix_commit": "c852981e3dae3767cb6baf76569fd993a8447779",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex d81ed56290476..0869a297f866e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -1977,6 +1977,41 @@ static Instruction *foldOrToXor(BinaryOperator &I,\n   return nullptr;\n }\n \n+static bool matchConstantMaskBitfieldClear(Value *OldBits, Value *NewBits,\n+                                           Value *&X, Value *&NotYAndM) {\n+  const APInt *Mask, *NotMask, *YMask;\n+\n+  if (!match(OldBits, m_c_And(m_Value(X), m_APInt(NotMask))))\n+    return false;\n+\n+  if (!match(NewBits,\n+             m_c_And(\n+                 m_c_And(m_Specific(X), m_APInt(Mask)),\n+                 m_Value(NotYAndM, m_Not(m_c_And(m_Value(), m_APInt(YMask)))))))\n+    return false;\n+\n+  return *Mask == *YMask && *NotMask == ~*Mask;\n+}\n+\n+static Instruction *foldOrOfConstantMaskBitfieldClear(BinaryOperator &I) {\n+  assert(I.getOpcode() == Instruction::Or);\n+\n+  if (!I.getType()->isIntegerTy())\n+    return nullptr;\n+\n+  // (X & ~M) | ((X & M) & ~(Y & M)) --> X & ~(Y & M)\n+  // Match only the exact constant-mask shape. The replacement reuses the\n+  // existing complement of (Y & M), so multi-use operands are not duplicated.\n+  Value *X, *NotYAndM;\n+  if (matchConstantMaskBitfieldClear(I.getOperand(0), I.getOperand(1), X,\n+                                     NotYAndM) ||\n+      matchConstantMaskBitfieldClear(I.getOperand(1), I.getOperand(0), X,\n+                                     NotYAndM))\n+    return BinaryOperator::CreateAnd(X, NotYAndM);\n+\n+  return nullptr;\n+}\n+\n /// Return true if a constant shift amount is always less than the specified\n /// bit-width. If not, the shift could create poison in the narrower type.\n static bool canNarrowShiftAmt(Constant *C, unsigned BitWidth) {\n@@ -4131,6 +4166,9 @@ Instruction *InstCombinerImpl::visitOr(BinaryOperator &I) {\n   if (Value *V = foldOrOfInversions(I, Builder))\n     return replaceInstUsesWith(I, V);\n \n+  if (Instruction *R = foldOrOfConstantMaskBitfieldClear(I))\n+    return R;\n+\n   // (A&B)|(A&C) -> A&(B|C) etc\n   if (Value *V = foldUsingDistributiveLaws(I))\n     return replaceInstUsesWith(I, V);\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "## Summary\n\nFold the scalar integer constant-mask bitfield clear pattern:\n\n```llvm\n(X & ~M) | ((X & M) & ~(Y & M))  ->  X & ~(Y & M)\n```\n\nThe matcher is intentionally narrow: it only handles scalar integer `or`\npatterns where `M` is an exact compile-time `APInt` mask reused by both\n`X & M` and `Y & M`, and it reuses the existing `~(Y & M)` value.\n\n## Alive2\n\nThe original issue's Alive2 proof covers the mask-1 form and the forward\nsymbolic-mask scalar transform:\n\nhttps://alive2.llvm.org/ce/z/GQeQTS\n\nI also ran local Alive2 files covering a concrete `0x55` mask, a symbolic\nscalar mask, and representative scalar widths:\n\n```console\nalive-tv ../alive2-83699.ll\nalive-tv --smt-to=60000 ../alive2-83699-widths.ll\n```\n\nResults: `5 correct transformations`, `0 incorrect transformations`,\n`0 failed-to-prove transformations`.\n\nVector splat matching was tried during development, but is intentionally not\nincluded because the local Alive2 vector proof timed out rather than proving\ncleanly.\n\n## Before / after\n\nI rebuilt `opt` once with this source change temporarily reversed and once with\nthe patch applied. For the issue pattern, pre-patch InstCombine left the masked\narms and root `or disjoint` intact:\n\n```llvm\n%x.mask = and i32 %x, 1\n%y.mask = and i32 %y, 1\n%not.ym = xor i32 %y.mask, -1\n%new.masked = and i32 %x.mask, %not.ym\n%old.bits = and i32 %x, -2\n%r = or disjoint i32 %old.bits, %new.masked\n```\n\nWith this patch, the same input folds to:\n\n```llvm\n%y.mask = and i32 %y, 1\n%not.ym = xor i32 %y.mask, -1\n%r = and i32 %x, %not.ym\n```\n\nThe negative case where `X & ~M` is not the exact complement of `X & M` remains\nunchanged after the patch.\n\n## Tests\n\nAdded `llvm/test/Transforms/InstCombine/or-bitfield-mask.ll` with coverage for:\n\n- the exact issue pattern with mask `1`\n- explicit `or disjoint` input with mask `1`\n- a wider nontrivial constant mask, `0x55`\n- a commuted `0x0f` pattern\n- negative mismatched-mask cases for `Y & M` and `X & ~M`\n- multi-use masked arms where the root `or` is still replaced without\n  duplicating operands\n\n## Validation\n\n```console\nninja -C build opt\npython3 llvm/utils/update_test_checks.py --tool-binary=build/bin/opt llvm/test/Transforms/InstCombine/or-bitfield-mask.ll\nbuild/bin/llvm-lit -v llvm/test/Transforms/InstCombine/or-bitfield-mask.ll\nbuild/bin/opt < llvm/test/Transforms/InstCombine/or-bitfield-mask.ll -passes=instcombine -S\nninja -C build check-llvm-transforms\nalive-tv ../alive2-83699.ll\nalive-tv --smt-to=60000 ../alive2-83699-widths.ll\n```\n\nFixes #83699\n\nAssisted-by: OpenAI Codex",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/or-bitfield-mask.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "negative_mismatched_y_mask",
+          "test_body": "define i32 @negative_mismatched_y_mask(i32 %x, i32 %y) {\n  %x.mask = and i32 %x, 85\n  %y.mask = and i32 %y, 15\n  %not.ym = xor i32 %y.mask, -1\n  %new.masked = and i32 %x.mask, %not.ym\n  %old.bits = and i32 %x, -86\n  %r = or i32 %old.bits, %new.masked\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "multi_use_masked_arms",
+          "test_body": "declare void @use(i32)\n\ndefine i32 @multi_use_masked_arms(i32 %x, i32 %y) {\n  %x.mask = and i32 %x, 15\n  %y.mask = and i32 %y, 15\n  %not.ym = xor i32 %y.mask, -1\n  %new.masked = and i32 %x.mask, %not.ym\n  %old.bits = and i32 %x, -16\n  %r = or i32 %old.bits, %new.masked\n  call void @use(i32 %old.bits)\n  call void @use(i32 %new.masked)\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "bitfield_mask1_disjoint",
+          "test_body": "define i32 @bitfield_mask1_disjoint(i32 %x, i32 %y) {\n  %x.mask = and i32 %x, 1\n  %y.mask = and i32 %y, 1\n  %not.ym = xor i32 %y.mask, -1\n  %new.masked = and i32 %x.mask, %not.ym\n  %old.bits = and i32 %x, -2\n  %r = or disjoint i32 %old.bits, %new.masked\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "bitfield_mask_0x55",
+          "test_body": "define i32 @bitfield_mask_0x55(i32 %x, i32 %y) {\n  %x.mask = and i32 %x, 85\n  %y.mask = and i32 %y, 85\n  %not.ym = xor i32 %y.mask, -1\n  %new.masked = and i32 %x.mask, %not.ym\n  %old.bits = and i32 %x, -86\n  %r = or i32 %old.bits, %new.masked\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "bitfield_mask1",
+          "test_body": "define i32 @bitfield_mask1(i32 %x, i32 %y) {\n  %x.mask = and i32 %x, 1\n  %y.mask = and i32 %y, 1\n  %not.ym = xor i32 %y.mask, -1\n  %new.masked = and i32 %x.mask, %not.ym\n  %old.bits = and i32 %x, -2\n  %r = or i32 %old.bits, %new.masked\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "bitfield_mask_0x0f_commuted",
+          "test_body": "define i32 @bitfield_mask_0x0f_commuted(i32 %x, i32 %y) {\n  %x.mask = and i32 %x, 15\n  %y.mask = and i32 %y, 15\n  %not.ym = xor i32 %y.mask, -1\n  %new.masked = and i32 %not.ym, %x.mask\n  %old.bits = and i32 %x, -16\n  %r = or i32 %new.masked, %old.bits\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "negative_mismatched_not_mask",
+          "test_body": "define i32 @negative_mismatched_not_mask(i32 %x, i32 %y) {\n  %x.mask = and i32 %x, 85\n  %y.mask = and i32 %y, 85\n  %not.ym = xor i32 %y.mask, -1\n  %new.masked = and i32 %x.mask, %not.ym\n  %old.bits = and i32 %x, -87\n  %r = or i32 %old.bits, %new.masked\n  ret i32 %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    }
+  ],
+  "knowledge_cutoff": "2026-04-28T22:00:02Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+      [
+        1977,
+        1982
+      ],
+      [
+        4131,
+        4136
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+      "InstCombinerImpl::visitOr",
+      "canNarrowShiftAmt",
+      "foldOrToXor"
+    ]
+  }
+}
