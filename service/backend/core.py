@@ -27,6 +27,7 @@ _TEST_PATH_PREFIXES: list[str] = [
   "llvm/test/Transforms/CorrelatedValuePropagation",
   "llvm/test/Transforms/SimplifyCFG",
   "llvm/test/Transforms/VectorCombine",
+  "llvm/test/Transforms/SLPVectorizer",
   "llvm/test/Transforms/AggressiveInstCombine",
 ]
 
@@ -54,6 +55,7 @@ _SOURCE_PATH_PREFIXES: list[str] = [
   "llvm/lib/Transforms/Scalar/CorrelatedValuePropagation",
   "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
   "llvm/lib/Transforms/Vectorize/VectorCombine",
+  "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp",
   "llvm/lib/Transforms/AggressiveInstCombine",
 ]
 
