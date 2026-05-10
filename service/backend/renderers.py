@@ -312,9 +312,8 @@ def build_review_html_from_stats(stats_data: dict) -> str:
       pointer-events: none;
     }}
     .bug-log-fold.expanded .bug-log-body {{
-      max-height: 400px;
-      overflow-y: auto;
-      overflow-x: auto;
+      max-height: none;
+      overflow: visible;
     }}
     .bug-log-fold.expanded .bug-log-body::after {{
       display: none;
@@ -362,9 +361,33 @@ def build_review_html_from_stats(stats_data: dict) -> str:
       transform: translateX(-50%) rotate(225deg);
     }}
     .fold-toggle:hover .fold-icon {{ background: #fff7e6; }}
+    .back-btn {{
+      position: fixed;
+      top: 24px;
+      left: 32px;
+      width: 32px;
+      height: 32px;
+      border: 1px solid #e6eef7;
+      background: #f7fbff;
+      color: #4f667d;
+      border-radius: 4px;
+      padding: 0;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      z-index: 100;
+      font-weight: 600;
+    }}
+    .back-btn:hover {{
+      background: #eef6ff;
+      border-color: #d6e3f0;
+    }}
   </style>
 </head>
 <body>
+  <button class="back-btn" type="button" title="Back to Review Board" onclick="window.location.href='/'">←</button>
   <div class="review-container">
     <div class="head">
       <h1 class="title">Review Report</h1>
@@ -536,9 +559,33 @@ def render_artifact_viewer(target: Path) -> str:
     }
     .fold-toggle:hover .fold-icon { background: #eef5fc; }
     h3 { margin: 0; font-size: 12px; color: #60758d; }
+    .back-btn {
+      position: fixed;
+      top: 24px;
+      left: 32px;
+      width: 32px;
+      height: 32px;
+      border: 1px solid #e6eef7;
+      background: #f7fbff;
+      color: #4f667d;
+      border-radius: 4px;
+      padding: 0;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      z-index: 100;
+      font-weight: 600;
+    }
+    .back-btn:hover {
+      background: #eef6ff;
+      border-color: #d6e3f0;
+    }
   </style>
 </head>
 <body>
+  <button class="back-btn" type="button" title="Back to Review Board" onclick="window.location.href='/'">←</button>
   <div class="viewer">
     <div class="head">
       <h1 class="title">Agent Trajectory</h1>
