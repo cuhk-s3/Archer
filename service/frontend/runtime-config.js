@@ -1,1 +1,1 @@
-window.ARCHER_BACKEND_BASE_URL = "https://47.84.45.11:8080";
+window.ARCHER_BACKEND_BASE_URL = "https://archer.top";

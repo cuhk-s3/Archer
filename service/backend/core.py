@@ -6,7 +6,7 @@ import threading
 import time
 import zipfile
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import requests
@@ -27,6 +27,7 @@ _TEST_PATH_PREFIXES: list[str] = [
   "llvm/test/Transforms/CorrelatedValuePropagation",
   "llvm/test/Transforms/SimplifyCFG",
   "llvm/test/Transforms/VectorCombine",
+  "llvm/test/Transforms/SLPVectorizer",
   "llvm/test/Transforms/AggressiveInstCombine",
   "llvm/test/Transforms/LoopVectorize",
 ]
@@ -55,6 +56,7 @@ _SOURCE_PATH_PREFIXES: list[str] = [
   "llvm/lib/Transforms/Scalar/CorrelatedValuePropagation",
   "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
   "llvm/lib/Transforms/Vectorize/VectorCombine",
+  "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp",
   "llvm/lib/Transforms/AggressiveInstCombine",
   "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp",
 ]
@@ -147,9 +149,7 @@ class ArcherService:
           remote_run_conclusion=job_data.get("remote_run_conclusion"),
         )
         if not j.components:
-          pr_info = self._get_pr_info(j.pr_id)
-          if isinstance(pr_info, dict):
-            j.components = pr_info.get("components", []) or []
+          j.components = self._resolve_components(j.pr_id)
         if j.status == "running":
           if j.executor == "github-actions":
             j.status = "running"
@@ -188,16 +188,99 @@ class ArcherService:
     return sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)
 
   def _get_pr_info(self, pr_id: int) -> Optional[dict]:
-    dataset_dir = self.config.repo_root / "dataset"
-    for sub in ["closed", "open"]:
-      path = dataset_dir / sub / f"{pr_id}.json"
-      if not path.exists():
-        continue
-      try:
-        return json.loads(path.read_text())
-      except Exception:
-        continue
+    dataset_roots = [
+      self.config.repo_root / "dataset",
+      self.config.repo_root.parent / "dataset",
+    ]
+    for dataset_dir in dataset_roots:
+      for sub in ["closed", "open"]:
+        path = dataset_dir / sub / f"{pr_id}.json"
+        if not path.exists():
+          continue
+        try:
+          return json.loads(path.read_text())
+        except Exception:
+          continue
     return None
+
+  def _infer_components_from_files(self, diff_files: List[str]) -> List[str]:
+    # Keep this behavior aligned with llvm/llvm_helper.py::infer_related_components.
+    prefixes = [
+      "llvm/lib/Analysis/",
+      "llvm/lib/Transforms/Scalar/",
+      "llvm/lib/Transforms/Vectorize/",
+      "llvm/lib/Transforms/Utils/",
+      "llvm/lib/Transforms/IPO/",
+      "llvm/lib/Transforms/",
+      "llvm/lib/IR/",
+    ]
+    components: List[str] = []
+    seen = set()
+    for file in diff_files:
+      for prefix in prefixes:
+        if not file.startswith(prefix):
+          continue
+        component_name = (
+          file.removeprefix(prefix)
+          .split("/")[0]
+          .removesuffix(".cpp")
+          .removesuffix(".h")
+        )
+        if component_name == "":
+          break
+        if (
+          component_name.startswith("VPlan")
+          or component_name.startswith("LoopVectoriz")
+          or component_name.startswith("VPRecipe")
+        ):
+          component_name = "LoopVectorize"
+        if component_name.startswith("ScalarEvolution"):
+          component_name = "ScalarEvolution"
+        if component_name.startswith("ConstantFold"):
+          component_name = "ConstantFold"
+        if "AliasAnalysis" in component_name:
+          component_name = "AliasAnalysis"
+        if component_name.startswith("Attributor"):
+          component_name = "Attributor"
+        if file.startswith("llvm/lib/IR"):
+          component_name = "IR"
+        if component_name not in seen:
+          seen.add(component_name)
+          components.append(component_name)
+        break
+    return components
+
+  def _resolve_components(
+    self,
+    pr_id: int,
+    files: Optional[List[str]] = None,
+    session: Optional[requests.Session] = None,
+  ) -> List[str]:
+    pr_info = self._get_pr_info(pr_id)
+    if isinstance(pr_info, dict):
+      stored_components = pr_info.get("components", []) or []
+      if stored_components:
+        return stored_components
+
+    if files is not None:
+      return self._infer_components_from_files(files)
+
+    if not self.config.github_token:
+      return []
+
+    own_session = False
+    active_session = session
+    if active_session is None:
+      active_session = self._github_session()
+      own_session = True
+    try:
+      pr_files = self._fetch_pull_files(active_session, pr_id)
+      return self._infer_components_from_files(pr_files)
+    except Exception:
+      return []
+    finally:
+      if own_session:
+        active_session.close()
 
   def enqueue_pr(self, pr_id: int, source: str = "manual", force: bool = False) -> Job:
     with self.lock:
@@ -328,10 +411,29 @@ class ArcherService:
     # to the same workflow run when many runs exist.
     return job.id.lower() in haystack
 
+  def _parse_github_datetime(self, value: str) -> Optional[datetime]:
+    if not value:
+      return None
+    try:
+      return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+      return None
+
+  def _is_remote_run_taken(self, run_id: Optional[int], exclude_job_id: str) -> bool:
+    if run_id is None:
+      return False
+    for j in self.jobs.values():
+      if j.id == exclude_job_id:
+        continue
+      if j.remote_run_id == run_id:
+        return True
+    return False
+
   def _find_remote_run(self, session: requests.Session, job: Job) -> Optional[dict]:
     workflow_path = self._actions_api_path(
       f"actions/workflows/{self.config.actions_workflow}/runs"
     )
+    collected_runs: List[dict] = []
 
     for page in range(1, 6):
       response = session.get(
@@ -350,11 +452,39 @@ class ArcherService:
         break
 
       for run in runs:
-        if self._match_remote_run(run, job):
+        run_id = run.get("id") if isinstance(run, dict) else None
+        parsed_run_id = int(run_id) if isinstance(run_id, int) else None
+        if self._match_remote_run(run, job) and not self._is_remote_run_taken(
+          parsed_run_id, job.id
+        ):
           return run
+        if isinstance(run, dict):
+          collected_runs.append(run)
 
       if len(runs) < 100:
         break
+
+    started_at = self._parse_github_datetime(str(job.started_at or ""))
+    if not started_at:
+      return None
+
+    candidates: List[tuple[float, dict]] = []
+    for run in collected_runs:
+      run_id = run.get("id")
+      parsed_run_id = int(run_id) if isinstance(run_id, int) else None
+      if self._is_remote_run_taken(parsed_run_id, job.id):
+        continue
+      created_at = self._parse_github_datetime(str(run.get("created_at") or ""))
+      if not created_at:
+        continue
+      # Fallback only within a narrow time window around dispatch.
+      if created_at < started_at - timedelta(minutes=3):
+        continue
+      delta_sec = abs((created_at - started_at).total_seconds())
+      candidates.append((delta_sec, run))
+
+    if len(candidates) == 1:
+      return candidates[0][1]
     return None
 
   def _wait_for_remote_run(
@@ -522,7 +652,9 @@ class ArcherService:
           except Exception as e:
             print(f"Artifact download error for {job.id}: {e}", file=sys.stderr)
       else:
-        job.status = "queued"
+        # Dispatch request already succeeded, but run is not visible yet.
+        # Keep this as running so dashboard reflects in-flight remote work.
+        job.status = "running"
         job.phase = "dispatched"
         job.updated_at = utc_now_iso()
       self._save_state()
@@ -613,11 +745,12 @@ class ArcherService:
         except queue.Full:
           errors += 1
           break
-        pr_info = self._get_pr_info(pr_number)
         job.title = str(pr.get("title", ""))
         user = pr.get("user")
         job.author = str(user.get("login", "")) if isinstance(user, dict) else ""
-        job.components = pr_info.get("components", []) if pr_info else []
+        job.components = self._resolve_components(
+          pr_number, files=files, session=session
+        )
         job.updated_at = utc_now_iso()
         self._save_state()
         created += 1
