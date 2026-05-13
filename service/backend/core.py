@@ -28,6 +28,7 @@ _TEST_PATH_PREFIXES: list[str] = [
   "llvm/test/Transforms/SimplifyCFG",
   "llvm/test/Transforms/VectorCombine",
   "llvm/test/Transforms/AggressiveInstCombine",
+  "llvm/test/Transforms/LoopVectorize",
 ]
 
 _SOURCE_PATH_PREFIXES: list[str] = [
@@ -55,6 +56,7 @@ _SOURCE_PATH_PREFIXES: list[str] = [
   "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
   "llvm/lib/Transforms/Vectorize/VectorCombine",
   "llvm/lib/Transforms/AggressiveInstCombine",
+  "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp",
 ]
 
 ALL_KEYWORDS: list[str] = _TEST_PATH_PREFIXES + _SOURCE_PATH_PREFIXES
