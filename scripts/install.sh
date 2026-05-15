@@ -31,7 +31,6 @@ fi
 
 mkdir ${DEP_LLVM_DIR}
 git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
-git -C ${DEP_LLVM_SOURCE_DIR} checkout 5ec1fb2217c07ee3b610abcf0e40f6b701e6d7f1
 cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_RTTI=ON \
@@ -69,7 +68,7 @@ sudo ninja -C ${DEP_RE2C_BUILD_DIR} install
 # alive2
 
 mkdir -p ${DEP_ALIVE2_DIR}
-git clone -b ${DEP_ALIVE2_VERSION} --depth 1 https://github.com/AliveToolkit/alive2 ${DEP_ALIVE2_SOURCE_DIR}
+git clone https://github.com/AliveToolkit/alive2 ${DEP_ALIVE2_SOURCE_DIR}
 cmake -S ${DEP_ALIVE2_SOURCE_DIR} -B ${DEP_ALIVE2_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C ${DEP_ALIVE2_BUILD_DIR}
 cmake -S ${DEP_ALIVE2_SOURCE_DIR} -B ${DEP_ALIVE2_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release \
