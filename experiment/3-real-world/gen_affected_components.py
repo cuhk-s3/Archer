@@ -237,7 +237,7 @@ conversion_map = {
   "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": "Vectorization Optimization",
   "llvm/lib/Transforms/Vectorize/VPlanUtils.h": "Vectorization Optimization",
   "llvm/lib/CodeGen/CodeGenPrepare.cpp": "Backend",
-  # added in archer
+  # added in aegis
   "llvm/include/llvm/Analysis/PtrUseVisitor.h": "Alias Analysis",
   "llvm/include/llvm/IR/FMF.h": "Peephole Optimizations",
   "llvm/include/llvm/IR/PatternMatch.h": "Peephole Optimizations",
@@ -322,7 +322,7 @@ def print_table_and_stats(
 
 if __name__ == "__main__":
   review_stats_path = Path("review_stats.json")
-  dataset_root = Path("/data/archer/projects/Archer/dataset")
+  dataset_root = Path("/data/aegis/projects/Aegis/dataset")
   print(f"Reading {review_stats_path}...")
 
   assert review_stats_path.exists(), f"Missing {review_stats_path}"

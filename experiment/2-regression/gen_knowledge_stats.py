@@ -60,7 +60,7 @@ def collect_lengths(base: Path) -> tuple[list[int], list[int], list[int], list[s
   summary_passes_non_reg = (
     base.parent / "1-pass-knowledge" / "summary" / "passes-non-regression"
   )
-  rag_result_dir = base / "results" / "archer-deepseek-chat-rag"
+  rag_result_dir = base / "results" / "aegis-deepseek-chat-rag"
   rag_dataset_dir = base / "dataset-regression-rag"
 
   issue_files = sorted(dataset_dir.glob("*.json"))

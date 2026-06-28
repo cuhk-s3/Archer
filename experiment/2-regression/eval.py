@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     "--experiment",
     type=str,
     required=True,
-    choices=["archer", "mswe", "direct-llm"],
+    choices=["aegis", "mswe", "direct-llm"],
     help="Experiment type to run.",
   )
   parser.add_argument(
@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     default="summary",
     choices=["summary", "passes"],
     help=(
-      "Knowledge source for archer: 'summary' -> 1-pass-knowledge/summary/non-regression, "
+      "Knowledge source for aegis: 'summary' -> 1-pass-knowledge/summary/non-regression, "
       "'passes' -> 1-pass-knowledge/passes-non-regression."
     ),
   )
@@ -89,17 +89,17 @@ def parse_args() -> argparse.Namespace:
     "--rag",
     action="store_true",
     default=False,
-    help="Enable RAG mode for experiments that support it (currently archer).",
+    help="Enable RAG mode for experiments that support it (currently aegis).",
   )
   return parser.parse_args()
 
 
 def resolve_experiment_config(name: str) -> dict[str, str | bool]:
-  if name == "archer":
+  if name == "aegis":
     return {
-      "script": "scripts/archer.py",
+      "script": "scripts/aegis.py",
       "needs_review": True,
-      "output_prefix": "archer",
+      "output_prefix": "aegis",
       "supports_no_knowledge": True,
     }
   if name == "mswe":
@@ -193,9 +193,9 @@ def run() -> int:
 
   model = args.model
   model_dir = resolve_model_dir(model, args.model_dir)
-  if experiment == "archer" and args.knowledge_source == "passes":
+  if experiment == "aegis" and args.knowledge_source == "passes":
     model_dir = f"{model_dir}-all-knowledge"
-  rag_enabled = bool(args.rag and experiment == "archer")
+  rag_enabled = bool(args.rag and experiment == "aegis")
   if rag_enabled:
     model_dir = f"{model_dir}-rag"
   output_dir = args.output_dir
@@ -251,7 +251,7 @@ def run() -> int:
   failed_issues: list[str] = []
   debug_enabled = not args.no_debug
   knowledge_dir: Path | None = None
-  if experiment == "archer":
+  if experiment == "aegis":
     knowledge_dir = resolve_knowledge_dir(base_dir, args.knowledge_source)
 
   for dataset_file in issue_files:

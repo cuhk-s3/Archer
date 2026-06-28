@@ -1,7 +1,7 @@
 #!/bin/bash
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-EXPERIMENT="${EXPERIMENT:-archer}"
+EXPERIMENT="${EXPERIMENT:-aegis}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 MODELS=(
