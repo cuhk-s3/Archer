@@ -205,6 +205,12 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
     bug_count = latest_summary["bug_count"] if latest_summary else 0
     patch_specific = latest_summary["patch_specific_count"] if latest_summary else 0
 
+    # Bugs of earlier versions that a later version has fixed (regression gate).
+    # Counted across the whole PR so the board can surface fix progress.
+    fixed_bug_count = sum(
+      1 for b in store.list_bugs_for_pr(pr_id) if b["status"] == "fixed"
+    )
+
     if live_phase == "queued" or (
       live_job is not None and str(getattr(live_job, "status", "")) == "queued"
     ):
@@ -244,6 +250,7 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
         "latest_status": latest_summary["status"] if latest_summary else None,
         "bug_count": bug_count,
         "patch_specific_count": patch_specific,
+        "fixed_bug_count": fixed_bug_count,
         "outcome": outcome,
         "live": live_phase,
         "updated_at": updated_at,

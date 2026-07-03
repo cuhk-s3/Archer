@@ -715,6 +715,57 @@ def persist_review(store, pr_id: int, version_id: int, review_id: int, stats, ag
       store.set_bug_baseline(bug_id, bool(bug.baseline_triggered))
 
 
+def export_db_snapshot(
+  store,
+  pr_id: int,
+  version_id: int,
+  review_id: int,
+  path: Path,
+  fixed_prev_commit: Optional[str] = None,
+) -> None:
+  """Serialize this run's DB rows into a self-contained JSON snapshot.
+
+  The snapshot is machine-independent: it carries the full PR + version, the
+  review run and its bugs *as data* (no DB row ids from this machine are relied
+  upon). A different machine can re-create the same rows in its own store by
+  replaying ``upsert_pr_version`` / ``create_review`` / ``finish_review`` /
+  ``add_bug``. This is what bridges a remote GitHub-Actions runner's result
+  back into the front-end's authoritative store.
+
+  ``fixed_prev_commit`` (set only when the multi-version regression gate passed)
+  names the previous version's commit whose still-active bugs this version has
+  fixed. The ingesting machine replays that status change on its own store so
+  the front-end can show the older bugs as "fixed in a later version". We carry
+  only the commit sha (not this machine's row ids) because the gate marks *all*
+  of the previous version's active bugs as fixed at once (see ``main`` below).
+  """
+  pr_info = store.to_pr_info(pr_id, version_id) or {}
+  version = store.get_version(version_id)
+  review = store.get_review(review_id)
+  bug_rows = store.list_bugs_for_review(review_id)
+
+  snapshot = {
+    "schema": 1,
+    "pr_info": pr_info,
+    "version": {
+      "seq": int(version["seq"]) if version is not None else None,
+      "fix_commit": (
+        version["fix_commit"] if version is not None else pr_info.get("fix_commit", "")
+      ),
+    },
+    "review": dict(review) if review is not None else None,
+    "bugs": [dict(b) for b in bug_rows],
+    # Commit of the previous version whose active bugs this run marked fixed
+    # (only populated when the regression gate passed). None otherwise.
+    "fixed_prev_commit": fixed_prev_commit,
+  }
+
+  path.parent.mkdir(parents=True, exist_ok=True)
+  with path.open("w", encoding="utf-8") as fout:
+    json.dump(snapshot, fout, ensure_ascii=False, indent=2)
+  console.print(f"DB snapshot saved to {path}.")
+
+
 def pr_review(
   agent: AgentBase,
   pr_info: PRInfo,
@@ -779,6 +830,17 @@ def parse_args():
     help="Path to save the generated review as a Markdown file (default: None).",
   )
   parser.add_argument(
+    "--db-export",
+    type=str,
+    default=None,
+    dest="db_export",
+    help=(
+      "Path to save a self-contained JSON snapshot of this run's DB rows "
+      "(PR version + review + bugs) so a remote runner's result can be "
+      "ingested into another machine's store (default: None)."
+    ),
+  )
+  parser.add_argument(
     "--debug",
     action="store_true",
     default=False,
@@ -819,6 +881,14 @@ def main():
   version_id = ensure_version(store, pr_info, pr_env.version_id)
   pr_env.version_id = version_id
 
+  # A snapshot of this run's DB rows, for ingestion into another machine's store
+  # (e.g. a remote GitHub-Actions runner -> the front-end's authoritative store).
+  db_export_path = Path(args.db_export) if args.db_export else None
+  # When the regression gate passes, this holds the previous version's commit
+  # whose active bugs this run has marked fixed, so the ingesting machine can
+  # replay that status change (see ``export_db_snapshot``).
+  gate_fixed_prev_commit: Optional[str] = None
+
   prev_version = store.get_previous_version(version_id)
   if prev_version is not None:
     still = run_regression_gate(store, prev_version, build_dir)
@@ -830,10 +900,13 @@ def main():
       )
       store.skip_review(review_id, reason)
       console.print(reason, color="yellow")
+      if db_export_path is not None:
+        export_db_snapshot(store, pr_info.pr_id, version_id, review_id, db_export_path)
       return
     # Previous version's bugs no longer trigger -> considered fixed by this version.
     for bug_row in store.list_active_bugs(int(prev_version["id"])):
       store.mark_bug_fixed(int(bug_row["id"]), version_id)
+    gate_fixed_prev_commit = prev_version["fix_commit"]
 
   # Set up LLM and agent
   if args.driver == "openai":
@@ -931,6 +1004,15 @@ def main():
       review_path,
       version_meta,
     )
+    if db_export_path is not None:
+      export_db_snapshot(
+        store,
+        pr_info.pr_id,
+        version_id,
+        review_id,
+        db_export_path,
+        fixed_prev_commit=gate_fixed_prev_commit,
+      )
 
   print_results(stats, console)
 
