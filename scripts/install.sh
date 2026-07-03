@@ -29,8 +29,8 @@ fi
 # LLVM
 #-================================
 
-mkdir ${DEP_LLVM_DIR}
-git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
+# mkdir ${DEP_LLVM_DIR}
+# git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
 cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_RTTI=ON \
@@ -41,7 +41,10 @@ cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DLLVM_ENABLE_PROJECTS="llvm;clang"
 ninja -C ${DEP_LLVM_BUILD_DIR}
 sudo ninja -C ${DEP_LLVM_BUILD_DIR} install
-sudo ldconfig
+# ldconfig is Linux-only; macOS uses dyld and does not need it.
+if command -v ldconfig > /dev/null 2>&1; then
+  sudo ldconfig
+fi
 
 #-================================
 # alive2
@@ -50,7 +53,7 @@ sudo ldconfig
 # Z3
 
 mkdir -p ${DEP_Z3_DIR}
-wget https://github.com/Z3Prover/z3/archive/refs/tags/z3-${DEP_Z3_VERSION}.zip -O ${DEP_Z3_DIR}/z3-${DEP_Z3_VERSION}.zip
+curl -L https://github.com/Z3Prover/z3/archive/refs/tags/z3-${DEP_Z3_VERSION}.zip -o ${DEP_Z3_DIR}/z3-${DEP_Z3_VERSION}.zip
 unzip ${DEP_Z3_DIR}/z3-${DEP_Z3_VERSION}.zip -d ${DEP_Z3_DIR}
 cmake -S ${DEP_Z3_SOURCE_DIR} -B ${DEP_Z3_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C ${DEP_Z3_BUILD_DIR}
@@ -59,7 +62,7 @@ sudo ninja -C ${DEP_Z3_BUILD_DIR} install
 # re2c
 
 mkdir -p ${DEP_RE2C_DIR}
-wget https://github.com/skvadrik/re2c/releases/download/${DEP_RE2C_VERSION}/re2c-${DEP_RE2C_VERSION}.tar.xz -O ${DEP_RE2C_DIR}/re2c-${DEP_RE2C_VERSION}.tar.xz
+curl -L https://github.com/skvadrik/re2c/releases/download/${DEP_RE2C_VERSION}/re2c-${DEP_RE2C_VERSION}.tar.xz -o ${DEP_RE2C_DIR}/re2c-${DEP_RE2C_VERSION}.tar.xz
 tar -xavf ${DEP_RE2C_DIR}/re2c-${DEP_RE2C_VERSION}.tar.xz --directory ${DEP_RE2C_DIR}
 cmake -S ${DEP_RE2C_SOURCE_DIR} -B ${DEP_RE2C_BUILD_DIR} -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C ${DEP_RE2C_BUILD_DIR}
@@ -95,7 +98,7 @@ cmake --build . -j
 # We assume that the python3 executable is available in the PATH.
 PYTHON3=python${DEP_PY3_VERSION}
 if ! command -v ${PYTHON3} > /dev/null 2>&1; then
-  echo "Error: Python ${DEP_PY3_VERSION} is not installed. We require the version as your GDB is reliant on it. Please install it first."
+  echo "Error: Python ${DEP_PY3_VERSION} is not installed. Please install it first."
   exit 1
 fi
 ${PYTHON3} -m venv ${DEP_PY3_VENV_DIR}

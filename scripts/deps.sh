@@ -63,5 +63,5 @@ DEP_LLUBI_BUILD_DIR=${DEP_LLUBI_DIR}/build
 # Python dependencies
 #-================================
 
-DEP_PY3_VERSION=$(gdb --nx -batch -ex "python import platform; v=platform.python_version().split('.'); print(v[0]+'.'+v[1])")
+DEP_PY3_VERSION=$(python3 -c "import platform; v=platform.python_version().split('.'); print(v[0]+'.'+v[1])")
 DEP_PY3_VENV_DIR=${LLVM_AUTOREVIEW_DEPS_DIR}/py3_venv

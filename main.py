@@ -14,7 +14,6 @@ import json_repair
 
 import prompts
 from base.console import get_boxed_console
-from llvm.debugger import DebuggerBase
 from llvm.llvm import LLVM
 from llvm.llvm_helper import (
   apply as apply_patch,
@@ -310,7 +309,6 @@ def get_tool_list(
   pr_env: PREnvironment,
   llvm: LLVM,
   build_dir: str,
-  debugger: DebuggerBase = None,
   phase: int = 0,
 ):
   """Get tool list for different phases"""
@@ -611,7 +609,6 @@ def run_pr_agent(
   llvm: LLVM,
   stats: RunStats,
   build_dir: str,
-  debugger: DebuggerBase = None,
 ) -> Optional[str]:
   """Main PR review agent"""
   agent.clear_history()
@@ -703,7 +700,7 @@ def run_pr_agent(
   stats.reason_thou = reasoning_thoughts
   stats.strategies = [s.as_dict() for s in test_strategies]
 
-  tools_phase2 = get_tool_list(pr_env, llvm, build_dir, debugger, phase=2)
+  tools_phase2 = get_tool_list(pr_env, llvm, build_dir, phase=2)
   try:
     if hasattr(agent.tools, "remove_tool"):
       agent.tools.remove_tool("stop")
@@ -735,15 +732,12 @@ def pr_review(
   build_dir: str,
 ):
   """Main PR review function"""
-  debugger = None
-
   # Register Phase 1 tools
-  tools_phase1 = get_tool_list(pr_env, llvm, build_dir, debugger, phase=1)
+  tools_phase1 = get_tool_list(pr_env, llvm, build_dir, phase=1)
   for to, th in tools_phase1:
     agent.register_tool(to, th)
 
   return run_pr_agent(
-    debugger=debugger,
     agent=agent,
     pr_info=pr_info,
     pr_env=pr_env,
