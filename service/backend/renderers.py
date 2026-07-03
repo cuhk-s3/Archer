@@ -780,10 +780,21 @@ def build_pr_detail_html(detail: dict) -> str:
         + "</div>"
       )
 
+    if status == "failed":
+      return (
+        f'<div class="rev {cls}">'
+        '<div class="rev-top rev-top-static">'
+        + f'<span class="st-pill {cls}">{esc(label)}</span>'
+        + metrics_html
+        + "</div>"
+        '<div class="rev-reason">Review failed before a report was produced.</div>'
+        + "</div>"
+      )
+
     # Everything else inlines the full report inside a collapsible block
     # (expanded by default), so the whole review lives on this one page.
     trace_html = ""
-    if status in ("succeeded", "failed", "tokenlimit"):
+    if status in ("succeeded", "tokenlimit"):
       trace_html = (
         '<div class="rev-links">'
         f'<a href="/trace/{review_id}" onclick="event.stopPropagation()">'

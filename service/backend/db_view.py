@@ -90,6 +90,18 @@ def _review_stats_data(store, review_row) -> Dict[str, Any]:
   full bug records, analysis report, and run metrics) so the PR page can show
   the whole review report without a separate ``/review/<id>`` hop.
   """
+  status = str(review_row["status"] or "")
+  if status == "failed":
+    return {
+      "strategies": [],
+      "bugs": [],
+      "report": None,
+      "chat_rounds": review_row["chat_rounds"],
+      "chat_cost": review_row["chat_cost"],
+      "total_time_sec": review_row["total_time_sec"],
+      "total_tokens": review_row["total_tokens"],
+    }
+
   bug_rows = store.list_bugs_for_review(int(review_row["id"]))
   return {
     "strategies": _loads(review_row["strategies"], []),
@@ -124,8 +136,8 @@ def _review_summary(store, review_row) -> Dict[str, Any]:
     "status": status,
     "outcome": _review_outcome(status, bug_count),
     "skipped_reason": review_row["skipped_reason"],
-    "error": review_row["error"],
-    "errmsg": review_row["errmsg"],
+    "error": None,
+    "errmsg": None,
     "created_at": review_row["created_at"],
     "finished_at": review_row["finished_at"],
     "total_time_sec": review_row["total_time_sec"],
@@ -321,11 +333,12 @@ def review_view(review_id: int) -> Optional[Dict[str, Any]]:
   pr = store.get_pr(int(review["pr_id"]))
   prev_version = store.get_previous_version(int(review["version_id"]))
   bug_rows = store.list_bugs_for_review(review_id)
+  status = str(review["status"] or "")
 
   stats_data = {
-    "strategies": _loads(review["strategies"], []),
-    "bugs": [_bug_full_dict(b) for b in bug_rows],
-    "report": review["report"],
+    "strategies": [] if status == "failed" else _loads(review["strategies"], []),
+    "bugs": [] if status == "failed" else [_bug_full_dict(b) for b in bug_rows],
+    "report": None if status == "failed" else review["report"],
     "chat_rounds": review["chat_rounds"],
     "chat_cost": review["chat_cost"],
     "total_time_sec": review["total_time_sec"],
@@ -343,10 +356,10 @@ def review_view(review_id: int) -> Optional[Dict[str, Any]]:
     "fix_commit": version["fix_commit"] if version is not None else "",
     "base_commit": version["base_commit"] if version is not None else "",
     "prev_commit": prev_version["fix_commit"] if prev_version is not None else None,
-    "status": review["status"],
+    "status": status,
     "skipped_reason": review["skipped_reason"],
-    "error": review["error"],
-    "errmsg": review["errmsg"],
+    "error": None,
+    "errmsg": None,
     "created_at": review["created_at"],
     "finished_at": review["finished_at"],
   }
@@ -358,6 +371,8 @@ def review_history(review_id: int) -> Optional[Dict[str, Any]]:
   store = _get_store()
   review = store.get_review(review_id)
   if review is None:
+    return None
+  if str(review["status"] or "") == "failed":
     return None
   history = _loads(review["history"], None)
   sidecar = {
