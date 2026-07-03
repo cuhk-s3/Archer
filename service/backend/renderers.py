@@ -312,7 +312,7 @@ def build_review_html_from_stats(stats_data: dict) -> str:
     .head {{ margin-bottom: 20px; padding-bottom: 16px; border-bottom: 2px solid var(--ink); }}
     .title {{ margin: 0; font-size: 22px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }}
     .subtitle {{ margin-top: 9px; color: var(--sub); font-size: 11.5px; letter-spacing: 0.03em; }}
-    .section {{ margin: 22px 0 0; padding-top: 18px; border-top: 1px solid var(--line); }}
+    .section {{ margin: 18px 0 0; padding-top: 14px; border-top: 1px solid var(--line); }}
     .section-title {{ font-size: 11px; font-weight: 700; margin-bottom: 12px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.12em; }}
 
     /* summary — linear hairline row, no cards */
@@ -344,7 +344,7 @@ def build_review_html_from_stats(stats_data: dict) -> str:
     .analysis-body .md-code-block pre {{ margin: 0; border: none; }}
 
     /* unified field layout */
-    .field {{ margin: 14px 0; }}
+    .field {{ margin: 10px 0; }}
     .field:first-child {{ margin-top: 0; }}
     .field-label {{ font-size: 10px; font-weight: 700; color: var(--sub); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 7px; }}
     .field-val {{ font-size: 13px; line-height: 1.6; color: var(--ink); }}
@@ -355,11 +355,11 @@ def build_review_html_from_stats(stats_data: dict) -> str:
     /* strategy — hairline rows, no card */
     .strat {{ border-bottom: 1px solid var(--line); }}
     .strat:first-of-type {{ border-top: 1px solid var(--line); }}
-    .strat-head {{ display: flex; align-items: center; gap: 12px; padding: 13px 0; cursor: pointer; user-select: none; }}
+    .strat-head {{ display: flex; align-items: center; gap: 12px; padding: 10px 0; cursor: pointer; user-select: none; }}
     .strat-head:hover .strat-name {{ color: var(--accent); }}
     .strat-idx {{ flex: none; width: 22px; height: 22px; background: var(--ink); color: #fff; font-size: 11px; font-weight: 700; font-family: var(--mono); display: inline-flex; align-items: center; justify-content: center; }}
     .strat-name {{ flex: 1; font-size: 13px; font-weight: 600; color: var(--ink); }}
-    .strat-body {{ display: none; padding: 2px 0 16px 34px; }}
+    .strat-body {{ display: none; padding: 2px 0 10px 34px; }}
     .strat.expanded .strat-body {{ display: block; }}
 
     /* bug — sharp left rule, no card */

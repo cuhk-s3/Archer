@@ -59,8 +59,8 @@ def build_dashboard_html() -> str:
     /* Stats — linear, hairline separated, no cards */
     .stats { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
     .stat-card { padding: 15px 18px 14px; border-left: 1px solid var(--line); }
-    .stat-card:first-child { border-left: none; padding-left: 0; }
-    .stat-num { font-size: 32px; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
+    .stat-card:first-child { border-left: none; padding-left: 8px; }
+    .stat-num { font-size: 24px; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
     .stat-card.run .stat-num { color: var(--run); }
     .stat-card.bug .stat-num { color: var(--err); }
     .stat-card.done .stat-num { color: var(--ok); }
@@ -87,9 +87,9 @@ def build_dashboard_html() -> str:
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 620px; table-layout: fixed; }
     thead th { color: var(--muted); font-weight: 700; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.12em; text-align: left; padding: 13px 14px; border-bottom: 1px solid var(--line-strong); }
-    thead th:first-child { padding-left: 0; }
+    thead th:first-child { padding-left: 8px; }
     tbody td { border-bottom: 1px solid var(--line); padding: 15px 14px; vertical-align: top; font-size: 13px; }
-    tbody td:first-child { padding-left: 0; }
+    tbody td:first-child { padding-left: 10px; }
     tbody tr { transition: background .12s; }
     tbody tr:hover { background: #fafbfc; }
     th:nth-child(1), td:nth-child(1) { width: 50%; }
