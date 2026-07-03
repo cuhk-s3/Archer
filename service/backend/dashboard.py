@@ -43,7 +43,7 @@ _DASHBOARD_STYLE = """
 
     .stats { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
     .stat-card { padding: 11px 18px 10px; border-left: 1px solid var(--line); }
-    .stat-card:first-child { border-left: none; padding-left: 8px; }
+    .stat-card:first-child { border-left: none; padding-left: 0; }
     .stat-num { font-size: 24px; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
     .stat-card.run .stat-num { color: var(--run); }
     .stat-card.bug .stat-num { color: var(--err); }
@@ -77,7 +77,7 @@ _DASHBOARD_STYLE = """
     th:nth-child(1), td:nth-child(1) { width: 57%; }
     th:nth-child(2), td:nth-child(2) { width: 16%; }
     th:nth-child(3), td:nth-child(3) { width: 9%; }
-    th:nth-child(4), td:nth-child(4) { width: 18%; }
+    th:nth-child(4), td:nth-child(4) { width: 18%; padding-right: 24px; }
 
     .pr-header { line-height: 1.55; }
     .pr-link { color: var(--accent); font-size: 12.5px; font-weight: 700; text-decoration: none; margin-right: 8px; }

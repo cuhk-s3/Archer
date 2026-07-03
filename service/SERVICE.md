@@ -9,17 +9,18 @@ This deployment mode separates responsibilities into two roles:
 
 ### Dispatcher
 
-1. Runs FastAPI service (`service.backend.app`) for `/api/jobs`, `/api/scan`, and `/artifact`.
+1. Runs FastAPI service (`service.backend.app`) for the dashboard API and DB-backed PR/review pages.
 2. Runs static UI from `service/frontend/`.
 3. Scans LLVM PRs with existing filtering logic.
 4. Dispatches work to GitHub Actions workflow.
-5. Polls workflow run status and updates dashboard data.
+5. Polls workflow run status, downloads artifacts, and ingests `run.db.json` into the local `dataset/archer.db`.
+6. Serves the review board from the local SQLite DB.
 
 ### Worker
 
 1. Runs GitHub Actions self-hosted runner with label `archer-school`.
 2. Executes workflow job by running `main.py`.
-3. Uploads stats/history/review artifacts to GitHub Actions.
+3. Uploads `run.stats.json`, `run.history.json`, `run.review.md`, and `run.db.json` to GitHub Actions.
 
 ## One-Command Startup
 
@@ -71,9 +72,17 @@ bash scripts/run_worker.sh
 1. Dispatcher scans PRs and enqueues jobs.
 2. Dispatcher dispatches workflow runs.
 3. Worker runner pulls the workflow job and runs `main.py`.
-4. Workflow uploads artifacts to GitHub.
-5. Dispatcher polls run status and updates `/api/jobs`.
-6. Dispatcher UI refreshes and displays status; review link falls back to workflow run URL when local artifacts are unavailable.
+4. `main.py` writes local stats/history/review files and exports a structured `run.db.json` snapshot.
+5. Workflow uploads the files to GitHub Actions artifacts.
+6. Dispatcher downloads the artifacts and replays `run.db.json` into its authoritative `dataset/archer.db`.
+7. Dashboard reads from `/api/prs`, `/pr/{pr_id}`, `/review/{review_id}`, and `/trace/{review_id}`.
+
+## Data Model
+
+- `dataset/archer.db` on the dispatcher is the authoritative dashboard store.
+- `run.db.json` is the machine-independent result snapshot sent from worker to dispatcher.
+- `run.stats.json`, `run.history.json`, and `run.review.md` are still saved as run artifacts for debugging and inspection.
+- With a single runner, copy the dispatcher's `dataset/archer.db` to the runner before starting if regression-gate history is needed there.
 
 ## Network Requirements
 
