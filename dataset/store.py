@@ -197,6 +197,15 @@ class ArcherStore:
         "SELECT * FROM prs WHERE pr_id=?", (int(pr_id),)
       ).fetchone()
 
+  def list_prs(self) -> List[sqlite3.Row]:
+    """All PRs, most recently updated first."""
+    with self._lock:
+      return list(
+        self._conn.execute(
+          "SELECT * FROM prs ORDER BY updated_at DESC, pr_id DESC"
+        ).fetchall()
+      )
+
   def has_version(self, pr_id: int, fix_commit: str) -> bool:
     with self._lock:
       row = self._conn.execute(
@@ -291,6 +300,32 @@ class ArcherStore:
       )
       self._conn.commit()
       return int(cur.lastrowid)
+
+  def get_review(self, review_id: int) -> Optional[sqlite3.Row]:
+    with self._lock:
+      return self._conn.execute(
+        "SELECT * FROM reviews WHERE id=?", (int(review_id),)
+      ).fetchone()
+
+  def list_reviews_for_version(self, version_id: int) -> List[sqlite3.Row]:
+    """Reviews of a single version, newest first."""
+    with self._lock:
+      return list(
+        self._conn.execute(
+          "SELECT * FROM reviews WHERE version_id=? ORDER BY created_at DESC, id DESC",
+          (int(version_id),),
+        ).fetchall()
+      )
+
+  def list_reviews_for_pr(self, pr_id: int) -> List[sqlite3.Row]:
+    """All reviews of a PR across every version, newest first."""
+    with self._lock:
+      return list(
+        self._conn.execute(
+          "SELECT * FROM reviews WHERE pr_id=? ORDER BY created_at DESC, id DESC",
+          (int(pr_id),),
+        ).fetchall()
+      )
 
   def skip_review(self, review_id: int, reason: str) -> None:
     with self._lock:
@@ -399,6 +434,24 @@ class ArcherStore:
       return list(
         self._conn.execute(
           "SELECT * FROM bugs WHERE review_id=?", (int(review_id),)
+        ).fetchall()
+      )
+
+  def list_bugs_for_version(self, version_id: int) -> List[sqlite3.Row]:
+    with self._lock:
+      return list(
+        self._conn.execute(
+          "SELECT * FROM bugs WHERE version_id=? ORDER BY created_at ASC, id ASC",
+          (int(version_id),),
+        ).fetchall()
+      )
+
+  def list_bugs_for_pr(self, pr_id: int) -> List[sqlite3.Row]:
+    with self._lock:
+      return list(
+        self._conn.execute(
+          "SELECT * FROM bugs WHERE pr_id=? ORDER BY created_at ASC, id ASC",
+          (int(pr_id),),
         ).fetchall()
       )
 
