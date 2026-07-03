@@ -1,0 +1,172 @@
+{
+  "base_commit": "85dbe18beef4537dcdfaf9a009b1dd3dbdab608b",
+  "bug_id": "156849",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        "SCEVExpander::generateOverflowCheck"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        [
+          2187,
+          2194
+        ]
+      ]
+    },
+    "components": [
+      "ScalarEvolution"
+    ],
+    "fix_commit": "f8972c8280d28660aaff888c093a9e01b9ee71e6"
+  },
+  "issue": {
+    "author": "nikic",
+    "body": "```llvm\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; out[i] = x[(i * 5) & 16]\ndefine void @test(ptr noalias %x, ptr noalias %out) {\nstart:\n  br label %loop\n\nloop:\n  %iv = phi i64 [ 0, %start ], [ %iv.next, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %iv.mul5 = mul nuw nsw i64 %iv, 5\n  %iv.mul5.masked = and i64 %iv.mul5, 15\n  %gep = getelementptr inbounds nuw i32, ptr %x, i64 %iv.mul5.masked\n  %v = load i32, ptr %gep, align 4\n  %out.i = getelementptr inbounds nuw i32, ptr %out, i64 %iv\n  store i32 %v, ptr %out.i, align 4\n  %exitcond.not = icmp eq i64 %iv.next, 16\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:\n  ret void\n}\n```\nProduces:\n```llvm\ndefine void @test(ptr noalias %x, ptr noalias %out) {\nstart:\n  br i1 false, label %scalar.ph, label %vector.ph\n\nvector.ph:\n  br label %vector.body\n\nvector.body:\n  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]\n  %0 = mul nuw nsw i64 %index, 5\n  %1 = and i64 %0, 15\n  %2 = getelementptr inbounds nuw i32, ptr %x, i64 %1\n  %wide.vec = load <20 x i32>, ptr %2, align 4\n  %strided.vec = shufflevector <20 x i32> %wide.vec, <20 x i32> poison, <4 x i32> <i32 0, i32 5, i32 10, i32 15>\n  %3 = getelementptr inbounds nuw i32, ptr %out, i64 %index\n  store <4 x i32> %strided.vec, ptr %3, align 4\n  %index.next = add nuw i64 %index, 4\n  %4 = icmp eq i64 %index.next, 12\n  br i1 %4, label %middle.block, label %vector.body\n\nmiddle.block:\n  br label %scalar.ph\n\nscalar.ph:\n  %bc.resume.val = phi i64 [ 12, %middle.block ], [ 0, %start ]\n  br label %loop\n\nloop:\n  %iv = phi i64 [ %bc.resume.val, %scalar.ph ], [ %iv.next, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %iv.mul5 = mul nuw nsw i64 %iv, 5\n  %iv.mul5.masked = and i64 %iv.mul5, 15\n  %gep = getelementptr inbounds nuw i32, ptr %x, i64 %iv.mul5.masked\n  %v = load i32, ptr %gep, align 4\n  %out.i = getelementptr inbounds nuw i32, ptr %out, i64 %iv\n  store i32 %v, ptr %out.i, align 4\n  %exitcond.not = icmp eq i64 %iv.next, 16\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:\n  ret void\n}\n```\n\nWhat's happening here with the load and shufflevector doesn't really make sense. It seems like the masking on the IV ended up being ignored?",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "cc @fhahn "
+      },
+      {
+        "author": "fhahn",
+        "body": "Looks like an SCEVExpander issue, will share a fix soon"
+      },
+      {
+        "author": "nikic",
+        "body": "Backport PR: https://github.com/llvm/llvm-project/pull/157410"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "release:cherry-pick-failed",
+      "llvm:SCEV"
+    ],
+    "title": "[LoopVectorize] Miscompile with masked IV"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/156849",
+  "knowledge_cutoff": "2025-09-04T10:35:34Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopDistribute",
+    "llvm/test/Transforms/LoopVectorize",
+    "llvm/test/Transforms/LoopVersioning"
+  ],
+  "patch": "commit f8972c8280d28660aaff888c093a9e01b9ee71e6\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Fri Sep 5 16:13:11 2025 +0100\n\n    [SCEVExp] Fix early exit in ComputeEndCheck. (#156910)\n    \n    ComputeEndCheck incorrectly returned false for unsigned predicates\n    starting at zero and a positive step.\n    \n    The AddRec could still wrap if Step * trunc ExitCount wraps or trunc\n    ExitCount strips leading 1s.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/156849.\n    \n    PR: https://github.com/llvm/llvm-project/pull/156910\n\ndiff --git a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\nindex 3e3d51bffff3..7c12dac73f3d 100644\n--- a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n+++ b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n@@ -2187,8 +2187,15 @@ Value *SCEVExpander::generateOverflowCheck(const SCEVAddRecExpr *AR,\n   // negative. If Step is known to be positive or negative, only create\n   // either 1. or 2.\n   auto ComputeEndCheck = [&]() -> Value * {\n-    // Checking <u 0 is always false.\n-    if (!Signed && Start->isZero() && SE.isKnownPositive(Step))\n+    // Checking <u 0 is always false, if (Step * trunc ExitCount) does not wrap.\n+    // TODO: Predicates that can be proven true/false should be discarded when\n+    // the predicates are created, not late during expansion.\n+    if (!Signed && Start->isZero() && SE.isKnownPositive(Step) &&\n+        DstBits < SrcBits &&\n+        ExitCount == SE.getZeroExtendExpr(SE.getTruncateExpr(ExitCount, ARTy),\n+                                          ExitCount->getType()) &&\n+        SE.willNotOverflow(Instruction::Mul, Signed, Step,\n+                           SE.getTruncateExpr(ExitCount, ARTy)))\n       return ConstantInt::getFalse(Loc->getContext());\n \n     // Get the backedge taken count and truncate or extended to the AR type.\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=loop-distribute -enable-loop-distribute -verify-loop-info -verify-dom-info -S -enable-mem-access-versioning=0 < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopDistribute/scev-inserted-runtime-check.ll",
+      "tests": [
+        {
+          "test_body": "define void @f(ptr noalias %a, ptr noalias %b, ptr noalias %c, ptr noalias %d, ptr noalias %e, i64 %N) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %ind = phi i64 [ 0, %entry ], [ %add, %for.body ]\n  %ind1 = phi i32 [ 0, %entry ], [ %inc1, %for.body ]\n  %mul = mul i32 %ind1, 2\n  %mul_ext = zext i32 %mul to i64\n  %arrayidxA = getelementptr inbounds i32, ptr %a, i64 %mul_ext\n  %loadA = load i32, ptr %arrayidxA, align 4\n  %arrayidxB = getelementptr inbounds i32, ptr %b, i64 %mul_ext\n  %loadB = load i32, ptr %arrayidxB, align 4\n  %mulA = mul i32 %loadB, %loadA\n  %add = add nuw nsw i64 %ind, 1\n  %inc1 = add i32 %ind1, 1\n  %arrayidxA_plus_4 = getelementptr inbounds i32, ptr %a, i64 %add\n  store i32 %mulA, ptr %arrayidxA_plus_4, align 4\n  %arrayidxD = getelementptr inbounds i32, ptr %d, i64 %mul_ext\n  %loadD = load i32, ptr %arrayidxD, align 4\n  %arrayidxE = getelementptr inbounds i32, ptr %e, i64 %mul_ext\n  %loadE = load i32, ptr %arrayidxE, align 4\n  %mulC = mul i32 %loadD, %loadE\n  %arrayidxC = getelementptr inbounds i32, ptr %c, i64 %mul_ext\n  store i32 %mulC, ptr %arrayidxC, align 4\n  %exitcond = icmp eq i64 %add, %N\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n",
+          "test_name": "f"
+        },
+        {
+          "test_body": "@global_a = external local_unnamed_addr global [8192 x i32], align 16\n\ndeclare void @use64(i64)\n\ndefine void @f_with_offset(ptr noalias %b, ptr noalias %c, ptr noalias %d, ptr noalias %e, i64 %N) {\nentry:\n  %a_intptr = ptrtoint ptr @global_a to i64\n  call void @use64(i64 %a_intptr)\n  %a = getelementptr i32, ptr @global_a, i32 42\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %ind = phi i64 [ 0, %entry ], [ %add, %for.body ]\n  %ind1 = phi i32 [ 0, %entry ], [ %inc1, %for.body ]\n  %mul = mul i32 %ind1, 2\n  %mul_ext = zext i32 %mul to i64\n  %arrayidxA = getelementptr inbounds i32, ptr %a, i64 %mul_ext\n  %loadA = load i32, ptr %arrayidxA, align 4\n  %arrayidxB = getelementptr inbounds i32, ptr %b, i64 %mul_ext\n  %loadB = load i32, ptr %arrayidxB, align 4\n  %mulA = mul i32 %loadB, %loadA\n  %add = add nuw nsw i64 %ind, 1\n  %inc1 = add i32 %ind1, 1\n  %arrayidxA_plus_4 = getelementptr inbounds i32, ptr %a, i64 %add\n  store i32 %mulA, ptr %arrayidxA_plus_4, align 4\n  %arrayidxD = getelementptr inbounds i32, ptr %d, i64 %mul_ext\n  %loadD = load i32, ptr %arrayidxD, align 4\n  %arrayidxE = getelementptr inbounds i32, ptr %e, i64 %mul_ext\n  %loadE = load i32, ptr %arrayidxE, align 4\n  %mulC = mul i32 %loadD, %loadE\n  %arrayidxC = getelementptr inbounds i32, ptr %c, i64 %mul_ext\n  store i32 %mulC, ptr %arrayidxC, align 4\n  %exitcond = icmp eq i64 %add, %N\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n",
+          "test_name": "f_with_offset"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt < %s -passes=loop-vectorize -mtriple=x86_64-apple-macosx10.8.0 -mcpu=corei7-avx -S"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/X86/cost-model.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine void @multi_exit(ptr %dst, ptr %src.1, ptr %src.2, i64 %A, i64 %B) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop.latch, %entry\n  %iv.1.wide = phi i64 [ 0, %entry ], [ %iv.1.next.wide, %loop.latch ]\n  %iv.1 = phi i32 [ 0, %entry ], [ %iv.1.next, %loop.latch ]\n  %ec.1 = icmp ult i64 %iv.1.wide, %A\n  br i1 %ec.1, label %loop.latch, label %exit\n\nloop.latch:                                       ; preds = %loop\n  %l.1 = load i64, ptr %src.1, align 8\n  %l.2 = load i64, ptr %src.2, align 8\n  %cmp55.us = icmp eq i64 %l.1, 0\n  %cmp.i.us = icmp ne i64 %l.2, 0\n  %and = and i1 %cmp.i.us, %cmp55.us\n  %ext = zext i1 %and to i8\n  store i8 %ext, ptr %dst, align 1\n  %iv.1.next = add i32 %iv.1, 1\n  %iv.1.next.wide = zext i32 %iv.1.next to i64\n  %ec.2 = icmp ult i64 %iv.1.next.wide, %B\n  br i1 %ec.2, label %loop, label %exit\n\nexit:                                             ; preds = %loop.latch, %loop\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"penryn\" }\n",
+          "test_name": "multi_exit"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i1 @any_of_cost(ptr %start, ptr %end) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %any.of = phi i1 [ false, %entry ], [ %any.of.next, %loop ]\n  %ptr.iv = phi ptr [ %start, %entry ], [ %ptr.iv.next, %loop ]\n  %gep = getelementptr i8, ptr %ptr.iv, i64 8\n  %l = load ptr, ptr %gep, align 8\n  %cmp13.not.not = icmp eq ptr %l, null\n  %any.of.next = select i1 %cmp13.not.not, i1 %any.of, i1 false\n  %ptr.iv.next = getelementptr inbounds i8, ptr %ptr.iv, i64 40\n  %cmp.not = icmp eq ptr %ptr.iv, %end\n  br i1 %cmp.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i1 %any.of.next\n}\n\nattributes #0 = { \"target-cpu\"=\"penryn\" }\n",
+          "test_name": "any_of_cost"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine float @PR27826(ptr nocapture readonly %a, ptr nocapture readonly %b, i32 %n) {\nentry:\n  %cmp = icmp sgt i32 %n, 0\n  br i1 %cmp, label %preheader, label %for.end\n\npreheader:                                        ; preds = %entry\n  %t0 = sext i32 %n to i64\n  br label %for\n\nfor:                                              ; preds = %for, %preheader\n  %indvars.iv = phi i64 [ 0, %preheader ], [ %indvars.iv.next, %for ]\n  %s.02 = phi float [ 0.000000e+00, %preheader ], [ %add4, %for ]\n  %arrayidx = getelementptr inbounds float, ptr %a, i64 %indvars.iv\n  %t1 = load float, ptr %arrayidx, align 4\n  %arrayidx3 = getelementptr inbounds float, ptr %b, i64 %indvars.iv\n  %t2 = load float, ptr %arrayidx3, align 4\n  %add = fadd fast float %t1, %s.02\n  %add4 = fadd fast float %add, %t2\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 32\n  %cmp1 = icmp slt i64 %indvars.iv.next, %t0\n  br i1 %cmp1, label %for, label %loopexit\n\nloopexit:                                         ; preds = %for\n  %add4.lcssa = phi float [ %add4, %for ]\n  br label %for.end\n\nfor.end:                                          ; preds = %loopexit, %entry\n  %s.0.lcssa = phi float [ 0.000000e+00, %entry ], [ %add4.lcssa, %loopexit ]\n  ret float %s.0.lcssa\n}\n",
+          "test_name": "PR27826"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i64 @cost_assume(ptr %end, i64 %N) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %0 = phi i64 [ 0, %entry ], [ %1, %loop ]\n  %1 = add i64 %0, 1\n  %iv.next = add nsw i64 %iv, 1\n  %c = icmp ne i64 %N, 0\n  tail call void @llvm.assume(i1 %c)\n  %gep = getelementptr nusw [9 x i8], ptr null, i64 %iv.next\n  %ec = icmp eq ptr %gep, %end\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i64 %1\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "test_name": "cost_assume"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i32 @g(i64 %n) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %select = phi i32 [ 0, %entry ], [ %select.next, %loop ]\n  %iv.widen = zext i32 %iv to i64\n  %exitcond = icmp eq i64 %n, %iv.widen\n  %select.i = select i1 %exitcond, i32 0, i32 2\n  %select.next = or i32 %select.i, %select\n  %iv.next = add i32 %iv, 1\n  br i1 %exitcond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %select.next\n}\n",
+          "test_name": "g"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine void @reduction_store(ptr noalias %src, ptr %dst, i1 %x) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %red = phi i32 [ 0, %entry ], [ %red.next, %loop ]\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %gep.src = getelementptr inbounds i32, ptr %src, i32 %iv\n  %l = load i32, ptr %gep.src, align 4\n  %l.and = and i32 %l, 3\n  store i32 %l.and, ptr %dst, align 4\n  %x.ext = zext i1 %x to i64\n  %lshr = lshr i64 %x.ext, 12\n  %t = trunc i64 %lshr to i32\n  %red.next = and i32 %red, %t\n  store i32 %red.next, ptr %dst, align 4\n  %iv.next = add i32 %iv, 1\n  %ec = icmp eq i32 %iv, 29\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"znver3\" }\n",
+          "test_name": "reduction_store"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i64 @live_in_known_1_via_scev() {\nentry:\n  %sel = select i1 false, i32 3, i32 0\n  br label %ph\n\nph:                                               ; preds = %entry\n  %p = phi i32 [ 1, %entry ]\n  %N = add nuw nsw i32 %sel, 6\n  %p.ext = zext nneg i32 %p to i64\n  br label %loop\n\nloop:                                             ; preds = %loop, %ph\n  %iv = phi i32 [ 0, %ph ], [ %iv.next, %loop ]\n  %red = phi i64 [ 3, %ph ], [ %red.mul, %loop ]\n  %red.mul = mul nsw i64 %red, %p.ext\n  %iv.next = add nuw nsw i32 %iv, 1\n  %ec = icmp eq i32 %iv.next, %N\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %res = phi i64 [ %red.mul, %loop ]\n  ret i64 %res\n}\n",
+          "test_name": "live_in_known_1_via_scev"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i64 @cost_loop_invariant_recipes(i1 %x, i64 %y) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next.i.i.i, %loop ]\n  %red = phi i64 [ 1, %entry ], [ %red.mul, %loop ]\n  %not.x = xor i1 %x, true\n  %ext = zext i1 %not.x to i64\n  %shl = shl i64 %y, %ext\n  %red.mul = mul i64 %shl, %red\n  %iv.next.i.i.i = add i64 %iv, 1\n  %ec = icmp eq i64 %iv, 1\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i64 %red.mul\n}\n",
+          "test_name": "cost_loop_invariant_recipes"
+        },
+        {
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-apple-macosx10.8.0\"\n\ndefine i32 @narrowed_reduction(ptr %a, i1 %cmp) #0 {\nentry:\n  %conv = zext i1 %cmp to i32\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 1, %entry ], [ %inc, %loop ]\n  %or13 = phi i32 [ 0, %entry ], [ %or, %loop ]\n  %and = and i32 %or13, 1\n  %or = or i32 %and, %conv\n  %inc = add i32 %iv, 1\n  %ec = icmp eq i32 %iv, 16\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret i32 %or\n}\n\nattributes #0 = { \"target-cpu\"=\"penryn\" }\n",
+          "test_name": "narrowed_reduction"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S -passes=loop-vectorize -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses=true %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/interleaved-accesses-requiring-scev-predicates.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine void @wrap_predicate_for_interleave_group_unknown_trip_count(ptr noalias %x, ptr noalias %out, i64 %n) {\nstart:\n  br label %loop\n\nloop:                                             ; preds = %loop, %start\n  %iv = phi i64 [ 0, %start ], [ %iv.next, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %iv.mul3 = mul nuw nsw i64 %iv, 3\n  %iv.mul3.masked = and i64 %iv.mul3, 15\n  %gep = getelementptr inbounds nuw i32, ptr %x, i64 %iv.mul3.masked\n  %v = load i32, ptr %gep, align 4\n  %out.i = getelementptr inbounds nuw i32, ptr %out, i64 %iv\n  store i32 %v, ptr %out.i, align 4\n  %exitcond.not = icmp eq i64 %iv.next, %n\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "wrap_predicate_for_interleave_group_unknown_trip_count"
+        },
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine void @wrap_predicate_for_interleave_group_wraps_for_known_trip_count(ptr noalias %x, ptr noalias %out) {\nstart:\n  br label %loop\n\nloop:                                             ; preds = %loop, %start\n  %iv = phi i64 [ 0, %start ], [ %iv.next, %loop ]\n  %iv.next = add nuw nsw i64 %iv, 1\n  %iv.mul5 = mul nuw nsw i64 %iv, 5\n  %iv.mul5.masked = and i64 %iv.mul5, 15\n  %gep = getelementptr inbounds nuw i32, ptr %x, i64 %iv.mul5.masked\n  %v = load i32, ptr %gep, align 4\n  %out.i = getelementptr inbounds nuw i32, ptr %out, i64 %iv\n  store i32 %v, ptr %out.i, align 4\n  %exitcond.not = icmp eq i64 %iv.next, 16\n  br i1 %exitcond.not, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "wrap_predicate_for_interleave_group_wraps_for_known_trip_count"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -passes=loop-vectorize -force-vector-width=4 -S %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/runtime-check-small-clamped-bounds.ll",
+      "tests": [
+        {
+          "test_body": "define void @load_clamped_index(ptr %A, ptr %B, i32 %N) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %clamped.index = urem i32 %iv, 4\n  %gep.A = getelementptr inbounds i32, ptr %A, i32 %clamped.index\n  %lv = load i32, ptr %gep.A, align 4\n  %add = add i32 %lv, 10\n  %gep.B = getelementptr inbounds i32, ptr %B, i32 %iv\n  store i32 %add, ptr %gep.B, align 4\n  %iv.next = add nuw nsw i32 %iv, 1\n  %cond = icmp eq i32 %iv.next, %N\n  br i1 %cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "load_clamped_index"
+        },
+        {
+          "test_body": "define void @store_clamped_index(ptr %A, ptr %B, i32 %N) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %clamped.index = urem i32 %iv, 4\n  %gep.B = getelementptr inbounds i32, ptr %B, i32 %iv\n  %lv = load i32, ptr %gep.B, align 4\n  %add = add i32 %lv, 10\n  %gep.A = getelementptr inbounds i32, ptr %A, i32 %clamped.index\n  store i32 %add, ptr %gep.A, align 4\n  %iv.next = add nuw nsw i32 %iv, 1\n  %cond = icmp eq i32 %iv.next, %N\n  br i1 %cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "store_clamped_index"
+        },
+        {
+          "test_body": "define void @clamped_index_equal_dependence(ptr %A, ptr %B, i32 %N) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]\n  %clamped.index = urem i32 %iv, 4\n  %gep.A = getelementptr inbounds i32, ptr %A, i32 %clamped.index\n  %lv.A = load i32, ptr %gep.A, align 4\n  %add = add i32 %lv.A, 10\n  %iv.next = add nuw nsw i32 %iv, 1\n  store i32 %add, ptr %gep.A, align 4\n  %cond = icmp eq i32 %iv.next, %N\n  br i1 %cond, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n",
+          "test_name": "clamped_index_equal_dependence"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -passes=loop-versioning -S < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVersioning/wrapping-pointer-versioning.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:o-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine void @f1(ptr noalias %a, ptr noalias %b, i64 %N) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %ind = phi i64 [ 0, %entry ], [ %inc, %for.body ]\n  %ind1 = phi i32 [ 0, %entry ], [ %inc1, %for.body ]\n  %mul = mul i32 %ind1, 2\n  %mul_ext = zext i32 %mul to i64\n  %arrayidxA = getelementptr i16, ptr %a, i64 %mul_ext\n  %loadA = load i16, ptr %arrayidxA, align 2\n  %arrayidxB = getelementptr i16, ptr %b, i64 %ind\n  %loadB = load i16, ptr %arrayidxB, align 2\n  %add = mul i16 %loadA, %loadB\n  store i16 %add, ptr %arrayidxA, align 2\n  %inc = add nuw nsw i64 %ind, 1\n  %inc1 = add i32 %ind1, 1\n  %exitcond = icmp eq i64 %inc, %N\n  br i1 %exitcond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n",
+          "test_name": "f1"
+        }
+      ]
+    }
+  ]
+}

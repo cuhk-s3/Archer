@@ -1,23 +1,21 @@
-import json
 import os
 import subprocess
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import List, Optional
 
+from dataset import get_store
 from llvm import llvm_helper
 from llvm.llvm_helper import (
   apply as apply_patch,
 )
 from llvm.llvm_helper import (
-  dataset_dir,
   get_langref_desc,
   get_llvm_build_dir,
   git_execute,
   reset,
   set_llvm_build_dir,
 )
-from store import get_store
 
 # Project root (parent of the `llvm` package directory).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -71,25 +69,6 @@ class PREnvironment:
   # Discovery / loading
   # ---------------------------------------------------------------------------
   @staticmethod
-  def get_pr_info_path(pr_id: int) -> Optional[Path]:
-    """Get the path to legacy JSON PR info (closed/ then open/).
-
-    Retained only as a fallback for datasets that have not been migrated to the
-    DB. The DB is the source of truth.
-    """
-    # Check closed directory first (most PRs should be closed)
-    closed_path = Path(dataset_dir) / "closed" / f"{pr_id}.json"
-    if closed_path.exists():
-      return closed_path
-
-    # Check open directory
-    open_path = Path(dataset_dir) / "open" / f"{pr_id}.json"
-    if open_path.exists():
-      return open_path
-
-    return None
-
-  @staticmethod
   def _pr_info_from_dict(data: dict) -> PRInfo:
     allowed_keys = {f.name for f in fields(PRInfo)}
     filtered = {k: v for k, v in data.items() if k in allowed_keys}
@@ -124,22 +103,9 @@ class PREnvironment:
 
   @classmethod
   def load_saved_pr_info(cls, pr_id: int, console=None) -> Optional[PRInfo]:
-    """Load previously saved PR info (DB first, legacy JSON as fallback)."""
+    """Load previously saved PR info (the latest version) from the DB."""
     pr_info, _ = cls.load_from_db(pr_id, console=console)
-    if pr_info is not None:
-      return pr_info
-
-    info_path = cls.get_pr_info_path(pr_id)
-    if info_path is None:
-      return None
-    try:
-      with open(info_path, "r") as f:
-        data = json.load(f)
-      return cls._pr_info_from_dict(data)
-    except Exception as e:
-      if console is not None:
-        console.print(f"Warning: Failed to load saved PR info: {e}", color="yellow")
-      return None
+    return pr_info
 
   @staticmethod
   def extract_pr_info(pr_id: int, console) -> bool:
@@ -180,17 +146,12 @@ class PREnvironment:
     pr_info, version_id = cls.load_from_db(pr_id, fix_commit, console)
 
     if pr_info is None:
-      # Not in DB yet: try legacy JSON, else extract via pr_extract.py (-> DB).
-      pr_info = cls.load_saved_pr_info(pr_id, console)
-
-    if pr_info is None:
+      # Not in the DB yet: extract via pr_extract.py, which writes to the DB.
       console.print(f"PR #{pr_id} data not found, extracting...")
       if not cls.extract_pr_info(pr_id, console):
         raise PREnvironmentError("Failed to extract PR information")
 
       pr_info, version_id = cls.load_from_db(pr_id, fix_commit, console)
-      if pr_info is None:
-        pr_info = cls.load_saved_pr_info(pr_id, console)
       if pr_info is None:
         raise PREnvironmentError("Failed to load PR information after extraction")
 

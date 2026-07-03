@@ -1,0 +1,69 @@
+{
+  "base_commit": "77c325b646301e394bcd89c2980b4c2da8af49cd",
+  "bug_id": "124387",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+        "InstCombinerImpl::SimplifyDemandedUseBits"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+        [
+          1039,
+          1049
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "2131115be5b9d8b39af80973d9b64c0adc41d38d"
+  },
+  "issue": {
+    "author": "cardigan1008",
+    "body": "This code prints random value at `-O2/3/s` and -1 at `-O0/1`:\n\n```c\nint printf(const char *, ...);\nint a, b;\nvoid c(char d) { a = d; }\nint e(int d) {\n  if (d < 0)\n    return 1;\n  return 0;\n}\nint f() {\n  if (b)\n    return 0;\n  return 1;\n}\nint g(int d) {\n  int h = 0;\n  if (3 + d)\n    h = f() - 1 - 1;\n  return e(h) + h + h;\n}\nint main() {\n  int i = g(0);\n  c(i);\n  printf(\"%d\\n\", a);\n}\n```\n\nCompiler Explorer: https://godbolt.org/z/KfWsKxcvE\n\nIt starts from x86_64 clang 19.1.0. ",
+    "comments": [
+      {
+        "author": "MaskRay",
+        "body": "InstCombine miscompiles \n\n```llvm\ndefine i32 @src(i32 %x) local_unnamed_addr {\nentry:\n  %cmp = icmp eq i32 %x, 0\n  %zext = zext i1 %cmp to i32\n  %or = or disjoint i32 %zext, -2\n  %fshl = call range(i32 -4, 2) i32 @llvm.fshl.i32(i32 %or, i32 %or, i32 1)\n  %tr = trunc nsw i32 %fshl to i8\n  %res = sext i8 %tr to i32\n  ret i32 %res\n}\n```\n\nedit: `g` has a Range return attribute, which is propagated to the call site in `main` after inlining.\nInstCombine `InstCombinerImpl::SimplifyDemandedUseBits` simplifies the operand, but keeps the no-longer-valid Range return attribute.\n\nThen, CorrelatedValuePropagationPass added nsw, and the value eventually becomes poison."
+      },
+      {
+        "author": "nikic",
+        "body": "Slightly reduced: https://alive2.llvm.org/ce/z/3Kf7-2\n\nI assume the problem is that we don't clear the return range attribute in SimplifyDemanded."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine",
+      "regression:19"
+    ],
+    "title": "[clang] Miscompile with -O2/3/s"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/124387",
+  "knowledge_cutoff": "2025-01-25T03:24:37Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 2131115be5b9d8b39af80973d9b64c0adc41d38d\nAuthor: Fangrui Song <i@maskray.me>\nDate:   Sat Jan 25 13:35:11 2025 -0800\n\n    [InstCombine] Drop Range attribute when simplifying 'fshl' based on demanded bits (#124429)\n    \n    When simplifying operands based on demanded bits, the return value range\n    of llvm.fshl might change. Keeping the Range attribute might cause\n    llvm.fshl to generate a poison and lead to miscompile. Drop the Range\n    attribute similar to `dropPosonGeneratingFlags` elsewhere.\n    \n    Fix #124387\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 943598a30f04..2c8939b5a051 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -1039,11 +1039,14 @@ Value *InstCombinerImpl::SimplifyDemandedUseBits(Instruction *I,\n         APInt DemandedMaskLHS(DemandedMask.lshr(ShiftAmt));\n         APInt DemandedMaskRHS(DemandedMask.shl(BitWidth - ShiftAmt));\n         if (I->getOperand(0) != I->getOperand(1)) {\n-          if (SimplifyDemandedBits(I, 0, DemandedMaskLHS, LHSKnown,\n-                                   Depth + 1, Q) ||\n+          if (SimplifyDemandedBits(I, 0, DemandedMaskLHS, LHSKnown, Depth + 1,\n+                                   Q) ||\n               SimplifyDemandedBits(I, 1, DemandedMaskRHS, RHSKnown, Depth + 1,\n-                                   Q))\n+                                   Q)) {\n+            // Range attribute may no longer hold.\n+            I->dropPoisonGeneratingReturnAttributes();\n             return I;\n+          }\n         } else { // fshl is a rotate\n           // Avoid converting rotate into funnel shift.\n           // Only simplify if one operand is constant.\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/fsh.ll",
+      "tests": [
+        {
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.fshl.i32(i32, i32, i32) #0\n\ndefine i8 @fshl_range_trunc(i1 %x) {\n  %zext = zext i1 %x to i32\n  %or = or disjoint i32 %zext, -2\n  %fshl = call range(i32 -4, 2) i32 @llvm.fshl.i32(i32 %or, i32 %or, i32 1)\n  %tr = trunc nsw i32 %fshl to i8\n  ret i8 %tr\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fshl_range_trunc"
+        }
+      ]
+    }
+  ]
+}

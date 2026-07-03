@@ -1,0 +1,68 @@
+{
+  "base_commit": "c726b34ea01b74741dd9a6ae072e5ca4d9a3e623",
+  "bug_id": "60748",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/DivRemPairs.cpp": [
+        "optimizeDivRem"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/DivRemPairs.cpp": [
+        [
+          371,
+          376
+        ]
+      ]
+    },
+    "components": [
+      "DivRemPairs"
+    ],
+    "fix_commit": "2ad0cc9186d4952b3009e1b8c3c606f0b13ea38a"
+  },
+  "issue": {
+    "author": "regehr",
+    "body": "this IR:\r\n```llvm\r\ndefine i8 @f(ptr %0, i8 %1, i8 %2) {\r\n  %4 = urem i8 %1, %2\r\n  %5 = udiv exact i8 %1, %2\r\n  store i8 %4, ptr %0, align 1\r\n  ret i8 %5\r\n}\r\n```\r\ngets turned by DivRemPairsPass into:\r\n```llvm\r\ndefine i8 @f(ptr %0, i8 %1, i8 %2) {\r\n  %.frozen = freeze i8 %1\r\n  %.frozen1 = freeze i8 %2\r\n  %4 = udiv exact i8 %.frozen, %.frozen1\r\n  %5 = mul i8 %4, %.frozen1\r\n  %.decomposed = sub i8 %.frozen, %5\r\n  store i8 %.decomposed, ptr %0, align 1\r\n  ret i8 %4\r\n}\r\n```\r\nbut the transformed code ends up not only returning poison (as does the original code) but also storing poison into the memory cell: https://alive2.llvm.org/ce/z/pDuGCm\r\n\r\ncc @aqjune @nunoplopes ",
+    "comments": [
+      {
+        "author": "aqjune",
+        "body": "Hmm, it seems stripping off the exact flag works: [https://alive2.llvm.org/ce/z/6korcD](https://alive2.llvm.org/ce/z/6korcD)"
+      },
+      {
+        "author": "regehr",
+        "body": "The `exact` is what's producing the poison so dropping that flag seems reasonable.\r\n\r\nI have some other triggers for this bug but they're not getting solved by Z3, after removing the `exact`\r\n\r\n```console\r\nJohns-MacBook-Pro:tmp regehr$ ~/alive2-regehr/build/alive-tv --disable-undef-input bla.ll --smt-to=1000000\r\n\r\n----------------------------------------\r\ndefine i37 @src(ptr %0, i37 %1) {\r\n%2:\r\n  %3 = srem i37 137423355903, %1\r\n  %4 = sdiv exact i37 137423355903, %1\r\n  store i37 %4, ptr %0, align 4\r\n  ret i37 %3\r\n}\r\n=>\r\ndefine i37 @tgt(ptr %0, i37 %1) {\r\n%2:\r\n  %.frozen = freeze i37 %1\r\n  %3 = sdiv i37 137423355903, %.frozen\r\n  %4 = mul i37 %3, %.frozen\r\n  %.decomposed = sub i37 137423355903, %4\r\n  store i37 %3, ptr %0, align 4\r\n  ret i37 %.decomposed\r\n}\r\n```\r\n\r\n```console\r\nJohns-MacBook-Pro:tmp regehr$ ~/alive2-regehr/build/alive-tv --disable-undef-input r4.ll --smt-to=100000000\r\n\r\n----------------------------------------\r\ndefine i24 @src(i24 %0, ptr %1, i24 %2) {\r\n%3:\r\n  %4 = udiv exact i24 %0, %2\r\n  %5 = urem i24 %0, %2\r\n  store i24 %4, ptr %1, align 4\r\n  ret i24 %5\r\n}\r\n=>\r\ndefine i24 @tgt(i24 %0, ptr nocapture noread %1, i24 %2) {\r\n%3:\r\n  %.frozen = freeze i24 %0\r\n  %.frozen1 = freeze i24 %2\r\n  %4 = udiv i24 %.frozen, %.frozen1\r\n  %5 = mul i24 %4, %.frozen1\r\n  %.decomposed = sub i24 %.frozen, %5\r\n  store i24 %4, ptr nocapture noread %1, align 4\r\n  ret i24 %.decomposed\r\n}\r\n```"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:optimizations"
+    ],
+    "title": "erroneous freeze-related optimization due to DivRemPairsPass"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/60748",
+  "knowledge_cutoff": "2023-02-14T17:55:12Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/DivRemPairs"
+  ],
+  "patch": "commit 2ad0cc9186d4952b3009e1b8c3c606f0b13ea38a\nAuthor: Juneyoung Lee <aqjune@gmail.com>\nDate:   Sat Feb 18 20:43:26 2023 +0000\n\n    [DivRemPairs] Strip division's poison generating flag\n    \n    Given this transformation: X % Y -> X - (X / Y) * Y\n    \n    This patch strips off the poison-generating flag of X / Y such as exact, because it may make the optimized form result poison whereas X % Y does not.\n    \n    The issue was reported here: https://github.com/llvm/llvm-project/issues/60748\n    \n    Reviewed By: nikic\n    \n    Differential Revision: https://reviews.llvm.org/D144333\n\ndiff --git a/llvm/lib/Transforms/Scalar/DivRemPairs.cpp b/llvm/lib/Transforms/Scalar/DivRemPairs.cpp\nindex 303951643a0b..2b06e8fe511a 100644\n--- a/llvm/lib/Transforms/Scalar/DivRemPairs.cpp\n+++ b/llvm/lib/Transforms/Scalar/DivRemPairs.cpp\n@@ -371,6 +371,10 @@ static bool optimizeDivRem(Function &F, const TargetTransformInfo &TTI,\n       Mul->insertAfter(RemInst);\n       Sub->insertAfter(Mul);\n \n+      // If DivInst has the exact flag, remove it. Otherwise this optimization\n+      // may replace a well-defined value 'X % Y' with poison.\n+      DivInst->dropPoisonGeneratingFlags();\n+\n       // If X can be undef, X should be frozen first.\n       // For example, let's assume that Y = 1 & X = undef:\n       //   %div = sdiv undef, 1 // %div = undef\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=div-rem-pairs -S -mtriple=aarch64-unknown-unknown"
+      ],
+      "file": "llvm/test/Transforms/DivRemPairs/AArch64/div-rem-pairs.ll",
+      "tests": [
+        {
+          "test_body": "define i8 @f(ptr %p, i8 %x, i8 %y) {\n  %xmody = urem i8 %x, %y\n  %xdivy = udiv exact i8 %x, %y\n  store i8 %xmody, ptr %p, align 1\n  ret i8 %xdivy\n}\n",
+          "test_name": "f"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,91 @@
+{
+  "base_commit": "4531f5385125dd6448004a16cd80a94484ca68b7",
+  "bug_id": "57187",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        "SCEVExpander::hoistIVInc",
+        "SCEVExpander::replaceCongruentIVs"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h": [
+        [
+          248,
+          255
+        ]
+      ],
+      "llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp": [
+        [
+          1024,
+          1030
+        ],
+        [
+          1052,
+          1057
+        ],
+        [
+          2006,
+          2017
+        ]
+      ]
+    },
+    "components": [
+      "ScalarEvolution"
+    ],
+    "fix_commit": "86d5586d78d813a6921d786f7ddb1a41c6fb56e0"
+  },
+  "issue": {
+    "author": "xortator",
+    "body": "https://godbolt.org/z/xdce1e8P4\r\n\r\nRun `opt -passes=indvars` on the following IR:\r\n```llvm\r\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\r\ntarget triple = \"x86_64-unknown-linux-gnu\"\r\n\r\ndefine void @test(i32 %tmp) {\r\nbb:\r\n  br label %bb2\r\n\r\nbb1:                                              ; preds = %bb12\r\n  br label %bb2\r\n\r\nbb2:                                              ; preds = %bb1, %bb\r\n  %tmp3 = phi i32 [ %tmp, %bb ], [ %tmp7, %bb1 ]\r\n  %tmp4 = zext i32 %tmp3 to i64\r\n  %tmp5 = getelementptr inbounds i64, i64 addrspace(1)* undef, i64 %tmp4\r\n  br label %bb6\r\n\r\nbb6:                                              ; preds = %bb2\r\n  %tmp7 = add i32 %tmp3, -1\r\n  %tmp8 = icmp slt i32 %tmp7, 11\r\n  br i1 %tmp8, label %bb9, label %bb11\r\n\r\nbb9:                                              ; preds = %bb6\r\n  %tmp10 = phi i32 [ %tmp7, %bb6 ]\r\n  ret void\r\n\r\nbb11:                                             ; preds = %bb6\r\n  br label %bb12\r\n\r\nbb12:                                             ; preds = %bb12, %bb11\r\n  br i1 false, label %bb1, label %bb12\r\n}\r\n```\r\n\r\nOutput:\r\n```llvm\r\ntarget datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\r\ntarget triple = \"x86_64-unknown-linux-gnu\"\r\n\r\ndefine void @test(i32 %tmp) {\r\nbb:\r\n  %0 = zext i32 %tmp to i64\r\n  br label %bb2\r\n\r\nbb1:                                              ; preds = %bb12\r\n  br label %bb2\r\n\r\nbb2:                                              ; preds = %bb1, %bb\r\n  %indvars.iv = phi i64 [ %indvars.iv.next, %bb1 ], [ %0, %bb ]\r\n  br label %bb6\r\n\r\nbb6:                                              ; preds = %bb2\r\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, -1\r\n  %indvars = trunc i64 %indvars.iv.next to i32\r\n  %tmp8 = icmp slt i32 %indvars, 11\r\n  br i1 %tmp8, label %bb9, label %bb11\r\n\r\nbb9:                                              ; preds = %bb6\r\n  %tmp10 = phi i32 [ %indvars, %bb6 ]\r\n  ret void\r\n\r\nbb11:                                             ; preds = %bb6\r\n  br label %bb12\r\n\r\nbb12:                                             ; preds = %bb12, %bb11\r\n  br i1 false, label %bb1, label %bb12\r\n}\r\n```\r\n\r\nThe original program is well-defined. The new program will have poison in `%indvars.iv.next` for any other input than zero, and then branch by poisoned condition.\r\n\r\nThe issue appeared with\r\n```\r\ncommit 34ae308c73e4d76dbdab25a6206d3fbc5ebafdf5\r\nAuthor: Max Kazantsev <mkazantsev@azul.com>\r\nDate:   Wed Aug 3 13:10:56 2022 +0700\r\n\r\n    [SCEV] Use context to strengthen flags of BinOps\r\n\r\n    Sometimes SCEV cannot infer nuw/nsw from something as simple as\r\n    ```\r\n      len in [0, MAX_INT]\r\n    ...\r\n      iv = phi(0, iv.next)\r\n      guard(iv <s len)\r\n      guard(iv <u len)\r\n      iv.next = iv + 1\r\n    ```\r\n    just because flag strenthening only relies on definition and does not use local facts.\r\n    This patch adds support for the simplest case: inference of flags of `add(x, constant)`\r\n    if we can contextually prove that `x <= max_int - constant`.\r\n\r\n    In case if it has negative CT impact, we can add an option to switch it off. I woudln't\r\n    expect that though.\r\n\r\n    Differential Revision: https://reviews.llvm.org/D129643\r\n    Reviewed By: apilipenko\r\n\r\n```\r\nbut this patch only exposed the issue, not caused it. Note that in the original program loop lever goes on 2nd iteration, and this patch managed to infer `nuw` for IV increment in (never executed) backedge. But then the another part of IndVars has moved this increment out of dead block and introduced uses to it.",
+    "comments": [
+      {
+        "author": "xortator",
+        "body": "Please don't revert this patch, it's not guilty. I'll prepare a proper fix."
+      },
+      {
+        "author": "xortator",
+        "body": "The problematic instruction was hoisted from backedge to inside the loop by \r\n```\r\nNumElimIV += Rewriter.replaceCongruentIVs(L, DT, DeadInsts, TTI);\r\n```\r\nGuess this thing just doesn't take poison into account."
+      },
+      {
+        "author": "xortator",
+        "body": "On review: https://reviews.llvm.org/D132022"
+      },
+      {
+        "author": "xortator",
+        "body": "```\r\ncommit 86d5586d78d813a6921d786f7ddb1a41c6fb56e0 (HEAD -> main, origin/main, origin/HEAD)\r\nAuthor: Max Kazantsev <mkazantsev@azul.com>\r\nDate:   Tue Sep 13 12:31:07 2022 +0700\r\n\r\n    [SCEVExpander] Recompute poison-generating flags on hoisting. PR57187\r\n\r\n    Instruction being hoisted could have nuw/nsw flags inferred from the old\r\n    context, and we cannot simply move it to the new location keeping them\r\n    because we are going to introduce new uses to them that didn't exist before.\r\n\r\n    Example in https://github.com/llvm/llvm-project/issues/57187 shows how\r\n    this can produce branch by poison from initially well-defined program.\r\n\r\n    This patch forcefully recomputes poison-generating flag in the new context.\r\n\r\n    Differential Revision: https://reviews.llvm.org/D132022\r\n    Reviewed By: fhahn, nikic\r\n\r\n```"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "loopoptim"
+    ],
+    "title": "[IndVars] Miscompile: UB introduced to a simple program by indvars"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/57187",
+  "knowledge_cutoff": "2022-08-17T07:56:24Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/IndVarSimplify"
+  ],
+  "patch": "commit 86d5586d78d813a6921d786f7ddb1a41c6fb56e0\nAuthor: Max Kazantsev <mkazantsev@azul.com>\nDate:   Tue Sep 13 12:31:07 2022 +0700\n\n    [SCEVExpander] Recompute poison-generating flags on hoisting. PR57187\n    \n    Instruction being hoisted could have nuw/nsw flags inferred from the old\n    context, and we cannot simply move it to the new location keeping them\n    because we are going to introduce new uses to them that didn't exist before.\n    \n    Example in https://github.com/llvm/llvm-project/issues/57187 shows how\n    this can produce branch by poison from initially well-defined program.\n    \n    This patch forcefully recomputes poison-generating flag in the new context.\n    \n    Differential Revision: https://reviews.llvm.org/D132022\n    Reviewed By: fhahn, nikic\n\ndiff --git a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\nindex 79004a4c535a..27691770b28a 100644\n--- a/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n+++ b/llvm/include/llvm/Transforms/Utils/ScalarEvolutionExpander.h\n@@ -248,8 +248,14 @@ public:\n   Instruction *getIVIncOperand(Instruction *IncV, Instruction *InsertPos,\n                                bool allowScale);\n \n-  /// Utility for hoisting an IV increment.\n-  bool hoistIVInc(Instruction *IncV, Instruction *InsertPos);\n+  /// Utility for hoisting \\p IncV (with all subexpressions requried for its\n+  /// computation) before \\p InsertPos. If \\p RecomputePoisonFlags is set, drops\n+  /// all poison-generating flags from instructions being hoisted and tries to\n+  /// re-infer them in the new location. It should be used when we are going to\n+  /// introduce a new use in the new position that didn't exist before, and may\n+  /// trigger new UB in case of poison.\n+  bool hoistIVInc(Instruction *IncV, Instruction *InsertPos,\n+                  bool RecomputePoisonFlags = false);\n \n   /// replace congruent phis with their most canonical representative. Return\n   /// the number of phis eliminated.\ndiff --git a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\nindex 3e7e016b99b5..568c6b5581cf 100644\n--- a/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n+++ b/llvm/lib/Transforms/Utils/ScalarEvolutionExpander.cpp\n@@ -1024,7 +1024,8 @@ void SCEVExpander::fixupInsertPoints(Instruction *I) {\n /// hoistStep - Attempt to hoist a simple IV increment above InsertPos to make\n /// it available to other uses in this loop. Recursively hoist any operands,\n /// until we reach a value that dominates InsertPos.\n-bool SCEVExpander::hoistIVInc(Instruction *IncV, Instruction *InsertPos) {\n+bool SCEVExpander::hoistIVInc(Instruction *IncV, Instruction *InsertPos,\n+                              bool RecomputePoisonFlags) {\n   if (SE.DT.dominates(IncV, InsertPos))\n       return true;\n \n@@ -1052,6 +1053,19 @@ bool SCEVExpander::hoistIVInc(Instruction *IncV, Instruction *InsertPos) {\n   for (Instruction *I : llvm::reverse(IVIncs)) {\n     fixupInsertPoints(I);\n     I->moveBefore(InsertPos);\n+    if (!RecomputePoisonFlags)\n+      continue;\n+    // Drop flags that are potentially inferred from old context and infer flags\n+    // in new context.\n+    I->dropPoisonGeneratingFlags();\n+    if (auto *OBO = dyn_cast<OverflowingBinaryOperator>(I))\n+      if (auto Flags = SE.getStrengthenedNoWrapFlagsFromBinOp(OBO)) {\n+        auto *BO = cast<BinaryOperator>(I);\n+        BO->setHasNoUnsignedWrap(\n+            ScalarEvolution::maskFlags(*Flags, SCEV::FlagNUW) == SCEV::FlagNUW);\n+        BO->setHasNoSignedWrap(\n+            ScalarEvolution::maskFlags(*Flags, SCEV::FlagNSW) == SCEV::FlagNSW);\n+      }\n   }\n   return true;\n }\n@@ -2006,12 +2020,14 @@ SCEVExpander::replaceCongruentIVs(Loop *L, const DominatorTree *DT,\n         // with the original phi. It's worth eagerly cleaning up the\n         // common case of a single IV increment so that DeleteDeadPHIs\n         // can remove cycles that had postinc uses.\n+        // Because we may potentially introduce a new use of OrigIV that didn't\n+        // exist before at this point, its poison flags need readjustment.\n         const SCEV *TruncExpr =\n             SE.getTruncateOrNoop(SE.getSCEV(OrigInc), IsomorphicInc->getType());\n         if (OrigInc != IsomorphicInc &&\n             TruncExpr == SE.getSCEV(IsomorphicInc) &&\n             SE.LI.replacementPreservesLCSSAForm(IsomorphicInc, OrigInc) &&\n-            hoistIVInc(OrigInc, IsomorphicInc)) {\n+            hoistIVInc(OrigInc, IsomorphicInc, /*RecomputePoisonFlags*/ true)) {\n           SCEV_DEBUG_WITH_TYPE(\n               DebugType, dbgs() << \"INDVARS: Eliminated congruent iv.inc: \"\n                                 << *IsomorphicInc << '\\n');\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=indvars < %s"
+      ],
+      "file": "llvm/test/Transforms/IndVarSimplify/X86/pr57187.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128-ni:1-p2:32:8:8:32-ni:2\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @test(i32 %start) {\nentry:\n  br label %loop\n\nbackedge:                                         ; preds = %stuck\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ %start, %entry ], [ %iv.next, %backedge ]\n  %iv.zext = zext i32 %iv to i64\n  %gep = getelementptr inbounds i64, ptr undef, i64 %iv.zext\n  %iv.next = add i32 %iv, -1\n  %loop.exit.cond = icmp slt i32 %iv.next, 11\n  br i1 %loop.exit.cond, label %exit, label %stuck\n\nexit:                                             ; preds = %loop\n  %iv.next.lcssa = phi i32 [ %iv.next, %loop ]\n  ret void\n\nstuck:                                            ; preds = %stuck, %loop\n  br i1 false, label %backedge, label %stuck\n}\n",
+          "test_name": "test"
+        }
+      ]
+    }
+  ]
+}

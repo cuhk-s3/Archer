@@ -1,0 +1,80 @@
+{
+  "base_commit": "1fadb2b0c881ced247931f442fdee6c4ed96dccb",
+  "bug_id": "91691",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        "foldBitCeil",
+        "isSafeToRemoveBitCeilSelect"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+        [
+          3343,
+          3349
+        ],
+        [
+          3366,
+          3371
+        ],
+        [
+          3379,
+          3384
+        ],
+        [
+          3448,
+          3461
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "b5f4210e9f51f938ae517f219f04f9ab431a2684"
+  },
+  "issue": {
+    "author": "regehr",
+    "body": "https://alive2.llvm.org/ce/z/c__jy8\r\n\r\nthis function:\r\n```llvm\r\ndefine i32 @f(i32 %0) {\r\n  %2 = sub nuw i32 -2, %0\r\n  %3 = tail call i32 @llvm.ctlz.i32(i32 %2, i1 false)\r\n  %4 = sub i32 32, %3\r\n  %5 = shl i32 1, %4\r\n  %6 = icmp ult i32 %0, -2\r\n  %7 = select i1 %6, i32 %5, i32 1\r\n  ret i32 %7\r\n}\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\r\n\r\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\r\n```\r\n\r\nis getting rewritten to not have the select, but the select was blocking a poison value. the bad thing happens when -1 is passed as an argument, see the Alive link for a detailed execution trace\r\n\r\n```llvm\r\ndefine i32 @f(i32 %0) {\r\n  %2 = sub nuw i32 -2, %0\r\n  %3 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %2, i1 false)\r\n  %4 = sub nsw i32 0, %3\r\n  %5 = and i32 %4, 31\r\n  %6 = shl nuw i32 1, %5\r\n  ret i32 %6\r\n}\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\r\n\r\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\r\n```\r\n\r\ncc @nunoplopes ",
+    "comments": [],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "instcombine removes a select, making code more poisonous"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/91691",
+  "knowledge_cutoff": "2024-05-10T02:43:43Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit b5f4210e9f51f938ae517f219f04f9ab431a2684\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Mon May 13 14:27:59 2024 +0800\n\n    [InstCombine] Drop nuw flag when CtlzOp is a sub nuw (#91776)\n    \n    See the following case:\n    ```\n    define i32 @src1(i32 %x) {\n      %dec = sub nuw i32 -2, %x\n      %ctlz = tail call i32 @llvm.ctlz.i32(i32 %dec, i1 false)\n      %sub = sub nsw i32 32, %ctlz\n      %shl = shl i32 1, %sub\n      %ugt = icmp ult i32 %x, -2\n      %sel = select i1 %ugt, i32 %shl, i32 1\n      ret i32 %sel\n    }\n    \n    define i32 @tgt1(i32 %x) {\n      %dec = sub nuw i32 -2, %x\n      %ctlz = tail call i32 @llvm.ctlz.i32(i32 %dec, i1 false)\n      %sub = sub nsw i32 32, %ctlz\n      %and = and i32 %sub, 31\n      %shl = shl nuw i32 1, %and\n      ret i32 %shl\n    }\n    ```\n    `nuw` in `%dec` should be dropped after the select instruction is\n    eliminated.\n    \n    Alive2: https://alive2.llvm.org/ce/z/7S9529\n    \n    Fixes https://github.com/llvm/llvm-project/issues/91691.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex ee090e012508..a3ddb402bf66 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -3343,7 +3343,8 @@ Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n // pattern.\n static bool isSafeToRemoveBitCeilSelect(ICmpInst::Predicate Pred, Value *Cond0,\n                                         const APInt *Cond1, Value *CtlzOp,\n-                                        unsigned BitWidth) {\n+                                        unsigned BitWidth,\n+                                        bool &ShouldDropNUW) {\n   // The challenge in recognizing std::bit_ceil(X) is that the operand is used\n   // for the CTLZ proper and select condition, each possibly with some\n   // operation like add and sub.\n@@ -3366,6 +3367,8 @@ static bool isSafeToRemoveBitCeilSelect(ICmpInst::Predicate Pred, Value *Cond0,\n   ConstantRange CR = ConstantRange::makeExactICmpRegion(\n       CmpInst::getInversePredicate(Pred), *Cond1);\n \n+  ShouldDropNUW = false;\n+\n   // Match the operation that's used to compute CtlzOp from CommonAncestor.  If\n   // CtlzOp == CommonAncestor, return true as no operation is needed.  If a\n   // match is found, execute the operation on CR, update CR, and return true.\n@@ -3379,6 +3382,7 @@ static bool isSafeToRemoveBitCeilSelect(ICmpInst::Predicate Pred, Value *Cond0,\n       return true;\n     }\n     if (match(CtlzOp, m_Sub(m_APInt(C), m_Specific(CommonAncestor)))) {\n+      ShouldDropNUW = true;\n       CR = ConstantRange(*C).sub(CR);\n       return true;\n     }\n@@ -3448,14 +3452,20 @@ static Instruction *foldBitCeil(SelectInst &SI, IRBuilderBase &Builder) {\n     Pred = CmpInst::getInversePredicate(Pred);\n   }\n \n+  bool ShouldDropNUW;\n+\n   if (!match(FalseVal, m_One()) ||\n       !match(TrueVal,\n              m_OneUse(m_Shl(m_One(), m_OneUse(m_Sub(m_SpecificInt(BitWidth),\n                                                     m_Value(Ctlz)))))) ||\n       !match(Ctlz, m_Intrinsic<Intrinsic::ctlz>(m_Value(CtlzOp), m_Zero())) ||\n-      !isSafeToRemoveBitCeilSelect(Pred, Cond0, Cond1, CtlzOp, BitWidth))\n+      !isSafeToRemoveBitCeilSelect(Pred, Cond0, Cond1, CtlzOp, BitWidth,\n+                                   ShouldDropNUW))\n     return nullptr;\n \n+  if (ShouldDropNUW)\n+    cast<Instruction>(CtlzOp)->setHasNoUnsignedWrap(false);\n+\n   // Build 1 << (-CTLZ & (BitWidth-1)).  The negation likely corresponds to a\n   // single hardware instruction as opposed to BitWidth - CTLZ, where BitWidth\n   // is an integer constant.  Masking with BitWidth-1 comes free on some\n",
+  "properties": {
+    "difficulty": "medium",
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/bit_ceil.ll",
+      "tests": [
+        {
+          "test_body": "define i32 @pr91691(i32 %0) {\n  %2 = sub nuw i32 -2, %0\n  %3 = tail call i32 @llvm.ctlz.i32(i32 %2, i1 false)\n  %4 = sub i32 32, %3\n  %5 = shl i32 1, %4\n  %6 = icmp ult i32 %0, -2\n  %7 = select i1 %6, i32 %5, i32 1\n  ret i32 %7\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "pr91691"
+        },
+        {
+          "test_body": "define i32 @pr91691_keep_nsw(i32 %0) {\n  %2 = sub nsw i32 -2, %0\n  %3 = tail call i32 @llvm.ctlz.i32(i32 %2, i1 false)\n  %4 = sub i32 32, %3\n  %5 = shl i32 1, %4\n  %6 = icmp ult i32 %0, -2\n  %7 = select i1 %6, i32 %5, i32 1\n  ret i32 %7\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "pr91691_keep_nsw"
+        },
+        {
+          "test_body": "define <4 x i32> @bit_ceil_v4i32(<4 x i32> %x) {\n  %dec = add <4 x i32> %x, splat (i32 -1)\n  %ctlz = tail call <4 x i32> @llvm.ctlz.v4i32(<4 x i32> %dec, i1 false)\n  %sub = sub <4 x i32> splat (i32 32), %ctlz\n  %shl = shl <4 x i32> splat (i32 1), %sub\n  %ugt = icmp ugt <4 x i32> %x, splat (i32 1)\n  %sel = select <4 x i1> %ugt, <4 x i32> %shl, <4 x i32> splat (i32 1)\n  ret <4 x i32> %sel\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <4 x i32> @llvm.ctlz.v4i32(<4 x i32>, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "bit_ceil_v4i32"
+        }
+      ]
+    }
+  ]
+}

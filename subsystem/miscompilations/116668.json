@@ -1,0 +1,76 @@
+{
+  "base_commit": "1d6ab189be031bf723abf35f772fbd5d4c86c612",
+  "bug_id": "116668",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/BasicAliasAnalysis.cpp": [
+        "BasicAAResult::getModRefInfo"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/BasicAliasAnalysis.cpp": [
+        [
+          947,
+          954
+        ]
+      ]
+    },
+    "components": [
+      "AliasAnalysis"
+    ],
+    "fix_commit": "5b0f4f2cb040f472d41870ba99ae45fc1022188f"
+  },
+  "issue": {
+    "author": "anoopkg6",
+    "body": "Any modification to malloc'd local variable between __builtin_setjmp and __builtin_longjmp calls does not persist. It is optimized by either by earlyCSE or GVN (global value numbering) pass. __builtin_setjmp has attribute (llvm::Attribute::ReturnsTwice).\r\n\r\n//bug.c\r\n```\r\n#include <stdio.h>\r\n#include <stdlib.h>\r\n\r\nvoid* buf[20];\r\nattribute((noinline))\r\nvoid foo(void)\r\n{\r\n  printf(\"Calling longjmp from inside function foo\\n\");\r\n  __builtin_longjmp(buf, 1);\r\n printf(\"This point should never be reached\\n\");\r\n}\r\n\r\nint main(void)\r\n{\r\n  int *local_var = malloc(sizeof(int));\r\n  *local_var = 10;\r\n  printf(\"local_val=%d \\n\", *local_var);\r\n  if (__builtin_setjmp(buf) == 0)\r\n  {\r\n    *local_var = 20;\r\n     printf(\"Calling function foo local_var=%d \\n\", *local_var);\r\n     foo();\r\n  }\r\n  printf(\"longjmp has been called local_val=%d \\n\", *local_var);\r\n}\r\n\r\n```\r\n/*******************Output should be as follows: **********************\r\nlocal_val=10\r\nCalling function foo local_var=20\r\nCalling longjmp from inside function foo\r\nlongjmp has been called local_val=20\r\n**********************************************************************/\r\n\r\n$clang -O2 bug.c\r\n$./a.out\r\nlocal_val=10\r\nCalling function foo local_var=20\r\nCalling longjmp from inside function foo\r\nlongjmp has been called local_val=10\r\n\r\nValue of local_var is modified between setjmp and longjmp calls to 20, but after return from longjmp local_var remains 10 because of GVN optimization.\r\n\r\nAfter some analyses I have attached setjmp_longjmp_bug.zip files have two tests case, bug1.c and and bug2.c. bug1.c is compiled at -O1 and has information after each pass using -dump-after-all in file bug1_dump_earlycse_o1. earlyCSE optimizes malloc'd local_var.\r\n\r\nSimilarly, in bug2.c, GVN optimizes malloc'd local variable local_var at -O2. It's dump after each pass is in bug2_dump_gvn_o2 file. Both dump files are marked with \"???\" where wrong optimization (constant folding) happens.\r\n[setjmp_longjmp_bug.zip](https://github.com/user-attachments/files/17803940/setjmp_longjmp_bug.zip)\r\n",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Godbolt: https://clang.godbolt.org/z/7efYnssqd\r\n\r\nProbably need a special case in AA to treat ReturnsTwice similar to a fence, clobbering even non-escaped memory."
+      },
+      {
+        "author": "nikic",
+        "body": "Reduced IR test case:\n```llvm\ndeclare i32 @setjmp() returns_twice\ndeclare void @longjmp()\ndeclare ptr @malloc(i64)\n\ndefine i32 @test() {\n  %malloc = call noalias ptr @malloc(i64 4)\n  store i32 10, ptr %malloc, align 4\n  %sj = call i32 @setjmp()\n  %cmp = icmp eq i32 %sj, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:\n  store i32 20, ptr %malloc\n  call void @longjmp()\n  unreachable\n\nif.end:\n  %res = load i32, ptr %malloc\n  ret i32 %res\n}\n```"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:analysis"
+    ],
+    "title": "Modification to malloc'd local variable between builtin setjmp and londjump calls not preserved"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/116668",
+  "knowledge_cutoff": "2024-11-18T18:02:33Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/GVN"
+  ],
+  "patch": "commit 5b0f4f2cb040f472d41870ba99ae45fc1022188f\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Tue Dec 3 09:55:12 2024 +0100\n\n    [BasicAA] Treat returns_twice functions as clobbering unescaped objects (#117902)\n    \n    Effectively this models all the accesses that occur between the first\n    and second return as happening at the point of the call.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/116668.\n\ndiff --git a/llvm/lib/Analysis/BasicAliasAnalysis.cpp b/llvm/lib/Analysis/BasicAliasAnalysis.cpp\nindex 381fb7bbdb51..648a22deaf6b 100644\n--- a/llvm/lib/Analysis/BasicAliasAnalysis.cpp\n+++ b/llvm/lib/Analysis/BasicAliasAnalysis.cpp\n@@ -947,8 +947,14 @@ ModRefInfo BasicAAResult::getModRefInfo(const CallBase *Call,\n   //\n   // Make sure the object has not escaped here, and then check that none of the\n   // call arguments alias the object below.\n+  //\n+  // We model calls that can return twice (setjmp) as clobbering non-escaping\n+  // objects, to model any accesses that may occur prior to the second return.\n+  // As an exception, ignore allocas, as setjmp is not required to preserve\n+  // non-volatile stores for them.\n   if (!isa<Constant>(Object) && Call != Object &&\n-      AAQI.CA->isNotCapturedBefore(Object, Call, /*OrAt*/ false)) {\n+      AAQI.CA->isNotCapturedBefore(Object, Call, /*OrAt*/ false) &&\n+      (isa<AllocaInst>(Object) || !Call->hasFnAttr(Attribute::ReturnsTwice))) {\n \n     // Optimistically assume that call doesn't touch Object and check this\n     // assumption in the following loop.\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=gvn < %s"
+      ],
+      "file": "llvm/test/Transforms/GVN/setjmp.ll",
+      "tests": [
+        {
+          "test_body": "; Function Attrs: returns_twice\ndeclare i32 @setjmp() #0\n\ndeclare void @longjmp()\n\ndeclare ptr @malloc(i64)\n\ndefine i32 @test() {\n  %malloc = call noalias ptr @malloc(i64 4)\n  store i32 10, ptr %malloc, align 4\n  %sj = call i32 @setjmp()\n  %cmp = icmp eq i32 %sj, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %0\n  store i32 20, ptr %malloc, align 4\n  call void @longjmp()\n  unreachable\n\nif.end:                                           ; preds = %0\n  %res = load i32, ptr %malloc, align 4\n  ret i32 %res\n}\n\nattributes #0 = { returns_twice }\n",
+          "test_name": "test"
+        },
+        {
+          "test_body": "; Function Attrs: returns_twice\ndeclare i32 @setjmp() #0\n\ndeclare void @longjmp()\n\ndefine i32 @test_alloca_volatile() {\n  %alloc = alloca i43, align 8\n  store volatile i32 10, ptr %alloc, align 4\n  %sj = call i32 @setjmp()\n  %cmp = icmp eq i32 %sj, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %0\n  store volatile i32 20, ptr %alloc, align 4\n  call void @longjmp()\n  unreachable\n\nif.end:                                           ; preds = %0\n  %res = load volatile i32, ptr %alloc, align 4\n  ret i32 %res\n}\n\nattributes #0 = { returns_twice }\n",
+          "test_name": "test_alloca_volatile"
+        },
+        {
+          "test_body": "; Function Attrs: returns_twice\ndeclare i32 @setjmp() #0\n\ndeclare void @longjmp()\n\ndefine i32 @test_alloca() {\n  %alloc = alloca i43, align 8\n  store i32 10, ptr %alloc, align 4\n  %sj = call i32 @setjmp()\n  %cmp = icmp eq i32 %sj, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %0\n  store i32 20, ptr %alloc, align 4\n  call void @longjmp()\n  unreachable\n\nif.end:                                           ; preds = %0\n  %res = load i32, ptr %alloc, align 4\n  ret i32 %res\n}\n\nattributes #0 = { returns_twice }\n",
+          "test_name": "test_alloca"
+        }
+      ]
+    }
+  ]
+}

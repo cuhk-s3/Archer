@@ -1,0 +1,116 @@
+{
+  "base_commit": "300e5b91144249a5b142b02d6331fcb33e13cf1d",
+  "bug_id": "93096",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Utils/SCCPSolver.cpp": [
+        "SCCPInstVisitor::handleCallResult",
+        "SCCPInstVisitor::handleExtractOfWithOverflow",
+        "SCCPInstVisitor::visitBinaryOperator",
+        "SCCPInstVisitor::visitCastInst",
+        "getConstantRange"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Utils/SCCPSolver.cpp": [
+        [
+          43,
+          49
+        ],
+        [
+          1297,
+          1303
+        ],
+        [
+          1329,
+          1336
+        ],
+        [
+          1534,
+          1541
+        ],
+        [
+          1818,
+          1824
+        ],
+        [
+          1863,
+          1869
+        ]
+      ]
+    },
+    "components": [
+      "SCCPSolver"
+    ],
+    "fix_commit": "27392a35ef052aa515f38359de89aced11a4363d"
+  },
+  "issue": {
+    "author": "weiguozhi",
+    "body": "Run ipsccp on the code\r\n```\r\n; opt -passes=ipsccp -S test.ll\r\n\r\ndefine void @foo(i1 %cond1, i32 %p1) {\r\nentry:\r\n  br label %loop\r\n\r\nloop:\r\n  %phi1 = phi i64 [undef, %entry], [%phi2, %latch]\r\n  br i1 %cond1, label %then2, label %else2\r\n\r\nthen2:\r\n  %and = and i64 %phi1, -1095216660481     ; 0xFFFFFF00FFFFFFFF\r\n  br label %latch\r\n\r\nelse2:\r\n  %ext = zext i32 %p1 to i64 \r\n  %or  = or i64 %ext, 4294967296           ; 0x100000000\r\n  br label %latch\r\n\r\nlatch:\r\n  %phi2 = phi i64 [%and, %then2], [%or, %else2]\r\n  %shr = lshr i64 %phi2, 32\r\n  %res = trunc i64 %shr to i8\r\n  %cond2 = call i1 @bar(i8 %res)\r\n  br i1 %cond2, label %loop, label %exit\r\n\r\nexit:\r\n  ret void\r\n}\r\n\r\ndeclare i1 @bar(i8)\r\n```\r\nLLVM adds nuw/nsw flags to the trunc instruction\r\n```\r\n%res = trunc nuw nsw i64 %shr to i8\r\n```\r\nIt means all high bits of %shr are 0. \r\nBut %phi1 may be undef, bits [32..39] of %and are cleared, bits[40..63] can still be undef, and later it is moved to bits[8..31] of %shr, so not all high bits of %shr are 0.\r\n",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "We do exclude ranges with undef here: https://github.com/llvm/llvm-project/blob/3061fed2f05cde574c84a26c702b1e7932fa4d7e/llvm/lib/Transforms/Utils/SCCPSolver.cpp#L118-L119 Maybe the undef flag doesn't get propagated properly somewhere..."
+      },
+      {
+        "author": "nikic",
+        "body": "Simplified test case:\r\n```llvm\r\ndefine i8 @src(i1 %cond, i8 %a) {\r\nentry: \r\n  br i1 %cond, label %if, label %join\r\n   \r\nif:\r\n  %a.ext = zext i8 %a to i16 \r\n  br label %join \r\n\r\njoin:\r\n  %phi = phi i16 [ undef, %entry ], [ %a.ext, %if ] \r\n  %and = and i16 %phi, u0x0000ffff \r\n  %trunc = trunc i16 %and to i8\r\n  ret i8 %trunc\r\n} \r\n```\r\nThis is indeed an issue with the propagation of the undef flag."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:transforms"
+    ],
+    "title": "nuw/nsw should not be added to trunc instruction when there are undef bits in the source value"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/93096",
+  "knowledge_cutoff": "2024-05-22T21:03:20Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/SCCP"
+  ],
+  "patch": "commit 27392a35ef052aa515f38359de89aced11a4363d\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Thu May 23 15:14:34 2024 +0200\n\n    [SCCP] Don't allow undef ranges when performing operations (#93163)\n    \n    When performing some range operation (e.g. and) on a constant range that\n    includes undef, we currently just ignore the undef value, which is\n    obviously incorrect. Instead, we can do one of two things:\n     * Say that the result range also includes undef.\n     * Treat undef as a full range.\n    \n    This patch goes with the second approach -- I'd expect it to be a bit\n    better overall, e.g. it allows preserving the fact that a zext of a\n    range with undef isn't a full range.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/93096.\n\ndiff --git a/llvm/lib/Transforms/Utils/SCCPSolver.cpp b/llvm/lib/Transforms/Utils/SCCPSolver.cpp\nindex ce40e8b31b76..4f36bac11e34 100644\n--- a/llvm/lib/Transforms/Utils/SCCPSolver.cpp\n+++ b/llvm/lib/Transforms/Utils/SCCPSolver.cpp\n@@ -43,7 +43,7 @@ static ValueLatticeElement::MergeOptions getMaxWidenStepsOpts() {\n }\n \n static ConstantRange getConstantRange(const ValueLatticeElement &LV, Type *Ty,\n-                                      bool UndefAllowed = true) {\n+                                      bool UndefAllowed) {\n   assert(Ty->isIntOrIntVectorTy() && \"Should be int or int vector\");\n   if (LV.isConstantRange(UndefAllowed))\n     return LV.getConstantRange();\n@@ -1297,7 +1297,8 @@ void SCCPInstVisitor::visitCastInst(CastInst &I) {\n \n   if (I.getDestTy()->isIntegerTy() && I.getSrcTy()->isIntOrIntVectorTy()) {\n     auto &LV = getValueState(&I);\n-    ConstantRange OpRange = getConstantRange(OpSt, I.getSrcTy());\n+    ConstantRange OpRange =\n+        getConstantRange(OpSt, I.getSrcTy(), /*UndefAllowed=*/false);\n \n     Type *DestTy = I.getDestTy();\n     // Vectors where all elements have the same known constant range are treated\n@@ -1329,8 +1330,8 @@ void SCCPInstVisitor::handleExtractOfWithOverflow(ExtractValueInst &EVI,\n     return; // Wait to resolve.\n \n   Type *Ty = LHS->getType();\n-  ConstantRange LR = getConstantRange(L, Ty);\n-  ConstantRange RR = getConstantRange(R, Ty);\n+  ConstantRange LR = getConstantRange(L, Ty, /*UndefAllowed=*/false);\n+  ConstantRange RR = getConstantRange(R, Ty, /*UndefAllowed=*/false);\n   if (Idx == 0) {\n     ConstantRange Res = LR.binaryOp(WO->getBinaryOp(), RR);\n     mergeInValue(&EVI, ValueLatticeElement::getRange(Res));\n@@ -1534,8 +1535,10 @@ void SCCPInstVisitor::visitBinaryOperator(Instruction &I) {\n     return markOverdefined(&I);\n \n   // Try to simplify to a constant range.\n-  ConstantRange A = getConstantRange(V1State, I.getType());\n-  ConstantRange B = getConstantRange(V2State, I.getType());\n+  ConstantRange A =\n+      getConstantRange(V1State, I.getType(), /*UndefAllowed=*/false);\n+  ConstantRange B =\n+      getConstantRange(V2State, I.getType(), /*UndefAllowed=*/false);\n \n   auto *BO = cast<BinaryOperator>(&I);\n   ConstantRange R = ConstantRange::getEmpty(I.getType()->getScalarSizeInBits());\n@@ -1818,7 +1821,8 @@ void SCCPInstVisitor::handleCallResult(CallBase &CB) {\n \n         // Combine range info for the original value with the new range from the\n         // condition.\n-        auto CopyOfCR = getConstantRange(CopyOfVal, CopyOf->getType());\n+        auto CopyOfCR = getConstantRange(CopyOfVal, CopyOf->getType(),\n+                                         /*UndefAllowed=*/true);\n         auto NewCR = ImposedCR.intersectWith(CopyOfCR);\n         // If the existing information is != x, do not use the information from\n         // a chained predicate, as the != x information is more likely to be\n@@ -1863,7 +1867,8 @@ void SCCPInstVisitor::handleCallResult(CallBase &CB) {\n         const ValueLatticeElement &State = getValueState(Op);\n         if (State.isUnknownOrUndef())\n           return;\n-        OpRanges.push_back(getConstantRange(State, Op->getType()));\n+        OpRanges.push_back(\n+            getConstantRange(State, Op->getType(), /*UndefAllowed=*/false));\n       }\n \n       ConstantRange Result =\n",
+  "properties": {
+    "difficulty": "medium",
+    "is_single_file_fix": true,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=ipsccp -S %s"
+      ],
+      "file": "llvm/test/Transforms/SCCP/ip-add-range-to-call.ll",
+      "tests": [
+        {
+          "test_body": "declare hidden i32 @callee5(i32, i32)\n\ndefine i32 @caller5() {\n  %c1 = call i32 @callee5(i32 10, i32 100)\n  %c2 = call i32 @callee5(i32 20, i32 200)\n  %a = add i32 %c1, %c2\n  ret i32 %a\n}\n",
+          "test_name": "caller5"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S -passes=ipsccp < %s"
+      ],
+      "file": "llvm/test/Transforms/SCCP/range-with-undef.ll",
+      "tests": [
+        {
+          "test_body": "define i8 @test_binop(i1 %cond, i8 %a) {\nentry:\n  br i1 %cond, label %if, label %join\n\nif:                                               ; preds = %entry\n  %a.ext = zext i8 %a to i16\n  br label %join\n\njoin:                                             ; preds = %if, %entry\n  %phi = phi i16 [ undef, %entry ], [ %a.ext, %if ]\n  %and = and i16 %phi, -1\n  %trunc = trunc i16 %and to i8\n  ret i8 %trunc\n}\n",
+          "test_name": "test_binop"
+        },
+        {
+          "test_body": "define i8 @test_cast(i1 %cond, i8 %a) {\nentry:\n  br i1 %cond, label %if, label %join\n\nif:                                               ; preds = %entry\n  %a.ext = zext i8 %a to i16\n  br label %join\n\njoin:                                             ; preds = %if, %entry\n  %phi = phi i16 [ undef, %entry ], [ %a.ext, %if ]\n  %zext = zext i16 %phi to i32\n  %trunc = trunc i32 %zext to i8\n  ret i8 %trunc\n}\n",
+          "test_name": "test_cast"
+        },
+        {
+          "test_body": "define i8 @test_intrin(i1 %cond, i8 %a) {\nentry:\n  br i1 %cond, label %if, label %join\n\nif:                                               ; preds = %entry\n  %a.ext = zext i8 %a to i16\n  br label %join\n\njoin:                                             ; preds = %if, %entry\n  %phi = phi i16 [ undef, %entry ], [ %a.ext, %if ]\n  %umax = call i16 @llvm.umax.i16(i16 %phi, i16 42)\n  %trunc = trunc i16 %umax to i8\n  ret i8 %trunc\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i16 @llvm.umax.i16(i16, i16) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "test_intrin"
+        },
+        {
+          "test_body": "define i9 @test_with_overflow(i1 %cond, i8 %a) {\nentry:\n  br i1 %cond, label %if, label %join\n\nif:                                               ; preds = %entry\n  %a.ext = zext i8 %a to i16\n  br label %join\n\njoin:                                             ; preds = %if, %entry\n  %phi = phi i16 [ undef, %entry ], [ %a.ext, %if ]\n  %wo = call { i16, i1 } @llvm.uadd.with.overflow.i16(i16 %phi, i16 1)\n  %add = extractvalue { i16, i1 } %wo, 0\n  %trunc = trunc i16 %add to i9\n  ret i9 %trunc\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare { i16, i1 } @llvm.uadd.with.overflow.i16(i16, i16) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "test_with_overflow"
+        }
+      ]
+    }
+  ]
+}

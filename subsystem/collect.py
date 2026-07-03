@@ -146,13 +146,11 @@ class SimpleOpenAIClient:
 
 
 def load_issue_data(dataset_dir: str, issue_id: str):
-  # Construct path assuming the dataset structure provided
-  dataset_path = Path(dataset_dir)
-  json_path = dataset_path / "issues" / f"{issue_id}.json"
+  # Miscompilation issue data lives under ``subsystem/miscompilations/``.
+  json_path = Path(__file__).resolve().parent / "miscompilations" / f"{issue_id}.json"
 
   if not json_path.exists():
-    # Fallback: check if the dataset dir contains the json files flatly
-    # or if the user provided the full path to json
+    # Fallback: allow passing the full path to a JSON file directly.
     if Path(issue_id).exists() and str(issue_id).endswith(".json"):
       json_path = Path(issue_id)
     else:

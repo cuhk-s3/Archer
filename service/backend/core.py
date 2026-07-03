@@ -186,20 +186,16 @@ class ArcherService:
     return sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)
 
   def _get_pr_info(self, pr_id: int) -> Optional[dict]:
-    dataset_roots = [
-      self.config.repo_root / "dataset",
-      self.config.repo_root.parent / "dataset",
-    ]
-    for dataset_dir in dataset_roots:
-      for sub in ["closed", "open"]:
-        path = dataset_dir / sub / f"{pr_id}.json"
-        if not path.exists():
-          continue
-        try:
-          return json.loads(path.read_text())
-        except Exception:
-          continue
-    return None
+    """Fetch stored PR info from the SQLite store (the single source of truth)."""
+    project_root = self.config.repo_root.parent
+    if str(project_root) not in sys.path:
+      sys.path.insert(0, str(project_root))
+    try:
+      from dataset import get_store
+
+      return get_store().to_pr_info(pr_id)
+    except Exception:
+      return None
 
   def _infer_components_from_files(self, diff_files: List[str]) -> List[str]:
     # Keep this behavior aligned with llvm/llvm_helper.py::infer_related_components.

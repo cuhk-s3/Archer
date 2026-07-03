@@ -1,0 +1,125 @@
+{
+  "base_commit": "2b09c50f69b79470d19e3621c4f526b9d81af306",
+  "bug_id": "62873",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/LoopIdiomRecognize.cpp": [
+        "LoopIdiomRecognize::recognizeShiftUntilBitTest"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/LoopIdiomRecognize.cpp": [
+        [
+          2393,
+          2398
+        ]
+      ]
+    },
+    "components": [
+      "LoopIdiomRecognize"
+    ],
+    "fix_commit": "e9ddb584e80194ab9f54e873aa733ae97da3bb95"
+  },
+  "issue": {
+    "author": "ericliuu",
+    "body": "The following IR is miscompiled by the LoopIdiomRecognize pass:\r\n```llvm\r\ndefine i32 @src(i1 %a, i32 %b) {\r\n  %z = zext i1 %a to i32\r\n  %bitmask.i = shl i32 1, %z\r\n  br label %loop.i\r\n\r\nloop.i:                                           ; preds = %loop.i, %0\r\n  %curr.i = phi i32 [ %b, %0 ], [ %next.i, %loop.i ]\r\n  %curr.bitmasked.i = and i32 %curr.i, %bitmask.i\r\n  %curr.isbitunset.i = icmp eq i32 %curr.bitmasked.i, 0\r\n  %next.i = shl i32 %curr.i, 1\r\n  br i1 %curr.isbitunset.i, label %loop.i, label %p2_different_liveout.SM.exit\r\n\r\np2_different_liveout.SM.exit:                     ; preds = %loop.i\r\n  ret i32 %next.i\r\n}\r\n```\r\nWhen optimized with `-passes=\"loop-idiom\"`, the output IR is:\r\n```llvm\r\ndefine i32 @tgt(i1 %a, i32 %b) {\r\n  %z = zext i1 %a to i32\r\n  %bitmask.i = shl i32 1, %z\r\n  %z.lowbitmask = add i32 %bitmask.i, -1\r\n  %z.mask = or i32 %z.lowbitmask, %bitmask.i\r\n  %b.masked = and i32 %b, %z.mask\r\n  %b.masked.numleadingzeros = call i32 @llvm.ctlz.i32(i32 %b.masked, i1 true)\r\n  %b.masked.numactivebits = sub nuw nsw i32 32, %b.masked.numleadingzeros\r\n  %b.masked.leadingonepos = add nsw i32 %b.masked.numactivebits, -1\r\n  %loop.i.backedgetakencount = sub nuw nsw i32 %z, %b.masked.leadingonepos\r\n  %loop.i.tripcount = add nuw nsw i32 %loop.i.backedgetakencount, 1\r\n  %curr.i = shl i32 %b, %loop.i.backedgetakencount\r\n  %next.i = shl i32 %curr.i, 1\r\n  br label %loop.i\r\n\r\nloop.i:                                           ; preds = %loop.i, %0\r\n  %loop.i.iv = phi i32 [ 0, %0 ], [ %loop.i.iv.next, %loop.i ]\r\n  %1 = phi i32 [ %b, %0 ], [ %2, %loop.i ]\r\n  %curr.bitmasked.i = and i32 %1, %bitmask.i\r\n  %curr.isbitunset.i = icmp eq i32 %curr.bitmasked.i, 0\r\n  %2 = shl i32 %1, 1\r\n  %loop.i.iv.next = add nuw nsw i32 %loop.i.iv, 1\r\n  %loop.i.ivcheck = icmp eq i32 %loop.i.iv.next, %loop.i.tripcount\r\n  br i1 %loop.i.ivcheck, label %p2_different_liveout.SM.exit, label %loop.i\r\n\r\np2_different_liveout.SM.exit:                     ; preds = %loop.i\r\n  %next.i.lcssa = phi i32 [ %next.i, %loop.i ]\r\n  ret i32 %next.i.lcssa\r\n}\r\n\r\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\r\ndeclare i32 @llvm.ctlz.i32(i32, i1 immarg) #0\r\n```\r\nThis optimized code can result in UB on the final branch to basic block `p2_different_liveout.SM.exit`. Here is Alive2 output that provides example input which triggers this error: https://alive2.llvm.org/ce/z/GcsFEn",
+    "comments": [
+      {
+        "author": "luxufan",
+        "body": "The transformation becomes correct If adds `noundef` attribute to `%a` in the original IR. So it seems like the bug is caused by we don't check isGuaranteedNotToBeUndefOrPoison at some point. I am interested to solve this. And also welcome other people's solutions."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "loopoptim"
+    ],
+    "title": "[LoopIdiomRecognize] Miscompilation on bitmask loop can trigger UB"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/62873",
+  "knowledge_cutoff": "2023-05-22T21:14:43Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopIdiom"
+  ],
+  "patch": "commit e9ddb584e80194ab9f54e873aa733ae97da3bb95\nAuthor: luxufan <luxufan@iscas.ac.cn>\nDate:   Wed Jun 7 14:01:59 2023 +0800\n\n    [LoopIdiom] Freeze BitPos if !isGuaranteedNotToBeUndefOrPoison\n    \n    Fixes: https://github.com/llvm/llvm-project/issues/62873\n    \n    Reviewed By: nikic\n    \n    Differential Revision: https://reviews.llvm.org/D151690\n\ndiff --git a/llvm/lib/Transforms/Scalar/LoopIdiomRecognize.cpp b/llvm/lib/Transforms/Scalar/LoopIdiomRecognize.cpp\nindex bb0099e409a9..0198a38f843a 100644\n--- a/llvm/lib/Transforms/Scalar/LoopIdiomRecognize.cpp\n+++ b/llvm/lib/Transforms/Scalar/LoopIdiomRecognize.cpp\n@@ -2393,6 +2393,24 @@ bool LoopIdiomRecognize::recognizeShiftUntilBitTest() {\n   // Ok, transform appears worthwhile.\n   MadeChange = true;\n \n+  if (!isGuaranteedNotToBeUndefOrPoison(BitPos)) {\n+    // BitMask may be computed from BitPos, Freeze BitPos so we can increase\n+    // it's use count.\n+    Instruction *InsertPt = nullptr;\n+    if (auto *BitPosI = dyn_cast<Instruction>(BitPos))\n+      InsertPt = BitPosI->getInsertionPointAfterDef();\n+    else\n+      InsertPt = &*DT->getRoot()->getFirstNonPHIOrDbgOrAlloca();\n+    if (!InsertPt)\n+      return false;\n+    FreezeInst *BitPosFrozen =\n+        new FreezeInst(BitPos, BitPos->getName() + \".fr\", InsertPt);\n+    BitPos->replaceUsesWithIf(BitPosFrozen, [BitPosFrozen](Use &U) {\n+      return U.getUser() != BitPosFrozen;\n+    });\n+    BitPos = BitPosFrozen;\n+  }\n+\n   // Step 1: Compute the loop trip count.\n \n   Value *LowBitMask = Builder.CreateAdd(BitMask, Constant::getAllOnesValue(Ty),\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=debugify,loop-idiom -mtriple=x86_64 -mcpu=core-avx2 < %s -S",
+        "opt -passes=debugify,loop-idiom -mtriple=x86_64 -mcpu=corei7 < %s -S"
+      ],
+      "file": "llvm/test/Transforms/LoopIdiom/X86/left-shift-until-bittest.ll",
+      "tests": [
+        {
+          "test_body": "define void @t37_i3(i3 %x, i3 %bit, ptr %p0, ptr %p1) {\nentry:\n  %bitmask = shl i3 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i3 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i3 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i3 %x.curr.bitmasked, 0\n  %x.next = shl i3 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  store i3 %x.curr, ptr %p0, align 1\n  store i3 %x.next, ptr %p1, align 1\n  ret void\n}\n",
+          "test_name": "t37_i3"
+        },
+        {
+          "test_body": "define i16 @p1_i16(i16 %x, i16 %bit) {\nentry:\n  %bitmask = shl i16 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i16 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i16 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i16 %x.curr.bitmasked, 0\n  %x.next = shl i16 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i16 %x.curr\n}\n",
+          "test_name": "p1_i16"
+        },
+        {
+          "test_body": "define i32 @p13(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x.next, %loop ], [ %x, %entry ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i32 %x.curr\n}\n",
+          "test_name": "p13"
+        },
+        {
+          "test_body": "declare void @external_side_effect()\n\ndefine i32 @n29(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  call void @external_side_effect()\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i32 %x.curr\n}\n",
+          "test_name": "n29"
+        },
+        {
+          "test_body": "define void @t36_i2(i2 %x, i2 %bit, ptr %p0, ptr %p1) {\nentry:\n  %bitmask = shl i2 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i2 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i2 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i2 %x.curr.bitmasked, 0\n  %x.next = shl i2 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  store i2 %x.curr, ptr %p0, align 1\n  store i2 %x.next, ptr %p1, align 1\n  ret void\n}\n",
+          "test_name": "t36_i2"
+        },
+        {
+          "test_body": "define void @p5_nuw(i32 %x, i32 %bit, ptr %p0, ptr %p1) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl nuw i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  store i32 %x.curr, ptr %p0, align 4\n  store i32 %x.next, ptr %p1, align 4\n  ret void\n}\n",
+          "test_name": "p5_nuw"
+        },
+        {
+          "test_body": "declare void @use32(i32)\n\ndefine i32 @n31(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  call void @use32(i32 %x.curr.bitmasked)\n  ret i32 %x.curr\n}\n",
+          "test_name": "n31"
+        },
+        {
+          "test_body": "define i32 @p0_i32(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i32 %x.curr\n}\n",
+          "test_name": "p0_i32"
+        },
+        {
+          "test_body": "define i32 @p11(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp ne i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %end, label %loop\n\nend:                                              ; preds = %loop\n  ret i32 %x.curr\n}\n",
+          "test_name": "p11"
+        },
+        {
+          "test_body": "declare void @use1(i1)\n\ndefine i32 @n32(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  call void @use1(i1 %x.curr.isbitunset)\n  ret i32 %x.curr\n}\n",
+          "test_name": "n32"
+        },
+        {
+          "test_body": "define void @p10_x_is_not_one(i32 %bit, ptr %p0, ptr %p1) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ 2, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  store i32 %x.curr, ptr %p0, align 4\n  store i32 %x.next, ptr %p1, align 4\n  ret void\n}\n",
+          "test_name": "p10_x_is_not_one"
+        },
+        {
+          "test_body": "define i32 @p12(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %bitmask, %x.curr\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i32 %x.curr\n}\n",
+          "test_name": "p12"
+        },
+        {
+          "test_body": "define void @t35_i1(i1 %x, i1 %bit, ptr %p0, ptr %p1) {\nentry:\n  %bitmask = shl i1 true, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i1 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i1 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i1 %x.curr.bitmasked, false\n  %x.next = shl i1 %x.curr, true\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  store i1 %x.curr, ptr %p0, align 1\n  store i1 %x.next, ptr %p1, align 1\n  ret void\n}\n",
+          "test_name": "t35_i1"
+        },
+        {
+          "test_body": "define i32 @p2_different_liveout(i32 %x, i32 %bit) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  ret i32 %x.next\n}\n",
+          "test_name": "p2_different_liveout"
+        },
+        {
+          "test_body": "define void @p6_nsw(i32 %x, i32 %bit, ptr %p0, ptr %p1) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl nsw i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  store i32 %x.curr, ptr %p0, align 4\n  store i32 %x.next, ptr %p1, align 4\n  ret void\n}\n",
+          "test_name": "p6_nsw"
+        },
+        {
+          "test_body": "define void @p7_nuwnsw(i32 %x, i32 %bit, ptr %p0, ptr %p1) {\nentry:\n  %bitmask = shl i32 1, %bit\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %x.curr = phi i32 [ %x, %entry ], [ %x.next, %loop ]\n  %x.curr.bitmasked = and i32 %x.curr, %bitmask\n  %x.curr.isbitunset = icmp eq i32 %x.curr.bitmasked, 0\n  %x.next = shl nuw nsw i32 %x.curr, 1\n  br i1 %x.curr.isbitunset, label %loop, label %end\n\nend:                                              ; preds = %loop\n  store i32 %x.curr, ptr %p0, align 4\n  store i32 %x.next, ptr %p1, align 4\n  ret void\n}\n",
+          "test_name": "p7_nuwnsw"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "base_commit": "662c6fc74c1ae7fdefd27524dfaeb7f3e9a1f553",
+  "bug_id": "98665",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Analysis/ConstantFolding.cpp": [
+        "ConstantFoldIntrinsicCall2"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Analysis/ConstantFolding.cpp": [
+        [
+          2754,
+          2780
+        ]
+      ]
+    },
+    "components": [
+      "ConstantFold"
+    ],
+    "fix_commit": "34bfed63313d1340378fc1be931253333db8c36c"
+  },
+  "issue": {
+    "author": "tgross35",
+    "body": "It looks like EarlyCSEPass is transformin the following:\r\n\r\n```llvm\r\n  %_6 = alloca [48 x i8], align 8\r\n  %_3 = alloca [2 x i8], align 2\r\n  %0 = call half @llvm.powi.f16.i32(half 0xH3C00, i32 1) ; 0xH3C00 = 1.0f16\r\n  store half %0, ptr %_3, align 2\r\n  %1 = load half, ptr %_3, align 2\r\n  %_4 = fcmp oeq half %1, 0xH3C00\r\n  br i1 %_4, label %bb1, label %bb2\r\n```\r\n\r\nInto this:\r\n\r\n```llvm\r\n  %_6 = alloca [48 x i8], align 8\r\n  %_3 = alloca [2 x i8], align 2\r\n  store float 1.000000e+00, ptr %_3, align 2\r\n  %0 = load half, ptr %_3, align 2\r\n  %_4 = fcmp oeq half %0, 0xH3C00\r\n  br i1 %_4, label %bb1, label %bb2\r\n```\r\n\r\nAnd later InstCombine folds further into:\r\n\r\n```llvm\r\n  %_6 = alloca [48 x i8], align 8\r\n  %_3 = alloca [2 x i8], align 2\r\n  store float 1.000000e+00, ptr %_3, align 2\r\n  br i1 false, label %bb1, label %bb2\r\n```\r\n\r\nEarlyCSE seems to be doing an incorrect transformation: the result of `powi.f16(1.0, 1)` should be `half` 1.0 (0x3c00), but it is returning `float` 1.0 (0x3f800000). This is incorrect and an OOB write.\r\n\r\nThis comes from the following rust code, which asserts only when optimizations are enabled:\r\n\r\n```rust\r\n#![feature(f16)]\r\n#![allow(unused)]\r\n\r\n#[inline(never)]\r\npub fn check_pow(a: f16) {\r\n    assert_eq!(1.0f16.powi(1), 1.0);\r\n}\r\n\r\npub fn main() {\r\n    check_pow(1.0);\r\n    println!(\"finished\");\r\n}\r\n```\r\n\r\nLink to compiler explorer: https://rust.godbolt.org/z/zsbzzxGvj\r\n\r\nI'm not sure how to reduce to a llc example since the passes appear different. I have been testing on aarch64 since x86 has other f16 ABI bugs, but I don't think this is limited to aarch64.",
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "Reproducer: https://godbolt.org/z/jhM834G3z\r\n```\r\ndefine half @test() {\r\n    %x = call half @llvm.powi.f16.i32(half 0xH3C00, i32 1)\r\n    ret half %x\r\n}\r\n```\r\n```\r\nopt: /root/llvm-project/llvm/lib/IR/Value.cpp:507: void llvm::Value::doRAUW(llvm::Value*, llvm::Value::ReplaceMetadataUses): Assertion `New->getType() == getType() && \"replaceAllUses of value with new value of different type!\"' failed.\r\nPLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.\r\nStack dump:\r\n0.\tProgram arguments: /opt/compiler-explorer/clang-assertions-trunk/bin/opt -o /app/output.s -S -passes=early-cse <source>\r\n1.\tRunning pass \"function(early-cse<>)\" on module \"<source>\"\r\n2.\tRunning pass \"early-cse<>\" on function \"test\"\r\n #0 0x0000000004e9b948 llvm::sys::PrintStackTrace(llvm::raw_ostream&, int) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4e9b948)\r\n #1 0x0000000004e990bc SignalHandler(int) Signals.cpp:0:0\r\n #2 0x000078ad4b442520 (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\r\n #3 0x000078ad4b4969fc pthread_kill (/lib/x86_64-linux-gnu/libc.so.6+0x969fc)\r\n #4 0x000078ad4b442476 gsignal (/lib/x86_64-linux-gnu/libc.so.6+0x42476)\r\n #5 0x000078ad4b4287f3 abort (/lib/x86_64-linux-gnu/libc.so.6+0x287f3)\r\n #6 0x000078ad4b42871b (/lib/x86_64-linux-gnu/libc.so.6+0x2871b)\r\n #7 0x000078ad4b439e96 (/lib/x86_64-linux-gnu/libc.so.6+0x39e96)\r\n #8 0x0000000004cce094 llvm::Value::doRAUW(llvm::Value*, llvm::Value::ReplaceMetadataUses) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4cce094)\r\n #9 0x0000000003ae3b58 (anonymous namespace)::EarlyCSE::processNode(llvm::DomTreeNodeBase<llvm::BasicBlock>*) EarlyCSE.cpp:0:0\r\n#10 0x0000000003ae5a85 (anonymous namespace)::EarlyCSE::run() EarlyCSE.cpp:0:0\r\n#11 0x0000000003ae81f8 llvm::EarlyCSEPass::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x3ae81f8)\r\n#12 0x0000000002ac11be llvm::detail::PassModel<llvm::Function, llvm::EarlyCSEPass, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x2ac11be)\r\n#13 0x0000000004c9f2d8 llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4c9f2d8)\r\n#14 0x0000000000dc9bee llvm::detail::PassModel<llvm::Function, llvm::PassManager<llvm::Function, llvm::AnalysisManager<llvm::Function>>, llvm::AnalysisManager<llvm::Function>>::run(llvm::Function&, llvm::AnalysisManager<llvm::Function>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xdc9bee)\r\n#15 0x0000000004c9dd46 llvm::ModuleToFunctionPassAdaptor::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4c9dd46)\r\n#16 0x0000000000dca1fe llvm::detail::PassModel<llvm::Module, llvm::ModuleToFunctionPassAdaptor, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0xdca1fe)\r\n#17 0x0000000004c9bf10 llvm::PassManager<llvm::Module, llvm::AnalysisManager<llvm::Module>>::run(llvm::Module&, llvm::AnalysisManager<llvm::Module>&) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x4c9bf10)\r\n#18 0x00000000008db1d2 llvm::runPassPipeline(llvm::StringRef, llvm::Module&, llvm::TargetMachine*, llvm::TargetLibraryInfoImpl*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::ToolOutputFile*, llvm::StringRef, llvm::ArrayRef<llvm::PassPlugin>, llvm::ArrayRef<std::function<void (llvm::PassBuilder&)>>, llvm::opt_tool::OutputKind, llvm::opt_tool::VerifierKind, bool, bool, bool, bool, bool, bool, bool) (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8db1d2)\r\n#19 0x00000000008ce0fc optMain (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8ce0fc)\r\n#20 0x000078ad4b429d90 (/lib/x86_64-linux-gnu/libc.so.6+0x29d90)\r\n#21 0x000078ad4b429e40 __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29e40)\r\n#22 0x00000000008c556e _start (/opt/compiler-explorer/clang-assertions-trunk/bin/opt+0x8c556e)\r\nProgram terminated with signal: SIGSEGV\r\nCompiler returned: 139\r\n```\r\n\r\nThere is a bug in constant folding.\r\n\r\n"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:analysis"
+    ],
+    "title": "Misoptimization: `EarlyCSEPass` uses replaces `powi.f16` with `float` result"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/98665",
+  "knowledge_cutoff": "2024-07-12T17:30:32Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/EarlyCSE"
+  ],
+  "patch": "commit 34bfed63313d1340378fc1be931253333db8c36c\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Mon Jul 15 13:00:25 2024 +0800\n\n    [ConstantFold] Fix result type when folding powi.f16 (#98681)\n    \n    Fixes #98665.\n\ndiff --git a/llvm/lib/Analysis/ConstantFolding.cpp b/llvm/lib/Analysis/ConstantFolding.cpp\nindex 962880f68f07..6c52091cd5d7 100644\n--- a/llvm/lib/Analysis/ConstantFolding.cpp\n+++ b/llvm/lib/Analysis/ConstantFolding.cpp\n@@ -2754,27 +2754,28 @@ static Constant *ConstantFoldIntrinsicCall2(Intrinsic::ID IntrinsicID, Type *Ty,\n           ((Mask & fcPosInf) && Op1V.isPosInfinity());\n         return ConstantInt::get(Ty, Result);\n       }\n+      case Intrinsic::powi: {\n+        int Exp = static_cast<int>(Op2C->getSExtValue());\n+        switch (Ty->getTypeID()) {\n+        case Type::HalfTyID:\n+        case Type::FloatTyID: {\n+          APFloat Res(std::pow(Op1V.convertToFloat(), Exp));\n+          if (Ty->isHalfTy()) {\n+            bool Unused;\n+            Res.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven,\n+                        &Unused);\n+          }\n+          return ConstantFP::get(Ty->getContext(), Res);\n+        }\n+        case Type::DoubleTyID:\n+          return ConstantFP::get(Ty, std::pow(Op1V.convertToDouble(), Exp));\n+        default:\n+          return nullptr;\n+        }\n+      }\n       default:\n         break;\n       }\n-\n-      if (!Ty->isHalfTy() && !Ty->isFloatTy() && !Ty->isDoubleTy())\n-        return nullptr;\n-      if (IntrinsicID == Intrinsic::powi && Ty->isHalfTy())\n-        return ConstantFP::get(\n-            Ty->getContext(),\n-            APFloat((float)std::pow((float)Op1V.convertToDouble(),\n-                                    (int)Op2C->getZExtValue())));\n-      if (IntrinsicID == Intrinsic::powi && Ty->isFloatTy())\n-        return ConstantFP::get(\n-            Ty->getContext(),\n-            APFloat((float)std::pow((float)Op1V.convertToDouble(),\n-                                    (int)Op2C->getZExtValue())));\n-      if (IntrinsicID == Intrinsic::powi && Ty->isDoubleTy())\n-        return ConstantFP::get(\n-            Ty->getContext(),\n-            APFloat((double)std::pow(Op1V.convertToDouble(),\n-                                     (int)Op2C->getZExtValue())));\n     }\n     return nullptr;\n   }\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=early-cse -earlycse-debug-hash -S -o - %s"
+      ],
+      "file": "llvm/test/Transforms/EarlyCSE/math-2.ll",
+      "tests": [
+        {
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare double @llvm.powi.f64.i32(double, i32) #0\n\ndefine double @i_powi() {\n  %res = tail call fast double @llvm.powi.f64.i32(double 1.000000e+00, i32 2)\n  ret double %res\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "i_powi"
+        },
+        {
+          "test_body": "define half @pr98665() {\n  %x = call half @llvm.powi.f16.i32(half 0xH3C00, i32 1)\n  ret half %x\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.powi.f16.i32(half, i32) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "pr98665"
+        }
+      ]
+    }
+  ]
+}

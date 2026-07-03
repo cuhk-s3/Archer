@@ -16,10 +16,10 @@ import requests
 import tqdm
 
 sys.path.append(str(Path(__file__).parent.parent))
-# Project root so ``store`` is importable.
+# Project root so the ``dataset`` package is importable.
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-from store import get_store
+from dataset import get_store
 
 # Time range filter (hardcoded)
 # PRs must be created within this date range

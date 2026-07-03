@@ -1,0 +1,96 @@
+{
+  "base_commit": "ed68aac9f225ce560a89315c30f1e97e7e035a03",
+  "bug_id": "81872",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+        "VPBuilder",
+        "clearInsertionPoint"
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlan.h": [
+        "hasNoSignedWrap"
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+        "m_Mul"
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        "VPlanTransforms::dropPoisonGeneratingRecipes"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h": [
+        [
+          68,
+          73
+        ]
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlan.h": [
+        [
+          1127,
+          1132
+        ]
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h": [
+        [
+          261,
+          266
+        ]
+      ],
+      "llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp": [
+        [
+          1255,
+          1261
+        ]
+      ]
+    },
+    "components": [
+      "LoopVectorize"
+    ],
+    "fix_commit": "6ef829941b38f7e8a28c4cba1ff25cd0ae9f7d3d"
+  },
+  "issue": {
+    "author": "annamthomas",
+    "body": "This latent bug was exposed through d77067d (improvement of known bits through dominating conditions). \r\n\r\nGiven this source code snippet:\r\n```\r\nlArr = new long[N]; // initialized to 0. \r\nfor (iv = 99; iv >= 90; --iv) {\r\n    int tmp9 = (iv % 2); \r\n    if (tmp9 == 0) {\r\n      int tmp7 = (iv + 1); \r\n      lArr[tmp7] = 1;\r\n    }\r\n}\r\nprint(lArr[99]);\r\n```\r\n\r\nThis should mean lArr[99] is 1 after the loop (it is set when iv is 98). With known bits improved by dominating conditions, we know that we can convert: `tmp7 = add iv, 1` into `tmp7 = or disjoint iv, 1` (since iv is known divisible by 2 at that point). \r\n\r\nWhen we vectorize this IR, we incorrectly vectorize the code:\r\n\r\nBefore vectorization:\r\n```\r\nbb15:                                             ; preds = %bb20, %bb8\r\n  %iv = phi i64 [ 99, %bb8 ], [ %iv.next, %bb20 ]\r\n  %and = and i64 %iv, 1\r\n  %icmp17 = icmp eq i64 %and, 0\r\n  br i1 %icmp17, label %bb18, label %bb20, !prof !21\r\n\r\nbb18:                                             ; preds = %bb15\r\n  %or = or disjoint i64 %iv, 1\r\n  %getelementptr19 = getelementptr inbounds i64, ptr addrspace(1) %getelementptr, i64 %or\r\n  store i64 1, ptr addrspace(1) %getelementptr19, align 8\r\n  br label %bb20\r\n\r\nbb20:                                             ; preds = %bb18, %bb15\r\n  %iv.next = add nsw i64 %iv, -1\r\n  %icmp22 = icmp eq i64 %iv.next, 90\r\n  br i1 %icmp22, label %bb6, label %bb15, !prof !22\r\n```\r\n\r\nAfter vectorization:\r\n```\r\nvector.body:                                      ; preds = %vector.body, %vector.ph\r\n  %index = phi i64 [ 0, %vector.ph ], [ %index.next, %vector.body ]\r\n  %vec.ind = phi <4 x i64> [ <i64 99, i64 98, i64 97, i64 96>, %vector.ph ], [ %vec.ind.next, %vector.body ]\r\n  %offset.idx = sub i64 99, %index\r\n  %0 = add i64 %offset.idx, 0\r\n  %broadcast.splatinsert = insertelement <4 x i64> poison, i64 %index, i64 0\r\n  %broadcast.splat = shufflevector <4 x i64> %broadcast.splatinsert, <4 x i64> poison, <4 x i32> zeroinitializer\r\n  %vec.iv = add <4 x i64> %broadcast.splat, <i64 0, i64 1, i64 2, i64 3>\r\n  %1 = icmp ule <4 x i64> %vec.iv, <i64 8, i64 8, i64 8, i64 8>\r\n  %2 = and <4 x i64> %vec.ind, <i64 1, i64 1, i64 1, i64 1>\r\n  %3 = icmp eq <4 x i64> %2, zeroinitializer\r\n  %4 = select <4 x i1> %1, <4 x i1> %3, <4 x i1> zeroinitializer\r\n  %5 = or i64 %0, 1\r\n  %6 = getelementptr i64, ptr addrspace(1) %getelementptr, i64 %5\r\n  %7 = getelementptr i64, ptr addrspace(1) %6, i32 0\r\n  %8 = getelementptr i64, ptr addrspace(1) %7, i32 -3\r\n  %reverse = shufflevector <4 x i1> %4, <4 x i1> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\r\n  call void @llvm.masked.store.v4i64.p1(<4 x i64> <i64 1, i64 1, i64 1, i64 1>, ptr addrspace(1) %8, i32 8, <4 x i1> %reverse)\r\n  %index.next = add i64 %index, 4\r\n  %vec.ind.next = add <4 x i64> %vec.ind, <i64 -4, i64 -4, i64 -4, i64 -4>\r\n  %9 = icmp eq i64 %index.next, 12\r\n  br i1 %9, label %middle.block, label %vector.body, !prof !3, !llvm.loop !4\r\n```\r\n\r\nComplete snippet transformation here: https://godbolt.org/z/Kvq1zerTs\r\n\r\n```\r\n99 disjoint 1 =  99\r\nThe array is in first iteration becomes:\r\na[96, 97, 98, 99] <\u2014 1,0,1,0\r\n```\r\nWhich makes a[99] as 0. \r\n\r\nBefore vectorization, we only did the store if `iv` was divisible by 2. \r\n",
+    "comments": [
+      {
+        "author": "annamthomas",
+        "body": "@fhahn  I'm not sure what the right fix here is. It looks like we should not vectorize this case. Note that if we convert the `disjoint or` to an add before vectorization, we would still vectorize it (and have the correct answer for a[99]) :\r\nbasically: `a[97, 98, 99, 100] <- 1,0,1,0`. Since it is a masked store, we do not access a[100] anyway. "
+      },
+      {
+        "author": "danilaml",
+        "body": "This issue is closed as fixed but the fix was reverted."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "vectorizers"
+    ],
+    "title": "Miscompile with LoopVectorizer: Incorrect code with disjoint or"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/81872",
+  "knowledge_cutoff": "2024-02-15T16:53:55Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/LoopVectorize"
+  ],
+  "patch": "commit 6ef829941b38f7e8a28c4cba1ff25cd0ae9f7d3d\nAuthor: Florian Hahn <flo@fhahn.com>\nDate:   Wed Mar 27 19:11:17 2024 +0000\n\n    Recommit \"[VPlan] Replace disjoint or with add instead of dropping disjoint. (#83821)\"\n    \n    Recommit with a fix for the use-after-free causing the revert.\n    This reverts the revert commit f872043e055f4163c3c4b1b86ca0354490174987.\n    \n    Original commit message:\n    \n    Dropping disjoint from an OR may yield incorrect results, as some\n    analysis may have converted it to an Add implicitly (e.g. SCEV used for\n    dependence analysis). Instead, replace it with an equivalent Add.\n    \n    This is possible as all users of the disjoint OR only access lanes where\n    the operands are disjoint or poison otherwise.\n    \n    Note that replacing all disjoint ORs with ADDs instead of dropping the\n    flags is not strictly necessary. It is only needed for disjoint ORs that\n    SCEV treated as ADDs, but those are not tracked.\n    \n    There are other places that may drop poison-generating flags; those\n    likely need similar treatment.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/81872\n    \n    PR: https://github.com/llvm/llvm-project/pull/83821\n\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\nindex e86705e89889..5d03b66b0ce3 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorizationPlanner.h\n@@ -68,6 +68,9 @@ class VPBuilder {\n public:\n   VPBuilder() = default;\n   VPBuilder(VPBasicBlock *InsertBB) { setInsertPoint(InsertBB); }\n+  VPBuilder(VPRecipeBase *InsertPt) {\n+    setInsertPoint(InsertPt->getParent(), InsertPt->getIterator());\n+  }\n \n   /// Clear the insertion point: created instructions will not be inserted into\n   /// a block.\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlan.h b/llvm/lib/Transforms/Vectorize/VPlan.h\nindex f70ccf8270b2..2f56799a7b51 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlan.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlan.h\n@@ -1127,6 +1127,12 @@ public:\n     return WrapFlags.HasNSW;\n   }\n \n+  bool isDisjoint() const {\n+    assert(OpType == OperationType::DisjointOp &&\n+           \"recipe cannot have a disjoing flag\");\n+    return DisjointFlags.IsDisjoint;\n+  }\n+\n #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)\n   void printFlags(raw_ostream &O) const;\n #endif\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\nindex aa2535906945..a03a408686ef 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n+++ b/llvm/lib/Transforms/Vectorize/VPlanPatternMatch.h\n@@ -261,6 +261,11 @@ m_Mul(const Op0_t &Op0, const Op1_t &Op1) {\n   return m_Binary<Instruction::Mul, Op0_t, Op1_t>(Op0, Op1);\n }\n \n+template <typename Op0_t, typename Op1_t>\n+inline AllBinaryRecipe_match<Op0_t, Op1_t, Instruction::Or>\n+m_Or(const Op0_t &Op0, const Op1_t &Op1) {\n+  return m_Binary<Instruction::Or, Op0_t, Op1_t>(Op0, Op1);\n+}\n } // namespace VPlanPatternMatch\n } // namespace llvm\n \ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\nindex e6ab27a918bc..006f4349d6fb 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanTransforms.cpp\n@@ -1255,7 +1255,24 @@ void VPlanTransforms::dropPoisonGeneratingRecipes(\n       // load/store. If the underlying instruction has poison-generating flags,\n       // drop them directly.\n       if (auto *RecWithFlags = dyn_cast<VPRecipeWithIRFlags>(CurRec)) {\n-        RecWithFlags->dropPoisonGeneratingFlags();\n+        VPValue *A, *B;\n+        using namespace llvm::VPlanPatternMatch;\n+        // Dropping disjoint from an OR may yield incorrect results, as some\n+        // analysis may have converted it to an Add implicitly (e.g. SCEV used\n+        // for dependence analysis). Instead, replace it with an equivalent Add.\n+        // This is possible as all users of the disjoint OR only access lanes\n+        // where the operands are disjoint or poison otherwise.\n+        if (match(RecWithFlags, m_Or(m_VPValue(A), m_VPValue(B))) &&\n+            RecWithFlags->isDisjoint()) {\n+          VPBuilder Builder(RecWithFlags);\n+          VPInstruction *New = Builder.createOverflowingOp(\n+              Instruction::Add, {A, B}, {false, false},\n+              RecWithFlags->getDebugLoc());\n+          RecWithFlags->replaceAllUsesWith(New);\n+          RecWithFlags->eraseFromParent();\n+          CurRec = New;\n+        } else\n+          RecWithFlags->dropPoisonGeneratingFlags();\n       } else {\n         Instruction *Instr = dyn_cast_or_null<Instruction>(\n             CurRec->getVPSingleValue()->getUnderlyingValue());\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -S -passes=loop-vectorize < %s"
+      ],
+      "file": "llvm/test/Transforms/LoopVectorize/X86/pr81872.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @test(ptr noundef align 8 dereferenceable_or_null(16) %arr) #0 {\nbb5:\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %bb5\n  %iv = phi i64 [ 99, %bb5 ], [ %iv.next, %loop.latch ]\n  %and = and i64 %iv, 1\n  %icmp17 = icmp eq i64 %and, 0\n  br i1 %icmp17, label %bb18, label %loop.latch, !prof !0\n\nbb18:                                             ; preds = %loop.header\n  %or = or disjoint i64 %iv, 1\n  %getelementptr19 = getelementptr inbounds i64, ptr %arr, i64 %or\n  store i64 1, ptr %getelementptr19, align 8\n  br label %loop.latch\n\nloop.latch:                                       ; preds = %bb18, %loop.header\n  %iv.next = add nsw i64 %iv, -1\n  %icmp22 = icmp eq i64 %iv.next, 90\n  br i1 %icmp22, label %bb6, label %loop.header, !prof !1\n\nbb6:                                              ; preds = %loop.latch\n  ret void\n}\n\nattributes #0 = { \"target-cpu\"=\"haswell\" \"target-features\"=\"+avx2\" }\n\n!0 = !{!\"branch_weights\", i32 1, i32 1}\n!1 = !{!\"branch_weights\", i32 1, i32 95}\n",
+          "test_name": "test"
+        }
+      ]
+    }
+  ]
+}

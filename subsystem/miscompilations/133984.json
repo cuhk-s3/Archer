@@ -1,0 +1,110 @@
+{
+  "base_commit": "2fe123a1195e16e065f913ba2bba8582370a8707",
+  "bug_id": "133984",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+        "MemCpyOptPass::performStackMoveOptzn"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp": [
+        [
+          1516,
+          1522
+        ],
+        [
+          1570,
+          1577
+        ],
+        [
+          1680,
+          1690
+        ]
+      ]
+    },
+    "components": [
+      "MemCpyOptimizer"
+    ],
+    "fix_commit": "716b02d8c575afde7af1af13df145019659abca2"
+  },
+  "issue": {
+    "author": "gbaraldi",
+    "body": "While debugging https://github.com/JuliaLang/julia/issues/57959. It got minimized to what looks to be a bug in MemCpyOpt, where it strips the noalias attribute of a memcpy https://github.com/llvm/llvm-project/blob/3c7a0e6c826b8bcfa4ec6154fd4247658ca3a03f/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp#L1682-L1688 but not the other aliasing metadatas (tbaa,tbaa.struct). Probably using `combineMetadata` as used elsewhere in the pass\n@khei4 was the one that originally added this optimization",
+    "comments": [
+      {
+        "author": "gbaraldi",
+        "body": "https://godbolt.org/z/qv1Mqo7eP For a small reproducer "
+      },
+      {
+        "author": "nikic",
+        "body": "There is a related PR here: https://github.com/llvm/llvm-project/pull/129537"
+      },
+      {
+        "author": "tstellar",
+        "body": "@nikic Were you able to manually backport this one?"
+      },
+      {
+        "author": "nikic",
+        "body": "@tstellar Manual backport: https://github.com/llvm/llvm-project/pull/135615"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "release:cherry-pick-failed",
+      "llvm:transforms"
+    ],
+    "title": "MemcpyOpt doesn't strip TBAA correctly"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/133984",
+  "knowledge_cutoff": "2025-04-01T20:41:00Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/MemCpyOpt"
+  ],
+  "patch": "commit 716b02d8c575afde7af1af13df145019659abca2\nAuthor: Dominik Adamski <dominik.adamski@amd.com>\nDate:   Thu Apr 10 12:23:53 2025 +0200\n\n    [LLVM][MemCpyOpt] Unify alias tags if we optimize allocas (#129537)\n    \n    Optimization of alloca instructions may lead to invalid alias tags.\n    Incorrect alias tags can result in incorrect optimization outcomes for\n    Fortran source code compiled by Flang with flags: `-O3 -mmlir\n    -local-alloc-tbaa -flto`.\n    \n    This commit removes alias tags when memcpy optimization replaces two\n    arrays with one array, thus ensuring correct compilation of Fortran\n    source code using flags: `-O3 -mmlir -local-alloc-tbaa -flto`.\n    \n    This commit is also a proposal to fix the reported issue:\n    https://github.com/llvm/llvm-project/issues/133984\n    \n    ---------\n    \n    Co-authored-by: Shilei Tian <i@tianshilei.me>\n\ndiff --git a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\nindex ce13f87d601a..0d03395f0ff2 100644\n--- a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n+++ b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp\n@@ -1516,7 +1516,7 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n   // to remove them.\n \n   SmallVector<Instruction *, 4> LifetimeMarkers;\n-  SmallSet<Instruction *, 4> NoAliasInstrs;\n+  SmallSet<Instruction *, 4> AAMetadataInstrs;\n   bool SrcNotDom = false;\n \n   // Recursively track the user and check whether modified alias exist.\n@@ -1570,8 +1570,8 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n               continue;\n             }\n           }\n-          if (UI->hasMetadata(LLVMContext::MD_noalias))\n-            NoAliasInstrs.insert(UI);\n+          AAMetadataInstrs.insert(UI);\n+\n           if (!ModRefCallback(UI))\n             return false;\n         }\n@@ -1680,11 +1680,16 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,\n   }\n \n   // As this transformation can cause memory accesses that didn't previously\n-  // alias to begin to alias one another, we remove !noalias metadata from any\n-  // uses of either alloca. This is conservative, but more precision doesn't\n-  // seem worthwhile right now.\n-  for (Instruction *I : NoAliasInstrs)\n+  // alias to begin to alias one another, we remove !alias.scope, !noalias,\n+  // !tbaa and !tbaa_struct metadata from any uses of either alloca.\n+  // This is conservative, but more precision doesn't seem worthwhile\n+  // right now.\n+  for (Instruction *I : AAMetadataInstrs) {\n+    I->setMetadata(LLVMContext::MD_alias_scope, nullptr);\n     I->setMetadata(LLVMContext::MD_noalias, nullptr);\n+    I->setMetadata(LLVMContext::MD_tbaa, nullptr);\n+    I->setMetadata(LLVMContext::MD_tbaa_struct, nullptr);\n+  }\n \n   LLVM_DEBUG(dbgs() << \"Stack Move: Performed staack-move optimization\\n\");\n   NumStackMove++;\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=memcpyopt,dse -S -verify-memoryssa"
+      ],
+      "file": "llvm/test/Transforms/MemCpyOpt/memcpy-tbaa.ll",
+      "tests": [
+        {
+          "test_body": "define void @test() local_unnamed_addr {\n  %test_array_a = alloca [31 x float], align 4\n  %test_array_b = alloca [31 x float], align 4\n  %1 = getelementptr float, ptr %test_array_b, i64 1\n  store float 0x3E6AA51880000000, ptr %1, align 4, !tbaa !0\n  call void @llvm.memcpy.p0.p0.i64(ptr noundef nonnull align 4 dereferenceable(124) %test_array_a, ptr noundef nonnull align 4 dereferenceable(124) %test_array_b, i64 124, i1 false)\n  %2 = getelementptr float, ptr %test_array_a, i64 1\n  %3 = load float, ptr %2, align 4, !tbaa !6\n  ret void\n}\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"allocated data/test_array_a\", !2, i64 0}\n!2 = !{!\"allocated data\", !3, i64 0}\n!3 = !{!\"any data access\", !4, i64 0}\n!4 = !{!\"any access\", !5, i64 0}\n!5 = !{!\"Flang function root test\"}\n!6 = !{!7, !7, i64 0}\n!7 = !{!\"allocated data/test_array_b\", !2, i64 0}\n",
+          "test_name": "test"
+        },
+        {
+          "test_body": "%struct.Outer = type { float, double, %struct.Inner }\n%struct.Inner = type { i32, float }\n\ndefine dso_local float @f() {\nentry:\n  %test = alloca %struct.Outer, align 8\n  %test1 = alloca %struct.Outer, align 8\n  %f = getelementptr inbounds nuw %struct.Outer, ptr %test1, i32 0, i32 0\n  store float 0.000000e+00, ptr %f, align 8, !tbaa !0\n  %inner_a = getelementptr inbounds nuw %struct.Outer, ptr %test1, i32 0, i32 2\n  %i = getelementptr inbounds nuw %struct.Inner, ptr %inner_a, i32 0, i32 0\n  store i32 0, ptr %i, align 8, !tbaa !8\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %test, ptr align 8 %test1, i64 24, i1 false)\n  %f1 = getelementptr inbounds nuw %struct.Outer, ptr %test, i32 0, i32 0\n  %0 = load float, ptr %f1, align 8, !tbaa !0\n  %add = fadd float %0, 2.000000e+00\n  store float %add, ptr %f1, align 8, !tbaa !0\n  %f2 = getelementptr inbounds nuw %struct.Outer, ptr %test, i32 0, i32 0\n  %1 = load float, ptr %f2, align 8, !tbaa !0\n  ret float %1\n}\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\n\n!0 = !{!1, !2, i64 0}\n!1 = !{!\"Outer\", !2, i64 0, !5, i64 8, !6, i64 16}\n!2 = !{!\"float\", !3, i64 0}\n!3 = !{!\"omnipotent char\", !4, i64 0}\n!4 = !{!\"Simple C/C++ TBAA\"}\n!5 = !{!\"double\", !3, i64 0}\n!6 = !{!\"Inner\", !7, i64 0, !2, i64 4}\n!7 = !{!\"int\", !3, i64 0}\n!8 = !{!1, !7, i64 16}\n",
+          "test_name": "f"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt < %s -passes=memcpyopt -verify-memoryssa -S"
+      ],
+      "file": "llvm/test/Transforms/MemCpyOpt/stack-move.ll",
+      "tests": [
+        {
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @remove_alloca_metadata() {\n  %src = alloca %struct.Foo, align 4, !annotation !0\n  %dest = alloca %struct.Foo, align 4\n  call void @llvm.lifetime.start.p0(i64 12, ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(i64 12, ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src), !alias.scope !1\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 12, i1 false)\n  %2 = call i32 @use_nocapture(ptr nocapture %dest), !noalias !1\n  call void @llvm.lifetime.end.p0(i64 12, ptr nocapture %src)\n  call void @llvm.lifetime.end.p0(i64 12, ptr nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n\n!0 = !{!\"Whatever\"}\n!1 = !{!2}\n!2 = distinct !{!2, !3}\n!3 = distinct !{!3}\n",
+          "test_name": "remove_alloca_metadata"
+        },
+        {
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @noalias_on_lifetime() {\n  %src = alloca %struct.Foo, align 4\n  %dest = alloca %struct.Foo, align 4\n  call void @llvm.lifetime.start.p0(i64 12, ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(i64 12, ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src), !alias.scope !0\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 12, i1 false)\n  call void @llvm.lifetime.end.p0(i64 12, ptr nocapture %src), !alias.scope !0\n  %2 = call i32 @use_nocapture(ptr nocapture %dest), !noalias !0\n  call void @llvm.lifetime.end.p0(i64 12, ptr nocapture %dest), !noalias !0\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n\n!0 = !{!1}\n!1 = distinct !{!1, !2}\n!2 = distinct !{!2}\n",
+          "test_name": "noalias_on_lifetime"
+        },
+        {
+          "test_body": "%struct.Foo = type { i32, i32, i32 }\n\n; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture) #1\n\ndeclare i32 @use_nocapture(ptr nocapture)\n\ndefine void @remove_scoped_noalias() {\n  %src = alloca %struct.Foo, align 4\n  %dest = alloca %struct.Foo, align 4\n  call void @llvm.lifetime.start.p0(i64 12, ptr nocapture %src)\n  call void @llvm.lifetime.start.p0(i64 12, ptr nocapture %dest)\n  store %struct.Foo { i32 10, i32 20, i32 30 }, ptr %src, align 4\n  %1 = call i32 @use_nocapture(ptr nocapture %src), !alias.scope !0\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %dest, ptr align 4 %src, i64 12, i1 false)\n  call void @llvm.lifetime.end.p0(i64 12, ptr nocapture %src)\n  %2 = call i32 @use_nocapture(ptr nocapture %dest), !noalias !0\n  call void @llvm.lifetime.end.p0(i64 12, ptr nocapture %dest)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n\n!0 = !{!1}\n!1 = distinct !{!1, !2}\n!2 = distinct !{!2}\n",
+          "test_name": "remove_scoped_noalias"
+        }
+      ]
+    }
+  ]
+}

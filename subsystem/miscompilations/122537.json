@@ -1,0 +1,50 @@
+{
+  "base_commit": "32126a3fda7b840d6125dd4375bdf53502b3c110",
+  "bug_id": "122537",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {},
+    "bug_location_lineno": {},
+    "components": [],
+    "fix_commit": "77d3f8a92564b533a3c60a8c8e0657c38fd88ba1"
+  },
+  "issue": {
+    "author": "mshockwave",
+    "body": "This is a relatively intertwinding bug and I think the best way to describe it is through chronological order:\n\nAt this moment RISC-V LLVM miscompiles 482.sphinx3 when we enable VLS vectorization + LTO:\n```\nclang -O3 -flto -target riscv64-linux-gnu -mcpu=sifive-p670 -mrvv-vector-bits=zvl ...\n```\n\nIf we remove the `-mrvv-vector-bits=zvl` flag (i.e. not using VLS vectorization), the issue goes away. Here are what happened:\n  1. With `-mrvv-vector-bits=zvl`, since we use a fixed VLEN all the `llvm.vscale` intrinsic calls will go away. All kinds of code simplifications then kick in and make some of the functions smaller\n  2. Some of the these functions started to get inlined, among them is a function (let's name it `allocate2D`) that allocates and returns a 2D array. This is effectively how it got called and used:\n```c\nvoid **allocate2D();\n\nint bar (float *p);\n\nint foo() {\n  float **buffer = (float **)allocate2D();\n  return bar(buffer[0]);\n}\n```\n  3. This is what it looks like after `allocate2D` got inlined\n``` llvm\ndeclare i32 @bar(ptr nocapture noundef)\n\ndeclare dso_local noalias noundef ptr @malloc(i64 noundef) local_unnamed_addr #0\n\ndefine i32 @foo(ptr %src, i64 %num, i64 %N) {\nb3:\n  %p0 = call noalias ptr @malloc(i64 noundef %num)\n  br label %b2\n\nb2:\n  %offset = phi i64 [0, %b3], [%iv, %b2]\n  %p2 = getelementptr inbounds nuw ptr, ptr %p0, i64 %offset\n  store ptr %src, ptr %p2, align 8, !tbaa !4\n  %iv = add nuw nsw i64 %offset, 1\n  %c = icmp eq i64 %iv, %N\n  br i1 %c, label %b1, label %b2\n\nb1:\n  %p = load ptr, ptr %p0, align 8, !tbaa !6\n  br label %b0\n\nb0:\n  %r = call i32 @bar(ptr noundef %p)\n  ret i32 %r\n}\n\nattributes #0 = { mustprogress nofree nounwind willreturn allockind(\"alloc,uninitialized\") allocsize(0) memory(inaccessiblemem: readwrite) \"alloc-family\"=\"malloc\" }\n\n!0 = !{!\"any pointer\", !1, i64 0}\n!1 = !{!\"omnipotent char\", !2, i64 0}\n!2 = !{!\"Simple C/C++ TBAA\"}\n!3 = !{!\"p1 omnipotent char\", !0, i64 0}\n!4 = !{!3, !3, i64 0}\n!5 = !{!\"p1 float\", !0, i64 0}\n!6 = !{!5, !5, i64 0}\n```\nb2, and b3 both originally belong to `allocate2D`: b3 mallocs the memory for row pointers in this 2D array and b2 initializes them (the code showed here is NOT what it actually did but merely demonstrating that it's using a loop to initialize the row pointers memory). b1 and b0, on the other hand, grab the first row from this 2D array and pass it to `bar`.\n\n  4. The problem is, if you run this snippet through GVN, `%r = call i32 @bar(ptr noundef %p)` will be turned into `%r = call i32 @bar(ptr noundef undef)`. Which is of course incorrect.\n  5. The reason GVN thought it's a good idea to replace %p with undef is twofold: first it uses MemoryDependenceAnalysis to retrieve all the dependencies of `%p = load ptr, ptr %p0, align 8, !tbaa !6`. And for some reasons it only returns `%p0 = call noalias ptr @malloc(i64 noundef %num)` as the only Def dependency and (incorrectly) ignores `store ptr %src, ptr %p2, align 8, !tbaa !4` which might clobber `%p0`. And since `malloc` has the `allockind(\"uninitialized\")` attribute, loading unintialized content is, to my best understandingss, undefined behavior so the optimizer can replace it with whatever it wants, hence the undef value.\n  6. The store instruction was ignored because the AA pipeline thought `store ptr %src, ptr %p2` and `%p = load ptr, ptr %p0` have NoAlias, which is rare considered 90% of the time we expected MayAlias and also wrong -- it should return MayAlias for the potential clobber.\n  7. Now the problem can be boiled down to the incorrect AA result between the said load and store instructions. This AA query was first processed by BasicAA, which (correctly) returns MayAlias\n  8. But when it passes to the subsequent TBAA, it thought they are NoAlias because of their type descriptor graph. Specifically, this is store instruction's tree:\n```\n<0x555555676658> = !{<0x5555555b33d8>, <0x5555555b33d8>, i64 0}\n  <0x5555555b33d8> = !{!\"p1 omnipotent char\", <0x55555583a118>, i64 0}\n    !\"p1 omnipotent char\"\n    <0x55555583a118> = !{!\"any pointer\", <0x55555583a3c8>, i64 0}\n      !\"any pointer\"\n      <0x55555583a3c8> = !{!\"omnipotent char\", <0x55555583a0d8>, i64 0}\n        !\"omnipotent char\"\n        <0x55555583a0d8> = !{!\"Simple C/C++ TBAA\"}\n          !\"Simple C/C++ TBAA\"\n```\nand this is load instruction's tree:\n```\n<0x5555557bdbe8> = !{<0x5555557c9108>, <0x5555557c9108>, i64 0}\n  <0x5555557c9108> = !{!\"p1 float\", <0x55555583a118>, i64 0}\n    !\"p1 sink\"\n    <0x55555583a118> = !{!\"any pointer\", <0x55555583a3c8>, i64 0}\n      !\"any pointer\"\n      <0x55555583a3c8> = !{!\"omnipotent char\", <0x55555583a0d8>, i64 0}\n        !\"omnipotent char\"\n        <0x55555583a0d8> = !{!\"Simple C/C++ TBAA\"}\n          !\"Simple C/C++ TBAA\"\n```\nAnd based on TBAA's rule, these two type descriptor graphs are indeed not alias.\n\nPersonally I think the TBAA tags are wrong. ~~: the tag for store instructions -- which represents storing `void *` to `void **` -- should probably be _any pointer_.~~",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Does https://github.com/llvm/llvm-project/pull/122116 fix this?"
+      },
+      {
+        "author": "mshockwave",
+        "body": "> Does [#122116](https://github.com/llvm/llvm-project/pull/122116) fix this?\n\nI'll give it a try (Update: no it doesn't fix this). That said, I looked into the original C code for `allocate2D`:\n```c\nvoid **allocate2D (int32 X, int32 Y, int32 elemsize, ...)\n{\n    char **ref, *mem;\n    int32 i, offset;\n\n    mem = (char *) calloc(...);\n    ref = (char **) malloc(...);\n\n    for (i = 0, offset = 0; i < X; i++, offset += Y*elemsize)\n        ref[i] = mem + offset;\n\n    return ((void **) ref);\n}\n```\nSeems like the TBAA tag for store is for `char *` rather than `void *`. "
+      },
+      {
+        "author": "fhahn",
+        "body": "> > Does [#122116](https://github.com/llvm/llvm-project/pull/122116) fix this?\n> \n> I'll give it a try (Update: no it doesn't fix this). That said, I looked into the original C code for `allocate2D`:\n> \n> void **allocate2D (int32 X, int32 Y, int32 elemsize, ...)\n> {\n>     char **ref, *mem;\n>     int32 i, offset;\n> \n>     mem = (char *) calloc(...);\n>     ref = (char **) malloc(...);\n> \n>     for (i = 0, offset = 0; i < X; i++, offset += Y*elemsize)\n>         ref[i] = mem + offset;\n> \n>     return ((void **) ref);\n> }\n> Seems like the TBAA tag for store is for `char *` rather than `void *`.\n\n\n\nWhich tag? IIUC the code is storing `char *` through `ref[I]` and then returning `ref` as `void **`. How is the return value then used to access the data? If it is loading `void *`, then the issue should probably be fixed by #122116. If it's a different type other than `char *`, it is a strict alias violation you probably either have to fix the source code or pass `-fno-strict-aliasing` (or `-fno-pointer-tbaa` .\n\nYou can also use `-fsanitize=type` to check for strict alias violations, although the sanitizer is still experimental."
+      },
+      {
+        "author": "mshockwave",
+        "body": "> > > Does [#122116](https://github.com/llvm/llvm-project/pull/122116) fix this?\n> > \n> > \n> > I'll give it a try (Update: no it doesn't fix this). That said, I looked into the original C code for `allocate2D`:\n> > void **allocate2D (int32 X, int32 Y, int32 elemsize, ...)\n> > {\n> > char **ref, *mem;\n> > int32 i, offset;\n> > ```\n> > mem = (char *) calloc(...);\n> > ref = (char **) malloc(...);\n> > \n> > for (i = 0, offset = 0; i < X; i++, offset += Y*elemsize)\n> >     ref[i] = mem + offset;\n> > \n> > return ((void **) ref);\n> > ```\n> > \n> > \n> >     \n> >       \n> >     \n> > \n> >       \n> >     \n> > \n> >     \n> >   \n> > }\n> > Seems like the TBAA tag for store is for `char *` rather than `void *`.\n> \n> Which tag? IIUC the code is storing `char *` through `ref[I]` and then returning `ref` as `void **`. How is the return value then used to access the data? If it is loading `void *`, then the issue should probably be fixed by [#122116](https://github.com/llvm/llvm-project/pull/122116). If it's a different type other than `char *`, it is a strict alias violation you probably either have to fix the source code or pass `-fno-strict-aliasing` (or `-fno-pointer-tbaa` .\n> \n> You can also use `-fsanitize=type` to check for strict alias violations, although the sanitizer is still experimental.\n\nWhile type sanitizer is not supported on RISC-V yet, I confirm that either `-fno-pointer-tbaa` or `-fno-strict-aliasing` fixes this issue."
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "release:backport",
+      "TBAA",
+      "llvm:GVN"
+    ],
+    "title": "[TBAA][GVN] Miscompile due to incorrectly replacing pointer with undef"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/122537",
+  "knowledge_cutoff": "2025-01-10T21:59:32Z",
+  "lit_test_dir": [],
+  "patch": "",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": []
+}

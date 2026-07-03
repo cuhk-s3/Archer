@@ -1,0 +1,111 @@
+{
+  "base_commit": "a976843033485ff44bb4bbb0b0b8a537956b4c40",
+  "bug_id": "152824",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/include/llvm/IR/GenericFloatingPointPredicateUtils.h": [
+        "fcmpImpliesClass"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/include/llvm/IR/GenericFloatingPointPredicateUtils.h": [
+        [
+          135,
+          140
+        ],
+        [
+          151,
+          176
+        ]
+      ]
+    },
+    "components": [],
+    "fix_commit": "d8b1b46cd39c91830bcf49ed91d80f38f78c2168"
+  },
+  "issue": {
+    "author": "ojhunt",
+    "body": "The below test case fails at optimization levels greater than -O1\n```cpp\n#include <math.h>\n#include <stdio.h>\n\n__attribute__((noinline))\nint test(double a, double b)\n{\n  int maxIdx = 0;\n  double maxDot = 0.0;\n  for (int i = 0; i < 2; ++i) {\n    double dot = a * b;\n    if (fabs(dot) > fabs(maxDot)) {\n      maxIdx = i;\n      maxDot = dot;\n    }\n  }\n  return maxIdx;\n}\n\nint main(int argc, char *argv[])\n{\n\n  int i = test(1.0, -1.0);\n  int failed = (i != 0);\n\n  printf(\"Returned %d, should be 0: %s\\n\", i, (failed ? \"failed\" : \"success\"));\n\n  return failed;\n}\n```\n\nThis is a regression introduced in #76360\n\n~The bug is due to https://github.com/llvm/llvm-project/pull/76360/files#diff-532fd830a7b080a7121645e6c8dccb2f94a7e25450c74aa496b8600f8f4481ccR6220~\n\n~comparing a std::optional<bool> to false rather than dereferencing it (maybe we need a way to warn about this? it's a super easy error)~\n\n[Implicit conversion means the comparison I thought was wrong, was correct, and my PoC fix worked by functionally disabling signedness propagation entirely]",
+    "comments": [
+      {
+        "author": "nikic",
+        "body": "Seems to go wrong during unroling: https://alive2.llvm.org/ce/z/sxJ5eo"
+      },
+      {
+        "author": "nikic",
+        "body": "Or rather in simplification during unrolling (https://alive2.llvm.org/ce/z/66EoES):\n```llvm\ndefine half @src(half noundef %mul) {\nentry:\n  %abs = call half @llvm.fabs.f16(half %mul)\n  %cmp1 = fcmp ogt half %abs, 0.000000e+00\n  %maxDot.1 = select i1 %cmp1, half %mul, half 0.000000e+00\n  %abs2 = call half @llvm.fabs.f16(half %maxDot.1)\n  ret half %abs2\n}\n\ndefine half @tgt(half noundef %mul) {\nentry:\n  %abs = call half @llvm.fabs.f16(half %mul)\n  %cmp1 = fcmp ogt half %abs, 0xH0000\n  %maxDot.1 = select i1 %cmp1, half %mul, half 0xH0000\n  ret half %maxDot.1\n}\n```\n\nThe second abs should not be eliminated."
+      },
+      {
+        "author": "nikic",
+        "body": "Presumably something is wrong in https://github.com/llvm/llvm-project/blob/fc44a4fcd3c54be927c15ddd9211aca1501633e7/llvm/lib/Analysis/ValueTracking.cpp#L4852-L4860 or the fcmpImpliesClass utility it calls."
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "@nikic @ojhunt Are you working on this issue?\n"
+      },
+      {
+        "author": "nikic",
+        "body": "I'm not working on it."
+      },
+      {
+        "author": "ojhunt",
+        "body": "> [@nikic](https://github.com/nikic) [@ojhunt](https://github.com/ojhunt) Are you working on this issue?\n\nI am not - I don't know anything like enough about the IR pipelines :D"
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "Okay. I will post a fix tomorrow."
+      },
+      {
+        "author": "ojhunt",
+        "body": "> Okay. I will post a fix tomorrow.\n\ncool, I'd love to see how this kind of issue comes about in IR land (obviously everything looks quite different from in clang)"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "floating-point",
+      "llvm:ir"
+    ],
+    "title": "[llvm] Incorrect simplification of fabs intrinsic"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/152824",
+  "knowledge_cutoff": "2025-08-09T03:58:43Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstSimplify"
+  ],
+  "patch": "commit d8b1b46cd39c91830bcf49ed91d80f38f78c2168\nAuthor: Yingwei Zheng <dtcxzyw2333@gmail.com>\nDate:   Sun Aug 10 22:55:04 2025 +0800\n\n    [IR] Handle fabs LHS in `fcmpImpliesClass` (#152913)\n    \n    Closes https://github.com/llvm/llvm-project/issues/152824.\n\ndiff --git a/llvm/include/llvm/IR/GenericFloatingPointPredicateUtils.h b/llvm/include/llvm/IR/GenericFloatingPointPredicateUtils.h\nindex 8aac9d5b49db..448a6e913eb8 100644\n--- a/llvm/include/llvm/IR/GenericFloatingPointPredicateUtils.h\n+++ b/llvm/include/llvm/IR/GenericFloatingPointPredicateUtils.h\n@@ -135,6 +135,12 @@ public:\n       if (Mode.Input != DenormalMode::IEEE)\n         return {Invalid, fcAllFlags, fcAllFlags};\n \n+      auto ExactClass = [IsFabs, Src](FPClassTest Mask) {\n+        if (IsFabs)\n+          Mask = llvm::inverse_fabs(Mask);\n+        return exactClass(Src, Mask);\n+      };\n+\n       switch (Pred) {\n       case FCmpInst::FCMP_OEQ: // Match x == 0.0\n         return exactClass(Src, fcZero);\n@@ -151,26 +157,24 @@ public:\n       case FCmpInst::FCMP_UNO:\n         return exactClass(Src, fcNan);\n       case FCmpInst::FCMP_OGT: // x > 0\n-        return exactClass(Src, fcPosSubnormal | fcPosNormal | fcPosInf);\n+        return ExactClass(fcPosSubnormal | fcPosNormal | fcPosInf);\n       case FCmpInst::FCMP_UGT: // isnan(x) || x > 0\n-        return exactClass(Src, fcPosSubnormal | fcPosNormal | fcPosInf | fcNan);\n+        return ExactClass(fcPosSubnormal | fcPosNormal | fcPosInf | fcNan);\n       case FCmpInst::FCMP_OGE: // x >= 0\n-        return exactClass(Src, fcPositive | fcNegZero);\n+        return ExactClass(fcPositive | fcNegZero);\n       case FCmpInst::FCMP_UGE: // isnan(x) || x >= 0\n-        return exactClass(Src, fcPositive | fcNegZero | fcNan);\n+        return ExactClass(fcPositive | fcNegZero | fcNan);\n       case FCmpInst::FCMP_OLT: // x < 0\n-        return exactClass(Src, fcNegSubnormal | fcNegNormal | fcNegInf);\n+        return ExactClass(fcNegSubnormal | fcNegNormal | fcNegInf);\n       case FCmpInst::FCMP_ULT: // isnan(x) || x < 0\n-        return exactClass(Src, fcNegSubnormal | fcNegNormal | fcNegInf | fcNan);\n+        return ExactClass(fcNegSubnormal | fcNegNormal | fcNegInf | fcNan);\n       case FCmpInst::FCMP_OLE: // x <= 0\n-        return exactClass(Src, fcNegative | fcPosZero);\n+        return ExactClass(fcNegative | fcPosZero);\n       case FCmpInst::FCMP_ULE: // isnan(x) || x <= 0\n-        return exactClass(Src, fcNegative | fcPosZero | fcNan);\n+        return ExactClass(fcNegative | fcPosZero | fcNan);\n       default:\n         llvm_unreachable(\"all compare types are handled\");\n       }\n-\n-      return {Invalid, fcAllFlags, fcAllFlags};\n     }\n \n     const bool IsDenormalRHS = (OrigClass & fcSubnormal) == OrigClass;\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=instsimplify -S"
+      ],
+      "file": "llvm/test/Transforms/InstSimplify/floating-point-arithmetic.ll",
+      "tests": [
+        {
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fptrunc.round.f32.f64(double, metadata) #0\n\ndefine i1 @fptrunc_round_unknown_positive(double %unknown) {\n  %op = call float @llvm.fptrunc.round.f32.f64(double %unknown, metadata !\"round.downward\")\n  %cmp = fcmp nnan oge float %op, 0.000000e+00\n  ret i1 %cmp\n}\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fptrunc_round_unknown_positive"
+        },
+        {
+          "test_body": "define double @fmul_nnan_ninf_nneg_n0.0_commute(i127 %x) {\n  %f = uitofp i127 %x to float\n  %e = fpext float %f to double\n  %r = fmul double -0.000000e+00, %e\n  ret double %r\n}\n",
+          "test_name": "fmul_nnan_ninf_nneg_n0.0_commute"
+        },
+        {
+          "test_body": "define float @fmul_ninf_nnan_mul_nzero_nsz(float nofpclass(nan inf) %f) {\n  %r = fmul nsz float %f, -0.000000e+00\n  ret float %r\n}\n",
+          "test_name": "fmul_ninf_nnan_mul_nzero_nsz"
+        },
+        {
+          "test_body": "define float @fmul_ninf_nnan_mul_zero_nsz(float nofpclass(nan inf) %f) {\n  %r = fmul nsz float %f, 0.000000e+00\n  ret float %r\n}\n",
+          "test_name": "fmul_ninf_nnan_mul_zero_nsz"
+        },
+        {
+          "test_body": "define half @fabs_select_fabs(half noundef %x) {\nentry:\n  %abs1 = call half @llvm.fabs.f16(half %x)\n  %cmp = fcmp ogt half %abs1, 0xH0000\n  %sel = select i1 %cmp, half %x, half 0xH0000\n  %abs2 = call half @llvm.fabs.f16(half %sel)\n  ret half %abs2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare half @llvm.fabs.f16(half) #0\n\nattributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n",
+          "test_name": "fabs_select_fabs"
+        }
+      ]
+    }
+  ]
+}

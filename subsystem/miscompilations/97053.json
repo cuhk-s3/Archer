@@ -1,0 +1,71 @@
+{
+  "base_commit": "a3571376ad9555de07e4d8f74f92de1eaa4c486e",
+  "bug_id": "97053",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp": [
+        "InstCombinerImpl::visitExtractElementInst"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp": [
+        [
+          419,
+          424
+        ],
+        [
+          426,
+          431
+        ],
+        [
+          471,
+          478
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "4d2ae88d1617a910ec3a1436ce53579523ac2f97"
+  },
+  "issue": {
+    "author": "bongjunj",
+    "body": "https://alive2.llvm.org/ce/z/mGNeLx\r\n\r\n\r\n```ll\r\n----------------------------------------\r\ndefine i8 @fun0(<4 x i8> %val0, i32 %val1) {\r\n#0:\r\n  %val2 = sdiv <4 x i8> { 42, 42, 42, 42 }, %val0\r\n  %val3 = extractelement <4 x i8> %val2, i32 %val1\r\n  ret i8 %val3\r\n}\r\n=>\r\ndefine i8 @fun0(<4 x i8> %val0, i32 %val1) {\r\n#0:\r\n  %#1 = extractelement <4 x i8> %val0, i32 %val1\r\n  %val3 = sdiv i8 42, %#1\r\n  ret i8 %val3\r\n}\r\nTransformation doesn't verify!\r\n\r\nERROR: Source is more defined than target\r\n\r\nExample:\r\n<4 x i8> %val0 = < #x01 (1), #x08 (8), #x02 (2), #x04 (4) >\r\ni32 %val1 = #x20000000 (536870912)\r\n\r\nSource:\r\n<4 x i8> %val2 = < #x2a (42), #x05 (5), #x15 (21), #x0a (10) >\r\ni8 %val3 = poison\r\n\r\nTarget:\r\ni8 %#1 = poison\r\ni8 %val3 = UB triggered!\r\n\r\n\r\nSummary:\r\n  0 correct transformations\r\n  1 incorrect transformations\r\n  0 failed-to-prove transformations\r\n  0 Alive2 errors\r\n```\r\n\r\n\r\n`sdiv` and `extractelement` cannot be swapped for vector operands as it can trigger UB, diving an integer by `poison`.",
+    "comments": [],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "Wrong swap between `sdiv` and `extractelement` by InstCombine"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/97053",
+  "knowledge_cutoff": "2024-06-28T12:58:31Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit 4d2ae88d1617a910ec3a1436ce53579523ac2f97\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Wed Jul 3 10:58:38 2024 +0200\n\n    [InstCombine] Fix invalid scalarization of div\n    \n    If the binop is not speculatable, and the extract index is out of\n    range, then scalarizing will perform the operation on a poison\n    operand, resulting in immediate UB, instead of the previous\n    poison result.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/97053.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\nindex 3de56a403803..753ed55523c8 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n@@ -419,6 +419,7 @@ Instruction *InstCombinerImpl::visitExtractElementInst(ExtractElementInst &EI) {\n   // If extracting a specified index from the vector, see if we can recursively\n   // find a previously computed scalar that was inserted into the vector.\n   auto *IndexC = dyn_cast<ConstantInt>(Index);\n+  bool HasKnownValidIndex = false;\n   if (IndexC) {\n     // Canonicalize type of constant indices to i64 to simplify CSE\n     if (auto *NewIdx = getPreferredVectorIndex(IndexC))\n@@ -426,6 +427,7 @@ Instruction *InstCombinerImpl::visitExtractElementInst(ExtractElementInst &EI) {\n \n     ElementCount EC = EI.getVectorOperandType()->getElementCount();\n     unsigned NumElts = EC.getKnownMinValue();\n+    HasKnownValidIndex = IndexC->getValue().ult(NumElts);\n \n     if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(SrcVec)) {\n       Intrinsic::ID IID = II->getIntrinsicID();\n@@ -471,8 +473,11 @@ Instruction *InstCombinerImpl::visitExtractElementInst(ExtractElementInst &EI) {\n     return UnaryOperator::CreateWithCopiedFlags(UO->getOpcode(), E, UO);\n   }\n \n+  // If the binop is not speculatable, we cannot hoist the extractelement if\n+  // it may make the operand poison.\n   BinaryOperator *BO;\n-  if (match(SrcVec, m_BinOp(BO)) && cheapToScalarize(SrcVec, Index)) {\n+  if (match(SrcVec, m_BinOp(BO)) && cheapToScalarize(SrcVec, Index) &&\n+      (HasKnownValidIndex || isSafeToSpeculativelyExecute(BO))) {\n     // extelt (binop X, Y), Index --> binop (extelt X, Index), (extelt Y, Index)\n     Value *X = BO->getOperand(0), *Y = BO->getOperand(1);\n     Value *E0 = Builder.CreateExtractElement(X, Index);\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/scalarization.ll",
+      "tests": [
+        {
+          "test_body": "define i8 @extract_element_binop_splat_variable_index_may_trap(<4 x i8> %x, <4 x i8> %y, i32 %z) {\n  %b = sdiv <4 x i8> splat (i8 42), %y\n  %r = extractelement <4 x i8> %b, i32 %z\n  ret i8 %r\n}\n",
+          "test_name": "extract_element_binop_splat_variable_index_may_trap"
+        },
+        {
+          "test_body": "define i8 @extract_element_binop_splat_variable_index(<4 x i8> %x, i32 %y) {\n  %b = sdiv <4 x i8> %x, splat (i8 42)\n  %r = extractelement <4 x i8> %b, i32 %y\n  ret i8 %r\n}\n",
+          "test_name": "extract_element_binop_splat_variable_index"
+        }
+      ]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ import json_repair
 
 import prompts
 from base.console import get_boxed_console
+from dataset import get_store
 from llvm.lab_env import PREnvironment, PREnvironmentError, PRInfo
 from llvm.llvm import LLVM
 from llvm.llvm_helper import (
@@ -19,7 +20,6 @@ from llvm.llvm_helper import (
 )
 from lms.agent import AgentBase, RepeatedToolCallLimitExceeded
 from repro import Reproducer, reproduce
-from store import get_store
 from tools.difftest import DiffTestTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool

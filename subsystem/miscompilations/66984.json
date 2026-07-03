@@ -1,0 +1,73 @@
+{
+  "base_commit": "bea56b0bc0682da6465acd6063026513123075fd",
+  "bug_id": "66984",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/CodeGen/StackColoring.cpp": [
+        "StackColoring::collectMarkers"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/CodeGen/StackColoring.cpp": [
+        [
+          370,
+          406
+        ],
+        [
+          462,
+          470
+        ],
+        [
+          660,
+          672
+        ],
+        [
+          722,
+          734
+        ],
+        [
+          739,
+          752
+        ]
+      ]
+    },
+    "components": [],
+    "fix_commit": "b3cb4f069c2cb99bdae68d6906156af20e76314f"
+  },
+  "issue": {
+    "author": "nikic",
+    "body": "Consider the following example (https://llvm.godbolt.org/z/h1WovoPMG):\r\n```llvm\r\n@type_info = external global ptr\r\n\r\ndefine void @test(ptr %arg) personality ptr @__CxxFrameHandler3 {\r\nbb:\r\n  %a1 = alloca ptr, align 4\r\n  %a2 = alloca ptr, align 4\r\n  call void @llvm.lifetime.start.p0(i64 4, ptr nonnull %a2)\r\n  invoke void @throw()\r\n          to label %bb14 unwind label %bb8\r\n\r\nbb8:                                              ; preds = %bb7\r\n  %i9 = cleanuppad within none []\r\n  call void @llvm.lifetime.start.p0(i64 4, ptr nonnull %a1)\r\n  store ptr %arg, ptr %a1, align 4\r\n  call fastcc void @foo(ptr %a1) [ \"funclet\"(token %i9) ]\r\n  call void @llvm.lifetime.end.p0(i64 4, ptr nonnull %a1)\r\n  cleanupret from %i9 unwind label %bb15\r\n\r\nbb14:                                             ; preds = %bb7\r\n  unreachable\r\n\r\nbb15:                                             ; preds = %bb13, %bb5\r\n  %cs = catchswitch within none [label %bb17] unwind to caller\r\n\r\nbb17:                                             ; preds = %bb15\r\n  %cp = catchpad within %cs [ptr @type_info, i32 8, ptr %a2]\r\n  %p = load ptr, ptr %a2, align 4\r\n  call fastcc void @cleanup(ptr %p) [ \"funclet\"(token %cp) ]\r\n  catchret from %cp to label %exit\r\n\r\nexit:\r\n  call void @llvm.lifetime.end.p0(i64 4, ptr nonnull %a2)\r\n  ret void\r\n}\r\n\r\ndeclare i32 @__CxxFrameHandler3(...)\r\ndeclare void @throw()\r\ndeclare void @cleanup(ptr)\r\ndeclare void @foo(ptr)\r\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture)\r\ndeclare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture)\r\n```\r\n\r\nHere `%a1` has a lifetime fully contained within the `cleanuppad`, while `%a2` has a lifetime across the whole function. However, the first use of `%a2` is inside the `catchpad`. `%a2` here is the pointer into which the exception object for the catchpad gets written.\r\n\r\nWith `stackcoloring-lifetime-start-on-first-use` (the default), `%a1` and `%a2` are allocated to the same stack slot. On the surface, this looks fine (because `%a2` is only used after the cleanuppad). However, there is a quirk of SEH exception handling that makes this incorrect: The exception will be copied into `%a2` by the personality function *before* both the `cleanuppad` and `catchpad` are called. As such, the write to `%a2` happens earlier than our IR modeling implies.\r\n\r\nThere has been a patch to fix this issue in https://reviews.llvm.org/D86673. Unfortunately, that patch does not handle this case, because it checks for `NumLoadInCatchPad[slot] > 1` -- I think the intention might have been to write `> 0`. (Funnily, just completely undoing the changes from that patch doesn't make the patch test case fail...)",
+    "comments": [],
+    "labels": [
+      "miscompilation",
+      "platform:windows"
+    ],
+    "title": "Incorrect stack coloring for alloca in SEH cleanuppad"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/66984",
+  "knowledge_cutoff": "2023-09-21T07:07:37Z",
+  "lit_test_dir": [
+    "llvm/test/CodeGen"
+  ],
+  "patch": "commit b3cb4f069c2cb99bdae68d6906156af20e76314f\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Thu Sep 21 09:13:27 2023 +0200\n\n    [StackColoring] Handle SEH catch object stack slots conservatively\n    \n    The write to the SEH catch object happens before cleanuppads are\n    executed, while the first reference to the object will typically\n    be in a catchpad.\n    \n    If we make use of first-use analysis, we may end up allocating\n    an alloca used inside the cleanuppad and the catch object at the\n    same stack offset, which would be incorrect.\n    \n    https://reviews.llvm.org/D86673 was a previous attempt to fix it.\n    It used the heuristic \"a slot loaded in a WinEH pad and never\n    written\" to detect catch objects. However, because it checks\n    for more than one load (while probably more than zero was\n    intended), the fix does not actually work.\n    \n    The general approach also seems dubious to me, so this patch\n    reverts that change entirely, and instead marks all catch object\n    slots as conservative (i.e. excluded from first-use analysis)\n    based on the WinEHFuncInfo. As far as I can tell we don't need\n    any heuristics here, we know exactly which slots are affected.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/66984.\n\ndiff --git a/llvm/lib/CodeGen/StackColoring.cpp b/llvm/lib/CodeGen/StackColoring.cpp\nindex 4d69b6104f68..d90c3e95f477 100644\n--- a/llvm/lib/CodeGen/StackColoring.cpp\n+++ b/llvm/lib/CodeGen/StackColoring.cpp\n@@ -370,37 +370,6 @@ STATISTIC(EscapedAllocas, \"Number of allocas that escaped the lifetime region\");\n // If in RPO ordering chosen to walk the CFG  we happen to visit the b[k]\n // before visiting the memcpy block (which will contain the lifetime start\n // for \"b\" then it will appear that 'b' has a degenerate lifetime.\n-//\n-// Handle Windows Exception with LifetimeStartOnFirstUse:\n-// -----------------\n-//\n-// There was a bug for using LifetimeStartOnFirstUse in win32.\n-// class Type1 {\n-// ...\n-// ~Type1(){ write memory;}\n-// }\n-// ...\n-// try{\n-// Type1 V\n-// ...\n-// } catch (Type2 X){\n-// ...\n-// }\n-// For variable X in catch(X), we put point pX=&(&X) into ConservativeSlots\n-// to prevent using LifetimeStartOnFirstUse. Because pX may merged with\n-// object V which may call destructor after implicitly writing pX. All these\n-// are done in C++ EH runtime libs (through CxxThrowException), and can't\n-// obviously check it in IR level.\n-//\n-// The loader of pX, without obvious writing IR, is usually the first LOAD MI\n-// in EHPad, Some like:\n-// bb.x.catch.i (landing-pad, ehfunclet-entry):\n-// ; predecessors: %bb...\n-//   successors: %bb...\n-//  %n:gr32 = MOV32rm %stack.pX ...\n-//  ...\n-// The Type2** %stack.pX will only be written in EH runtime libs, so we\n-// check the StoreSlots to screen it out.\n \n namespace {\n \n@@ -462,9 +431,6 @@ class StackColoring : public MachineFunctionPass {\n   /// slots lifetime-start-on-first-use is disabled).\n   BitVector ConservativeSlots;\n \n-  /// Record the FI slots referenced by a 'may write to memory'.\n-  BitVector StoreSlots;\n-\n   /// Number of iterations taken during data flow analysis.\n   unsigned NumIterations;\n \n@@ -660,13 +626,10 @@ unsigned StackColoring::collectMarkers(unsigned NumSlot) {\n   InterestingSlots.resize(NumSlot);\n   ConservativeSlots.clear();\n   ConservativeSlots.resize(NumSlot);\n-  StoreSlots.clear();\n-  StoreSlots.resize(NumSlot);\n \n   // number of start and end lifetime ops for each slot\n   SmallVector<int, 8> NumStartLifetimes(NumSlot, 0);\n   SmallVector<int, 8> NumEndLifetimes(NumSlot, 0);\n-  SmallVector<int, 8> NumLoadInCatchPad(NumSlot, 0);\n \n   // Step 1: collect markers and populate the \"InterestingSlots\"\n   // and \"ConservativeSlots\" sets.\n@@ -722,13 +685,6 @@ unsigned StackColoring::collectMarkers(unsigned NumSlot) {\n           if (! BetweenStartEnd.test(Slot)) {\n             ConservativeSlots.set(Slot);\n           }\n-          // Here we check the StoreSlots to screen catch point out. For more\n-          // information, please refer \"Handle Windows Exception with\n-          // LifetimeStartOnFirstUse\" at the head of this file.\n-          if (MI.mayStore())\n-            StoreSlots.set(Slot);\n-          if (MF->getWinEHFuncInfo() && MBB->isEHPad() && MI.mayLoad())\n-            NumLoadInCatchPad[Slot] += 1;\n         }\n       }\n     }\n@@ -739,14 +695,23 @@ unsigned StackColoring::collectMarkers(unsigned NumSlot) {\n     return 0;\n   }\n \n-  // 1) PR27903: slots with multiple start or end lifetime ops are not\n+  // PR27903: slots with multiple start or end lifetime ops are not\n   // safe to enable for \"lifetime-start-on-first-use\".\n-  // 2) And also not safe for variable X in catch(X) in windows.\n   for (unsigned slot = 0; slot < NumSlot; ++slot) {\n-    if (NumStartLifetimes[slot] > 1 || NumEndLifetimes[slot] > 1 ||\n-        (NumLoadInCatchPad[slot] > 1 && !StoreSlots.test(slot)))\n+    if (NumStartLifetimes[slot] > 1 || NumEndLifetimes[slot] > 1)\n       ConservativeSlots.set(slot);\n   }\n+\n+  // The write to the catch object by the personality function is not propely\n+  // modeled in IR: It happens before any cleanuppads are executed, even if the\n+  // first mention of the catch object is in a catchpad. As such, mark catch\n+  // object slots as conservative, so they are excluded from first-use analysis.\n+  if (WinEHFuncInfo *EHInfo = MF->getWinEHFuncInfo())\n+    for (WinEHTryBlockMapEntry &TBME : EHInfo->TryBlockMap)\n+      for (WinEHHandlerType &H : TBME.HandlerArray)\n+        if (H.CatchObj.FrameIndex != std::numeric_limits<int>::max())\n+          ConservativeSlots.set(H.CatchObj.FrameIndex);\n+\n   LLVM_DEBUG(dumpBV(\"Conservative slots\", ConservativeSlots));\n \n   // Step 2: compute begin/end sets for each block\n",
+  "properties": {
+    "difficulty": "easy",
+    "is_single_file_fix": true,
+    "is_single_func_fix": true
+  },
+  "tests": [
+    {
+      "commands": [
+        "llc -mtriple=i686-windows-msvc < %s"
+      ],
+      "file": "llvm/test/CodeGen/X86/stack-coloring-wineh.ll",
+      "tests": [
+        {
+          "test_body": "@type_info = external global ptr\n\ndefine void @pr66984(ptr %arg) personality ptr @__CxxFrameHandler3 {\nbb:\n  %a1 = alloca ptr, align 4\n  %a2 = alloca ptr, align 4\n  call void @llvm.lifetime.start.p0(i64 4, ptr nonnull %a2)\n  invoke void @throw()\n          to label %bb14 unwind label %bb8\n\nbb8:                                              ; preds = %bb\n  %i9 = cleanuppad within none []\n  call void @llvm.lifetime.start.p0(i64 4, ptr nonnull %a1)\n  store ptr %arg, ptr %a1, align 4\n  call fastcc void @foo(ptr %a1) [ \"funclet\"(token %i9) ]\n  call void @llvm.lifetime.end.p0(i64 4, ptr nonnull %a1)\n  cleanupret from %i9 unwind label %bb15\n\nbb14:                                             ; preds = %bb\n  unreachable\n\nbb15:                                             ; preds = %bb8\n  %cs = catchswitch within none [label %bb17] unwind to caller\n\nbb17:                                             ; preds = %bb15\n  %cp = catchpad within %cs [ptr @type_info, i32 8, ptr %a2]\n  %p = load ptr, ptr %a2, align 4\n  call fastcc void @cleanup(ptr %p) [ \"funclet\"(token %cp) ]\n  catchret from %cp to label %exit\n\nexit:                                             ; preds = %bb17\n  call void @llvm.lifetime.end.p0(i64 4, ptr nonnull %a2)\n  ret void\n}\n\ndeclare i32 @__CxxFrameHandler3(...)\n\ndeclare void @throw()\n\ndeclare void @cleanup(ptr)\n\ndeclare void @foo(ptr)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(i64 immarg, ptr nocapture) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(i64 immarg, ptr nocapture) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n",
+          "test_name": "pr66984"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "base_commit": "fdcfb277465e4530e5837fb8a95031794e58cb9b",
+  "bug_id": "97330",
+  "bug_type": "miscompilation",
+  "hints": {
+    "bug_location_funcname": {
+      "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+        "InstCombinerImpl::SimplifyDemandedBits",
+        "InstCombinerImpl::SimplifyDemandedUseBits"
+      ]
+    },
+    "bug_location_lineno": {
+      "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+        [
+          545,
+          554
+        ]
+      ],
+      "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+        [
+          91,
+          98
+        ],
+        [
+          124,
+          173
+        ],
+        [
+          1105,
+          1117
+        ],
+        [
+          1119,
+          1131
+        ]
+      ]
+    },
+    "components": [
+      "InstCombine"
+    ],
+    "fix_commit": "b558ac0eef57a3737b1e27844115fa91e0b32582"
+  },
+  "issue": {
+    "author": "dtcxzyw",
+    "body": "Reproducer: https://alive2.llvm.org/ce/z/zKvpXV\r\n```\r\n; bin/opt -passes=instcombine reduced.ll -S\r\ndefine i16 @src(i16 %g, ptr %e, ptr %d) {\r\nentry:\r\n  %0 = load i64, ptr %d, align 8\r\n  %conv = trunc i64 %0 to i16\r\n  %tobool.not.i = icmp eq i16 %g, 0\r\n  br i1 %tobool.not.i, label %i.exit, label %for.cond.preheader.i\r\n\r\nfor.cond.preheader.i:\r\n  %cmp5.i = icmp ne i16 %g, %conv\r\n  %conv6.i = zext i1 %cmp5.i to i32\r\n  store i32 %conv6.i, ptr %e, align 4\r\n  %cmp7.i = icmp eq i64 %0, 1\r\n  call void @llvm.assume(i1 %cmp7.i)\r\n  unreachable\r\n\r\ni.exit:\r\n  ret i16 %conv\r\n}\r\n```\r\n```\r\ndefine i16 @tgt(i16 %g, ptr %e, ptr %d) {\r\nentry:\r\n  %tobool.not.i = icmp eq i16 %g, 0\r\n  br i1 %tobool.not.i, label %i.exit, label %for.cond.preheader.i\r\n\r\nfor.cond.preheader.i:                             ; preds = %entry\r\n  unreachable\r\n\r\ni.exit:                                           ; preds = %entry\r\n  ret i16 1\r\n}\r\n```\r\n\r\nllvm version: a8e1c3e1239604ac787b6a2d39b5278ddec8aa8a\r\n\r\ncc @nikic",
+    "comments": [
+      {
+        "author": "dtcxzyw",
+        "body": "Reverting https://github.com/llvm/llvm-project/commit/11484cb817bcc2a6e2ef9572be982a1a5a4964ec fixes this issue.\r\n"
+      },
+      {
+        "author": "nikic",
+        "body": "I've applied two fixes for this. https://github.com/llvm/llvm-project/commit/86b37944a70229b07626e63bdb9a46b4bc3d1460 tries to stick closer to the current logic, while https://github.com/llvm/llvm-project/commit/05670b42f5b45710bfdba48dcb7e8c30c8c7478f is a more thorough fix on top of that."
+      },
+      {
+        "author": "dtcxzyw",
+        "body": "Confirmed that the original case has been fixed. Thank you!\r\n"
+      },
+      {
+        "author": "chapuni",
+        "body": "@nikic Fixed, thanks!"
+      }
+    ],
+    "labels": [
+      "miscompilation",
+      "llvm:instcombine"
+    ],
+    "title": "[InstCombine] Miscompilation with llvm.assume in unreachable blocks"
+  },
+  "issue_url": "https://github.com/llvm/llvm-project/issues/97330",
+  "knowledge_cutoff": "2024-07-01T17:37:19Z",
+  "lit_test_dir": [
+    "llvm/test/Transforms/InstCombine"
+  ],
+  "patch": "commit b558ac0eef57a3737b1e27844115fa91e0b32582\nAuthor: Nikita Popov <npopov@redhat.com>\nDate:   Tue Jul 2 10:08:45 2024 +0200\n\n    [InstCombine] Fix context for multi-use demanded bits simplification\n    \n    When simplifying a multi-use root value, the demanded bits were\n    reset to full, but we also need to reset the context extract. To\n    make this convenient (without requiring by-value passing of\n    SimplifyQuery), move the logic that that handles constants and\n    dispatches to SimplifyDemandedUseBits/SimplifyMultipleUseDemandedBits\n    into SimplifyDemandedBits. The SimplifyDemandedInstructionBits\n    caller starts with full demanded bits and an appropriate context\n    anyway.\n    \n    The different context instruction does mean that the ephemeral\n    value protection no longer triggers in some cases, as the changes\n    to assume tests show.\n    \n    An alternative, which I will explore in a followup, is to always\n    use SimplifyMultipleUseDemandedBits() -- the previous root special\n    case is only really intended for SimplifyDemandedInstructionBits(),\n    which now no longer shares this code path.\n    \n    Fixes https://github.com/llvm/llvm-project/issues/97330.\n\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 318c455fd7ef..64fbcc80e0ed 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -545,10 +545,11 @@ public:\n                                ConstantInt *&Less, ConstantInt *&Equal,\n                                ConstantInt *&Greater);\n \n-  /// Attempts to replace V with a simpler value based on the demanded\n+  /// Attempts to replace I with a simpler value based on the demanded\n   /// bits.\n-  Value *SimplifyDemandedUseBits(Value *V, APInt DemandedMask, KnownBits &Known,\n-                                 unsigned Depth, const SimplifyQuery &Q);\n+  Value *SimplifyDemandedUseBits(Instruction *I, const APInt &DemandedMask,\n+                                 KnownBits &Known, unsigned Depth,\n+                                 const SimplifyQuery &Q);\n   using InstCombiner::SimplifyDemandedBits;\n   bool SimplifyDemandedBits(Instruction *I, unsigned Op,\n                             const APInt &DemandedMask, KnownBits &Known,\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 6cf2e71363ab..b1d03786f321 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -91,8 +91,47 @@ bool InstCombinerImpl::SimplifyDemandedBits(Instruction *I, unsigned OpNo,\n                                             KnownBits &Known, unsigned Depth,\n                                             const SimplifyQuery &Q) {\n   Use &U = I->getOperandUse(OpNo);\n-  Value *NewVal = SimplifyDemandedUseBits(U.get(), DemandedMask, Known,\n-                                          Depth, Q);\n+  Value *V = U.get();\n+  if (isa<Constant>(V)) {\n+    llvm::computeKnownBits(V, Known, Depth, Q);\n+    return false;\n+  }\n+\n+  Known.resetAll();\n+  if (DemandedMask.isZero()) {\n+    // Not demanding any bits from V.\n+    replaceUse(U, UndefValue::get(V->getType()));\n+    return true;\n+  }\n+\n+  if (Depth == MaxAnalysisRecursionDepth)\n+    return false;\n+\n+  Instruction *VInst = dyn_cast<Instruction>(V);\n+  if (!VInst) {\n+    llvm::computeKnownBits(V, Known, Depth, Q);\n+    return false;\n+  }\n+\n+  Value *NewVal;\n+  if (VInst->hasOneUse()) {\n+    // If the instruction has one use, we can directly simplify it.\n+    NewVal = SimplifyDemandedUseBits(VInst, DemandedMask, Known, Depth, Q);\n+  } else if (Depth != 0) {\n+    // If there are multiple uses of this instruction and we aren't at the root,\n+    // then we can simplify VInst to some other value, but not modify the\n+    // instruction.\n+    NewVal =\n+        SimplifyMultipleUseDemandedBits(VInst, DemandedMask, Known, Depth, Q);\n+  } else {\n+    // If this is the root being simplified, allow it to have multiple uses,\n+    // just set the DemandedMask to all bits and reset the context instruction.\n+    // This allows visitTruncInst (for example) to simplify the operand of a\n+    // trunc without duplicating all the SimplifyDemandedUseBits() logic.\n+    NewVal =\n+        SimplifyDemandedUseBits(VInst, APInt::getAllOnes(Known.getBitWidth()),\n+                                Known, Depth, Q.getWithInstruction(VInst));\n+  }\n   if (!NewVal) return false;\n   if (Instruction* OpInst = dyn_cast<Instruction>(U))\n     salvageDebugInfo(*OpInst);\n@@ -124,50 +163,21 @@ bool InstCombinerImpl::SimplifyDemandedBits(Instruction *I, unsigned OpNo,\n /// operands based on the information about what bits are demanded. This returns\n /// some other non-null value if it found out that V is equal to another value\n /// in the context where the specified bits are demanded, but not for all users.\n-Value *InstCombinerImpl::SimplifyDemandedUseBits(Value *V, APInt DemandedMask,\n+Value *InstCombinerImpl::SimplifyDemandedUseBits(Instruction *I,\n+                                                 const APInt &DemandedMask,\n                                                  KnownBits &Known,\n                                                  unsigned Depth,\n                                                  const SimplifyQuery &Q) {\n-  assert(V != nullptr && \"Null pointer of Value???\");\n+  assert(I != nullptr && \"Null pointer of Value???\");\n   assert(Depth <= MaxAnalysisRecursionDepth && \"Limit Search Depth\");\n   uint32_t BitWidth = DemandedMask.getBitWidth();\n-  Type *VTy = V->getType();\n+  Type *VTy = I->getType();\n   assert(\n       (!VTy->isIntOrIntVectorTy() || VTy->getScalarSizeInBits() == BitWidth) &&\n       Known.getBitWidth() == BitWidth &&\n       \"Value *V, DemandedMask and Known must have same BitWidth\");\n \n-  if (isa<Constant>(V)) {\n-    llvm::computeKnownBits(V, Known, Depth, Q);\n-    return nullptr;\n-  }\n-\n-  Known.resetAll();\n-  if (DemandedMask.isZero()) // Not demanding any bits from V.\n-    return UndefValue::get(VTy);\n-\n-  if (Depth == MaxAnalysisRecursionDepth)\n-    return nullptr;\n-\n-  Instruction *I = dyn_cast<Instruction>(V);\n-  if (!I) {\n-    llvm::computeKnownBits(V, Known, Depth, Q);\n-    return nullptr;        // Only analyze instructions.\n-  }\n-\n-  // If there are multiple uses of this value and we aren't at the root, then\n-  // we can't do any simplifications of the operands, because DemandedMask\n-  // only reflects the bits demanded by *one* of the users.\n-  if (Depth != 0 && !I->hasOneUse())\n-    return SimplifyMultipleUseDemandedBits(I, DemandedMask, Known, Depth, Q);\n-\n   KnownBits LHSKnown(BitWidth), RHSKnown(BitWidth);\n-  // If this is the root being simplified, allow it to have multiple uses,\n-  // just set the DemandedMask to all bits so that we can try to simplify the\n-  // operands.  This allows visitTruncInst (for example) to simplify the\n-  // operand of a trunc without duplicating all the logic below.\n-  if (Depth == 0 && !V->hasOneUse())\n-    DemandedMask.setAllBits();\n \n   // Update flags after simplifying an operand based on the fact that some high\n   // order bits are not demanded.\n@@ -1105,13 +1115,13 @@ Value *InstCombinerImpl::SimplifyDemandedUseBits(Value *V, APInt DemandedMask,\n     }\n \n     if (!KnownBitsComputed)\n-      llvm::computeKnownBits(V, Known, Depth, Q);\n+      llvm::computeKnownBits(I, Known, Depth, Q);\n     break;\n   }\n   }\n \n-  if (V->getType()->isPointerTy()) {\n-    Align Alignment = V->getPointerAlignment(DL);\n+  if (I->getType()->isPointerTy()) {\n+    Align Alignment = I->getPointerAlignment(DL);\n     Known.Zero.setLowBits(Log2(Alignment));\n   }\n \n@@ -1119,13 +1129,14 @@ Value *InstCombinerImpl::SimplifyDemandedUseBits(Value *V, APInt DemandedMask,\n   // constant. We can't directly simplify pointers as a constant because of\n   // pointer provenance.\n   // TODO: We could return `(inttoptr const)` for pointers.\n-  if (!V->getType()->isPointerTy() && DemandedMask.isSubsetOf(Known.Zero | Known.One))\n+  if (!I->getType()->isPointerTy() &&\n+      DemandedMask.isSubsetOf(Known.Zero | Known.One))\n     return Constant::getIntegerValue(VTy, Known.One);\n \n   if (VerifyKnownBits) {\n-    KnownBits ReferenceKnown = llvm::computeKnownBits(V, Depth, Q);\n+    KnownBits ReferenceKnown = llvm::computeKnownBits(I, Depth, Q);\n     if (Known != ReferenceKnown) {\n-      errs() << \"Mismatched known bits for \" << *V << \" in \"\n+      errs() << \"Mismatched known bits for \" << *I << \" in \"\n              << I->getFunction()->getName() << \"\\n\";\n       errs() << \"computeKnownBits(): \" << ReferenceKnown << \"\\n\";\n       errs() << \"SimplifyDemandedBits(): \" << Known << \"\\n\";\n",
+  "properties": {
+    "difficulty": "hard",
+    "is_single_file_fix": false,
+    "is_single_func_fix": false
+  },
+  "tests": [
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/assume-inseltpoison.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i32 @PR40940(<4 x i8> %x) {\n  %shuf = shufflevector <4 x i8> %x, <4 x i8> poison, <4 x i32> <i32 1, i32 1, i32 2, i32 3>\n  %t2 = bitcast <4 x i8> %shuf to i32\n  %t3 = icmp ult i32 %t2, 65536\n  call void @llvm.assume(i1 %t3)\n  ret i32 %t2\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "test_name": "PR40940"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine --enable-knowledge-retention -S",
+        "opt < %s -passes=instcombine -S --try-experimental-debuginfo-iterators",
+        "opt < %s -passes=instcombine --enable-knowledge-retention -S --try-experimental-debuginfo-iterators"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/assume.ll",
+      "tests": [
+        {
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i32 @PR40940(<4 x i8> %x) {\n  %shuf = shufflevector <4 x i8> %x, <4 x i8> undef, <4 x i32> <i32 1, i32 1, i32 2, i32 3>\n  %t2 = bitcast <4 x i8> %shuf to i32\n  %t3 = icmp ult i32 %t2, 65536\n  call void @llvm.assume(i1 %t3)\n  ret i32 %t2\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n",
+          "test_name": "PR40940"
+        }
+      ]
+    },
+    {
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "file": "llvm/test/Transforms/InstCombine/known-bits.ll",
+      "tests": [
+        {
+          "test_body": "define i16 @pr97330(i1 %c, ptr %p1, ptr %p2) {\nentry:\n  %v = load i64, ptr %p1, align 8\n  %conv = trunc i64 %v to i16\n  br i1 %c, label %exit, label %if\n\nif:                                               ; preds = %entry\n  %cmp = icmp ne i16 %conv, 1\n  %conv2 = zext i1 %cmp to i32\n  store i32 %conv2, ptr %p2, align 4\n  %cmp2 = icmp eq i64 %v, 1\n  call void @llvm.assume(i1 %cmp2)\n  unreachable\n\nexit:                                             ; preds = %entry\n  ret i16 %conv\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "test_name": "pr97330"
+        },
+        {
+          "test_body": "define i8 @simplifydemanded_context(i8 %x, i8 %y) {\n  %and1 = and i8 %x, 1\n  call void @dummy()\n  %x.lobits = and i8 %x, 3\n  %precond = icmp eq i8 %x.lobits, 0\n  call void @llvm.assume(i1 %precond)\n  %and2 = and i8 %and1, %y\n  ret i8 %and2\n}\n\ndeclare void @dummy()\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n",
+          "test_name": "simplifydemanded_context"
+        }
+      ]
+    }
+  ]
+}

@@ -17,13 +17,14 @@ import requests
 from unidiff import PatchSet
 
 sys.path.append(str(Path(__file__).parent.parent))
-# Project root, so ``store`` (the SQLite-backed source of truth) is importable.
+# Project root, so the ``dataset`` package (the SQLite-backed source of truth)
+# is importable.
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 import hints
 
 import llvm.llvm_helper as llvm_helper
-from store import get_store
+from dataset import get_store
 
 if os.environ.get("LLVM_AUTOREVIEW_HOME_DIR") is None:
   print("Error: The llvm-autoreview environment has not been brought up.")
