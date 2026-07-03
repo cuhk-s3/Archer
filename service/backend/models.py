@@ -13,6 +13,11 @@ def utc_now_iso() -> str:
 class Job:
   id: str
   pr_id: int
+  # Head commit SHA this job reviews. The dedup identity is (pr_id, head_sha),
+  # matching the commit-based store (a PR pushing a new commit is a new job),
+  # not merely the PR id. May be None for legacy/manual jobs that did not
+  # capture a commit; those fall back to a gentler per-PR active-job guard.
+  head_sha: Optional[str] = None
   executor: str = "local"
   status: str = "queued"
   phase: str = "queued"

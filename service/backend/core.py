@@ -126,6 +126,7 @@ class ArcherService:
         j = Job(
           id=job_data["id"],
           pr_id=job_data["pr_id"],
+          head_sha=job_data.get("head_sha"),
           executor=job_data.get("executor", "local"),
           status=job_data.get("status", "queued"),
           phase=job_data.get("phase", "queued"),
@@ -279,11 +280,68 @@ class ArcherService:
       if own_session:
         active_session.close()
 
-  def enqueue_pr(self, pr_id: int, source: str = "manual", force: bool = False) -> Job:
+  # --- Commit-level dedup helpers -------------------------------------------
+  # The review identity is (pr_id, head_sha): a PR pushing a new commit must be
+  # reviewed again, whereas the same commit must never be reviewed twice. This
+  # mirrors the store's (pr_id, fix_commit) versioning. A failed job is allowed
+  # to be retried; any other status counts as "already handled".
+  _REDO_STATUSES = {"failed"}
+
+  def _jobs_for_pr(self, pr_id: int) -> List[Job]:
+    return sorted(
+      (j for j in self.jobs.values() if j.pr_id == pr_id),
+      key=lambda j: j.created_at,
+      reverse=True,
+    )
+
+  def _find_active_job_for_commit(self, pr_id: int, head_sha: str) -> Optional[Job]:
+    """Return an existing non-failed job for this exact (pr, commit), if any."""
+    for j in self._jobs_for_pr(pr_id):
+      if j.head_sha == head_sha and j.status not in self._REDO_STATUSES:
+        return j
+    return None
+
+  def _find_inflight_job_for_pr(self, pr_id: int) -> Optional[Job]:
+    """Return an in-flight (queued/running) job for the PR, ignoring commit.
+
+    Only a gentle guard for manual enqueues that carry no head_sha, so repeated
+    manual clicks do not stack duplicate jobs for the same PR.
+    """
+    for j in self._jobs_for_pr(pr_id):
+      if j.status in {"queued", "running"}:
+        return j
+    return None
+
+  def _commit_already_reviewed(self, pr_id: int, head_sha: str) -> bool:
+    """Restart-proof authoritative check: does this commit have a version row?
+
+    The store dedups on (pr_id, fix_commit); a present version means the commit
+    was already reviewed (or gate-skipped), even if local job state was lost.
+    Best-effort: any error is treated as "not reviewed" so scanning proceeds.
+    """
+    try:
+      store = self._store()
+      return store.get_version_by_commit(int(pr_id), str(head_sha)) is not None
+    except Exception:
+      return False
+
+  def enqueue_pr(
+    self,
+    pr_id: int,
+    source: str = "manual",
+    force: bool = False,
+    head_sha: Optional[str] = None,
+  ) -> Job:
     with self.lock:
+      if not force:
+        existing = (
+          self._find_active_job_for_commit(pr_id, head_sha)
+          if head_sha
+          else self._find_inflight_job_for_pr(pr_id)
+        )
+        if existing is not None:
+          return existing
       existing_id = self.jobs_by_pr.get(pr_id)
-      if existing_id and not force:
-        return self.jobs[existing_id]
       existing_job = self.jobs.get(existing_id) if existing_id else None
       prior_jobs = sorted(
         (j for j in self.jobs.values() if j.pr_id == pr_id),
@@ -300,6 +358,7 @@ class ArcherService:
       job = Job(
         id=job_id,
         pr_id=pr_id,
+        head_sha=head_sha,
         executor=self.config.executor,
         status="queued",
         created_at=utc_now_iso(),
@@ -685,6 +744,11 @@ class ArcherService:
     # Re-create (or reuse) the PR + commit version in the local store.
     version_id, _ = store.upsert_pr_version(pr_info)
     fix_commit = str(pr_info.get("fix_commit", "") or "")
+    # Align the job's recorded head with the commit the runner actually ran, so
+    # commit-level dedup keys off the real reviewed commit (guards against a
+    # stale scan value if the PR advanced between scan and execution).
+    if fix_commit and job.head_sha != fix_commit:
+      job.head_sha = fix_commit
     review_id = store.create_review(int(pr_info["pr_id"]), version_id, fix_commit)
 
     status = str((review or {}).get("status") or "succeeded")
@@ -902,10 +966,24 @@ class ArcherService:
         pr_number = int(pr.get("number", 0))
         if pr_number <= 0:
           continue
+        head = pr.get("head") if isinstance(pr, dict) else None
+        head_sha = str(head.get("sha", "") or "") if isinstance(head, dict) else ""
+        # Dedup on the exact commit, not the PR: a new commit pushed onto an
+        # already-seen PR is a new version and must be reviewed again.
         with self.lock:
-          if pr_number in self.jobs_by_pr:
-            skipped_existing += 1
-            continue
+          already_local = (
+            self._find_active_job_for_commit(pr_number, head_sha) is not None
+            if head_sha
+            else pr_number in self.jobs_by_pr
+          )
+        if already_local:
+          skipped_existing += 1
+          continue
+        # Authoritative, restart-proof: this commit already has a version row
+        # in the store (reviewed or gate-skipped), so nothing to do.
+        if head_sha and self._commit_already_reviewed(pr_number, head_sha):
+          skipped_existing += 1
+          continue
         try:
           files = self._fetch_pull_files(session, pr_number)
         except Exception:
@@ -915,7 +993,7 @@ class ArcherService:
           skipped_filtered += 1
           continue
         try:
-          job = self.enqueue_pr(pr_number, source="auto")
+          job = self.enqueue_pr(pr_number, source="auto", head_sha=head_sha or None)
         except queue.Full:
           errors += 1
           break
