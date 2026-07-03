@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -18,6 +17,7 @@ from llvm.llvm_helper import (
   reset,
   set_llvm_build_dir,
 )
+from store import get_store
 
 # Project root (parent of the `llvm` package directory).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -59,18 +59,24 @@ class PREnvironment:
     - Exposing helpers used by the agent tools (langref / tests).
   """
 
-  def __init__(self, pr_info: PRInfo, console):
+  def __init__(self, pr_info: PRInfo, console, version_id: Optional[int] = None):
     self.pr_info = pr_info
     self.base_commit = pr_info.base_commit
     self.console = console
+    self.version_id = version_id
     self.build_dir: Optional[str] = None
+    self.baseline_dir: Optional[str] = None
 
   # ---------------------------------------------------------------------------
   # Discovery / loading
   # ---------------------------------------------------------------------------
   @staticmethod
   def get_pr_info_path(pr_id: int) -> Optional[Path]:
-    """Get the path to PR info, checking both closed/ and open/ directories"""
+    """Get the path to legacy JSON PR info (closed/ then open/).
+
+    Retained only as a fallback for datasets that have not been migrated to the
+    DB. The DB is the source of truth.
+    """
     # Check closed directory first (most PRs should be closed)
     closed_path = Path(dataset_dir) / "closed" / f"{pr_id}.json"
     if closed_path.exists():
@@ -83,18 +89,53 @@ class PREnvironment:
 
     return None
 
+  @staticmethod
+  def _pr_info_from_dict(data: dict) -> PRInfo:
+    allowed_keys = {f.name for f in fields(PRInfo)}
+    filtered = {k: v for k, v in data.items() if k in allowed_keys}
+    return PRInfo(**filtered)
+
+  @classmethod
+  def load_from_db(
+    cls, pr_id: int, fix_commit: Optional[str] = None, console=None
+  ) -> tuple:
+    """Load a PR version from the DB.
+
+    If ``fix_commit`` is given, load that specific commit version; otherwise the
+    latest version. Returns ``(PRInfo | None, version_id | None)``.
+    """
+    try:
+      store = get_store()
+      if fix_commit:
+        ver = store.get_version_by_commit(pr_id, fix_commit)
+      else:
+        ver = store.get_latest_version(pr_id)
+      if ver is None:
+        return None, None
+      version_id = int(ver["id"])
+      info_dict = store.to_pr_info(pr_id, version_id)
+      if info_dict is None:
+        return None, None
+      return cls._pr_info_from_dict(info_dict), version_id
+    except Exception as e:
+      if console is not None:
+        console.print(f"Warning: Failed to load PR info from DB: {e}", color="yellow")
+      return None, None
+
   @classmethod
   def load_saved_pr_info(cls, pr_id: int, console=None) -> Optional[PRInfo]:
-    """Load previously saved PR info"""
+    """Load previously saved PR info (DB first, legacy JSON as fallback)."""
+    pr_info, _ = cls.load_from_db(pr_id, console=console)
+    if pr_info is not None:
+      return pr_info
+
     info_path = cls.get_pr_info_path(pr_id)
     if info_path is None:
       return None
     try:
       with open(info_path, "r") as f:
         data = json.load(f)
-      allowed_keys = {f.name for f in fields(PRInfo)}
-      filtered = {k: v for k, v in data.items() if k in allowed_keys}
-      return PRInfo(**filtered)
+      return cls._pr_info_from_dict(data)
     except Exception as e:
       if console is not None:
         console.print(f"Warning: Failed to load saved PR info: {e}", color="yellow")
@@ -128,22 +169,32 @@ class PREnvironment:
       return False
 
   @classmethod
-  def load(cls, pr_id: int, console) -> "PREnvironment":
-    """Load PR info (extracting it first if necessary) and build the env."""
-    pr_info = cls.load_saved_pr_info(pr_id, console)
+  def load(
+    cls, pr_id: int, console, fix_commit: Optional[str] = None
+  ) -> "PREnvironment":
+    """Load PR info (extracting it first if necessary) and build the env.
+
+    When ``fix_commit`` is given, that specific commit version is loaded from the
+    DB; otherwise the latest version is used.
+    """
+    pr_info, version_id = cls.load_from_db(pr_id, fix_commit, console)
 
     if pr_info is None:
-      # PR info not found, extract it using pr_extract.py
+      # Not in DB yet: try legacy JSON, else extract via pr_extract.py (-> DB).
+      pr_info = cls.load_saved_pr_info(pr_id, console)
+
+    if pr_info is None:
       console.print(f"PR #{pr_id} data not found, extracting...")
       if not cls.extract_pr_info(pr_id, console):
         raise PREnvironmentError("Failed to extract PR information")
 
-      # Try loading again
-      pr_info = cls.load_saved_pr_info(pr_id, console)
+      pr_info, version_id = cls.load_from_db(pr_id, fix_commit, console)
+      if pr_info is None:
+        pr_info = cls.load_saved_pr_info(pr_id, console)
       if pr_info is None:
         raise PREnvironmentError("Failed to load PR information after extraction")
 
-    return cls(pr_info, console)
+    return cls(pr_info, console, version_id=version_id)
 
   @staticmethod
   def pr_info_changed(
@@ -170,33 +221,28 @@ class PREnvironment:
   # ---------------------------------------------------------------------------
   # Build directory + LLVM setup
   # ---------------------------------------------------------------------------
+  @staticmethod
+  def _root_build_dir() -> str:
+    """Stable root build dir (immune to per-run set_llvm_build_dir mutations)."""
+    return os.environ.get("LAB_LLVM_BUILD_DIR") or get_llvm_build_dir()
+
   def prepare_build_dir(self) -> str:
-    """Set up the per-PR build directory, wiping it if the PR changed."""
-    base_build_dir = get_llvm_build_dir()
-    build_dir = os.path.join(base_build_dir, "pr", str(self.pr_info.pr_id))
+    """Set up the per-commit build directory for the patched build.
 
-    # Check if PR info has changed
-    saved_pr_info = self.load_saved_pr_info(self.pr_info.pr_id, self.console)
-    pr_changed = self.pr_info_changed(saved_pr_info, self.pr_info, self.console)
-
-    if pr_changed and Path(build_dir).exists():
-      self.console.print(
-        "PR has changed. Removing old build directory...",
-        color="yellow",
-      )
-      self.console.print(f"Removing old build directory: {build_dir}", color="yellow")
-      shutil.rmtree(build_dir)
-
-    # Ensure build directory exists
+    Keyed by ``(pr_id, fix_commit)`` so different commit versions of the same PR
+    get isolated build directories (no wiping needed across versions).
+    """
+    commit_tag = (self.pr_info.fix_commit or "unknown")[:12]
+    build_dir = os.path.join(
+      self._root_build_dir(), "pr", str(self.pr_info.pr_id), commit_tag
+    )
     os.makedirs(build_dir, exist_ok=True)
     set_llvm_build_dir(build_dir)
     self.build_dir = build_dir
     return build_dir
 
-  def setup_llvm(self):
-    """Setup LLVM environment by checking out base commit and applying patch"""
-    # Checkout base commit
-    self.console.print("Checking out the base commit ...")
+  def _checkout_base(self):
+    """Checkout the base commit (with a sync-retry). Does NOT apply the patch."""
     try:
       reset(self.pr_info.base_commit)
     except Exception as e:
@@ -214,22 +260,26 @@ class PREnvironment:
           f"Failed to reset HEAD to {self.pr_info.base_commit}: {e}"
         )
 
+  def setup_llvm(self):
+    """Setup LLVM by checking out the base commit and applying the PR patch."""
+    self.console.print("Checking out the base commit ...")
+    self._checkout_base()
+
     # Apply the patch
     success, log = apply_patch(self.pr_info.patch)
     if not success:
       raise PREnvironmentError(f"Failed to apply patch: {log}")
 
-  def build(self, additional_cmake_args=None, max_build_jobs: Optional[int] = None):
-    """Build LLVM into the prepared build directory if `opt` is missing."""
-    if self.build_dir is None:
-      raise PREnvironmentError("Build directory is not prepared yet.")
-
-    opt_path = Path(self.build_dir) / "bin" / "opt"
+  def _build_into(
+    self, target_dir, additional_cmake_args=None, max_build_jobs: Optional[int] = None
+  ):
+    """Build `opt` into ``target_dir`` (which must be the active build dir)."""
+    opt_path = Path(target_dir) / "bin" / "opt"
     if opt_path.exists():
-      self.console.print(f"LLVM already built at {self.build_dir}", color="green")
+      self.console.print(f"LLVM already built at {target_dir}", color="green")
       return
 
-    self.console.print("Building LLVM with the PR patch...")
+    self.console.print("Building LLVM...")
     if max_build_jobs is None:
       max_build_jobs = int(
         os.environ.get("LLVM_AUTOREVIEW_MAX_BUILD_JOBS", os.cpu_count())
@@ -247,12 +297,18 @@ class PREnvironment:
 
     self.console.print("LLVM built successfully!", color="green")
 
+  def build(self, additional_cmake_args=None, max_build_jobs: Optional[int] = None):
+    """Build LLVM into the prepared (patched) build directory if missing."""
+    if self.build_dir is None:
+      raise PREnvironmentError("Build directory is not prepared yet.")
+    self._build_into(self.build_dir, additional_cmake_args, max_build_jobs)
+
   def prepare(
     self, additional_cmake_args=None, max_build_jobs: Optional[int] = None
   ) -> str:
-    """Full environment setup: build dir -> checkout+patch -> build.
+    """Full patched-environment setup: build dir -> checkout+patch -> build.
 
-    Returns the per-PR build directory path.
+    Returns the per-commit patched build directory path.
     """
     self.prepare_build_dir()
     self.setup_llvm()
@@ -260,6 +316,36 @@ class PREnvironment:
       additional_cmake_args=additional_cmake_args, max_build_jobs=max_build_jobs
     )
     return self.build_dir
+
+  def prepare_baseline(
+    self, additional_cmake_args=None, max_build_jobs: Optional[int] = None
+  ) -> str:
+    """Build the base commit WITHOUT the PR patch (the baseline build).
+
+    Used to check whether a bug found on the patched build also triggers on the
+    unpatched baseline (a non-patch-specific bug). The baseline is keyed by
+    ``base_commit`` so it can be reused across versions / PRs sharing the base.
+
+    NOTE: this mutates the git working tree (checks out the clean base commit),
+    so it must run after the patched review is finished, not concurrently.
+
+    Returns the baseline build directory path.
+    """
+    base_tag = (self.base_commit or "unknown")[:12]
+    baseline_dir = os.path.join(self._root_build_dir(), "baseline", base_tag)
+    os.makedirs(baseline_dir, exist_ok=True)
+    set_llvm_build_dir(baseline_dir)
+    self.baseline_dir = baseline_dir
+
+    opt_path = Path(baseline_dir) / "bin" / "opt"
+    if opt_path.exists():
+      self.console.print(f"Baseline already built at {baseline_dir}", color="green")
+      return baseline_dir
+
+    self.console.print("Checking out base commit for baseline (no patch)...")
+    self._checkout_base()
+    self._build_into(baseline_dir, additional_cmake_args, max_build_jobs)
+    return baseline_dir
 
   # ---------------------------------------------------------------------------
   # Helpers used by the agent tools

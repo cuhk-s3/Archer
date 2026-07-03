@@ -4,7 +4,7 @@ import os
 import re
 import time
 from argparse import ArgumentParser
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -18,6 +18,8 @@ from llvm.llvm_helper import (
   llvm_dir,
 )
 from lms.agent import AgentBase, RepeatedToolCallLimitExceeded
+from repro import Reproducer, reproduce
+from store import get_store
 from tools.difftest import DiffTestTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
@@ -308,6 +310,8 @@ def generate_test_for_pr(
               transformed_ir=bug["transformed_ir"],
               log=bug["log"],
               thoughts=bug.get("thoughts"),
+              repro_kind="verify",
+              args=bug.get("args"),
             )
           )
 
@@ -331,6 +335,8 @@ def generate_test_for_pr(
               transformed_ir=trans_result.get("transformed_ir", "<crash>"),
               log=trans_result["log"],
               thoughts=trans_result.get("thoughts"),
+              repro_kind="trans",
+              args=trans_result.get("args"),
             )
           )
           return (True, res)
@@ -358,6 +364,8 @@ def generate_test_for_pr(
           transformed_ir = "<missing>"
           original_out = "<missing>"
           transformed_out = "<missing>"
+          difftest_args = None
+          difftest_call_instr = None
           for i in range(len(stats.test_traj) - 1, -1, -1):
             try:
               prev_res = json.loads(stats.test_traj[i])
@@ -372,6 +380,8 @@ def generate_test_for_pr(
                 transformed_out = prev_res.get("log", {}).get(
                   "transformed_test_output", ""
                 )
+                difftest_args = prev_res.get("args")
+                difftest_call_instr = prev_res.get("call_instr")
                 prev_res["confirmed"] = True
                 stats.test_traj[i] = json.dumps(prev_res)
                 break
@@ -386,6 +396,9 @@ def generate_test_for_pr(
                 transformed_ir=transformed_ir,
                 log=log_msg,
                 thoughts=diff_result.get("thoughts"),
+                repro_kind="difftest",
+                args=difftest_args,
+                call_instr=difftest_call_instr,
               )
             )
         elif diff_result.get("action") == "test":
@@ -570,6 +583,138 @@ def run_pr_agent(
   )
 
 
+# - ===============================================
+# - DB-backed review orchestration helpers
+# - ===============================================
+def _repro_from_row(row) -> Reproducer:
+  """Build a Reproducer from a ``bugs`` DB row."""
+  return Reproducer(
+    kind=row["repro_kind"] or "verify",
+    original_ir=row["original_ir"] or "",
+    args=row["args"] or "",
+    call_instr=row["call_instr"],
+  )
+
+
+def _repro_from_bug(bug: Bug) -> Reproducer:
+  """Build a Reproducer from an in-memory ``Bug``."""
+  return Reproducer(
+    kind=bug.repro_kind or "verify",
+    original_ir=bug.original_ir or "",
+    args=bug.args or "",
+    call_instr=bug.call_instr,
+  )
+
+
+def ensure_version(store, pr_info: PRInfo, existing_version_id: Optional[int]) -> int:
+  """Return the DB version_id for this PR commit, creating it if necessary."""
+  if existing_version_id is not None:
+    return existing_version_id
+  version_id, _ = store.upsert_pr_version(asdict(pr_info))
+  return version_id
+
+
+def run_regression_gate(
+  store, prev_version, build_dir: str
+) -> List[Tuple[object, str]]:
+  """Regression gate for multi-version PRs.
+
+  Re-run every still-active bug of the *previous* version against the *current*
+  patched build. Returns the list of ``(bug_row, log)`` that STILL trigger. An
+  empty list means the current version is clear to open a review.
+  """
+  still_triggering: List[Tuple[object, str]] = []
+  active = store.list_active_bugs(int(prev_version["id"]))
+  if not active:
+    return still_triggering
+
+  console.print(
+    f"Regression gate: re-running {len(active)} previous-version bug(s) "
+    f"on the current build..."
+  )
+  for bug_row in active:
+    repro = _repro_from_row(bug_row)
+    if not repro.is_runnable():
+      console.print(
+        f"  bug #{bug_row['id']} ({repro.kind}) not runnable; skipping.",
+        color="yellow",
+      )
+      continue
+    triggered, log = reproduce(
+      build_dir, repro, alive_path=ALIVE_TV_PATH, llubi_path=LLUBI_PATH
+    )
+    console.print(f"  bug #{bug_row['id']} ({repro.kind}) triggered={triggered}")
+    if triggered:
+      still_triggering.append((bug_row, log))
+  return still_triggering
+
+
+def run_baseline_check(pr_env: PREnvironment, bugs: List[Bug]) -> None:
+  """Check patch-specificity: re-run each found bug on the baseline build.
+
+  Builds the base commit WITHOUT the patch and re-runs every bug. A bug that
+  also triggers on the baseline is flagged ``non_patch_specific`` (the patch is
+  not what introduced it).
+  """
+  if not bugs:
+    return
+
+  try:
+    baseline_dir = pr_env.prepare_baseline(additional_cmake_args=ADDITIONAL_CMAKE_FLAGS)
+  except PREnvironmentError as e:
+    console.print(
+      f"Baseline build failed; skipping baseline check: {e}", color="yellow"
+    )
+    return
+
+  console.print(f"Baseline check: re-running {len(bugs)} bug(s) on the baseline...")
+  for bug in bugs:
+    repro = _repro_from_bug(bug)
+    bug.baseline_checked = True
+    if not repro.is_runnable():
+      bug.baseline_triggered = None
+      continue
+    triggered, _ = reproduce(
+      baseline_dir, repro, alive_path=ALIVE_TV_PATH, llubi_path=LLUBI_PATH
+    )
+    bug.baseline_triggered = triggered
+    bug.non_patch_specific = triggered
+    console.print(
+      f"  bug ({repro.kind}) triggered_on_baseline={triggered} "
+      f"-> non_patch_specific={triggered}"
+    )
+
+
+def persist_review(store, pr_id: int, version_id: int, review_id: int, stats, agent):
+  """Persist final review stats and its bugs (with baseline flags) to the DB."""
+  status = "failed" if stats.error else "succeeded"
+  payload = stats.as_dict()
+  payload["status"] = status
+  try:
+    payload["history"] = [asdict(m) for m in agent.get_history()]
+  except Exception:
+    payload["history"] = None
+  store.finish_review(review_id, payload)
+
+  for bug in stats.bugs:
+    bug_id = store.add_bug(
+      pr_id,
+      version_id,
+      review_id,
+      {
+        "repro_kind": bug.repro_kind,
+        "original_ir": bug.original_ir,
+        "transformed_ir": bug.transformed_ir,
+        "args": bug.args,
+        "call_instr": bug.call_instr,
+        "log": bug.log,
+        "thoughts": bug.thoughts,
+      },
+    )
+    if bug.baseline_checked and bug.baseline_triggered is not None:
+      store.set_bug_baseline(bug_id, bool(bug.baseline_triggered))
+
+
 def pr_review(
   agent: AgentBase,
   pr_info: PRInfo,
@@ -668,6 +813,28 @@ def main():
 
   pr_info = pr_env.pr_info
 
+  # Resolve this commit's DB version and apply the multi-version regression gate:
+  # only open a review if the previous version's bugs no longer trigger here.
+  store = get_store()
+  version_id = ensure_version(store, pr_info, pr_env.version_id)
+  pr_env.version_id = version_id
+
+  prev_version = store.get_previous_version(version_id)
+  if prev_version is not None:
+    still = run_regression_gate(store, prev_version, build_dir)
+    if still:
+      review_id = store.create_review(pr_info.pr_id, version_id, pr_info.fix_commit)
+      reason = (
+        f"{len(still)} previous-version bug(s) still trigger on commit "
+        f"{pr_info.fix_commit[:10]}; review not opened."
+      )
+      store.skip_review(review_id, reason)
+      console.print(reason, color="yellow")
+      return
+    # Previous version's bugs no longer trigger -> considered fixed by this version.
+    for bug_row in store.list_active_bugs(int(prev_version["id"])):
+      store.mark_bug_fixed(int(bug_row["id"]), version_id)
+
   # Set up LLM and agent
   if args.driver == "openai":
     from lms.openai import OpenAIAgent
@@ -711,6 +878,9 @@ def main():
 
   llvm = LLVM()
 
+  # Open the review run in the DB now that the gate has passed.
+  review_id = store.create_review(pr_info.pr_id, version_id, pr_info.fix_commit)
+
   # Run PR review
   stats = RunStats(command=vars(args))
   stats.total_time_sec = time.time()
@@ -736,6 +906,10 @@ def main():
   finally:
     stats.total_time_sec = time.time() - stats.total_time_sec
     collect_agent_stats(stats, agent)
+    # Patch-specificity: re-run found bugs on the baseline (base commit, no patch).
+    run_baseline_check(pr_env, stats.bugs)
+    # Persist review + bugs (with baseline flags) to the DB.
+    persist_review(store, pr_info.pr_id, version_id, review_id, stats, agent)
     save_outputs(stats, pr_info, agent, console, stats_path, history_path, review_path)
 
   print_results(stats, console)

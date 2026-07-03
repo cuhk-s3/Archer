@@ -12,6 +12,15 @@ class Bug:
   transformed_ir: str
   log: str
   thoughts: Optional[str] = None
+  # Reproducer info: enough to re-run the bug on any LLVM build (baseline or a
+  # newer commit version) for patch-specificity / regression checks.
+  repro_kind: str = "verify"  # verify / trans / difftest
+  args: Optional[str] = None  # opt arguments used to reproduce
+  call_instr: Optional[str] = None  # difftest driver call (nullable)
+  # Baseline (base commit, no patch) re-run outcome.
+  baseline_checked: bool = False
+  baseline_triggered: Optional[bool] = None
+  non_patch_specific: bool = False
 
 
 @dataclass

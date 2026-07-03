@@ -16,8 +16,10 @@ import requests
 import tqdm
 
 sys.path.append(str(Path(__file__).parent.parent))
+# Project root so ``store`` is importable.
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-from llvm import llvm_helper
+from store import get_store
 
 # Time range filter (hardcoded)
 # PRs must be created within this date range
@@ -58,19 +60,17 @@ def fetch_pr(pr_id, state_filter="closed"):
     pr_id: PR ID to fetch
     state_filter: "open", "closed", or "all"
   """
-  # Check if already processed (in either open or closed directory)
-  data_json_paths = [
-    os.path.join(llvm_helper.dataset_dir, "open", f"{pr_id}.json"),
-    os.path.join(llvm_helper.dataset_dir, "closed", f"{pr_id}.json"),
-  ]
-  if any(os.path.exists(p) for p in data_json_paths):
-    return False
-
   # Fetch PR metadata to check filters
   pr_url = f"https://api.github.com/repos/llvm/llvm-project/pulls/{pr_id}"
   pr = session.get(pr_url).json()
 
   if "message" in pr and pr["message"] == "Not Found":
+    return False
+
+  # Dedup on commit SHA (not open/closed): skip only if this exact head commit
+  # has already been extracted into the DB. A new head commit -> new version.
+  fix_commit = pr.get("head", {}).get("sha")
+  if fix_commit and get_store().has_version(pr_id, fix_commit):
     return False
 
   # Apply state filter
