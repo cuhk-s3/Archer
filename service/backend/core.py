@@ -443,6 +443,13 @@ class ArcherService:
     except Exception:
       return None
 
+  def _github_timestamp_iso(self, run: dict, *keys: str) -> Optional[str]:
+    for key in keys:
+      parsed = self._parse_github_datetime(str(run.get(key) or ""))
+      if parsed:
+        return parsed.astimezone(timezone.utc).isoformat()
+    return None
+
   def _is_remote_run_taken(self, run_id: Optional[int], exclude_job_id: str) -> bool:
     if run_id is None:
       return False
@@ -524,12 +531,20 @@ class ArcherService:
 
   def _apply_remote_run_state(self, job: Job, run: dict) -> None:
     run_id = run.get("id")
+    previous_state = (
+      job.remote_run_id,
+      job.remote_run_status,
+      job.remote_run_conclusion,
+      job.status,
+      job.phase,
+    )
     job.remote_run_id = int(run_id) if run_id is not None else None
     job.remote_run_url = str(run.get("html_url") or "") or None
     job.remote_run_status = str(run.get("status") or "") or None
     job.remote_run_conclusion = str(run.get("conclusion") or "") or None
 
     if job.remote_run_status == "completed":
+      completed_at = self._github_timestamp_iso(run, "completed_at", "updated_at")
       if job.remote_run_conclusion == "success":
         job.status = "succeeded"
         job.phase = "done"
@@ -538,14 +553,29 @@ class ArcherService:
         job.phase = job.remote_run_conclusion or "failed"
         if not job.error and job.remote_run_conclusion:
           job.error = f"GitHub Actions concluded with {job.remote_run_conclusion}"
-      job.finished_at = utc_now_iso()
+      if completed_at:
+        job.finished_at = completed_at
+        job.updated_at = completed_at
+      elif not job.finished_at:
+        job.finished_at = utc_now_iso()
+        job.updated_at = job.finished_at
     elif job.remote_run_status:
       if job.remote_run_status in {"queued", "requested", "waiting", "pending"}:
         job.status = "queued"
       else:
         job.status = "running"
       job.phase = job.remote_run_status
-    job.updated_at = utc_now_iso()
+      current_state = (
+        job.remote_run_id,
+        job.remote_run_status,
+        job.remote_run_conclusion,
+        job.status,
+        job.phase,
+      )
+      if current_state != previous_state:
+        job.updated_at = (
+          self._github_timestamp_iso(run, "updated_at", "created_at") or utc_now_iso()
+        )
 
   def _download_remote_artifacts(
     self, session: requests.Session, job: Job, run_id: int

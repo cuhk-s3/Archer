@@ -48,6 +48,12 @@ cat > "${FRONTEND_DIR}/runtime-config.js" <<EOF
 window.ARCHER_BACKEND_BASE_URL = "${BACKEND_BASE_URL}";
 EOF
 
+LOGO_SOURCE="${ROOT_DIR}/service/Archer.png"
+LOGO_TARGET="${FRONTEND_DIR}/logo.png"
+if [[ -f "${LOGO_SOURCE}" ]]; then
+  ln -sfn "../Archer.png" "${LOGO_TARGET}" || cp "${LOGO_SOURCE}" "${LOGO_TARGET}"
+fi
+
 echo "Frontend runtime config written: ${FRONTEND_DIR}/runtime-config.js"
 echo "Dispatcher model=${ARCHER_MODEL}, driver=${ARCHER_DRIVER}, ref=${ARCHER_ACTIONS_REF}, auto_scan=${ARCHER_AUTO_SCAN}"
 
