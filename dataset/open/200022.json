@@ -1,0 +1,84 @@
+{
+  "pr_id": 200022,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/200022",
+  "state": "open",
+  "title": "[InstCombine] Remove redundant overflow select before umin clamp",
+  "author": "MadhurKumar004",
+  "base_commit": "8a55aca421d64db9f82bda2ae3330bdf2dc12cf0",
+  "fix_commit": "17f944f3ffae311a059a399944dd035998a434d3",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 58605a5da3de8..825ccad627b41 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -1419,6 +1419,45 @@ static Value *canonicalizeSaturatedAdd(ICmpInst *Cmp, Value *TVal, Value *FVal,\n   return nullptr;\n }\n \n+static Value *foldRedundantUMinOverflowSelect(ICmpInst *Cmp, Value *TVal,\n+                                              Value *FVal,\n+                                              const SimplifyQuery &SQ) {\n+  Value *Sum = Cmp->getOperand(0);\n+  Value *X = Cmp->getOperand(1);\n+\n+  // Match overflow check from unsigned addition: icmp ult %sum, %x\n+  if (Cmp->getPredicate() != ICmpInst::ICMP_ULT)\n+    return nullptr;\n+\n+  // TrueVal must be K (the clamp bound). Match FalseVal: umin(sum, K)\n+  Value *K = TVal;\n+  if (!match(FVal,\n+             m_c_Intrinsic<Intrinsic::umin>(m_Specific(Sum), m_Specific(K))))\n+    return nullptr;\n+\n+  // Ensure Sum is an add with NSW before extracting operands.\n+  auto *SumInst = dyn_cast<BinaryOperator>(Sum);\n+  if (!SumInst || !SumInst->hasNoSignedWrap() ||\n+      SumInst->getOpcode() != Instruction::Add)\n+    return nullptr;\n+\n+  // Match the guarded sum commutatively and capture U\n+  Value *U;\n+  if (!match(Sum, m_c_Add(m_Value(U), m_Specific(X))))\n+    return nullptr;\n+\n+  // Match growth source: %u = umax(x, C)\n+  Value *C;\n+  if (!match(U, m_c_Intrinsic<Intrinsic::umax>(m_Specific(X), m_Value(C))))\n+    return nullptr;\n+\n+  // Require C <=u signbit and K <=u signbit\n+  if (!isKnownNonNegative(C, SQ) || !isKnownNonNegative(K, SQ))\n+    return nullptr;\n+\n+  return FVal;\n+}\n+\n /// Try to match patterns with select and subtract as absolute difference.\n static Value *foldAbsDiff(ICmpInst *Cmp, Value *TVal, Value *FVal,\n                           InstCombiner::BuilderTy &Builder) {\n@@ -2466,6 +2505,10 @@ Instruction *InstCombinerImpl::foldSelectInstWithICmp(SelectInst &SI,\n   if (Value *V = canonicalizeSaturatedAdd(ICI, TrueVal, FalseVal, Builder))\n     return replaceInstUsesWith(SI, V);\n \n+  SimplifyQuery SQ = getSimplifyQuery().getWithInstruction(&SI);\n+  if (Value *V = foldRedundantUMinOverflowSelect(ICI, TrueVal, FalseVal, SQ))\n+    return replaceInstUsesWith(SI, V);\n+\n   if (Value *V = foldAbsDiff(ICI, TrueVal, FalseVal, Builder))\n     return replaceInstUsesWith(SI, V);\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "fix: https://github.com/llvm/llvm-project/issues/199806\r\n\r\nAdded a foldRedundantUMinOverflowSelect function to handle the fold.\r\nAlive Proof : https://alive2.llvm.org/ce/z/2UEYwP\r\nCompiler-explorer sample & perf : https://compiler-explorer.com/z/3nvj53rcv\r\nRealWorld Usage : https://github.com/dtcxzyw/llvm-opt-benchmark-nightly/pull/379/changes",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-min-max.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "redundant_overflow_select_umin_k_too_large",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @redundant_overflow_select_umin_k_too_large(i8 %x) {\n  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n  %sum = add nsw i8 %u, %x\n  %ov = icmp ult i8 %sum, %x\n  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 -56)\n  %r = select i1 %ov, i8 -56, i8 %clamp\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "redundant_overflow_select_umin_no_nsw",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @redundant_overflow_select_umin_no_nsw(i8 %x) {\n  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n  %sum = add i8 %u, %x\n  %ov = icmp ult i8 %sum, %x\n  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n  %r = select i1 %ov, i8 100, i8 %clamp\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "redundant_overflow_select_umin_swapped_add",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @redundant_overflow_select_umin_swapped_add(i8 %x) {\n  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n  %sum = add nsw i8 %x, %u\n  %ov = icmp ult i8 %sum, %x\n  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n  %r = select i1 %ov, i8 100, i8 %clamp\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "redundant_overflow_select_umin_c_too_large",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @redundant_overflow_select_umin_c_too_large(i8 %x) {\n  %u = call i8 @llvm.umax.i8(i8 %x, i8 -56)\n  %sum = add nsw i8 %u, %x\n  %ov = icmp ult i8 %sum, %x\n  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n  %r = select i1 %ov, i8 100, i8 %clamp\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "redundant_overflow_select_umin",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umax.i8(i8, i8) #0\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @redundant_overflow_select_umin(i8 %x) {\n  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n  %sum = add nsw i8 %u, %x\n  %ov = icmp ult i8 %sum, %x\n  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n  %r = select i1 %ov, i8 100, i8 %clamp\n  ret i8 %r\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "sel_umin_non_constant",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @sel_umin_non_constant(i8 %x, i8 %y) {\n  %cmp = icmp sgt i8 %x, -1\n  %umin = call i8 @llvm.umin.i8(i8 %x, i8 16)\n  %sel = select i1 %cmp, i8 %umin, i8 %y\n  ret i8 %sel\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Madhur Kumar (MadhurKumar004)\n\n<details>\n<summary>Changes</summary>\n\nfix: https://github.com/llvm/llvm-project/issues/199806\r\n\r\nAdded a foldRedundantUMinOverflowSelect function to handle the fold.\r\nAlive Proof : https://alive2.llvm.org/ce/z/2UEYwP\r\nCompiler-explorer sample &amp; perf : https://compiler-explorer.com/z/3nvj53rcv\r\nRealWorld Usage : https://github.com/dtcxzyw/llvm-opt-benchmark-nightly/pull/379/changes\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/200022.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp (+43) \n- (modified) llvm/test/Transforms/InstCombine/select-min-max.ll (+81) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 58605a5da3de8..825ccad627b41 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -1419,6 +1419,45 @@ static Value *canonicalizeSaturatedAdd(ICmpInst *Cmp, Value *TVal, Value *FVal,\n   return nullptr;\n }\n \n+static Value *foldRedundantUMinOverflowSelect(ICmpInst *Cmp, Value *TVal,\n+                                              Value *FVal,\n+                                              const SimplifyQuery &SQ) {\n+  Value *Sum = Cmp->getOperand(0);\n+  Value *X = Cmp->getOperand(1);\n+\n+  // Match overflow check from unsigned addition: icmp ult %sum, %x\n+  if (Cmp->getPredicate() != ICmpInst::ICMP_ULT)\n+    return nullptr;\n+\n+  // TrueVal must be K (the clamp bound). Match FalseVal: umin(sum, K)\n+  Value *K = TVal;\n+  if (!match(FVal,\n+             m_c_Intrinsic<Intrinsic::umin>(m_Specific(Sum), m_Specific(K))))\n+    return nullptr;\n+\n+  // Ensure Sum is an add with NSW before extracting operands.\n+  auto *SumInst = dyn_cast<BinaryOperator>(Sum);\n+  if (!SumInst || !SumInst->hasNoSignedWrap() ||\n+      SumInst->getOpcode() != Instruction::Add)\n+    return nullptr;\n+\n+  // Match the guarded sum commutatively and capture U\n+  Value *U;\n+  if (!match(Sum, m_c_Add(m_Value(U), m_Specific(X))))\n+    return nullptr;\n+\n+  // Match growth source: %u = umax(x, C)\n+  Value *C;\n+  if (!match(U, m_c_Intrinsic<Intrinsic::umax>(m_Specific(X), m_Value(C))))\n+    return nullptr;\n+\n+  // Require C <=u signbit and K <=u signbit\n+  if (!isKnownNonNegative(C, SQ) || !isKnownNonNegative(K, SQ))\n+    return nullptr;\n+\n+  return FVal;\n+}\n+\n /// Try to match patterns with select and subtract as absolute difference.\n static Value *foldAbsDiff(ICmpInst *Cmp, Value *TVal, Value *FVal,\n                           InstCombiner::BuilderTy &Builder) {\n@@ -2466,6 +2505,10 @@ Instruction *InstCombinerImpl::foldSelectInstWithICmp(SelectInst &SI,\n   if (Value *V = canonicalizeSaturatedAdd(ICI, TrueVal, FalseVal, Builder))\n     return replaceInstUsesWith(SI, V);\n \n+  SimplifyQuery SQ = getSimplifyQuery().getWithInstruction(&SI);\n+  if (Value *V = foldRedundantUMinOverflowSelect(ICI, TrueVal, FalseVal, SQ))\n+    return replaceInstUsesWith(SI, V);\n+\n   if (Value *V = foldAbsDiff(ICI, TrueVal, FalseVal, Builder))\n     return replaceInstUsesWith(SI, V);\n \ndiff --git a/llvm/test/Transforms/InstCombine/select-min-max.ll b/llvm/test/Transforms/InstCombine/select-min-max.ll\nindex 4db75b84e12e7..3d6aa5eec00e4 100644\n--- a/llvm/test/Transforms/InstCombine/select-min-max.ll\n+++ b/llvm/test/Transforms/InstCombine/select-min-max.ll\n@@ -364,3 +364,84 @@ define i8 @sel_umin_non_constant(i8 %x, i8 %y) {\n   %sel = select i1 %cmp, i8 %umin, i8 %y\n   ret i8 %sel\n }\n+\n+define i8 @redundant_overflow_select_umin(i8 %x) {\n+; CHECK-LABEL: @redundant_overflow_select_umin(\n+; CHECK-NEXT:    [[U:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 64)\n+; CHECK-NEXT:    [[SUM:%.*]] = add nsw i8 [[U]], [[X]]\n+; CHECK-NEXT:    [[CLAMP:%.*]] = call i8 @llvm.umin.i8(i8 [[SUM]], i8 100)\n+; CHECK-NEXT:    ret i8 [[CLAMP]]\n+;\n+  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n+  %sum = add nsw i8 %u, %x\n+  %ov = icmp ult i8 %sum, %x\n+  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n+  %r = select i1 %ov, i8 100, i8 %clamp\n+  ret i8 %r\n+}\n+\n+define i8 @redundant_overflow_select_umin_swapped_add(i8 %x) {\n+; CHECK-LABEL: @redundant_overflow_select_umin_swapped_add(\n+; CHECK-NEXT:    [[U:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 64)\n+; CHECK-NEXT:    [[SUM:%.*]] = add nsw i8 [[X]], [[U]]\n+; CHECK-NEXT:    [[CLAMP:%.*]] = call i8 @llvm.umin.i8(i8 [[SUM]], i8 100)\n+; CHECK-NEXT:    ret i8 [[CLAMP]]\n+;\n+  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n+  %sum = add nsw i8 %x, %u\n+  %ov = icmp ult i8 %sum, %x\n+  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n+  %r = select i1 %ov, i8 100, i8 %clamp\n+  ret i8 %r\n+}\n+\n+define i8 @redundant_overflow_select_umin_no_nsw(i8 %x) {\n+; CHECK-LABEL: @redundant_overflow_select_umin_no_nsw(\n+; CHECK-NEXT:    [[U:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 64)\n+; CHECK-NEXT:    [[SUM:%.*]] = add i8 [[U]], [[X]]\n+; CHECK-NEXT:    [[OV:%.*]] = icmp ult i8 [[SUM]], [[X]]\n+; CHECK-NEXT:    [[CLAMP:%.*]] = call i8 @llvm.umin.i8(i8 [[SUM]], i8 100)\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[OV]], i8 100, i8 [[CLAMP]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n+  %sum = add i8 %u, %x\n+  %ov = icmp ult i8 %sum, %x\n+  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n+  %r = select i1 %ov, i8 100, i8 %clamp\n+  ret i8 %r\n+}\n+\n+define i8 @redundant_overflow_select_umin_k_too_large(i8 %x) {\n+; CHECK-LABEL: @redundant_overflow_select_umin_k_too_large(\n+; CHECK-NEXT:    [[U:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 64)\n+; CHECK-NEXT:    [[SUM:%.*]] = add nsw i8 [[U]], [[X]]\n+; CHECK-NEXT:    [[OV:%.*]] = icmp ult i8 [[SUM]], [[X]]\n+; CHECK-NEXT:    [[CLAMP:%.*]] = call i8 @llvm.umin.i8(i8 [[SUM]], i8 -56)\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[OV]], i8 -56, i8 [[CLAMP]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %u = call i8 @llvm.umax.i8(i8 %x, i8 64)\n+  %sum = add nsw i8 %u, %x\n+  %ov = icmp ult i8 %sum, %x\n+  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 200)\n+  %r = select i1 %ov, i8 200, i8 %clamp\n+  ret i8 %r\n+}\n+\n+define i8 @redundant_overflow_select_umin_c_too_large(i8 %x) {\n+; CHECK-LABEL: @redundant_overflow_select_umin_c_too_large(\n+; CHECK-NEXT:    [[U:%.*]] = call i8 @llvm.umax.i8(i8 [[X:%.*]], i8 -56)\n+; CHECK-NEXT:    [[SUM:%.*]] = add nsw i8 [[U]], [[X]]\n+; CHECK-NEXT:    [[OV:%.*]] = icmp ult i8 [[SUM]], [[X]]\n+; CHECK-NEXT:    [[CLAMP:%.*]] = call i8 @llvm.umin.i8(i8 [[SUM]], i8 100)\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[OV]], i8 100, i8 [[CLAMP]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+  %u = call i8 @llvm.umax.i8(i8 %x, i8 200)\n+  %sum = add nsw i8 %u, %x\n+  %ov = icmp ult i8 %sum, %x\n+  %clamp = call i8 @llvm.umin.i8(i8 %sum, i8 100)\n+  %r = select i1 %ov, i8 100, i8 %clamp\n+  ret i8 %r\n+}\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-27T18:00:04Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        1419,
+        1424
+      ],
+      [
+        2466,
+        2471
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/select-min-max.ll": [
+      [
+        364,
+        366
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::foldSelectInstWithICmp",
+      "canonicalizeSaturatedAdd",
+      "foldAbsDiff"
+    ]
+  }
+}

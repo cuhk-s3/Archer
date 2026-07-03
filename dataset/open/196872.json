@@ -1,0 +1,135 @@
+{
+  "pr_id": 196872,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/196872",
+  "state": "open",
+  "title": "[InstCombine] Fold constant shift/mul into select arms for mul instruction",
+  "author": "FathimaHaris",
+  "base_commit": "21c75f0b2e5472ed368ea8fbee81d05af089e5e7",
+  "fix_commit": "35b320c4f5c149240ae9a92f318bf6dcb3411ec3",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp b/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\nindex 384f38b2c5362..9d9192d49d5ce 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\n@@ -331,6 +331,41 @@ Instruction *InstCombinerImpl::visitMul(BinaryOperator &I) {\n   if (Value *FoldedMul = foldMulSelectToNegate(I, Builder))\n     return replaceInstUsesWith(I, FoldedMul);\n \n+  // (shl X, C1)*(select cond, C2, C3)--> X * (select cond, C2<<C1, C3<<C1)\n+  // (mul X, C1)*(select cond, C2, C3)--> X * (select cond, C2*C1, C3*C1)\n+  // (Includes commuted forms)\n+\n+  {\n+    Value *NewOp, *Cond, *OtherValue;\n+    Constant *C1, *C2, *C3;\n+\n+    if (match(&I, m_c_Mul(m_OneUse(m_Value(OtherValue)),\n+                          m_OneUse(m_Select(m_Value(Cond), m_Constant(C2),\n+                                            m_Constant(C3))))) &&\n+        (match(OtherValue, m_c_Mul(m_Value(NewOp), m_Constant(C1))) ||\n+         match(OtherValue, m_Shl(m_Value(NewOp), m_Constant(C1))))) {\n+\n+      auto *OtherInst = cast<OverflowingBinaryOperator>(OtherValue);\n+      auto Opc = OtherInst->getOpcode();\n+\n+      Constant *NewTV = ConstantFoldBinaryOpOperands(Opc, C2, C1, DL);\n+      Constant *NewFV = ConstantFoldBinaryOpOperands(Opc, C3, C1, DL);\n+\n+      if (NewTV && NewFV) {\n+        Value *NewSel = Builder.CreateSelect(Cond, NewTV, NewFV);\n+        BinaryOperator *BO = BinaryOperator::CreateMul(NewOp, NewSel);\n+\n+        if (HasNUW && OtherInst->hasNoUnsignedWrap())\n+          BO->setHasNoUnsignedWrap();\n+        if (HasNSW && OtherInst->hasNoSignedWrap() &&\n+            NewTV->isNotMinSignedValue() && NewFV->isNotMinSignedValue())\n+          BO->setHasNoSignedWrap();\n+\n+        return BO;\n+      }\n+    }\n+  }\n+\n   // Simplify mul instructions with a constant RHS.\n   Constant *MulC;\n   if (match(Op1, m_ImmConstant(MulC))) {\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Fixes llvm#190907\r\n\r\nExtends the optimization reported   to cover four symmetric\r\npatterns where one operand of a multiplication is a constant shift or\r\nmultiply, and the other is a select with constant arms.\r\n\r\nInstead of keeping the outer shl/mul, the constant is pushed into the\r\nselect arms:\r\n  (shl X, C1) * (select cond, C2, C3) --> X * (select cond, C2<<C1, C3<<C1)\r\n  (mul X, C1) * (select cond, C2, C3) --> X * (select cond, C2*C1, C3*C1)\r\n(Also handles their commuted forms )\r\n\r\nAlive2 Proof :https://alive2.llvm.org/ce/z/dwTXJw",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/mul.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine -use-constant-int-for-fixed-length-splat -S"
+      ],
+      "tests": [
+        {
+          "test_name": "shl_select_mul",
+          "test_body": "define i16 @shl_select_mul(i16 %x, i1 %cond) {\n  %shl = shl i16 %x, 2\n  %sel = select i1 %cond, i16 5, i16 3\n  %mul = mul i16 %shl, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_no_flags",
+          "test_body": "define i16 @shl_select_no_flags(i16 %x, i1 %cond) {\n  %shl = shl nsw i16 %x, 2\n  %sel = select i1 %cond, i16 5, i16 3\n  %mul = mul i16 %shl, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "pow2_multiplier",
+          "test_body": "define i32 @pow2_multiplier(i32 %A) {\n  %B = mul i32 %A, 2\n  ret i32 %B\n}\n"
+        },
+        {
+          "test_name": "mul_select_mul",
+          "test_body": "define i16 @mul_select_mul(i16 %x, i1 %cond) {\n  %mul1 = mul i16 %x, 3\n  %sel = select i1 %cond, i16 4, i16 2\n  %mul = mul i16 %mul1, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "mul_sext_bool",
+          "test_body": "define i32 @mul_sext_bool(i1 %x) !prof !0 {\n  %s = sext i1 %x to i32\n  %m = mul i32 %s, 42\n  ret i32 %m\n}\n\n!0 = !{!\"function_entry_count\", i64 1000}\n"
+        },
+        {
+          "test_name": "shl_select_vec_non_splat",
+          "test_body": "define <4 x i16> @shl_select_vec_non_splat(<4 x i16> %x, i1 %cond) {\n  %shl = shl <4 x i16> %x, <i16 1, i16 2, i16 3, i16 4>\n  %sel = select i1 %cond, <4 x i16> <i16 5, i16 3, i16 7, i16 1>, <4 x i16> <i16 2, i16 4, i16 6, i16 8>\n  %mul = mul <4 x i16> %shl, %sel\n  ret <4 x i16> %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_zero_arm",
+          "test_body": "define noundef i64 @shl_select_zero_arm(i64 %0, i1 %1) {\n  %3 = select i1 %1, i64 2, i64 0\n  %4 = shl i64 %0, 1\n  %5 = mul i64 %4, %3\n  ret i64 %5\n}\n"
+        },
+        {
+          "test_name": "shl_select_vec_splat",
+          "test_body": "define <4 x i16> @shl_select_vec_splat(<4 x i16> %x, i1 %cond) {\n  %shl = shl <4 x i16> %x, splat (i16 2)\n  %sel = select i1 %cond, <4 x i16> splat (i16 5), <4 x i16> splat (i16 3)\n  %mul = mul <4 x i16> %shl, %sel\n  ret <4 x i16> %mul\n}\n"
+        },
+        {
+          "test_name": "mul_select_extra_use_mul",
+          "test_body": "declare void @use16(i16)\n\ndefine i16 @mul_select_extra_use_mul(i16 %x, i1 %cond) {\n  %mul1 = mul nuw nsw i16 %x, 3\n  call void @use16(i16 %mul1)\n  %sel = select i1 %cond, i16 9, i16 5\n  %mul = mul nuw nsw i16 %mul1, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "mul_udiv_zext_uneq",
+          "test_body": "define i16 @mul_udiv_zext_uneq(i8 %x) {\n  %div = udiv i8 %x, 20\n  %zext = zext i8 %div to i16\n  %mul = mul i16 %zext, 15\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_vector_with_poison",
+          "test_body": "define <4 x i16> @shl_select_vector_with_poison(<4 x i16> %x, i1 %cond) {\n  %shl = shl <4 x i16> %x, <i16 2, i16 poison, i16 poison, i16 2>\n  %sel = select i1 %cond, <4 x i16> <i16 5, i16 poison, i16 5, i16 5>, <4 x i16> <i16 3, i16 poison, i16 3, i16 3>\n  %mul = mul <4 x i16> %shl, %sel\n  ret <4 x i16> %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_commuted",
+          "test_body": "define i16 @shl_select_commuted(i16 %x, i1 %cond) {\n  %shl = shl i16 %x, 2\n  %sel = select i1 %cond, i16 5, i16 3\n  %mul = mul i16 %sel, %shl\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_extra_use_shl",
+          "test_body": "declare void @use16(i16)\n\ndefine i16 @shl_select_extra_use_shl(i16 %x, i1 %cond) {\n  %shl = shl nuw nsw i16 %x, 2\n  call void @use16(i16 %shl)\n  %sel = select i1 %cond, i16 5, i16 3\n  %mul = mul nuw nsw i16 %shl, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_extra_use_sel",
+          "test_body": "declare void @use16(i16)\n\ndefine i16 @shl_select_extra_use_sel(i16 %x, i1 %cond) {\n  %shl = shl nuw nsw i16 %x, 2\n  %sel = select i1 %cond, i16 5, i16 3\n  call void @use16(i16 %sel)\n  %mul = mul nuw nsw i16 %shl, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_nuw_only",
+          "test_body": "define i16 @shl_select_nuw_only(i16 %x, i1 %cond) {\n  %shl = shl i16 %x, 2\n  %sel = select i1 %cond, i16 5, i16 3\n  %mul = mul nuw i16 %shl, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "shl_select_both_nuw_nsw",
+          "test_body": "define i16 @shl_select_both_nuw_nsw(i16 %x, i1 %cond) {\n  %shl = shl nuw nsw i16 %x, 2\n  %sel = select i1 %cond, i16 5, i16 3\n  %mul = mul nuw nsw i16 %shl, %sel\n  ret i16 %mul\n}\n"
+        },
+        {
+          "test_name": "mul_select_vec_splat",
+          "test_body": "define <4 x i16> @mul_select_vec_splat(<4 x i16> %x, i1 %cond) {\n  %mul1 = mul <4 x i16> %x, splat (i16 3)\n  %sel = select i1 %cond, <4 x i16> splat (i16 4), <4 x i16> splat (i16 2)\n  %mul = mul <4 x i16> %mul1, %sel\n  ret <4 x i16> %mul\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: FathimaHaris\n\n<details>\n<summary>Changes</summary>\n\nFixes llvm#<!-- -->190907\r\n\r\nExtends the optimization reported   to cover four symmetric\r\npatterns where one operand of a multiplication is a constant shift or\r\nmultiply, and the other is a select with constant arms.\r\n\r\nInstead of keeping the outer shl/mul, the constant is pushed into the\r\nselect arms:\r\n  (shl X, C1) * (select cond, C2, C3) --&gt; X * (select cond, C2&lt;&lt;C1, C3&lt;&lt;C1)\r\n  (mul X, C1) * (select cond, C2, C3) --&gt; X * (select cond, C2*C1, C3*C1)\r\n(Also handles their commuted forms )\r\n\r\nAlive2 Proof :https://alive2.llvm.org/ce/z/dwTXJw\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/196872.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp (+35) \n- (modified) llvm/test/Transforms/InstCombine/mul.ll (+217-6) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp b/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\nindex 384f38b2c5362..9d9192d49d5ce 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp\n@@ -331,6 +331,41 @@ Instruction *InstCombinerImpl::visitMul(BinaryOperator &I) {\n   if (Value *FoldedMul = foldMulSelectToNegate(I, Builder))\n     return replaceInstUsesWith(I, FoldedMul);\n \n+  // (shl X, C1)*(select cond, C2, C3)--> X * (select cond, C2<<C1, C3<<C1)\n+  // (mul X, C1)*(select cond, C2, C3)--> X * (select cond, C2*C1, C3*C1)\n+  // (Includes commuted forms)\n+\n+  {\n+    Value *NewOp, *Cond, *OtherValue;\n+    Constant *C1, *C2, *C3;\n+\n+    if (match(&I, m_c_Mul(m_OneUse(m_Value(OtherValue)),\n+                          m_OneUse(m_Select(m_Value(Cond), m_Constant(C2),\n+                                            m_Constant(C3))))) &&\n+        (match(OtherValue, m_c_Mul(m_Value(NewOp), m_Constant(C1))) ||\n+         match(OtherValue, m_Shl(m_Value(NewOp), m_Constant(C1))))) {\n+\n+      auto *OtherInst = cast<OverflowingBinaryOperator>(OtherValue);\n+      auto Opc = OtherInst->getOpcode();\n+\n+      Constant *NewTV = ConstantFoldBinaryOpOperands(Opc, C2, C1, DL);\n+      Constant *NewFV = ConstantFoldBinaryOpOperands(Opc, C3, C1, DL);\n+\n+      if (NewTV && NewFV) {\n+        Value *NewSel = Builder.CreateSelect(Cond, NewTV, NewFV);\n+        BinaryOperator *BO = BinaryOperator::CreateMul(NewOp, NewSel);\n+\n+        if (HasNUW && OtherInst->hasNoUnsignedWrap())\n+          BO->setHasNoUnsignedWrap();\n+        if (HasNSW && OtherInst->hasNoSignedWrap() &&\n+            NewTV->isNotMinSignedValue() && NewFV->isNotMinSignedValue())\n+          BO->setHasNoSignedWrap();\n+\n+        return BO;\n+      }\n+    }\n+  }\n+\n   // Simplify mul instructions with a constant RHS.\n   Constant *MulC;\n   if (match(Op1, m_ImmConstant(MulC))) {\ndiff --git a/llvm/test/Transforms/InstCombine/mul.ll b/llvm/test/Transforms/InstCombine/mul.ll\nindex 696490190511d..8d11c74fd637c 100644\n--- a/llvm/test/Transforms/InstCombine/mul.ll\n+++ b/llvm/test/Transforms/InstCombine/mul.ll\n@@ -1,14 +1,13 @@\n+\n ; NOTE: Assertions have been autogenerated by utils/update_test_checks.py UTC_ARGS: --check-globals\n ; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n ; RUN: opt < %s -passes=instcombine -use-constant-int-for-fixed-length-splat -S | FileCheck %s\n \n declare i32 @llvm.abs.i32(i32, i1)\n \n-;.\n ; CHECK: @g = internal global i32 0, align 4\n ; CHECK: @PR22087 = external global i32\n ; CHECK: @X = global i32 5\n-;.\n define i32 @pow2_multiplier(i32 %A) {\n ; CHECK-LABEL: @pow2_multiplier(\n ; CHECK-NEXT:    [[B:%.*]] = shl i32 [[A:%.*]], 1\n@@ -359,7 +358,7 @@ define i32 @mul_sext_bool(i1 %x) !prof !0 {\n ; CHECK-LABEL: @mul_sext_bool(\n ; CHECK-NEXT:    [[M:%.*]] = select i1 [[X:%.*]], i32 -42, i32 0\n ; CHECK-NEXT:    ret i32 [[M]]\n-;\n+\n   %s = sext i1 %x to i32\n   %m = mul i32 %s, 42\n   ret i32 %m\n@@ -2235,12 +2234,224 @@ define i16 @mul_udiv_zext_uneq(i8 %x) {\n   ret i16 %mul\n }\n \n+; (shl  X, C1) * (select cond, C2, C3) --> X * (select cond, C2<<C1, C3<<C1)\n+define i16 @shl_select_mul(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_mul(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], i16 20, i16 12\n+; CHECK-NEXT:    [[MUL:%.*]] = mul i16 [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %shl = shl  i16 %x, 2\n+  %sel = select i1 %cond, i16 5, i16 3\n+  %mul = mul  i16 %shl, %sel\n+  ret i16 %mul\n+}\n+\n+; (select cond, C2, C3) * (shl  X, C1) --> commuted outer mul\n+define i16 @shl_select_commuted(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_commuted(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], i16 20, i16 12\n+; CHECK-NEXT:    [[MUL:%.*]] = mul i16 [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %shl = shl  i16 %x, 2\n+  %sel = select i1 %cond, i16 5, i16 3\n+  %mul = mul  i16 %sel, %shl\n+  ret i16 %mul\n+}\n+\n+\n+; One select arm is zero (reproduced from issue report)\n+define noundef i64 @shl_select_zero_arm(i64 %0, i1 %1) {\n+; CHECK-LABEL: @shl_select_zero_arm(\n+; CHECK-NEXT:    [[TMP3:%.*]] = select i1 [[TMP1:%.*]], i64 4, i64 0\n+; CHECK-NEXT:    [[TMP4:%.*]] = mul i64 [[TMP0:%.*]], [[TMP3]]\n+; CHECK-NEXT:    ret i64 [[TMP4]]\n+;\n+  %3 = select i1 %1, i64 2, i64 0\n+  %4 = shl i64 %0, 1\n+  %5 = mul i64 %4, %3\n+  ret i64 %5\n+}\n+\n+; (mul  X, C1) * (select cond, C2, C3) --> X * (select cond, C2*C1, C3*C1)\n+define i16 @mul_select_mul(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @mul_select_mul(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], i16 12, i16 6\n+; CHECK-NEXT:    [[MUL:%.*]] = mul i16 [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %mul1 = mul  i16 %x, 3\n+  %sel  = select i1 %cond, i16 4, i16 2\n+  %mul  = mul  i16 %mul1, %sel\n+  ret i16 %mul\n+}\n+\n+\n+; Flag tests\n+\n+; No flags on outer mul \u2014 no flags on result\n+define i16 @shl_select_no_flags(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_no_flags(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], i16 20, i16 12\n+; CHECK-NEXT:    [[MUL:%.*]] = mul i16 [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %shl = shl  nsw i16 %x, 2\n+  %sel = select i1 %cond, i16 5, i16 3\n+  %mul = mul i16 %shl, %sel\n+  ret i16 %mul\n+}\n+\n+; Only nuw on outer mul - no flag on result\n+define i16 @shl_select_nuw_only(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_nuw_only(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], i16 20, i16 12\n+; CHECK-NEXT:    [[MUL:%.*]] = mul i16 [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %shl = shl  i16 %x, 2\n+  %sel = select i1 %cond, i16 5, i16 3\n+  %mul = mul nuw i16 %shl, %sel\n+  ret i16 %mul\n+}\n+\n+\n+\n+; Both inner shl and outer mul carry nuw nsw \u2014  flags on result\n+define i16 @shl_select_both_nuw_nsw(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_both_nuw_nsw(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], i16 20, i16 12\n+; CHECK-NEXT:    [[MUL:%.*]] = mul nuw nsw i16 [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %shl = shl nuw nsw i16 %x, 2\n+  %sel = select i1 %cond, i16 5, i16 3\n+  %mul = mul nuw nsw i16 %shl, %sel\n+  ret i16 %mul\n+}\n+\n+\n+; Vector tests \u2014 splat\n+\n+; shl splat vector\n+define <4 x i16> @shl_select_vec_splat(<4 x i16> %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_vec_splat(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], <4 x i16> splat (i16 20), <4 x i16> splat (i16 12)\n+; CHECK-NEXT:    [[MUL:%.*]] = mul <4 x i16> [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret <4 x i16> [[MUL]]\n+;\n+  %shl = shl  <4 x i16> %x, <i16 2, i16 2, i16 2, i16 2>\n+  %sel = select i1 %cond,\n+  <4 x i16> <i16 5, i16 5, i16 5, i16 5>,\n+  <4 x i16> <i16 3, i16 3, i16 3, i16 3>\n+  %mul = mul  <4 x i16> %shl, %sel\n+  ret <4 x i16> %mul\n+}\n+\n+; mul splat vector\n+define <4 x i16> @mul_select_vec_splat(<4 x i16> %x, i1 %cond) {\n+; CHECK-LABEL: @mul_select_vec_splat(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], <4 x i16> splat (i16 12), <4 x i16> splat (i16 6)\n+; CHECK-NEXT:    [[MUL:%.*]] = mul <4 x i16> [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret <4 x i16> [[MUL]]\n+;\n+  %mul1 = mul  <4 x i16> %x, <i16 3, i16 3, i16 3, i16 3>\n+  %sel  = select i1 %cond,\n+  <4 x i16> <i16 4, i16 4, i16 4, i16 4>,\n+  <4 x i16> <i16 2, i16 2, i16 2, i16 2>\n+  %mul  = mul  <4 x i16> %mul1, %sel\n+  ret <4 x i16> %mul\n+}\n+\n+; splat with poison element\n+define <4 x i16> @shl_select_vector_with_poison(<4 x i16> %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_vector_with_poison(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], <4 x i16> <i16 20, i16 poison, i16 poison, i16 20>, <4 x i16> <i16 12, i16 poison, i16 poison, i16 12>\n+; CHECK-NEXT:    [[MUL:%.*]] = mul <4 x i16> [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret <4 x i16> [[MUL]]\n+;\n+  %shl = shl  <4 x i16> %x, <i16 2, i16 poison, i16 poison, i16 2>\n+  %sel = select i1 %cond,\n+  <4 x i16> <i16 5, i16 poison, i16 5, i16 5>,\n+  <4 x i16> <i16 3, i16 poison, i16 3, i16 3>\n+  %mul = mul  <4 x i16> %shl, %sel\n+  ret <4 x i16> %mul\n+}\n+\n+; non-splat vector\n+\n+define <4 x i16> @shl_select_vec_non_splat(<4 x i16> %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_vec_non_splat(\n+; CHECK-NEXT:    [[TMP1:%.*]] = select i1 [[COND:%.*]], <4 x i16> <i16 10, i16 12, i16 56, i16 16>, <4 x i16> <i16 4, i16 16, i16 48, i16 128>\n+; CHECK-NEXT:    [[MUL:%.*]] = mul <4 x i16> [[X:%.*]], [[TMP1]]\n+; CHECK-NEXT:    ret <4 x i16> [[MUL]]\n+;\n+  %shl = shl  <4 x i16> %x, <i16 1, i16 2, i16 3, i16 4>\n+  %sel = select i1 %cond,\n+  <4 x i16> <i16 5, i16 3, i16 7, i16 1>,\n+  <4 x i16> <i16 2, i16 4, i16 6, i16 8>\n+  %mul = mul  <4 x i16> %shl, %sel\n+  ret <4 x i16> %mul\n+}\n+\n+; Negative tests \u2014 transform should NOT fire\n+\n+declare void @use16(i16)\n+; shl has extra use\n+define i16 @shl_select_extra_use_shl(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_extra_use_shl(\n+; CHECK-NEXT:    [[SHL:%.*]] = shl nuw nsw i16 [[X:%.*]], 2\n+; CHECK-NEXT:    call void @use16(i16 [[SHL]])\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[COND:%.*]], i16 5, i16 3\n+; CHECK-NEXT:    [[MUL:%.*]] = mul nuw nsw i16 [[SHL]], [[SEL]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %shl = shl nuw nsw i16 %x, 2\n+  call void @use16(i16 %shl)\n+  %sel = select i1 %cond, i16 5, i16 3\n+  %mul = mul nuw nsw i16 %shl, %sel\n+  ret i16 %mul\n+}\n+\n+; select has extra use\n+define i16 @shl_select_extra_use_sel(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @shl_select_extra_use_sel(\n+; CHECK-NEXT:    [[SHL:%.*]] = shl nuw nsw i16 [[X:%.*]], 2\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[COND:%.*]], i16 5, i16 3\n+; CHECK-NEXT:    call void @use16(i16 [[SEL]])\n+; CHECK-NEXT:    [[MUL:%.*]] = mul nuw nsw i16 [[SHL]], [[SEL]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %shl = shl nuw nsw i16 %x, 2\n+  %sel = select i1 %cond, i16 5, i16 3\n+  call void @use16(i16 %sel)\n+  %mul = mul nuw nsw i16 %shl, %sel\n+  ret i16 %mul\n+}\n+\n+; inner mul has extra use\n+define i16 @mul_select_extra_use_mul(i16 %x, i1 %cond) {\n+; CHECK-LABEL: @mul_select_extra_use_mul(\n+; CHECK-NEXT:    [[MUL1:%.*]] = mul nuw nsw i16 [[X:%.*]], 3\n+; CHECK-NEXT:    call void @use16(i16 [[MUL1]])\n+; CHECK-NEXT:    [[SEL:%.*]] = select i1 [[COND:%.*]], i16 9, i16 5\n+; CHECK-NEXT:    [[MUL:%.*]] = mul nuw nsw i16 [[MUL1]], [[SEL]]\n+; CHECK-NEXT:    ret i16 [[MUL]]\n+;\n+  %mul1 = mul nuw nsw i16 %x, 3\n+  call void @use16(i16 %mul1)\n+  %sel  = select i1 %cond, i16 9, i16 5\n+  %mul  = mul nuw nsw i16 %mul1, %sel\n+  ret i16 %mul\n+}\n+\n+\n+\n !0 = !{!\"function_entry_count\", i64 1000}\n-;.\n+\n ; CHECK: attributes #[[ATTR0:[0-9]+]] = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n ; CHECK: attributes #[[ATTR1:[0-9]+]] = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n ; CHECK: attributes #[[ATTR2:[0-9]+]] = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n-;.\n ; CHECK: [[META0:![0-9]+]] = !{!\"function_entry_count\", i64 1000}\n ; CHECK: [[PROF1]] = !{!\"unknown\", !\"instcombine\"}\n-;.\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-11T04:40:27Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp": [
+      [
+        331,
+        336
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/mul.ll": [
+      [
+        1,
+        14
+      ],
+      [
+        359,
+        365
+      ],
+      [
+        2235,
+        2246
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineMulDivRem.cpp": [
+      "InstCombinerImpl::visitMul"
+    ]
+  }
+}

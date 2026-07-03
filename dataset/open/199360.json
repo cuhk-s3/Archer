@@ -1,0 +1,706 @@
+{
+  "pr_id": 199360,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/199360",
+  "state": "open",
+  "title": "[InstCombine] Don't shrink AND mask if it grows the immediate",
+  "author": "mygitljf",
+  "base_commit": "9d533e977eea1e1c0ee94515bc5dd0bd70d15d95",
+  "fix_commit": "ede31090cd736ef1cb4abf3533d227f1f311802c",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 83ea2d2932ac9..5aa3e04cf1f17 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -55,8 +55,14 @@ static bool ShrinkDemandedConstant(Instruction *I, unsigned OpNo,\n   if (C->isSubsetOf(Demanded))\n     return false;\n \n+  APInt NewC = *C & Demanded;\n+\n+  // Don't grow a sign-extendable 32-bit immediate into a wider one.\n+  if (C->isSignedIntN(32) && !NewC.isSignedIntN(32))\n+    return false;\n+\n   // This instruction is producing bits that are not demanded. Shrink the RHS.\n-  I->setOperand(OpNo, ConstantInt::get(Op->getType(), *C & Demanded));\n+  I->setOperand(OpNo, ConstantInt::get(Op->getType(), NewC));\n \n   return true;\n }\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "I added a guard: if the original constant fits a 32-bit sign-extended immediate but the new one doesn't, keep the original. For widths <= 32 this is a no-op. The same guard also covers the Add/Or/Xor/Sub callers.\r\nFixes #199095",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/cast.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S -data-layout=\"E-p:64:64:64-p1:32:32:32-p2:64:64:64-p3:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128-n8:16:32:64\"",
+        "opt < %s -passes=instcombine -S -data-layout=\"e-p:64:64:64-p1:32:32:32-p2:64:64:64-p3:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128-n8:16:32:64\"",
+        "opt < %s -passes=instcombine -S -data-layout=\"E-p:64:64:64-p1:32:32:32-p2:64:64:64-p3:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128-n8:16:32:64\" -use-constant-int-for-fixed-length-splat",
+        "opt < %s -passes=instcombine -S -data-layout=\"e-p:64:64:64-p1:32:32:32-p2:64:64:64-p3:64:64:64-a0:0:8-f32:32:32-f64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-v64:64:64-v128:128:128-n8:16:32:64\" -use-constant-int-for-fixed-length-splat"
+      ],
+      "tests": [
+        {
+          "test_name": "test50",
+          "test_body": "define i64 @test50(i64 %x) {\n  %a = lshr i64 %x, 2\n  %B = trunc i64 %a to i32\n  %D = add i32 %B, -1\n  %E = sext i32 %D to i64\n  ret i64 %E\n}\n"
+        },
+        {
+          "test_name": "test51",
+          "test_body": "define i64 @test51(i64 %A, i1 %cond) {\n  %B = trunc i64 %A to i32\n  %C = and i32 %B, -2\n  %D = or i32 %B, 1\n  %E = select i1 %cond, i32 %C, i32 %D\n  %F = sext i32 %E to i64\n  ret i64 %F\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "PR37005",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare void @blackhole(<2 x ptr>)\n\ndefine void @PR37005(ptr %base, ptr %in) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %e1 = getelementptr inbounds ptr, ptr %in, i64 undef\n  %e2 = getelementptr inbounds ptr, ptr %e1, i64 6\n  %e4 = getelementptr inbounds ptr, ptr %e2, <2 x i64> <i64 0, i64 1>\n  %pi1 = ptrtoint <2 x ptr> %e4 to <2 x i64>\n  %lr1 = lshr <2 x i64> %pi1, splat (i64 21)\n  %sl1 = shl nuw nsw <2 x i64> %lr1, splat (i64 7)\n  %e5 = getelementptr inbounds i8, ptr %base, <2 x i64> %sl1\n  %e6 = getelementptr inbounds i8, <2 x ptr> %e5, i64 80\n  call void @blackhole(<2 x ptr> %e6)\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "PR37005_2",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare void @blackhole(<2 x ptr>)\n\ndefine void @PR37005_2(ptr %base, ptr %in) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %e1 = getelementptr inbounds ptr, ptr %in, i64 undef\n  %e2 = getelementptr inbounds ptr, ptr %e1, i64 6\n  %pi1 = ptrtoint ptr %e2 to i64\n  %lr1 = lshr i64 %pi1, 21\n  %sl1 = shl nuw nsw i64 %lr1, 7\n  %e5 = getelementptr inbounds i8, ptr %base, i64 %sl1\n  %e6 = getelementptr inbounds i8, ptr %e5, <2 x i64> <i64 80, i64 60>\n  call void @blackhole(<2 x ptr> %e6)\n  br label %loop\n}\n"
+        },
+        {
+          "test_name": "PR37005_3",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare void @blackhole(<2 x ptr>)\n\ndefine void @PR37005_3(<2 x ptr> %base, ptr %in) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %e1 = getelementptr inbounds ptr, ptr %in, i64 undef\n  %e2 = getelementptr inbounds ptr, ptr %e1, i64 6\n  %e4 = getelementptr inbounds ptr, ptr %e2, <2 x i64> <i64 0, i64 1>\n  %pi1 = ptrtoint <2 x ptr> %e4 to <2 x i64>\n  %lr1 = lshr <2 x i64> %pi1, splat (i64 21)\n  %sl1 = shl nuw nsw <2 x i64> %lr1, splat (i64 7)\n  %e5 = getelementptr inbounds i8, <2 x ptr> %base, <2 x i64> %sl1\n  %e6 = getelementptr inbounds i8, <2 x ptr> %e5, i64 80\n  call void @blackhole(<2 x ptr> %e6)\n  br label %loop\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/pr199095.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "pr199095_align16",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i64 @pr199095_align16(i64 %x) {\n  %nn = icmp sge i64 %x, 0\n  tail call void @llvm.assume(i1 %nn)\n  %r = and i64 %x, -16\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "pr199095_align4",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i64 @pr199095_align4(i64 %x) {\n  %nn = icmp sge i64 %x, 0\n  tail call void @llvm.assume(i1 %nn)\n  %r = and i64 %x, -4\n  ret i64 %r\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "pr199095_vector",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine <2 x i64> @pr199095_vector(<2 x i64> %x) {\n  %nn = icmp sge <2 x i64> %x, zeroinitializer\n  %nn0 = extractelement <2 x i1> %nn, i64 0\n  tail call void @llvm.assume(i1 %nn0)\n  %nn1 = extractelement <2 x i1> %nn, i64 1\n  tail call void @llvm.assume(i1 %nn1)\n  %r = and <2 x i64> %x, splat (i64 -4)\n  ret <2 x i64> %r\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopUnroll/runtime-unroll-remainder.ll",
+      "commands": [
+        "opt < %s -S -passes=loop-unroll,instcombine -unroll-runtime=true -unroll-count=4 -unroll-remainder"
+      ],
+      "tests": [
+        {
+          "test_name": "unroll",
+          "test_body": "define i32 @unroll(ptr readonly captures(none) %a, ptr readonly captures(none) %b, i32 %N) local_unnamed_addr {\nentry:\n  %cmp9 = icmp eq i32 %N, 0\n  br i1 %cmp9, label %for.cond.cleanup, label %for.body.lr.ph\n\nfor.body.lr.ph:                                   ; preds = %entry\n  %wide.trip.count = zext i32 %N to i64\n  br label %for.body\n\nfor.cond.cleanup:                                 ; preds = %for.body, %entry\n  %c.0.lcssa = phi i32 [ 0, %entry ], [ %add, %for.body ]\n  ret i32 %c.0.lcssa\n\nfor.body:                                         ; preds = %for.body, %for.body.lr.ph\n  %indvars.iv = phi i64 [ 0, %for.body.lr.ph ], [ %indvars.iv.next, %for.body ]\n  %c.010 = phi i32 [ 0, %for.body.lr.ph ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds i32, ptr %a, i64 %indvars.iv\n  %0 = load i32, ptr %arrayidx, align 4\n  %arrayidx2 = getelementptr inbounds i32, ptr %b, i64 %indvars.iv\n  %1 = load i32, ptr %arrayidx2, align 4\n  %mul = mul nsw i32 %1, %0\n  %add = add nsw i32 %mul, %c.010\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond = icmp eq i64 %indvars.iv.next, %wide.trip.count\n  br i1 %exitcond, label %for.cond.cleanup, label %for.body\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll",
+      "commands": [
+        "opt -mcpu=skx -S -passes='loop-vectorize,instcombine,loop-mssa(licm)' -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses -tail-folding-policy=must-fold-tail < %s",
+        "opt -mcpu=skx -S -passes='loop-vectorize,instcombine,loop-mssa(licm)' -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses  -enable-masked-interleaved-mem-accesses -tail-folding-policy=must-fold-tail < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test2",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine void @test2(ptr noalias captures(none) %points, i32 %numPoints, ptr noalias readonly captures(none) %x, ptr noalias readonly captures(none) %y) {\nentry:\n  %cmp15 = icmp sgt i32 %numPoints, 0\n  br i1 %cmp15, label %for.body.preheader, label %for.end\n\nfor.body.preheader:                               ; preds = %entry\n  %wide.trip.count = zext i32 %numPoints to i64\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %indvars.iv = phi i64 [ 0, %for.body.preheader ], [ %indvars.iv.next, %for.body ]\n  %arrayidx = getelementptr inbounds i16, ptr %x, i64 %indvars.iv\n  %0 = load i16, ptr %arrayidx, align 2\n  %1 = shl nsw i64 %indvars.iv, 2\n  %arrayidx2 = getelementptr inbounds i16, ptr %points, i64 %1\n  store i16 %0, ptr %arrayidx2, align 2\n  %arrayidx4 = getelementptr inbounds i16, ptr %y, i64 %indvars.iv\n  %2 = load i16, ptr %arrayidx4, align 2\n  %3 = or disjoint i64 %1, 1\n  %arrayidx7 = getelementptr inbounds i16, ptr %points, i64 %3\n  store i16 %2, ptr %arrayidx7, align 2\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond.not = icmp eq i64 %indvars.iv.next, %wide.trip.count\n  br i1 %exitcond.not, label %for.end.loopexit, label %for.body\n\nfor.end.loopexit:                                 ; preds = %for.body\n  br label %for.end\n\nfor.end:                                          ; preds = %for.end.loopexit, %entry\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/float-induction.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=1 -force-vector-width=4 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=2 -force-vector-width=4 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=2 -force-vector-width=1 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=1 -force-vector-width=2 -keep-loops=false -S"
+      ],
+      "tests": [
+        {
+          "test_name": "non_primary_iv_float_scalar",
+          "test_body": "define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.inc, %entry\n  %i = phi i64 [ %i.next, %for.inc ], [ 0, %entry ]\n  %j = phi float [ %j.next, %for.inc ], [ 0.000000e+00, %entry ]\n  %var0 = getelementptr inbounds float, ptr %A, i64 %i\n  %var1 = load float, ptr %var0, align 4\n  %var2 = fcmp fast oeq float %var1, 0.000000e+00\n  br i1 %var2, label %if.pred, label %for.inc\n\nif.pred:                                          ; preds = %for.body\n  store float %j, ptr %var0, align 4\n  br label %for.inc\n\nfor.inc:                                          ; preds = %if.pred, %for.body\n  %i.next = add nuw nsw i64 %i, 1\n  %j.next = fadd fast float %j, 1.000000e+00\n  %cond = icmp slt i64 %i.next, %N\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.inc\n  ret void\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "fp_iv_used_in_gep_fsub",
+          "test_body": "define void @fp_iv_used_in_gep_fsub(float %init, ptr noalias captures(none) %A, float %fpinc, i32 %N) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %x.05 = phi float [ %init, %entry ], [ %add, %for.body ]\n  %c = fptoui float %x.05 to i32\n  %arrayidx = getelementptr inbounds float, ptr %A, i32 %c\n  store float %x.05, ptr %arrayidx, align 4\n  %add = fsub fast float %x.05, %fpinc\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %lftr.wideiv = trunc i64 %indvars.iv.next to i32\n  %exitcond = icmp eq i32 %lftr.wideiv, %N\n  br i1 %exitcond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "fp_iv_used_in_gep_fadd",
+          "test_body": "define void @fp_iv_used_in_gep_fadd(float %init, ptr noalias captures(none) %A, float %fpinc, i32 %N) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %x.05 = phi float [ %init, %entry ], [ %add, %for.body ]\n  %c = fptoui float %x.05 to i32\n  %arrayidx = getelementptr inbounds float, ptr %A, i32 %c\n  store float %x.05, ptr %arrayidx, align 4\n  %add = fadd fast float %x.05, %fpinc\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %lftr.wideiv = trunc i64 %indvars.iv.next to i32\n  %exitcond = icmp eq i32 %lftr.wideiv, %N\n  br i1 %exitcond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        },
+        {
+          "test_name": "fp_iv_loop3",
+          "test_body": "@fp_inc = external global float, align 4\n\ndefine void @fp_iv_loop3(float %init, ptr noalias captures(none) %A, ptr noalias captures(none) %B, ptr noalias captures(none) %C, i32 %N) {\nentry:\n  %cmp9 = icmp sgt i32 %N, 0\n  br i1 %cmp9, label %for.body.lr.ph, label %for.end\n\nfor.body.lr.ph:                                   ; preds = %entry\n  %0 = load float, ptr @fp_inc, align 4\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.lr.ph\n  %indvars.iv = phi i64 [ 0, %for.body.lr.ph ], [ %indvars.iv.next, %for.body ]\n  %y.012 = phi float [ 1.000000e-01, %for.body.lr.ph ], [ %conv1, %for.body ]\n  %x.011 = phi float [ %init, %for.body.lr.ph ], [ %add, %for.body ]\n  %arrayidx = getelementptr inbounds float, ptr %A, i64 %indvars.iv\n  store float %x.011, ptr %arrayidx, align 4\n  %add = fadd fast float %x.011, %0\n  %conv1 = fadd fast float %y.012, -5.000000e-01\n  %add2 = fadd fast float %conv1, %add\n  %arrayidx4 = getelementptr inbounds float, ptr %B, i64 %indvars.iv\n  store float %add2, ptr %arrayidx4, align 4\n  %arrayidx6 = getelementptr inbounds float, ptr %C, i64 %indvars.iv\n  store float %conv1, ptr %arrayidx6, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %lftr.wideiv = trunc i64 %indvars.iv.next to i32\n  %exitcond = icmp eq i32 %lftr.wideiv, %N\n  br i1 %exitcond, label %for.end.loopexit, label %for.body\n\nfor.end.loopexit:                                 ; preds = %for.body\n  br label %for.end\n\nfor.end:                                          ; preds = %for.end.loopexit, %entry\n  ret void\n}\n\n!llvm.module.flags = !{!0}\n\n!0 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/if-conversion.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,dce,instcombine -force-vector-interleave=1 -force-vector-width=4 -enable-if-conversion -S"
+      ],
+      "tests": [
+        {
+          "test_name": "function0",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @function0(ptr captures(none) %a, ptr captures(none) %b, i32 %start, i32 %end) {\nentry:\n  %cmp16 = icmp slt i32 %start, %end\n  br i1 %cmp16, label %for.body.lr.ph, label %for.end\n\nfor.body.lr.ph:                                   ; preds = %entry\n  %0 = sext i32 %start to i64\n  br label %for.body\n\nfor.body:                                         ; preds = %if.end, %for.body.lr.ph\n  %indvars.iv = phi i64 [ %0, %for.body.lr.ph ], [ %indvars.iv.next, %if.end ]\n  %arrayidx = getelementptr inbounds i32, ptr %a, i64 %indvars.iv\n  %1 = load i32, ptr %arrayidx, align 4\n  %arrayidx4 = getelementptr inbounds i32, ptr %b, i64 %indvars.iv\n  %2 = load i32, ptr %arrayidx4, align 4\n  %cmp5 = icmp sgt i32 %1, %2\n  br i1 %cmp5, label %if.then, label %if.end\n\nif.then:                                          ; preds = %for.body\n  %mul = mul i32 %1, 5\n  %add = add i32 %mul, 3\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %for.body\n  %k.0 = phi i32 [ %add, %if.then ], [ %1, %for.body ]\n  store i32 %k.0, ptr %arrayidx, align 4\n  %indvars.iv.next = add i64 %indvars.iv, 1\n  %3 = trunc i64 %indvars.iv.next to i32\n  %cmp = icmp slt i32 %3, %end\n  br i1 %cmp, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %if.end, %entry\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/induction.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=1 -force-vector-width=2 -force-widen-divrem-via-masked-intrinsic=0 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=1 -force-vector-width=2 -force-widen-divrem-via-masked-intrinsic=0 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=2 -force-vector-width=2 -force-widen-divrem-via-masked-intrinsic=0 -S",
+        "opt < %s -passes=loop-vectorize -force-vector-interleave=2 -force-vector-width=2 -force-widen-divrem-via-masked-intrinsic=0 -S",
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-interleave=2 -force-vector-width=4 -force-widen-divrem-via-masked-intrinsic=0 -enable-interleaved-mem-accesses -S"
+      ],
+      "tests": [
+        {
+          "test_name": "multi_int_induction",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @multi_int_induction(ptr %A, i32 %N) {\nfor.body.lr.ph:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.lr.ph\n  %indvars.iv = phi i64 [ 0, %for.body.lr.ph ], [ %indvars.iv.next, %for.body ]\n  %count.09 = phi i32 [ 190, %for.body.lr.ph ], [ %inc, %for.body ]\n  %arrayidx2 = getelementptr inbounds i32, ptr %A, i64 %indvars.iv\n  store i32 %count.09, ptr %arrayidx2, align 4\n  %inc = add nsw i32 %count.09, 1\n  %indvars.iv.next = add i64 %indvars.iv, 1\n  %lftr.wideiv = trunc i64 %indvars.iv.next to i32\n  %exitcond = icmp ne i32 %lftr.wideiv, %N\n  br i1 %exitcond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "iv_vector_and_scalar_users",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\n%pair.i16 = type { i16, i16 }\n\ndefine void @iv_vector_and_scalar_users(ptr %p, i32 %a, i32 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %0 = trunc i64 %i to i32\n  %1 = add i32 %a, %0\n  %2 = trunc i32 %1 to i16\n  %3 = getelementptr inbounds %pair.i16, ptr %p, i64 %i, i32 1\n  store i16 %2, ptr %3, align 2\n  %i.next = add nuw nsw i64 %i, 1\n  %4 = trunc i64 %i.next to i32\n  %cond = icmp eq i32 %4, %n\n  br i1 %cond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "trunciv",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @trunciv(ptr captures(none) %a, i32 %start, i64 %k) {\nfor.body.preheader:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %for.body.preheader\n  %indvars.iv = phi i64 [ %indvars.iv.next, %for.body ], [ 0, %for.body.preheader ]\n  %trunc.iv = trunc i64 %indvars.iv to i32\n  %arrayidx = getelementptr inbounds i32, ptr %a, i32 %trunc.iv\n  store i32 %trunc.iv, ptr %arrayidx, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %exitcond = icmp eq i64 %indvars.iv.next, %k\n  br i1 %exitcond, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "scalarize_induction_variable_04",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\n%pair.i32 = type { i32, i32 }\n\ndefine void @scalarize_induction_variable_04(ptr %a, ptr %p, i32 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %0 = shl nsw i64 %i, 2\n  %1 = getelementptr inbounds i32, ptr %a, i64 %0\n  %2 = load i32, ptr %1, align 1\n  %3 = getelementptr inbounds %pair.i32, ptr %p, i64 %i, i32 1\n  store i32 %2, ptr %3, align 1\n  %i.next = add nuw nsw i64 %i, 1\n  %4 = trunc i64 %i.next to i32\n  %cond = icmp eq i32 %4, %n\n  br i1 %cond, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "scalarize_induction_variable_02",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine float @scalarize_induction_variable_02(ptr %a, ptr %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ 0, %entry ], [ %i.next, %for.body ]\n  %s = phi float [ 0.000000e+00, %entry ], [ %6, %for.body ]\n  %0 = getelementptr inbounds float, ptr %a, i64 %i\n  %1 = load float, ptr %0, align 4\n  %2 = getelementptr inbounds float, ptr %b, i64 %i\n  %3 = load float, ptr %2, align 4\n  %4 = fadd fast float %s, 1.000000e+00\n  %5 = fadd fast float %4, %1\n  %6 = fadd fast float %5, %3\n  %i.next = add nuw nsw i64 %i, 8\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  %s.lcssa = phi float [ %6, %for.body ]\n  ret float %s.lcssa\n}\n"
+        },
+        {
+          "test_name": "non_primary_iv_trunc",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @non_primary_iv_trunc(ptr %a, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %j = phi i64 [ %j.next, %for.body ], [ 0, %entry ]\n  %var0 = getelementptr inbounds i32, ptr %a, i64 %i\n  %var1 = trunc i64 %j to i32\n  store i32 %var1, ptr %var0, align 4\n  %i.next = add nuw nsw i64 %i, 1\n  %j.next = add nuw nsw i64 %j, 2\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "scalarize_induction_variable_03",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\n%pair.i32 = type { i32, i32 }\n\ndefine void @scalarize_induction_variable_03(ptr %p, i32 %y, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %f = getelementptr inbounds %pair.i32, ptr %p, i64 %i, i32 1\n  %0 = load i32, ptr %f, align 8\n  %1 = xor i32 %0, %y\n  store i32 %1, ptr %f, align 8\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "scalarize_induction_variable_01",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine i64 @scalarize_induction_variable_01(ptr %a, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %sum = phi i64 [ %2, %for.body ], [ 0, %entry ]\n  %0 = getelementptr inbounds i64, ptr %a, i64 %i\n  %1 = load i64, ptr %0, align 8\n  %2 = add i64 %1, %sum\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  %3 = phi i64 [ %2, %for.body ]\n  ret i64 %3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/interleaved-accesses.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize,instcombine -force-vector-width=4 -force-vector-interleave=1 -enable-interleaved-mem-accesses=true -runtime-memory-check-threshold=24 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "PR27626_5",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @PR27626_5(ptr %a, i32 %x, i32 %y, i32 %z, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 3, %entry ]\n  %i_minus_1 = sub i64 %i, 1\n  %i_minus_3 = sub i64 %i_minus_1, 2\n  %a_i = getelementptr inbounds i32, ptr %a, i64 %i\n  %a_i_minus_1 = getelementptr inbounds i32, ptr %a, i64 %i_minus_1\n  %a_i_minus_3 = getelementptr inbounds i32, ptr %a, i64 %i_minus_3\n  store i32 %x, ptr %a_i_minus_1, align 4\n  store i32 %y, ptr %a_i_minus_3, align 4\n  store i32 %z, ptr %a_i, align 4\n  %i.next = add nuw nsw i64 %i, 2\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "PR27626_4",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @PR27626_4(ptr %a, i32 %x, i32 %y, i32 %z, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %i_plus_1 = add i64 %i, 1\n  %a_i = getelementptr inbounds i32, ptr %a, i64 %i\n  %a_i_plus_1 = getelementptr inbounds i32, ptr %a, i64 %i_plus_1\n  store i32 %x, ptr %a_i, align 4\n  store i32 %y, ptr %a_i, align 4\n  store i32 %z, ptr %a_i_plus_1, align 4\n  %i.next = add nuw nsw i64 %i, 2\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/invariant-store-vectorization-2.ll",
+      "commands": [
+        "opt < %s -aa-pipeline=basic-aa -passes='loop-mssa(licm),loop-vectorize,instcombine,loop-mssa(licm)' -force-vector-width=4 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "variant_val_store_to_inv_address",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine i32 @variant_val_store_to_inv_address(ptr %a, i64 %n, ptr %b, i32 %k) {\nentry:\n  %ntrunc = trunc i64 %n to i32\n  %cmp = icmp eq i32 %ntrunc, %k\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %i0 = phi i32 [ %i3, %for.body ], [ 0, %entry ]\n  %i1 = getelementptr inbounds i32, ptr %b, i64 %i\n  %i2 = load i32, ptr %i1, align 8\n  store i32 %i2, ptr %a, align 4\n  %i3 = add i32 %i0, %i2\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  %rdx.lcssa = phi i32 [ %i3, %for.body ]\n  ret i32 %rdx.lcssa\n}\n"
+        },
+        {
+          "test_name": "inv_val_store_to_inv_address_conditional_inv",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @inv_val_store_to_inv_address_conditional_inv(ptr %a, i64 %n, ptr %b, i32 %k) {\nentry:\n  %ntrunc = trunc i64 %n to i32\n  %cmp = icmp eq i32 %ntrunc, %k\n  br label %for.body\n\nfor.body:                                         ; preds = %latch, %entry\n  %i = phi i64 [ %i.next, %latch ], [ 0, %entry ]\n  %i1 = getelementptr inbounds i32, ptr %b, i64 %i\n  %i2 = load i32, ptr %i1, align 8\n  store i32 %ntrunc, ptr %i1, align 4\n  br i1 %cmp, label %cond_store, label %cond_store_k\n\ncond_store:                                       ; preds = %for.body\n  br label %latch\n\ncond_store_k:                                     ; preds = %for.body\n  br label %latch\n\nlatch:                                            ; preds = %cond_store_k, %cond_store\n  %storeval = phi i32 [ %ntrunc, %cond_store ], [ %k, %cond_store_k ]\n  store i32 %storeval, ptr %a, align 4\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %latch\n  ret void\n}\n"
+        },
+        {
+          "test_name": "inv_val_store_to_inv_address_conditional_diff_values_ic",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @inv_val_store_to_inv_address_conditional_diff_values_ic(ptr %a, i64 %n, ptr %b, i32 %k) {\nentry:\n  %ntrunc = trunc i64 %n to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %latch, %entry\n  %i = phi i64 [ %i.next, %latch ], [ 0, %entry ]\n  %i1 = getelementptr inbounds i32, ptr %b, i64 %i\n  %i2 = load i32, ptr %i1, align 8\n  %cmp = icmp eq i32 %i2, %k\n  store i32 %ntrunc, ptr %i1, align 4\n  br i1 %cmp, label %cond_store, label %cond_store_k\n\ncond_store:                                       ; preds = %for.body\n  br label %latch\n\ncond_store_k:                                     ; preds = %for.body\n  br label %latch\n\nlatch:                                            ; preds = %cond_store_k, %cond_store\n  %storeval = phi i32 [ %ntrunc, %cond_store ], [ %k, %cond_store_k ]\n  store i32 %storeval, ptr %a, align 4\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %latch\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/invariant-store-vectorization.ll",
+      "commands": [
+        "opt < %s -aa-pipeline=basic-aa -passes='loop-mssa(licm),loop-vectorize,instcombine,loop-mssa(licm)' -force-vector-width=4 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "inv_val_store_to_inv_address",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @inv_val_store_to_inv_address(ptr %a, i64 %n, ptr %b) {\nentry:\n  %ntrunc = trunc i64 %n to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %i1 = getelementptr inbounds i32, ptr %b, i64 %i\n  %i2 = load i32, ptr %i1, align 8\n  store i32 %ntrunc, ptr %a, align 4\n  store i32 %ntrunc, ptr %i1, align 4\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "inv_val_store_to_inv_address_conditional",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @inv_val_store_to_inv_address_conditional(ptr %a, i64 %n, ptr %b, i32 %k) {\nentry:\n  %ntrunc = trunc i64 %n to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %latch, %entry\n  %i = phi i64 [ %i.next, %latch ], [ 0, %entry ]\n  %i1 = getelementptr inbounds i32, ptr %b, i64 %i\n  %i2 = load i32, ptr %i1, align 8\n  %cmp = icmp eq i32 %i2, %k\n  store i32 %ntrunc, ptr %i1, align 4\n  br i1 %cmp, label %cond_store, label %latch\n\ncond_store:                                       ; preds = %for.body\n  store i32 %ntrunc, ptr %a, align 4\n  br label %latch\n\nlatch:                                            ; preds = %cond_store, %for.body\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %latch\n  ret void\n}\n"
+        },
+        {
+          "test_name": "multiple_uniform_stores",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine void @multiple_uniform_stores(ptr captures(none) %var1, ptr readonly captures(none) %var2, i32 %itr) {\nentry:\n  %cmp20 = icmp eq i32 %itr, 0\n  br i1 %cmp20, label %for.end10, label %for.cond1.preheader\n\nfor.cond1.preheader:                              ; preds = %for.inc8, %entry\n  %indvars.iv23 = phi i64 [ %indvars.iv.next24, %for.inc8 ], [ 0, %entry ]\n  %j.022 = phi i32 [ %j.1.lcssa, %for.inc8 ], [ 0, %entry ]\n  %cmp218 = icmp ult i32 %j.022, %itr\n  br i1 %cmp218, label %for.body3.lr.ph, label %for.inc8\n\nfor.body3.lr.ph:                                  ; preds = %for.cond1.preheader\n  %arrayidx5 = getelementptr inbounds i32, ptr %var1, i64 %indvars.iv23\n  %0 = zext i32 %j.022 to i64\n  br label %for.body3\n\nfor.body3:                                        ; preds = %for.body3, %for.body3.lr.ph\n  %indvars.iv = phi i64 [ %0, %for.body3.lr.ph ], [ %indvars.iv.next, %for.body3 ]\n  %arrayidx = getelementptr inbounds i32, ptr %var2, i64 %indvars.iv\n  %1 = load i32, ptr %arrayidx, align 4\n  %2 = load i32, ptr %arrayidx5, align 4\n  %add = add nsw i32 %2, %1\n  store i32 %add, ptr %arrayidx5, align 4\n  %3 = load i32, ptr %arrayidx5, align 4\n  %4 = add nsw i32 %3, 1\n  store i32 %4, ptr %arrayidx5, align 4\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1\n  %lftr.wideiv = trunc i64 %indvars.iv.next to i32\n  %exitcond = icmp eq i32 %lftr.wideiv, %itr\n  br i1 %exitcond, label %for.inc8, label %for.body3\n\nfor.inc8:                                         ; preds = %for.body3, %for.cond1.preheader\n  %j.1.lcssa = phi i32 [ %j.022, %for.cond1.preheader ], [ %itr, %for.body3 ]\n  %indvars.iv.next24 = add nuw nsw i64 %indvars.iv23, 1\n  %lftr.wideiv25 = trunc i64 %indvars.iv.next24 to i32\n  %exitcond26 = icmp eq i32 %lftr.wideiv25, %itr\n  br i1 %exitcond26, label %for.end10, label %for.cond1.preheader\n\nfor.end10:                                        ; preds = %for.inc8, %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "inv_val_store_to_inv_address_with_reduction",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128\"\n\ndefine i32 @inv_val_store_to_inv_address_with_reduction(ptr %a, i64 %n, ptr %b) {\nentry:\n  %ntrunc = trunc i64 %n to i32\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %i0 = phi i32 [ %i3, %for.body ], [ 0, %entry ]\n  %i1 = getelementptr inbounds i32, ptr %b, i64 %i\n  %i2 = load i32, ptr %i1, align 8\n  %i3 = add i32 %i0, %i2\n  store i32 %ntrunc, ptr %a, align 4\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  %i4 = phi i32 [ %i3, %for.body ]\n  ret i32 %i4\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/loop-scalars.ll",
+      "commands": [
+        "opt < %s -aa-pipeline=basic-aa -passes=loop-vectorize,instcombine -force-vector-width=2 -force-vector-interleave=1 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "vector_gep",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @vector_gep(ptr %a, ptr %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %var0 = getelementptr inbounds i32, ptr %b, i64 %i\n  %var1 = getelementptr inbounds ptr, ptr %a, i64 %i\n  store ptr %var0, ptr %var1, align 8\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "no_gep_or_bitcast",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @no_gep_or_bitcast(ptr noalias %a, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %var0 = getelementptr inbounds ptr, ptr %a, i64 %i\n  %var1 = load ptr, ptr %var0, align 8\n  store i32 0, ptr %var1, align 8\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "scalar_store",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @scalar_store(ptr %a, ptr %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %var0 = getelementptr inbounds i32, ptr %b, i64 %i\n  %var1 = getelementptr inbounds ptr, ptr %a, i64 %i\n  store ptr %var0, ptr %var1, align 8\n  %i.next = add nuw nsw i64 %i, 2\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "expansion",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @expansion(ptr %a, ptr %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %var0 = getelementptr inbounds i64, ptr %b, i64 %i\n  %var3 = getelementptr inbounds ptr, ptr %a, i64 %i\n  store ptr %var0, ptr %var3, align 8\n  %i.next = add nuw nsw i64 %i, 2\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/vector-geps.ll",
+      "commands": [
+        "opt < %s -passes=loop-vectorize,instcombine -force-vector-width=4 -force-vector-interleave=1 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "vector_gep_stored",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @vector_gep_stored(ptr %a, ptr %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %var0 = getelementptr inbounds i32, ptr %b, i64 %i\n  %var1 = getelementptr inbounds ptr, ptr %a, i64 %i\n  store ptr %var0, ptr %var1, align 8\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        },
+        {
+          "test_name": "uniform_vector_gep_stored",
+          "test_body": "target datalayout = \"e-m:e-i64:64-i128:128-n32:64-S128\"\n\ndefine void @uniform_vector_gep_stored(ptr %a, ptr %b, i64 %n) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %i = phi i64 [ %i.next, %for.body ], [ 0, %entry ]\n  %var0 = getelementptr inbounds i32, ptr %b, i64 1\n  %var1 = getelementptr inbounds ptr, ptr %a, i64 %i\n  store ptr %var0, ptr %var1, align 8\n  %i.next = add nuw nsw i64 %i, 1\n  %cond = icmp slt i64 %i.next, %n\n  br i1 %cond, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/X86/pr48844-br-to-switch-vectorization.ll",
+      "commands": [
+        "opt -S -passes=\"default<O2>\" -mattr=avx < %s",
+        "opt -S -passes=\"default<O2>\" -mattr=avx2 < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine dso_local void @test(ptr %start, ptr %end) {\nentry:\n  br label %header\n\nheader:                                           ; preds = %latch, %entry\n  %ptr = phi ptr [ %start, %entry ], [ %ptr.next, %latch ]\n  %i11 = icmp ne ptr %ptr, %end\n  br i1 %i11, label %bb12, label %exit\n\nbb12:                                             ; preds = %header\n  %val = load i32, ptr %ptr, align 4\n  %c1 = icmp eq i32 %val, 13\n  %c2 = icmp eq i32 %val, -12\n  %c3 = or i1 %c1, %c2\n  br i1 %c3, label %store, label %latch\n\nstore:                                            ; preds = %bb12\n  store i32 42, ptr %ptr, align 4\n  br label %latch\n\nlatch:                                            ; preds = %store, %bb12\n  %ptr.next = getelementptr inbounds i32, ptr %ptr, i32 1\n  br label %header\n\nexit:                                             ; preds = %header\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nHello @mygitljf :wave:\n\nThank you for submitting a Pull Request (PR) to the LLVM Project. Since this is your first PR, here are a few useful links covering our main contribution policies and review practices.\n\n* All contributions to LLVM must follow our [LLVM AI Tool Use Policy](https://llvm.org/docs/AIToolPolicy.html). In particular, if you used AI while working on this PR, remember to add a note to the PR description.\n* The [LLVM Code-Review Policy and Practices](https://llvm.org/docs/CodeReview.html) document contains practical information about the PR process, including how patches are reviewed and accepted, and who can review a PR.\n* Our [LLVM Developer Policy](https://llvm.org/docs/DeveloperPolicy.html) describes our expectations for code quality, commit summaries and contains notes on our CI system.\n\nPlease reply to this message to confirm that you have read these policies, especially the LLVM AI Tool Use Policy, and that any AI tool usage has been noted in the PR description.\n\n---\n\n### Frequently asked questions\n\n**How do I add reviewers?**\n\nThis PR will be automatically labeled, and the relevant teams will be notified. For some parts of the project, reviewers may also be added automatically.\n\nYou can also add reviewers manually using the **Reviewers** section on this page. If you cannot use that section, it is probably because you do not have write permissions for the repository. In that case, you can request a review by tagging reviewers in a comment using `@` followed by their GitHub username.\n\n**What if there are no comments?**\n\nIf you have not received any comments on your PR after a week, you can request a review by pinging the PR with a comment such as \u201cPing\u201d. The common courtesy ping rate is once a week. Please remember that you are asking for volunteer time from other developers.\n\n**Are any special GitHub settings required to contribute to LLVM?**\n\nWe only require contributors to have a public email address associated with their GitHub commits, see this [section](https://llvm.org/docs/DeveloperPolicy.html#email-addresses) of LLVM Developer Policy for details.\n\n---\n\nIf you have questions, feel free to leave a comment on this PR, or ask on [LLVM Discord](https://discord.com/invite/xS7Z362) or [LLVM Discourse](https://discourse.llvm.org/).\n\nThank you,\nThe LLVM Community"
+    },
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: mygitljf\n\n<details>\n<summary>Changes</summary>\n\nI added a guard: if the original constant fits a 32-bit sign-extended immediate but the new one doesn't, keep the original. For widths &lt;= 32 this is a no-op. The same guard also covers the Add/Or/Xor/Sub callers.\r\nFixes #<!-- -->199095\n\n---\n\nPatch is 67.70 KiB, truncated to 20.00 KiB below, full version: https://github.com/llvm/llvm-project/pull/199360.diff\n\n\n15 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp (+7-1) \n- (modified) llvm/test/Transforms/InstCombine/cast.ll (+2-2) \n- (modified) llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll (+3-3) \n- (added) llvm/test/Transforms/InstCombine/pr199095.ll (+59) \n- (modified) llvm/test/Transforms/LoopUnroll/runtime-unroll-remainder.ll (+1-1) \n- (modified) llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll (+2-2) \n- (modified) llvm/test/Transforms/LoopVectorize/float-induction.ll (+26-26) \n- (modified) llvm/test/Transforms/LoopVectorize/if-conversion.ll (+1-1) \n- (modified) llvm/test/Transforms/LoopVectorize/induction.ll (+36-36) \n- (modified) llvm/test/Transforms/LoopVectorize/interleaved-accesses.ll (+2-2) \n- (modified) llvm/test/Transforms/LoopVectorize/invariant-store-vectorization-2.ll (+6-6) \n- (modified) llvm/test/Transforms/LoopVectorize/invariant-store-vectorization.ll (+7-7) \n- (modified) llvm/test/Transforms/LoopVectorize/loop-scalars.ll (+7-7) \n- (modified) llvm/test/Transforms/LoopVectorize/vector-geps.ll (+5-5) \n- (modified) llvm/test/Transforms/PhaseOrdering/X86/pr48844-br-to-switch-vectorization.ll (+2-2) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\nindex 83ea2d2932ac9..5aa3e04cf1f17 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp\n@@ -55,8 +55,14 @@ static bool ShrinkDemandedConstant(Instruction *I, unsigned OpNo,\n   if (C->isSubsetOf(Demanded))\n     return false;\n \n+  APInt NewC = *C & Demanded;\n+\n+  // Don't grow a sign-extendable 32-bit immediate into a wider one.\n+  if (C->isSignedIntN(32) && !NewC.isSignedIntN(32))\n+    return false;\n+\n   // This instruction is producing bits that are not demanded. Shrink the RHS.\n-  I->setOperand(OpNo, ConstantInt::get(Op->getType(), *C & Demanded));\n+  I->setOperand(OpNo, ConstantInt::get(Op->getType(), NewC));\n \n   return true;\n }\ndiff --git a/llvm/test/Transforms/InstCombine/cast.ll b/llvm/test/Transforms/InstCombine/cast.ll\nindex 8fdf9033b4e4a..d37de82997a96 100644\n--- a/llvm/test/Transforms/InstCombine/cast.ll\n+++ b/llvm/test/Transforms/InstCombine/cast.ll\n@@ -688,11 +688,11 @@ define i64 @test50(i64 %x) {\n \n define i64 @test51(i64 %A, i1 %cond) {\n ; ALL-LABEL: @test51(\n-; ALL-NEXT:    [[C:%.*]] = and i64 [[A:%.*]], 4294967294\n+; ALL-NEXT:    [[C:%.*]] = and i64 [[A:%.*]], -2\n ; ALL-NEXT:    [[NOT_COND:%.*]] = xor i1 [[COND:%.*]], true\n ; ALL-NEXT:    [[MASKSEL:%.*]] = zext i1 [[NOT_COND]] to i64\n ; ALL-NEXT:    [[E:%.*]] = or disjoint i64 [[C]], [[MASKSEL]]\n-; ALL-NEXT:    [[SEXT:%.*]] = shl nuw i64 [[E]], 32\n+; ALL-NEXT:    [[SEXT:%.*]] = shl i64 [[E]], 32\n ; ALL-NEXT:    [[F:%.*]] = ashr exact i64 [[SEXT]], 32\n ; ALL-NEXT:    ret i64 [[F]]\n ;\ndiff --git a/llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll b/llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll\nindex 081ba679bf53e..8a4c45a882423 100644\n--- a/llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll\n+++ b/llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll\n@@ -98,7 +98,7 @@ define void @PR37005(ptr %base, ptr %in) {\n ; CHECK-NEXT:    [[E4:%.*]] = getelementptr inbounds [8 x i8], ptr [[E2]], <2 x i64> <i64 0, i64 1>\n ; CHECK-NEXT:    [[PI1:%.*]] = ptrtoint <2 x ptr> [[E4]] to <2 x i64>\n ; CHECK-NEXT:    [[TMP0:%.*]] = lshr <2 x i64> [[PI1]], splat (i64 14)\n-; CHECK-NEXT:    [[SL1:%.*]] = and <2 x i64> [[TMP0]], splat (i64 1125899906842496)\n+; CHECK-NEXT:    [[SL1:%.*]] = and <2 x i64> [[TMP0]], splat (i64 -128)\n ; CHECK-NEXT:    [[E5:%.*]] = getelementptr inbounds i8, ptr [[BASE:%.*]], <2 x i64> [[SL1]]\n ; CHECK-NEXT:    [[E6:%.*]] = getelementptr inbounds i8, <2 x ptr> [[E5]], i64 80\n ; CHECK-NEXT:    call void @blackhole(<2 x ptr> [[E6]])\n@@ -129,7 +129,7 @@ define void @PR37005_2(ptr %base, ptr %in) {\n ; CHECK-NEXT:    [[E2:%.*]] = getelementptr inbounds nuw i8, ptr [[E1]], i64 48\n ; CHECK-NEXT:    [[PI1:%.*]] = ptrtoint ptr [[E2]] to i64\n ; CHECK-NEXT:    [[TMP0:%.*]] = lshr i64 [[PI1]], 14\n-; CHECK-NEXT:    [[SL1:%.*]] = and i64 [[TMP0]], 1125899906842496\n+; CHECK-NEXT:    [[SL1:%.*]] = and i64 [[TMP0]], -128\n ; CHECK-NEXT:    [[E5:%.*]] = getelementptr inbounds nuw i8, ptr [[BASE:%.*]], i64 [[SL1]]\n ; CHECK-NEXT:    [[E6:%.*]] = getelementptr inbounds i8, ptr [[E5]], <2 x i64> <i64 80, i64 60>\n ; CHECK-NEXT:    call void @blackhole(<2 x ptr> [[E6]])\n@@ -160,7 +160,7 @@ define void @PR37005_3(<2 x ptr> %base, ptr %in) {\n ; CHECK-NEXT:    [[E4:%.*]] = getelementptr inbounds [8 x i8], ptr [[E2]], <2 x i64> <i64 0, i64 1>\n ; CHECK-NEXT:    [[PI1:%.*]] = ptrtoint <2 x ptr> [[E4]] to <2 x i64>\n ; CHECK-NEXT:    [[TMP0:%.*]] = lshr <2 x i64> [[PI1]], splat (i64 14)\n-; CHECK-NEXT:    [[SL1:%.*]] = and <2 x i64> [[TMP0]], splat (i64 1125899906842496)\n+; CHECK-NEXT:    [[SL1:%.*]] = and <2 x i64> [[TMP0]], splat (i64 -128)\n ; CHECK-NEXT:    [[E5:%.*]] = getelementptr inbounds i8, <2 x ptr> [[BASE:%.*]], <2 x i64> [[SL1]]\n ; CHECK-NEXT:    [[E6:%.*]] = getelementptr inbounds i8, <2 x ptr> [[E5]], i64 80\n ; CHECK-NEXT:    call void @blackhole(<2 x ptr> [[E6]])\ndiff --git a/llvm/test/Transforms/InstCombine/pr199095.ll b/llvm/test/Transforms/InstCombine/pr199095.ll\nnew file mode 100644\nindex 0000000000000..833c77a12993d\n--- /dev/null\n+++ b/llvm/test/Transforms/InstCombine/pr199095.ll\n@@ -0,0 +1,59 @@\n+; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n+target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n+target triple = \"x86_64-unknown-linux-gnu\"\n+\n+declare void @llvm.assume(i1) #0\n+\n+; PR199095: with `assume %x sge 0` the sign bit of %x is known-zero, so\n+; SimplifyDemandedBits would shrink `and %x, -4` to\n+; `and %x, 0x7FFFFFFFFFFFFFFC`, replacing a sign-extendable small immediate\n+; with one that requires an i64 movabs on x86. The fix in\n+; ShrinkDemandedConstant must keep the original `-4` mask.\n+\n+define i64 @pr199095_align4(i64 %x) {\n+; CHECK-LABEL: @pr199095_align4(\n+; CHECK-NEXT:    [[NN:%.*]] = icmp sgt i64 [[X:%.*]], -1\n+; CHECK-NEXT:    tail call void @llvm.assume(i1 [[NN]])\n+; CHECK-NEXT:    [[R:%.*]] = and i64 [[X]], -4\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+  %nn = icmp sge i64 %x, 0\n+  tail call void @llvm.assume(i1 %nn)\n+  %r = and i64 %x, -4\n+  ret i64 %r\n+}\n+\n+define i64 @pr199095_align16(i64 %x) {\n+; CHECK-LABEL: @pr199095_align16(\n+; CHECK-NEXT:    [[NN:%.*]] = icmp sgt i64 [[X:%.*]], -1\n+; CHECK-NEXT:    tail call void @llvm.assume(i1 [[NN]])\n+; CHECK-NEXT:    [[R:%.*]] = and i64 [[X]], -16\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+  %nn = icmp sge i64 %x, 0\n+  tail call void @llvm.assume(i1 %nn)\n+  %r = and i64 %x, -16\n+  ret i64 %r\n+}\n+\n+define <2 x i64> @pr199095_vector(<2 x i64> %x) {\n+; CHECK-LABEL: @pr199095_vector(\n+; CHECK-NEXT:    [[NN:%.*]] = icmp sgt <2 x i64> [[X:%.*]], splat (i64 -1)\n+; CHECK-NEXT:    [[NN0:%.*]] = extractelement <2 x i1> [[NN]], i64 0\n+; CHECK-NEXT:    tail call void @llvm.assume(i1 [[NN0]])\n+; CHECK-NEXT:    [[NN1:%.*]] = extractelement <2 x i1> [[NN]], i64 1\n+; CHECK-NEXT:    tail call void @llvm.assume(i1 [[NN1]])\n+; CHECK-NEXT:    [[R:%.*]] = and <2 x i64> [[X]], splat (i64 -4)\n+; CHECK-NEXT:    ret <2 x i64> [[R]]\n+;\n+  %nn = icmp sge <2 x i64> %x, zeroinitializer\n+  %nn0 = extractelement <2 x i1> %nn, i64 0\n+  tail call void @llvm.assume(i1 %nn0)\n+  %nn1 = extractelement <2 x i1> %nn, i64 1\n+  tail call void @llvm.assume(i1 %nn1)\n+  %r = and <2 x i64> %x, splat (i64 -4)\n+  ret <2 x i64> %r\n+}\n+\n+attributes #0 = { nounwind }\ndiff --git a/llvm/test/Transforms/LoopUnroll/runtime-unroll-remainder.ll b/llvm/test/Transforms/LoopUnroll/runtime-unroll-remainder.ll\nindex 3c9c3bd10a93c..5a2c6037461a3 100644\n--- a/llvm/test/Transforms/LoopUnroll/runtime-unroll-remainder.ll\n+++ b/llvm/test/Transforms/LoopUnroll/runtime-unroll-remainder.ll\n@@ -13,7 +13,7 @@ define i32 @unroll(ptr nocapture readonly %a, ptr nocapture readonly %b, i32 %N)\n ; CHECK-NEXT:    [[TMP0:%.*]] = icmp ult i32 [[N]], 4\n ; CHECK-NEXT:    br i1 [[TMP0]], label [[FOR_BODY_EPIL_PREHEADER:%.*]], label [[FOR_BODY_LR_PH_NEW:%.*]]\n ; CHECK:       for.body.lr.ph.new:\n-; CHECK-NEXT:    [[UNROLL_ITER:%.*]] = and i64 [[WIDE_TRIP_COUNT]], 4294967292\n+; CHECK-NEXT:    [[UNROLL_ITER:%.*]] = and i64 [[WIDE_TRIP_COUNT]], -4\n ; CHECK-NEXT:    br label [[FOR_BODY:%.*]]\n ; CHECK:       for.cond.cleanup.loopexit.unr-lcssa:\n ; CHECK-NEXT:    [[LCMP_MOD_NOT:%.*]] = icmp eq i64 [[XTRAITER]], 0\ndiff --git a/llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll b/llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll\nindex 545b845bead7d..969e8fe8a3d87 100644\n--- a/llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll\n+++ b/llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll\n@@ -141,7 +141,7 @@ define void @test2(ptr noalias nocapture %points, i32 %numPoints, ptr noalias no\n ; DISABLED_MASKED_STRIDED:       [[VECTOR_PH]]:\n ; DISABLED_MASKED_STRIDED-NEXT:    [[WIDE_TRIP_COUNT:%.*]] = zext nneg i32 [[NUMPOINTS]] to i64\n ; DISABLED_MASKED_STRIDED-NEXT:    [[N_RND_UP:%.*]] = add nuw nsw i64 [[WIDE_TRIP_COUNT]], 3\n-; DISABLED_MASKED_STRIDED-NEXT:    [[N_VEC:%.*]] = and i64 [[N_RND_UP]], 4294967292\n+; DISABLED_MASKED_STRIDED-NEXT:    [[N_VEC:%.*]] = and i64 [[N_RND_UP]], -4\n ; DISABLED_MASKED_STRIDED-NEXT:    [[TRIP_COUNT_MINUS_1:%.*]] = add nsw i64 [[WIDE_TRIP_COUNT]], -1\n ; DISABLED_MASKED_STRIDED-NEXT:    [[BROADCAST_SPLATINSERT:%.*]] = insertelement <4 x i64> poison, i64 [[TRIP_COUNT_MINUS_1]], i64 0\n ; DISABLED_MASKED_STRIDED-NEXT:    [[BROADCAST_SPLAT:%.*]] = shufflevector <4 x i64> [[BROADCAST_SPLATINSERT]], <4 x i64> poison, <4 x i32> zeroinitializer\n@@ -245,7 +245,7 @@ define void @test2(ptr noalias nocapture %points, i32 %numPoints, ptr noalias no\n ; ENABLED_MASKED_STRIDED:       [[VECTOR_PH]]:\n ; ENABLED_MASKED_STRIDED-NEXT:    [[WIDE_TRIP_COUNT:%.*]] = zext nneg i32 [[NUMPOINTS]] to i64\n ; ENABLED_MASKED_STRIDED-NEXT:    [[N_RND_UP:%.*]] = add nuw nsw i64 [[WIDE_TRIP_COUNT]], 3\n-; ENABLED_MASKED_STRIDED-NEXT:    [[N_VEC:%.*]] = and i64 [[N_RND_UP]], 4294967292\n+; ENABLED_MASKED_STRIDED-NEXT:    [[N_VEC:%.*]] = and i64 [[N_RND_UP]], -4\n ; ENABLED_MASKED_STRIDED-NEXT:    [[TRIP_COUNT_MINUS_1:%.*]] = add nsw i64 [[WIDE_TRIP_COUNT]], -1\n ; ENABLED_MASKED_STRIDED-NEXT:    [[BROADCAST_SPLATINSERT:%.*]] = insertelement <4 x i64> poison, i64 [[TRIP_COUNT_MINUS_1]], i64 0\n ; ENABLED_MASKED_STRIDED-NEXT:    [[BROADCAST_SPLAT:%.*]] = shufflevector <4 x i64> [[BROADCAST_SPLATINSERT]], <4 x i64> poison, <4 x i32> zeroinitializer\ndiff --git a/llvm/test/Transforms/LoopVectorize/float-induction.ll b/llvm/test/Transforms/LoopVectorize/float-induction.ll\nindex f20b1cf8ed5ce..1a54a1f48b026 100644\n--- a/llvm/test/Transforms/LoopVectorize/float-induction.ll\n+++ b/llvm/test/Transforms/LoopVectorize/float-induction.ll\n@@ -1062,13 +1062,13 @@ define void @fp_iv_loop3(float %init, ptr noalias nocapture %A, ptr noalias noca\n ; VEC2_INTERL1_PRED_STORE-NEXT:    br i1 [[CMP_N]], label %[[FOR_END_LOOPEXIT:.*]], label %[[SCALAR_PH]]\n ; VEC2_INTERL1_PRED_STORE:       [[SCALAR_PH]]:\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL:%.*]] = phi i64 [ [[N_VEC]], %[[MIDDLE_BLOCK]] ], [ 0, %[[FOR_BODY_LR_PH]] ]\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL10:%.*]] = phi float [ [[TMP3]], %[[MIDDLE_BLOCK]] ], [ 1.000000e-01, %[[FOR_BODY_LR_PH]] ]\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL11:%.*]] = phi float [ [[TMP5]], %[[MIDDLE_BLOCK]] ], [ [[INIT]], %[[FOR_BODY_LR_PH]] ]\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL9:%.*]] = phi float [ [[TMP3]], %[[MIDDLE_BLOCK]] ], [ 1.000000e-01, %[[FOR_BODY_LR_PH]] ]\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL10:%.*]] = phi float [ [[TMP5]], %[[MIDDLE_BLOCK]] ], [ [[INIT]], %[[FOR_BODY_LR_PH]] ]\n ; VEC2_INTERL1_PRED_STORE-NEXT:    br label %[[FOR_BODY:.*]]\n ; VEC2_INTERL1_PRED_STORE:       [[FOR_BODY]]:\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[INDVARS_IV:%.*]] = phi i64 [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ], [ [[INDVARS_IV_NEXT:%.*]], %[[FOR_BODY]] ]\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[Y_012:%.*]] = phi float [ [[BC_RESUME_VAL10]], %[[SCALAR_PH]] ], [ [[CONV1:%.*]], %[[FOR_BODY]] ]\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[X_011:%.*]] = phi float [ [[BC_RESUME_VAL11]], %[[SCALAR_PH]] ], [ [[ADD:%.*]], %[[FOR_BODY]] ]\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[Y_012:%.*]] = phi float [ [[BC_RESUME_VAL9]], %[[SCALAR_PH]] ], [ [[CONV1:%.*]], %[[FOR_BODY]] ]\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[X_011:%.*]] = phi float [ [[BC_RESUME_VAL10]], %[[SCALAR_PH]] ], [ [[ADD:%.*]], %[[FOR_BODY]] ]\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[ARRAYIDX:%.*]] = getelementptr inbounds nuw [4 x i8], ptr [[A]], i64 [[INDVARS_IV]]\n ; VEC2_INTERL1_PRED_STORE-NEXT:    store float [[X_011]], ptr [[ARRAYIDX]], align 4\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[ADD]] = fadd fast float [[X_011]], [[TMP0]]\n@@ -1357,7 +1357,7 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC4_INTERL1-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp slt i64 [[N]], 4\n ; VEC4_INTERL1-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n ; VEC4_INTERL1:       [[VECTOR_PH]]:\n-; VEC4_INTERL1-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], 9223372036854775804\n+; VEC4_INTERL1-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], -4\n ; VEC4_INTERL1-NEXT:    [[DOTCAST:%.*]] = uitofp nneg i64 [[N_VEC]] to float\n ; VEC4_INTERL1-NEXT:    br label %[[VECTOR_BODY:.*]]\n ; VEC4_INTERL1:       [[VECTOR_BODY]]:\n@@ -1412,7 +1412,7 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC4_INTERL1:       [[FOR_BODY]]:\n ; VEC4_INTERL1-NEXT:    [[I:%.*]] = phi i64 [ [[I_NEXT:%.*]], %[[FOR_INC:.*]] ], [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ]\n ; VEC4_INTERL1-NEXT:    [[J:%.*]] = phi float [ [[J_NEXT:%.*]], %[[FOR_INC]] ], [ [[BC_RESUME_VAL7]], %[[SCALAR_PH]] ]\n-; VEC4_INTERL1-NEXT:    [[VAR0:%.*]] = getelementptr inbounds nuw [4 x i8], ptr [[A]], i64 [[I]]\n+; VEC4_INTERL1-NEXT:    [[VAR0:%.*]] = getelementptr inbounds [4 x i8], ptr [[A]], i64 [[I]]\n ; VEC4_INTERL1-NEXT:    [[VAR1:%.*]] = load float, ptr [[VAR0]], align 4\n ; VEC4_INTERL1-NEXT:    [[VAR2:%.*]] = fcmp fast oeq float [[VAR1]], 0.000000e+00\n ; VEC4_INTERL1-NEXT:    br i1 [[VAR2]], label %[[IF_PRED:.*]], label %[[FOR_INC]]\n@@ -1434,7 +1434,7 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC4_INTERL2-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp slt i64 [[N]], 8\n ; VEC4_INTERL2-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n ; VEC4_INTERL2:       [[VECTOR_PH]]:\n-; VEC4_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], 9223372036854775800\n+; VEC4_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], -8\n ; VEC4_INTERL2-NEXT:    [[DOTCAST:%.*]] = uitofp nneg i64 [[N_VEC]] to float\n ; VEC4_INTERL2-NEXT:    br label %[[VECTOR_BODY:.*]]\n ; VEC4_INTERL2:       [[VECTOR_BODY]]:\n@@ -1528,7 +1528,7 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC4_INTERL2:       [[FOR_BODY]]:\n ; VEC4_INTERL2-NEXT:    [[I:%.*]] = phi i64 [ [[I_NEXT:%.*]], %[[FOR_INC:.*]] ], [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ]\n ; VEC4_INTERL2-NEXT:    [[J:%.*]] = phi float [ [[J_NEXT:%.*]], %[[FOR_INC]] ], [ [[BC_RESUME_VAL16]], %[[SCALAR_PH]] ]\n-; VEC4_INTERL2-NEXT:    [[VAR0:%.*]] = getelementptr inbounds nuw [4 x i8], ptr [[A]], i64 [[I]]\n+; VEC4_INTERL2-NEXT:    [[VAR0:%.*]] = getelementptr inbounds [4 x i8], ptr [[A]], i64 [[I]]\n ; VEC4_INTERL2-NEXT:    [[VAR1:%.*]] = load float, ptr [[VAR0]], align 4\n ; VEC4_INTERL2-NEXT:    [[VAR2:%.*]] = fcmp fast oeq float [[VAR1]], 0.000000e+00\n ; VEC4_INTERL2-NEXT:    br i1 [[VAR2]], label %[[IF_PRED:.*]], label %[[FOR_INC]]\n@@ -1550,7 +1550,7 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC1_INTERL2-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp slt i64 [[N]], 2\n ; VEC1_INTERL2-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n ; VEC1_INTERL2:       [[VECTOR_PH]]:\n-; VEC1_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], 9223372036854775806\n+; VEC1_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], -2\n ; VEC1_INTERL2-NEXT:    [[DOTCAST:%.*]] = uitofp nneg i64 [[N_VEC]] to float\n ; VEC1_INTERL2-NEXT:    br label %[[VECTOR_BODY:.*]]\n ; VEC1_INTERL2:       [[VECTOR_BODY]]:\n@@ -1587,7 +1587,7 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC1_INTERL2:       [[FOR_BODY]]:\n ; VEC1_INTERL2-NEXT:    [[I:%.*]] = phi i64 [ [[I_NEXT:%.*]], %[[FOR_INC:.*]] ], [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ]\n ; VEC1_INTERL2-NEXT:    [[J:%.*]] = phi float [ [[J_NEXT:%.*]], %[[FOR_INC]] ], [ [[BC_RESUME_VAL3]], %[[SCALAR_PH]] ]\n-; VEC1_INTERL2-NEXT:    [[VAR0:%.*]] = getelementptr inbounds nuw [4 x i8], ptr [[A]], i64 [[I]]\n+; VEC1_INTERL2-NEXT:    [[VAR0:%.*]] = getelementptr inbounds [4 x i8], ptr [[A]], i64 [[I]]\n ; VEC1_INTERL2-NEXT:    [[VAR1:%.*]] = load float, ptr [[VAR0]], align 4\n ; VEC1_INTERL2-NEXT:    [[VAR2:%.*]] = fcmp fast oeq float [[VAR1]], 0.000000e+00\n ; VEC1_INTERL2-NEXT:    br i1 [[VAR2]], label %[[IF_PRED:.*]], label %[[FOR_INC]]\n@@ -1609,7 +1609,7 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp slt i64 [[N]], 2\n ; VEC2_INTERL1_PRED_STORE-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n ; VEC2_INTERL1_PRED_STORE:       [[VECTOR_PH]]:\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], 9223372036854775806\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[N_VEC:%.*]] = and i64 [[SMAX]], -2\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[DOTCAST:%.*]] = uitofp nneg i64 [[N_VEC]] to float\n ; VEC2_INTERL1_PRED_STORE-NEXT:    br label %[[VECTOR_BODY:.*]]\n ; VEC2_INTERL1_PRED_STORE:       [[VECTOR_BODY]]:\n@@ -1641,12 +1641,12 @@ define void @non_primary_iv_float_scalar(ptr %A, i64 %N) {\n ; VEC2_INTERL1_PRED_STORE-NEXT:    br i1 [[CMP_N]], label %[[FOR_END:.*]], label %[[SCALAR_PH]]\n ; VEC2_INTERL1_PRED_STORE:       [[SCALAR_PH]]:\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL:%.*]] = phi i64 [ [[N_VEC]], %[[MIDDLE_BLOCK]] ], [ 0, %[[ENTRY]] ]\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL4:%.*]] = phi float [ [[DOTCAST]], %[[MIDDLE_BLOCK]] ], [ 0.000000e+00, %[[ENTRY]] ]\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[BC_RESUME_VAL3:%.*]] = phi float [ [[DOTCAST]], %[[MIDDLE_BLOCK]] ], [ 0.000000e+00, %[[ENTRY]] ]\n ; VEC2_INTERL1_PRED_STORE-NEXT:    br label %[[FOR_BODY:.*]]\n ; VEC2_INTERL1_PRED_STORE:       [[FOR_BODY]]:\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[I:%.*]] = phi i64 [ [[I_NEXT:%.*]], %[[FOR_INC:.*]] ], [ [[BC_RESUME_VAL]], %[[SCALAR_PH]] ]\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[J:%.*]] = phi float [ [[J_NEXT:%.*]], %[[FOR_INC]] ], [ [[BC_RESUME_VAL4]], %[[SCALAR_PH]] ]\n-; VEC2_INTERL1_PRED_STORE-NEXT:    [[VAR0:%.*]] = getelementptr inbounds nuw [4 x i8], ptr [[A]], i64 [[I]]\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[J:%.*]] = phi float [ [[J_NEXT:%.*]], %[[FOR_INC]] ], [ [[BC_RESUME_VAL3]], %[[SCALAR_PH]] ]\n+; VEC2_INTERL1_PRED_STORE-NEXT:    [[VAR0:%.*]] = getelementptr inbounds [4 x i8], ptr [[A]], i64 [[I]]\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[VAR1:%.*]] = load float, ptr [[VAR0]], align 4\n ; VEC2_INTERL1_PRED_STORE-NEXT:    [[VAR2:%.*]] = fcmp fast oeq float [[VAR1]], 0.000000e+00\n ; VEC2_INTERL1_PRED_STORE-NEXT:    br i1 [[VAR2]], label %[[IF_PRED:.*]], label %[[FOR_INC]]\n@@ -1794,7 +1794,7 @@ define void @fp_iv_used_in_gep_fadd(float %init, ptr noalias nocapture %A, float\n ; VEC4_INTERL1-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i32 [[TMP0]], 3\n ; VEC4_INTERL1-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n ; VEC4_INTERL1:       [[VECTOR_PH]]:\n-; VEC4_INTERL1-NEXT:    [[N_VEC:%.*]] = and i64 [[TMP2]], 8589934588\n+; VEC4_INTERL1-NEXT:    [[N_VEC:%.*]] = and i64 [[TMP2]], -4\n ; VEC4_INTERL1-NEXT:    [[DOTCAST:%.*]] = uitofp nneg i64 [[N_VEC]] to float\n ; VEC4_INTERL1-NEXT:    [[TMP3:%.*]] = fmul fast float [[FPINC]], [[DOTCAST]]\n ; VEC4_INTERL1-NEXT:    [[TMP4:%.*]] = fadd fast float [[INIT]], [[TMP3]]\n@@ -1871,7 +1871,7 @@ define void @fp_iv_used_in_gep_fadd(float %init, ptr noalias nocapture %A, float\n ; VEC4_INTERL2-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i32 [[TMP0]], 7\n ; VEC4_INTERL2-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n ; VEC4_INTERL2:       [[VECTOR_PH]]:\n-; VEC4_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[TMP2]], 8589934584\n+; VEC4_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[TMP2]], -8\n ; VEC4_INTERL2-NEXT:    [[BROADCAST_SPLATINSERT:%.*]] = insertelement <4 x float> poison, float [[FPINC]], i64 0\n ; VEC4_INTERL2-NEXT:    [[BROADCAST_SPLAT:%.*]] = shufflevector <4 x float> [[BROADCAST_SPLATINSERT]], <4 x float> poison, <4 x i32> zeroinitializer\n ; VEC4_INTERL2-NEXT:    [[DOTCAST:%.*]] = uitofp nneg i64 [[N_VEC]] to float\n@@ -1972,7 +1972,7 @@ define void @fp_iv_used_in_gep_fadd(float %init, ptr noalias nocapture %A, float\n ; VEC1_INTERL2-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp eq i32 [[TMP0]], 0\n ; VEC1_INTERL2-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_PH:.*]]\n ; VEC1_INTERL2:       [[VECTOR_PH]]:\n-; VEC1_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[TMP2]], 8589934590\n+; VEC1_INTERL2-NEXT:    [[N_VEC:%.*]] = and i64 [[TMP2]], -2\n ; VEC1_INTERL2-NEXT:    [[DOTCAST:%.*]] = uitofp nneg i64 [[N_VEC]] to float\n ; VEC1_INTERL2-NEXT:    [[TMP3:%.*]] = fmul f...\n[truncated]\n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "LumioseSil",
+      "body": "Isn't this more of a DAG thing?"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-23T15:34:56Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      [
+        55,
+        62
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/cast.ll": [
+      [
+        688,
+        698
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/gep-combine-loop-invariant.ll": [
+      [
+        98,
+        104
+      ],
+      [
+        129,
+        135
+      ],
+      [
+        160,
+        166
+      ]
+    ],
+    "llvm/test/Transforms/LoopUnroll/runtime-unroll-remainder.ll": [
+      [
+        13,
+        19
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/x86-interleaved-store-accesses-with-gaps.ll": [
+      [
+        141,
+        147
+      ],
+      [
+        245,
+        251
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/float-induction.ll": [
+      [
+        1062,
+        1074
+      ],
+      [
+        1357,
+        1363
+      ],
+      [
+        1412,
+        1418
+      ],
+      [
+        1434,
+        1440
+      ],
+      [
+        1528,
+        1534
+      ],
+      [
+        1550,
+        1556
+      ],
+      [
+        1587,
+        1593
+      ],
+      [
+        1609,
+        1615
+      ],
+      [
+        1641,
+        1652
+      ],
+      [
+        1794,
+        1800
+      ],
+      [
+        1871,
+        1877
+      ],
+      [
+        1972,
+        1978
+      ],
+      [
+        2025,
+        2031
+      ],
+      [
+        2064,
+        2074
+      ],
+      [
+        2110,
+        2116
+      ],
+      [
+        2187,
+        2193
+      ],
+      [
+        2287,
+        2293
+      ],
+      [
+        2340,
+        2346
+      ],
+      [
+        2379,
+        2389
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/if-conversion.ll": [
+      [
+        48,
+        54
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/induction.ll": [
+      [
+        60,
+        66
+      ],
+      [
+        101,
+        107
+      ],
+      [
+        190,
+        196
+      ],
+      [
+        654,
+        660
+      ],
+      [
+        676,
+        682
+      ],
+      [
+        692,
+        698
+      ],
+      [
+        719,
+        725
+      ],
+      [
+        779,
+        785
+      ],
+      [
+        806,
+        812
+      ],
+      [
+        916,
+        922
+      ],
+      [
+        976,
+        982
+      ],
+      [
+        1274,
+        1280
+      ],
+      [
+        1304,
+        1310
+      ],
+      [
+        1321,
+        1327
+      ],
+      [
+        1364,
+        1370
+      ],
+      [
+        1618,
+        1624
+      ],
+      [
+        1649,
+        1657
+      ],
+      [
+        1683,
+        1689
+      ],
+      [
+        1728,
+        1736
+      ],
+      [
+        2461,
+        2467
+      ],
+      [
+        2493,
+        2499
+      ],
+      [
+        2511,
+        2517
+      ],
+      [
+        2554,
+        2560
+      ],
+      [
+        2632,
+        2638
+      ],
+      [
+        2691,
+        2697
+      ],
+      [
+        4267,
+        4273
+      ],
+      [
+        4307,
+        4313
+      ],
+      [
+        4395,
+        4401
+      ],
+      [
+        4717,
+        4723
+      ],
+      [
+        4739,
+        4745
+      ],
+      [
+        4755,
+        4761
+      ],
+      [
+        4780,
+        4786
+      ],
+      [
+        4838,
+        4844
+      ],
+      [
+        4863,
+        4869
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/interleaved-accesses.ll": [
+      [
+        1252,
+        1258
+      ],
+      [
+        1338,
+        1344
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/invariant-store-vectorization-2.ll": [
+      [
+        33,
+        39
+      ],
+      [
+        59,
+        65
+      ],
+      [
+        133,
+        139
+      ],
+      [
+        153,
+        159
+      ],
+      [
+        218,
+        224
+      ],
+      [
+        243,
+        249
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/invariant-store-vectorization.ll": [
+      [
+        32,
+        38
+      ],
+      [
+        56,
+        62
+      ],
+      [
+        106,
+        112
+      ],
+      [
+        126,
+        132
+      ],
+      [
+        181,
+        187
+      ],
+      [
+        228,
+        234
+      ],
+      [
+        379,
+        385
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/loop-scalars.ll": [
+      [
+        11,
+        17
+      ],
+      [
+        31,
+        38
+      ],
+      [
+        67,
+        73
+      ],
+      [
+        127,
+        133
+      ],
+      [
+        184,
+        190
+      ],
+      [
+        205,
+        211
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/vector-geps.ll": [
+      [
+        11,
+        17
+      ],
+      [
+        31,
+        38
+      ],
+      [
+        64,
+        70
+      ],
+      [
+        85,
+        91
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/X86/pr48844-br-to-switch-vectorization.ll": [
+      [
+        47,
+        53
+      ],
+      [
+        89,
+        95
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSimplifyDemanded.cpp": [
+      "ShrinkDemandedConstant"
+    ]
+  }
+}

@@ -1,0 +1,169 @@
+{
+  "pr_id": 192909,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/192909",
+  "state": "open",
+  "title": "[ConstantFolding] Compare a global and an inbounds GEP",
+  "author": "mwb-cde",
+  "base_commit": "285ac8c1a33cae80357bdc3419e9633e700c1d06",
+  "fix_commit": "d4452f45288f879cdb692c2cad8c5d0ae2d83cde",
+  "patch": "diff --git a/llvm/lib/Analysis/ConstantFolding.cpp b/llvm/lib/Analysis/ConstantFolding.cpp\nindex e035cd1bc1ac0..b16961bac386e 100644\n--- a/llvm/lib/Analysis/ConstantFolding.cpp\n+++ b/llvm/lib/Analysis/ConstantFolding.cpp\n@@ -1328,6 +1328,31 @@ Constant *llvm::ConstantFoldInstOperands(const Instruction *I,\n                                       AllowNonDeterministic);\n }\n \n+// Try to decide if an inbounds GEP is entirely inside the object it points to.\n+// Return std::nullopt if not possible.\n+static std::optional<bool> isGEPInObject(const GEPOperator *GEP,\n+                                         const DataLayout &DL) {\n+  if (!GEP->isInBounds() || !GEP->hasAllConstantIndices()) {\n+    return std::nullopt;\n+  }\n+  if (const auto *GVar = dyn_cast<GlobalVariable>(GEP->getPointerOperand())) {\n+    if (GVar->isInterposable() || GVar->hasGlobalUnnamedAddr() ||\n+        isa<GlobalAlias>(GVar))\n+      return std::nullopt;\n+    Type *GVType = GVar->getValueType();\n+    if (!GVType->isSized() || GVType->isEmptyTy())\n+      return std::nullopt;\n+    const auto Bitwidth = DL.getIndexTypeSizeInBits(GEP->getType());\n+    APInt ObjectSize(Bitwidth, GVar->getGlobalSize(DL));\n+    APInt GEPOffset(Bitwidth, 0);\n+    GEP->accumulateConstantOffset(DL, GEPOffset);\n+    if (GEPOffset.ult(ObjectSize))\n+      return true;\n+    return false;\n+  }\n+  return false;\n+}\n+\n Constant *llvm::ConstantFoldCompareInstOperands(\n     unsigned IntPredicate, Constant *Ops0, Constant *Ops1, const DataLayout &DL,\n     const TargetLibraryInfo *TLI, const Instruction *I) {\n@@ -1420,6 +1445,39 @@ Constant *llvm::ConstantFoldCompareInstOperands(\n             Ops0->getContext(),\n             ICmpInst::compare(Offset0, Offset1,\n                               ICmpInst::getSignedPredicate(Predicate)));\n+\n+      // Try to fold a GEP/GlobalVariable comparison.\n+      if (IsEqPred && isa<GlobalVariable>(Stripped0) &&\n+          isa<GlobalVariable>(Stripped1)) {\n+        const auto CanFoldPtr = [](Constant *Op) -> bool {\n+          if (const auto *GV = dyn_cast<GlobalVariable>(Op)) {\n+            if (GV->isInterposable() || GV->hasGlobalUnnamedAddr() ||\n+                isa<GlobalAlias>(GV))\n+              return false;\n+            Type *GVType = GV->getValueType();\n+            if (GVType->isSized() && !GVType->isEmptyTy())\n+              return true;\n+          }\n+          return false;\n+        };\n+        bool InObject0 = CanFoldPtr(Ops0);\n+        if (const auto *GEP = dyn_cast<GEPOperator>(Ops0)) {\n+          if (auto CanDecide = isGEPInObject(GEP, DL))\n+            InObject0 = *CanDecide;\n+          else\n+            InObject0 = false;\n+        }\n+        bool InObject1 = CanFoldPtr(Ops1);\n+        if (const auto *GEP = dyn_cast<GEPOperator>(Ops1)) {\n+          if (auto CanDecide = isGEPInObject(GEP, DL))\n+            InObject1 = *CanDecide;\n+          else\n+            InObject1 = false;\n+        }\n+        if (InObject0 && InObject1)\n+          return ConstantInt::getBool(Ops0->getContext(),\n+                                      Predicate == CmpInst::ICMP_NE);\n+      }\n     }\n   } else if (isa<ConstantExpr>(Ops1)) {\n     // If RHS is a constant expression, but the left side isn't, swap the\n",
+  "components": [
+    "ConstantFold"
+  ],
+  "description": "An inbounds GEP with constant, non-zero indices can sometimes be compared against the address of a global. Try to use this when constant-folding icmp.\r\n\r\nFixes https://github.com/llvm/llvm-project/issues/48801",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/EarlyCSE/cmp-gep-global.ll",
+      "commands": [
+        "opt -S -passes=early-cse < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_different_first",
+          "test_body": "%struct.anon = type { i32, i32 }\n\n@d = external global %struct.anon, align 4\n@c = external global %struct.anon, align 4\n\ndeclare void @foo()\n\ndefine i32 @test_different_first() {\nentry:\n  %cmp = icmp eq ptr @c, @d\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  call void @foo()\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret i32 0\n}\n"
+        },
+        {
+          "test_name": "test_same_first",
+          "test_body": "%struct.anon = type { i32, i32 }\n\n@c = external global %struct.anon, align 4\n\ndeclare void @foo()\n\ndefine i32 @test_same_first() {\nentry:\n  %cmp = icmp eq ptr @c, @c\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  call void @foo()\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret i32 0\n}\n"
+        },
+        {
+          "test_name": "test_different",
+          "test_body": "%struct.anon = type { i32, i32 }\n\n@d = external global %struct.anon, align 4\n@c = external global %struct.anon, align 4\n\ndeclare void @foo()\n\ndefine i32 @test_different() {\nentry:\n  %cmp = icmp eq ptr @c, @d\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  call void @foo()\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret i32 0\n}\n"
+        },
+        {
+          "test_name": "test_same_offset",
+          "test_body": "%struct.anon = type { i32, i32 }\n\n@c = external global %struct.anon, align 4\n\ndeclare void @foo()\n\ndefine i32 @test_same_offset() {\nentry:\n  %cmp = icmp eq ptr @c, getelementptr inbounds nuw (i8, ptr @c, i64 4)\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  call void @foo()\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret i32 0\n}\n"
+        },
+        {
+          "test_name": "test_different_offset",
+          "test_body": "%struct.anon = type { i32, i32 }\n\n@d = external global %struct.anon, align 4\n@c = external global %struct.anon, align 4\n\ndeclare void @foo()\n\ndefine i32 @test_different_offset() {\nentry:\n  %cmp = icmp eq ptr @c, getelementptr inbounds nuw (i8, ptr @d, i64 4)\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  call void @foo()\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret i32 0\n}\n"
+        },
+        {
+          "test_name": "test_same",
+          "test_body": "%struct.anon = type { i32, i32 }\n\n@c = external global %struct.anon, align 4\n\ndeclare void @foo()\n\ndefine i32 @test_same() {\nentry:\n  %cmp = icmp eq ptr @c, @c\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  call void @foo()\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret i32 0\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/binop-select-cast-of-select-cond.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "vectorized_add",
+          "test_body": "define <2 x i8> @vectorized_add(<2 x i1> %c, <2 x i8> %arg) {\n  %zext = zext <2 x i1> %c to <2 x i8>\n  %sel = select <2 x i1> %c, <2 x i8> %arg, <2 x i8> splat (i8 1)\n  %add = add <2 x i8> %sel, %zext\n  ret <2 x i8> %add\n}\n"
+        },
+        {
+          "test_name": "pr64669",
+          "test_body": "@b = external global [72 x i32]\n@c = external global i32\n\ndefine i64 @pr64669(i64 %a) {\n  %cmp = icmp ne ptr getelementptr inbounds ([72 x i32], ptr @b, i64 0, i64 25), @c\n  %mul = select i1 %cmp, i64 %a, i64 0\n  %conv3 = zext i1 %cmp to i64\n  %add = add nsw i64 %mul, %conv3\n  ret i64 %add\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/hoist-xor-by-constant-from-xor-by-value.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "constantexpr2",
+          "test_body": "@global_constant3 = external global [6 x [1 x i64]], align 1\n@global_constant4 = external global i64, align 1\n@global_constant5 = external global ptr, align 1\n\ndefine i16 @constantexpr2() {\n  %i0 = icmp ne ptr getelementptr inbounds ([6 x [1 x i64]], ptr @global_constant3, i16 0, i16 5, i16 0), @global_constant4\n  %i1 = zext i1 %i0 to i16\n  %i2 = load ptr, ptr @global_constant5, align 1\n  %i3 = load i16, ptr %i2, align 1\n  %i4 = xor i16 %i3, %i1\n  %i5 = xor i16 %i4, -1\n  ret i16 %i5\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstSimplify/compare.ll",
+      "commands": [
+        "opt < %s -passes=instsimplify -S"
+      ],
+      "tests": [
+        {
+          "test_name": "globals_inequal",
+          "test_body": "target datalayout = \"p:32:32-p1:64:64\"\n\n@A = external global i32\n@B = external global i32\n\ndefine i1 @globals_inequal() {\n  %res = icmp ne ptr @A, @B\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "globals_offset_inequal",
+          "test_body": "target datalayout = \"p:32:32-p1:64:64\"\n\n@A = external global i32\n@B = external global i32\n\ndefine i1 @globals_offset_inequal() {\n  %a.off = getelementptr i8, ptr @A, i32 1\n  %b.off = getelementptr i8, ptr @B, i32 1\n  %res = icmp ne ptr %a.off, %b.off\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "test_byval_global_inequal",
+          "test_body": "target datalayout = \"p:32:32-p1:64:64\"\n\n@B = external global i32\n\ndefine i1 @test_byval_global_inequal(ptr byval(i32) %a) {\n  %b = alloca i32, align 4\n  %res = icmp ne ptr %a, @B\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "globals_offset_past_end_inequal",
+          "test_body": "target datalayout = \"p:32:32-p1:64:64\"\n\n@A = external global i32\n@B = external global i32\n\ndefine i1 @globals_offset_past_end_inequal() {\n  %a.off = getelementptr i32, ptr @A, i32 1\n  %b.off = getelementptr i32, ptr @B, i32 1\n  %res = icmp ne ptr %a.off, %b.off\n  ret i1 %res\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nThank you for submitting a Pull Request (PR) to the LLVM Project!\n\nThis PR will be automatically labeled and the relevant teams will be notified.\n\nIf you wish to, you can add reviewers by using the \"Reviewers\" section on this page.\n\nIf this is not working for you, it is probably because you do not have write permissions for the repository. In which case you can instead tag reviewers by name in a comment by using `@` followed by their GitHub username.\n\nIf you have received no comments on your PR for a week, you can request a review by \"ping\"ing the PR by adding a comment \u201cPing\u201d. The common courtesy \"ping\" rate is once a week. Please remember that you are asking for valuable time from other developers.\n\nIf you have further questions, they may be answered by the [LLVM GitHub User Guide](https://llvm.org/docs/GitHub.html).\n\nYou can also ask questions in a comment on this PR, on the [LLVM Discord](https://discord.com/invite/xS7Z362) or on the [forums](https://discourse.llvm.org/)."
+    },
+    {
+      "author": "mwb-cde",
+      "body": "Note, I don't have commit access."
+    },
+    {
+      "author": "mwb-cde",
+      "body": "Ping"
+    }
+  ],
+  "knowledge_cutoff": "2026-04-20T08:07:07Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      [
+        1328,
+        1333
+      ],
+      [
+        1420,
+        1425
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/binop-select-cast-of-select-cond.ll": [
+      [
+        231,
+        239
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/hoist-xor-by-constant-from-xor-by-value.ll": [
+      [
+        94,
+        105
+      ]
+    ],
+    "llvm/test/Transforms/InstSimplify/compare.ll": [
+      [
+        3357,
+        3364
+      ],
+      [
+        3366,
+        3371
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ConstantFolding.cpp": [
+      "llvm::ConstantFoldCompareInstOperands",
+      "llvm::ConstantFoldInstOperands"
+    ],
+    "llvm/test/Transforms/InstSimplify/compare.ll": [
+      "byval_args_inequal",
+      "neg_args_adjacent",
+      "neg_byval_alloca_adjacent",
+      "scalar_vectors_are_non_empty",
+      "test_byval_alloca_inequal",
+      "test_byval_global_inequal",
+      "zero_sized_alloca2"
+    ]
+  }
+}

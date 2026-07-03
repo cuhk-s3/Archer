@@ -1,0 +1,1400 @@
+{
+  "pr_id": 152859,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/152859",
+  "state": "open",
+  "title": "[GVN] MemorySSA for GVN: eliminate redundant loads via MemorySSA",
+  "author": "antoniofrighetto",
+  "base_commit": "24dc0d0d1064ad8894eb2e05d9fef04cd342faee",
+  "fix_commit": "eb4b0da40196dcf91126a2e9e491fe0f6263b1cf",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Scalar/GVN.h b/llvm/include/llvm/Transforms/Scalar/GVN.h\nindex 806e969211e7a..816ea43ae1508 100644\n--- a/llvm/include/llvm/Transforms/Scalar/GVN.h\n+++ b/llvm/include/llvm/Transforms/Scalar/GVN.h\n@@ -19,6 +19,7 @@\n #include \"llvm/ADT/MapVector.h\"\n #include \"llvm/ADT/SetVector.h\"\n #include \"llvm/ADT/SmallVector.h\"\n+#include \"llvm/Analysis/PHITransAddr.h\"\n #include \"llvm/IR/Dominators.h\"\n #include \"llvm/IR/InstrTypes.h\"\n #include \"llvm/IR/PassManager.h\"\n@@ -37,8 +38,10 @@ class AAResults;\n class AssumeInst;\n class AssumptionCache;\n class BasicBlock;\n+class BatchAAResults;\n class CallInst;\n class CondBrInst;\n+class EarliestEscapeAnalysis;\n class ExtractValueInst;\n class Function;\n class FunctionPass;\n@@ -255,6 +258,7 @@ class GVNPass : public OptionalPassInfoMixin<GVNPass> {\n   OptimizationRemarkEmitter *ORE = nullptr;\n   ImplicitControlFlowTracking *ICF = nullptr;\n   LoopInfo *LI = nullptr;\n+  AAResults *AA = nullptr;\n   MemorySSAUpdater *MSSAU = nullptr;\n \n   ValueTable VN;\n@@ -360,21 +364,91 @@ class GVNPass : public OptionalPassInfoMixin<GVNPass> {\n   // List of critical edges to be split between iterations.\n   SmallVector<std::pair<Instruction *, unsigned>, 4> ToSplit;\n \n+  enum class DepKind {\n+    Other = 0, // Unknown value.\n+    Def,       // Exactly overlapping locations.\n+    Clobber,   // Reaching value superset of needed bits.\n+  };\n+\n+  // Describe a memory location value, such that there exists a path to a point\n+  // in the program, along which that memory location is not modified.\n+  struct ReachingMemVal {\n+    DepKind Kind;\n+    BasicBlock *Block;\n+    const Value *Addr;\n+    Instruction *Inst;\n+    int32_t Offset;\n+\n+    static ReachingMemVal getUnknown(BasicBlock *BB, const Value *Addr,\n+                                     Instruction *Inst = nullptr) {\n+      return {DepKind::Other, BB, Addr, Inst, -1};\n+    }\n+\n+    static ReachingMemVal getDef(const Value *Addr, Instruction *Inst) {\n+      return {DepKind::Def, Inst->getParent(), Addr, Inst, -1};\n+    }\n+\n+    static ReachingMemVal getClobber(const Value *Addr, Instruction *Inst,\n+                                     int32_t Offset = -1) {\n+      return {DepKind::Clobber, Inst->getParent(), Addr, Inst, Offset};\n+    }\n+  };\n+\n+  struct DependencyBlockInfo {\n+    DependencyBlockInfo() = delete;\n+    DependencyBlockInfo(const PHITransAddr &Addr, MemoryAccess *ClobberMA)\n+        : Addr(Addr), InitialClobberMA(ClobberMA), ClobberMA(ClobberMA),\n+          ForceUnknown(false), Visited(false) {}\n+    PHITransAddr Addr;\n+    MemoryAccess *InitialClobberMA;\n+    MemoryAccess *ClobberMA;\n+    std::optional<ReachingMemVal> MemVal;\n+    bool ForceUnknown : 1;\n+    bool Visited : 1;\n+  };\n+\n+  using DependencyBlockSet = DenseMap<BasicBlock *, DependencyBlockInfo>;\n+\n+  std::optional<GVNPass::ReachingMemVal> scanMemoryAccessesUsers(\n+      const MemoryLocation &Loc, bool IsInvariantLoad, BasicBlock *BB,\n+      const SmallVectorImpl<MemoryAccess *> &ClobbersList, MemorySSA &MSSA,\n+      BatchAAResults &AA, LoadInst *L = nullptr);\n+\n+  std::optional<GVNPass::ReachingMemVal>\n+  accessMayModifyLocation(MemoryAccess *ClobberMA, const MemoryLocation &Loc,\n+                          bool IsInvariantLoad, BasicBlock *BB, MemorySSA &MSSA,\n+                          BatchAAResults &AA);\n+\n+  bool collectPredecessors(BasicBlock *BB, const PHITransAddr &Addr,\n+                           MemoryAccess *ClobberMA, DependencyBlockSet &Blocks,\n+                           SmallVectorImpl<BasicBlock *> &Worklist);\n+\n+  void collectClobberList(SmallVectorImpl<MemoryAccess *> &Clobbers,\n+                          BasicBlock *BB, const DependencyBlockInfo &StartInfo,\n+                          const DependencyBlockSet &Blocks, MemorySSA &MSSA);\n+\n+  bool findReachingValuesForLoad(LoadInst *Inst,\n+                                 SmallVectorImpl<ReachingMemVal> &Values,\n+                                 MemorySSA &MSSA, AAResults &AA);\n+\n   // Helper functions of redundant load elimination.\n   bool processLoad(LoadInst *L);\n   bool processMaskedLoad(IntrinsicInst *I);\n   bool processNonLocalLoad(LoadInst *L);\n+  bool processNonLocalLoad(LoadInst *L, SmallVectorImpl<ReachingMemVal> &Deps);\n   bool processAssumeIntrinsic(AssumeInst *II);\n \n   /// Given a local dependency (Def or Clobber) determine if a value is\n   /// available for the load.\n   std::optional<gvn::AvailableValue>\n-  AnalyzeLoadAvailability(LoadInst *Load, MemDepResult DepInfo, Value *Address);\n+  AnalyzeLoadAvailability(LoadInst *Load, const ReachingMemVal &Dep,\n+                          Value *Address);\n \n   /// Given a list of non-local dependencies, determine if a value is\n   /// available for the load in each specified block.  If it is, add it to\n   /// ValuesPerBlock.  If not, add it to UnavailableBlocks.\n-  void AnalyzeLoadAvailability(LoadInst *Load, LoadDepVect &Deps,\n+  void AnalyzeLoadAvailability(LoadInst *Load,\n+                               SmallVectorImpl<ReachingMemVal> &Deps,\n                                AvailValInBlkVect &ValuesPerBlock,\n                                UnavailBlkVect &UnavailableBlocks);\n \ndiff --git a/llvm/lib/Transforms/Scalar/GVN.cpp b/llvm/lib/Transforms/Scalar/GVN.cpp\nindex c069c1600a79b..0326bd95fe01b 100644\n--- a/llvm/lib/Transforms/Scalar/GVN.cpp\n+++ b/llvm/lib/Transforms/Scalar/GVN.cpp\n@@ -117,6 +117,11 @@ static cl::opt<bool> GVNEnableMemDep(\"enable-gvn-memdep\", cl::init(true));\n static cl::opt<bool> GVNEnableMemorySSA(\"enable-gvn-memoryssa\",\n                                         cl::init(false));\n \n+static cl::opt<unsigned> ScanUsersLimit(\n+    \"gvn-scan-users-limit\", cl::Hidden, cl::init(100),\n+    cl::desc(\"The number of memory accesses to scan in a block in reaching \"\n+             \"memory values analysis (default = 100)\"));\n+\n static cl::opt<uint32_t> MaxNumDeps(\n     \"gvn-max-num-deps\", cl::Hidden, cl::init(100),\n     cl::desc(\"Max number of dependences to attempt Load PRE (default = 100)\"));\n@@ -1322,15 +1327,16 @@ static Value *findDominatingValue(const MemoryLocation &Loc, Type *LoadTy,\n }\n \n std::optional<AvailableValue>\n-GVNPass::AnalyzeLoadAvailability(LoadInst *Load, MemDepResult DepInfo,\n+GVNPass::AnalyzeLoadAvailability(LoadInst *Load, const ReachingMemVal &Dep,\n                                  Value *Address) {\n   assert(Load->isUnordered() && \"rules below are incorrect for ordered access\");\n-  assert(DepInfo.isLocal() && \"expected a local dependence\");\n+  assert((Dep.Kind == DepKind::Def || Dep.Kind == DepKind::Clobber) &&\n+         \"expected a local dependence\");\n \n-  Instruction *DepInst = DepInfo.getInst();\n+  Instruction *DepInst = Dep.Inst;\n \n   const DataLayout &DL = Load->getDataLayout();\n-  if (DepInfo.isClobber()) {\n+  if (Dep.Kind == DepKind::Clobber) {\n     // If the dependence is to a store that writes to a superset of the bits\n     // read by the load, we can extract the bits we need for the load from the\n     // stored value.\n@@ -1355,17 +1361,23 @@ GVNPass::AnalyzeLoadAvailability(LoadInst *Load, MemDepResult DepInfo,\n       if (DepLoad != Load && Address &&\n           Load->isAtomic() <= DepLoad->isAtomic()) {\n         Type *LoadType = Load->getType();\n-        int Offset = -1;\n-\n-        // If MD reported clobber, check it was nested.\n-        if (DepInfo.isClobber() &&\n-            canCoerceMustAliasedValueToLoad(DepLoad, LoadType,\n-                                            DepLoad->getFunction())) {\n-          const auto ClobberOff = MD->getClobberOffset(DepLoad);\n-          // GVN has no deal with a negative offset.\n-          Offset = (ClobberOff == std::nullopt || *ClobberOff < 0)\n-                       ? -1\n-                       : *ClobberOff;\n+        int Offset = Dep.Offset;\n+\n+        if (!isMemorySSAEnabled()) {\n+          // If MD reported clobber, check it was nested.\n+          if (canCoerceMustAliasedValueToLoad(DepLoad, LoadType,\n+                                              DepLoad->getFunction())) {\n+            const auto ClobberOff = MD->getClobberOffset(DepLoad);\n+            // GVN has no deal with a negative offset.\n+            Offset = (ClobberOff == std::nullopt || *ClobberOff < 0)\n+                         ? -1\n+                         : *ClobberOff;\n+          }\n+        } else {\n+          if (!canCoerceMustAliasedValueToLoad(DepLoad, LoadType,\n+                                               DepLoad->getFunction()) ||\n+              Offset < 0)\n+            Offset = -1;\n         }\n         if (Offset == -1)\n           Offset =\n@@ -1396,7 +1408,7 @@ GVNPass::AnalyzeLoadAvailability(LoadInst *Load, MemDepResult DepInfo,\n \n     return std::nullopt;\n   }\n-  assert(DepInfo.isDef() && \"follows from above\");\n+  assert(Dep.Kind == DepKind::Def && \"follows from above\");\n \n   // Loading the alloca -> undef.\n   // Loading immediately after lifetime begin -> undef.\n@@ -1464,7 +1476,8 @@ GVNPass::AnalyzeLoadAvailability(LoadInst *Load, MemDepResult DepInfo,\n   return std::nullopt;\n }\n \n-void GVNPass::AnalyzeLoadAvailability(LoadInst *Load, LoadDepVect &Deps,\n+void GVNPass::AnalyzeLoadAvailability(LoadInst *Load,\n+                                      SmallVectorImpl<ReachingMemVal> &Deps,\n                                       AvailValInBlkVect &ValuesPerBlock,\n                                       UnavailBlkVect &UnavailableBlocks) {\n   // Filter out useless results (non-locals, etc).  Keep track of the blocks\n@@ -1472,8 +1485,7 @@ void GVNPass::AnalyzeLoadAvailability(LoadInst *Load, LoadDepVect &Deps,\n   // dependencies that produce an unknown value for the load (such as a call\n   // that could potentially clobber the load).\n   for (const auto &Dep : Deps) {\n-    BasicBlock *DepBB = Dep.getBB();\n-    MemDepResult DepInfo = Dep.getResult();\n+    BasicBlock *DepBB = Dep.Block;\n \n     if (DeadBlocks.count(DepBB)) {\n       // Dead dependent mem-op disguise as a load evaluating the same value\n@@ -1482,7 +1494,7 @@ void GVNPass::AnalyzeLoadAvailability(LoadInst *Load, LoadDepVect &Deps,\n       continue;\n     }\n \n-    if (!DepInfo.isLocal()) {\n+    if (Dep.Kind == DepKind::Other) {\n       UnavailableBlocks.push_back(DepBB);\n       continue;\n     }\n@@ -1490,7 +1502,8 @@ void GVNPass::AnalyzeLoadAvailability(LoadInst *Load, LoadDepVect &Deps,\n     // The address being loaded in this non-local block may not be the same as\n     // the pointer operand of the load if PHI translation occurs.  Make sure\n     // to consider the right address.\n-    if (auto AV = AnalyzeLoadAvailability(Load, DepInfo, Dep.getAddress())) {\n+    if (auto AV =\n+            AnalyzeLoadAvailability(Load, Dep, const_cast<Value *>(Dep.Addr))) {\n       // subtlety: because we know this was a non-local dependency, we know\n       // it's safe to materialize anywhere between the instruction within\n       // DepInfo and the end of it's block.\n@@ -1546,12 +1559,24 @@ LoadInst *GVNPass::findLoadToHoistIntoPred(BasicBlock *Pred, BasicBlock *LoadBB,\n     if (!Inst.isIdenticalTo(Load))\n       continue;\n \n-    MemDepResult Dep = MD->getDependency(&Inst);\n+    bool HasLocalDep = true;\n+    if (!isMemorySSAEnabled()) {\n+      MemDepResult Dep = MD->getDependency(&Inst);\n+      HasLocalDep = !Dep.isNonLocal();\n+    } else {\n+      auto *MSSA = MSSAU->getMemorySSA();\n+      // Do not hoist if the identical load has ordering constraint.\n+      if (auto *MA = MSSA->getMemoryAccess(&Inst); MA && isa<MemoryUse>(MA)) {\n+        auto *Clobber = MSSA->getWalker()->getClobberingMemoryAccess(MA);\n+        HasLocalDep = Clobber->getBlock() == SuccBB;\n+      }\n+    }\n+\n     // If an identical load doesn't depends on any local instructions, it can\n     // be safely moved to PredBB.\n     // Also check for the implicit control flow instructions. See the comments\n     // in PerformLoadPRE for details.\n-    if (Dep.isNonLocal() && !ICF->isDominatedByICFIFromSameBlock(&Inst))\n+    if (!HasLocalDep && !ICF->isDominatedByICFIFromSameBlock(&Inst))\n       return cast<LoadInst>(&Inst);\n \n     // Otherwise there is something in the same BB clobbers the memory, we can't\n@@ -1611,7 +1636,8 @@ void GVNPass::eliminatePartiallyRedundantLoad(\n     // Add the newly created load.\n     ValuesPerBlock.push_back(\n         AvailableValueInBlock::get(UnavailableBlock, NewLoad));\n-    MD->invalidateCachedPointerInfo(LoadPtr);\n+    if (MD)\n+      MD->invalidateCachedPointerInfo(LoadPtr);\n     LLVM_DEBUG(dbgs() << \"GVN INSERTED \" << *NewLoad << '\\n');\n \n     // For PredBB in CriticalEdgePredAndLoad we need to replace the uses of old\n@@ -1641,7 +1667,7 @@ void GVNPass::eliminatePartiallyRedundantLoad(\n     V->takeName(Load);\n   if (Instruction *I = dyn_cast<Instruction>(V))\n     I->setDebugLoc(Load->getDebugLoc());\n-  if (V->getType()->isPtrOrPtrVectorTy())\n+  if (MD && V->getType()->isPtrOrPtrVectorTy())\n     MD->invalidateCachedPointerInfo(V);\n   ORE->emit([&]() {\n     return OptimizationRemark(DEBUG_TYPE, \"LoadPRE\", Load)\n@@ -1996,13 +2022,11 @@ static void reportLoadElim(LoadInst *Load, Value *AvailableValue,\n /// non-local by performing PHI construction.\n bool GVNPass::processNonLocalLoad(LoadInst *Load) {\n   // Non-local speculations are not allowed under asan.\n-  if (Load->getParent()->getParent()->hasFnAttribute(\n-          Attribute::SanitizeAddress) ||\n-      Load->getParent()->getParent()->hasFnAttribute(\n-          Attribute::SanitizeHWAddress))\n+  if (Load->getFunction()->hasFnAttribute(Attribute::SanitizeAddress) ||\n+      Load->getFunction()->hasFnAttribute(Attribute::SanitizeHWAddress))\n     return false;\n \n-  // Step 1: Find the non-local dependencies of the load.\n+  // Find the non-local dependencies of the load.\n   LoadDepVect Deps;\n   MD->getNonLocalPointerDependency(Load, Deps);\n \n@@ -2013,10 +2037,30 @@ bool GVNPass::processNonLocalLoad(LoadInst *Load) {\n   if (NumDeps > MaxNumDeps)\n     return false;\n \n+  SmallVector<ReachingMemVal, 64> MemVals;\n+  MemVals.reserve(Deps.size());\n+\n+  for (const NonLocalDepResult &Dep : Deps) {\n+    const auto &R = Dep.getResult();\n+    Value *Address = Dep.getAddress();\n+    BasicBlock *BB = Dep.getBB();\n+    Instruction *Inst = R.getInst();\n+    if (R.isClobber())\n+      MemVals.emplace_back(ReachingMemVal::getClobber(Address, Inst));\n+    else if (R.isDef())\n+      MemVals.emplace_back(ReachingMemVal::getDef(Address, Inst));\n+    else\n+      MemVals.emplace_back(ReachingMemVal::getUnknown(BB, Address, Inst));\n+  }\n+\n+  return processNonLocalLoad(Load, MemVals);\n+}\n+\n+bool GVNPass::processNonLocalLoad(LoadInst *Load,\n+                                  SmallVectorImpl<ReachingMemVal> &Deps) {\n   // If we had a phi translation failure, we'll have a single entry which is a\n   // clobber in the current block.  Reject this early.\n-  if (NumDeps == 1 &&\n-      !Deps[0].getResult().isDef() && !Deps[0].getResult().isClobber()) {\n+  if (Deps.size() == 1 && Deps[0].Kind == DepKind::Other) {\n     LLVM_DEBUG(dbgs() << \"GVN: non-local load \"; Load->printAsOperand(dbgs());\n                dbgs() << \" has unknown dependencies\\n\";);\n     return false;\n@@ -2034,7 +2078,7 @@ bool GVNPass::processNonLocalLoad(LoadInst *Load) {\n     }\n   }\n \n-  // Step 2: Analyze the availability of the load.\n+  // Step 1: Analyze the availability of the load.\n   AvailValInBlkVect ValuesPerBlock;\n   UnavailBlkVect UnavailableBlocks;\n   AnalyzeLoadAvailability(Load, Deps, ValuesPerBlock, UnavailableBlocks);\n@@ -2044,7 +2088,7 @@ bool GVNPass::processNonLocalLoad(LoadInst *Load) {\n   if (ValuesPerBlock.empty())\n     return Changed;\n \n-  // Step 3: Eliminate fully redundancy.\n+  // Step 2: Eliminate fully redundancy.\n   //\n   // If all of the instructions we depend on produce a known value for this\n   // load, then it is fully redundant and we can use PHI insertion to compute\n@@ -2066,7 +2110,7 @@ bool GVNPass::processNonLocalLoad(LoadInst *Load) {\n       // to propagate Load's DebugLoc because Load may not post-dominate I.\n       if (Load->getDebugLoc() && Load->getParent() == I->getParent())\n         I->setDebugLoc(Load->getDebugLoc());\n-    if (V->getType()->isPtrOrPtrVectorTy())\n+    if (MD && V->getType()->isPtrOrPtrVectorTy())\n       MD->invalidateCachedPointerInfo(V);\n     ++NumGVNLoad;\n     reportLoadElim(Load, V, ORE);\n@@ -2074,7 +2118,7 @@ bool GVNPass::processNonLocalLoad(LoadInst *Load) {\n     return true;\n   }\n \n-  // Step 4: Eliminate partial redundancy.\n+  // Step 3: Eliminate partial redundancy.\n   if (!isLoadPREEnabled())\n     return Changed;\n   if (!isLoadInLoopPREEnabled() && LI->getLoopFor(Load->getParent()))\n@@ -2153,10 +2197,554 @@ static void patchAndReplaceAllUsesWith(Instruction *I, Value *Repl) {\n   I->replaceAllUsesWith(Repl);\n }\n \n+/// If a load has !invariant.group, try to find the most-dominating instruction\n+/// with the same metadata and equivalent pointer (modulo bitcasts and zero\n+/// GEPs). If one is found that dominates the load, its value can be reused.\n+static Instruction *findInvariantGroupValue(LoadInst *L, DominatorTree &DT) {\n+  Value *PointerOperand = L->getPointerOperand()->stripPointerCasts();\n+\n+  // It's not safe to walk the use list of a global value because function\n+  // passes aren't allowed to look outside their functions.\n+  // FIXME: this could be fixed by filtering instructions from outside of\n+  // current function.\n+  if (isa<Constant>(PointerOperand))\n+    return nullptr;\n+\n+  // Queue to process all pointers that are equivalent to load operand.\n+  SmallVector<Value *, 8> PointerUsesQueue;\n+  PointerUsesQueue.push_back(PointerOperand);\n+\n+  Instruction *MostDominatingInstruction = L;\n+\n+  // FIXME: This loop is potentially O(n^2) due to repeated dominates checks.\n+  while (!PointerUsesQueue.empty()) {\n+    Value *Ptr = PointerUsesQueue.pop_back_val();\n+    assert(Ptr && !isa<GlobalValue>(Ptr) &&\n+           \"Null or GlobalValue should not be inserted\");\n+\n+    for (User *U : Ptr->users()) {\n+      auto *I = dyn_cast<Instruction>(U);\n+      if (!I || I == L || !DT.dominates(I, MostDominatingInstruction))\n+        continue;\n+\n+      // Add bitcasts and zero GEPs to queue.\n+      // TODO: Should drop bitcast?\n+      if (isa<BitCastInst>(I) ||\n+          (isa<GetElementPtrInst>(I) &&\n+           cast<GetElementPtrInst>(I)->hasAllZeroIndices())) {\n+        PointerUsesQueue.push_back(I);\n+        continue;\n+      }\n+\n+      // If we hit a load/store with an invariant.group metadata and the same\n+      // pointer operand, we can assume that value pointed to by the pointer\n+      // operand didn't change.\n+      if (I->hasMetadata(LLVMContext::MD_invariant_group) &&\n+          Ptr == getLoadStorePointerOperand(I) && !I->isVolatile())\n+        MostDominatingInstruction = I;\n+    }\n+  }\n+\n+  return MostDominatingInstruction != L ? MostDominatingInstruction : nullptr;\n+}\n+\n+/// Return the memory location accessed by the (masked) load/store instruction\n+/// `I`, if the instruction could potentially provide a useful value for\n+/// eliminating the load.\n+static std::optional<MemoryLocation>\n+maybeLoadStoreLocation(Instruction *I, bool AllowStores,\n+                       const TargetLibraryInfo *TLI) {\n+  if (auto *LI = dyn_cast<LoadInst>(I))\n+    return MemoryLocation::get(LI);\n+\n+  if (auto *II = dyn_cast<IntrinsicInst>(I)) {\n+    switch (II->getIntrinsicID()) {\n+    case Intrinsic::masked_load:\n+      return MemoryLocation::getForArgument(II, 0, TLI);\n+    case Intrinsic::masked_store:\n+      if (AllowStores)\n+        return MemoryLocation::getForArgument(II, 1, TLI);\n+      return std::nullopt;\n+    default:\n+      break;\n+    }\n+  }\n+\n+  if (!AllowStores)\n+    return std::nullopt;\n+\n+  if (auto *SI = dyn_cast<StoreInst>(I))\n+    return MemoryLocation::get(SI);\n+  return std::nullopt;\n+}\n+\n+/// Scan the users of each MemoryAccess in `ClobbersList` that belong to `BB`,\n+/// looking for memory reads whose location aliases `Loc` and dominates our\n+/// load.\n+std::optional<GVNPass::ReachingMemVal> GVNPass::scanMemoryAccessesUsers(\n+    const MemoryLocation &Loc, bool IsInvariantLoad, BasicBlock *BB,\n+    const SmallVectorImpl<MemoryAccess *> &ClobbersList, MemorySSA &MSSA,\n+    BatchAAResults &AA, LoadInst *L) {\n+\n+  // Prefer a candidate that is closer to the load within the same block.\n+  auto UpdateChoice = [&](std::optional<ReachingMemVal> &Choice,\n+                          AliasResult &AR, Instruction *Candidate) {\n+    if (!Choice) {\n+      if (AR == AliasResult::PartialAlias)\n+        Choice = ReachingMemVal::getClobber(Loc.Ptr, Candidate, AR.getOffset());\n+      else\n+        Choice = ReachingMemVal::getDef(Loc.Ptr, Candidate);\n+      return;\n+    }\n+    if (!MSSA.locallyDominates(MSSA.getMemoryAccess(Choice->Inst),\n+                               MSSA.getMemoryAccess(Candidate)))\n+      return;\n+\n+    if (AR == AliasResult::PartialAlias) {\n+      Choice->Kind = DepKind::Clobber;\n+      Choice->Offset = AR.getOffset();\n+    } else {\n+      Choice->Kind = DepKind::Def;\n+      Choice->Offset = -1;\n+    }\n+\n+    Choice->Inst = Candidate;\n+    Choice->Block = Candidate->getParent();\n+  };\n+\n+  std::optional<ReachingMemVal> ReachingVal;\n+  for (MemoryAccess *MA : ClobbersList) {\n+    unsigned Scanned = 0;\n+    for (User *U : MA->users()) {\n+      if (++Scanned >= ScanUsersLimit)\n+        return ReachingMemVal::getUnknown(BB, Loc.Ptr);\n+\n+      auto *UseOrDef = dyn_cast<MemoryUseOrDef>(U);\n+      if (!UseOrDef || UseOrDef->getBlock() != BB)\n+        continue;\n+\n+      Instruction *MemI = UseOrDef->getMemoryInst();\n+      if (MemI == L ||\n+          (L && !MSSA.locallyDominates(UseOrDef, MSSA.getMemoryAccess(L))))\n+        continue;\n+\n+      if (auto MaybeLoc = maybeLoadStoreLocation(MemI, IsInvariantLoad, TLI)) {\n+        AliasResult AR = AA.alias(*MaybeLoc, Loc);\n+        // If the locations do not certainly alias, we cannot possibly infer the\n+        // following load loads the same value.\n+        if (AR == AliasResult::NoAlias || AR == AliasResult::MayAlias)\n+          continue;\n+\n+        // Locations partially overlap, but neither is a subset of the other, or\n+        // the second location is before the first.\n+        if (AR == AliasResult::PartialAlias &&\n+            (!AR.hasOffset() || AR.getOffset() < 0))\n+          continue;\n+\n+        // Found candidate, the new load memory location and the given location\n+        // must alias: precise overlap, or subset with non-negative offset.\n+        UpdateChoice(ReachingVal, AR, MemI);\n+      }\n+    }\n+    if (ReachingVal)\n+      break;\n+  }\n+\n+  return ReachingVal;\n+}\n+\n+/// Check if a given MemoryAccess (usually a MemoryDef) actually modifies a\n+/// given location. Returns a ReachingMemVal describing the dependency.\n+std::optional<GVNPass::ReachingMemVal> GVNPass::accessMayModifyLocation(\n+    MemoryAccess *ClobberMA, const MemoryLocation &Loc, bool IsInvariantLoad,\n+    BasicBlock *BB, MemorySSA &MSSA, BatchAAResults &AA) {\n+  assert(ClobberMA->getBlock() == BB);\n+\n+  // If the clobbering access is the entry memory state, we cannot say anything\n+  // about the content of the memory, except when we are accessing a local\n+  // object, which can be turned later into producing `undef`.\n+  if (MSSA.isLiveOnEntryDef(ClobberMA)) {\n+    if (auto *Alloc = dyn_cast<AllocaInst>(getUnderlyingObject(Loc.Ptr)))\n+      if (Alloc->getParent() == BB)\n+        return ReachingMemVal::getDef(Loc.Ptr, const_cast<AllocaInst *>(Alloc));\n+    return ReachingMemVal::getUnknown(BB, Loc.Ptr);\n+  }\n+\n+  // Loads from \"constant\" memory can't be clobbered.\n+  if (IsInvariantLoad || AA.pointsToConstantMemory(Loc))\n+    return std::nullopt;\n+\n+  auto GetOrdering = [](const Instruction *I) {\n+    if (auto *L = dyn_cast<LoadInst>(I))\n+      return L->getOrdering();\n+    return cast<StoreInst>(I)->getOrdering();\n+  };\n+  Instruction *ClobberI = cast<MemoryDef>(ClobberMA)->getMemoryInst();\n+\n+  // Check if the clobbering access is a load or a store that we can reuse.\n+  if (auto MaybeLoc = maybeLoadStoreLocation(ClobberI, true, TLI)) {\n+    AliasResult AR = AA.alias(*MaybeLoc, Loc);\n+    if (AR == AliasResult::MustAlias)\n+      return ReachingMemVal::getDef(Loc.Ptr, ClobberI);\n+\n+    if (AR == AliasResult::NoAlias) {\n+      // If the locations do not alias we may still be able to skip over the\n+      // clobbering instruction, even if it is atomic.\n+      // The original load is either non-atomic or unordered. We can reorder\n+      // these across non-atomic, unordered or monotonic loads or across any\n+      // store.\n+      if (!ClobberI->isAtomic() ||\n+          !isStrongerThan(GetOrdering(ClobberI), AtomicOrdering::Monotonic) ||\n+          isa<StoreInst>(ClobberI))\n+        return std::nullopt;\n+      return ReachingMemVal::getClobber(Loc.Ptr, ClobberI);\n+    }\n+\n+    // Skip over volatile loads (the original load is non-volatile, non-atomic).\n+    if (!ClobberI->isAtomic() && isa<LoadInst>(ClobberI))\n+      return std::nullopt;\n+\n+    if (AR == AliasResult::MayAlias ||\n+        (AR == AliasResult::PartialAlias &&\n+         (!AR.hasOffset() || AR.getOffset() < 0)))\n+      return ReachingMemVal::getClobber(Loc.Ptr, ClobberI);\n+\n+    // The only option left is a store of the superset of the required bits.\n+    assert(AR == AliasResult::PartialAlias && AR.hasOffset() &&\n+           AR.getOffset() > 0 &&\n+           \"Must be the superset/partial overlap case with positive offset\");\n+    return ReachingMemVal::getClobber(Loc.Ptr, ClobberI, AR.getOffset());\n+  }\n+\n+  if (auto *II = dyn_cast<IntrinsicInst>(ClobberI)) {\n+    if (isa<DbgInfoIntrinsic>(II))\n+      return std::nullopt;\n+    if (II->getIntrinsicID() == Intrinsic::lifetime_start) {\n+      MemoryLocation IIObjLoc = MemoryLocation::getForArgument(II, 0, TLI);\n+      if (AA.isMustAlias(IIObjLoc, Loc))\n+        return ReachingMemVal::getDef(Loc.Ptr, ClobberI);\n+      return std::nullopt;\n+    }\n+  }\n+\n+  // If we are at a malloc-like function call, we can turn the load into `undef`\n+  // or zero.\n+  if (isNoAliasCall(ClobberI)) {\n+    const Value *Obj = getUnderlyingObject(Loc.Ptr);\n+    if (Obj == ClobberI || AA.isMustAlias(ClobberI, Loc.Ptr))\n+      return ReachingMemVal::getDef(Loc.Ptr, ClobberI);\n+  }\n+\n+  // Can reorder loads across a release fence.\n+  if (auto *FI = dyn_cast<FenceInst>(ClobberI))\n+    if (FI->getOrdering() == AtomicOrdering::Release)\n+      return std::nullopt;\n+\n+  // See if the clobber instruction (e.g., a generic call) may modify the\n+  // location.\n+  ModRefInfo MR = AA.getModRefInfo(ClobberI, Loc);\n+  // If may modify the location, analyze deeper, to exclude accesses to\n+  // non-escaping local allocations.\n+  if (MR == ModRefInfo::NoModRef || MR == ModRefInfo::Ref)\n+    return std::nullopt;\n+\n+  // Conservatively assume the clobbering memory access may overwrite the\n+  // location.\n+  return ReachingMemVal::getClobber(Loc.Ptr, ClobberI);\n+}\n+\n+/// Collect the predecessors of block, while doing phi-translation of the memory\n+/// address and the memory clobber. Return false if the block should be marked\n+/// as clobbering the memory location in an unknown way.\n+bool GVNPass::collectPredecessors(BasicBlock *BB, const PHITransAddr &Addr,\n+                                  MemoryAccess *ClobberMA,\n+                                  DependencyBlockSet &Blocks,\n+                                  SmallVectorImpl<BasicBlock *> &Worklist) {\n+  if (Addr.needsPHITranslationFromBlock(BB) &&\n+      !Addr.isPotentiallyPHITranslatable())\n+    return false;\n+\n+  auto *MPhi =\n+      ClobberMA->getBlock() == BB ? dyn_cast<MemoryPhi>(ClobberMA) : nullptr;\n+  SmallVector<std::pair<BasicBlock *, DependencyBlockInfo>, 8> Preds;\n+  for (BasicBlock *Pred : predecessors(BB)) {\n+    // Skip unreachable predecessors.\n+    if (!DT->isReachableFromEntry(Pred))\n+      continue;\n+\n+    // Skip already visited predecessors.\n+    if (llvm::any_of(Preds, [Pred](const auto &P) { return P.first == Pred; }))\n+      continue;\n+\n+    PHITransAddr TransAddr = Addr;\n+    if (TransAddr.needsPHITranslationFromBlock(BB))\n+      TransAddr.translateValue(BB, Pred, DT, false);\n+\n+    auto It = Blocks.find(Pred);\n+    if (It != Blocks.end()) {\n+      // If we reach a visited block with a different address, set the\n+      // current block as clobbering the memory location in an unknown way\n+      // (by returning false).\n+      if (It->second.Addr.getAddr() != TransAddr.getAddr())\n+        return false;\n+      // Otherwise, just stop the traversal.\n+      continue;\n+    }\n+\n+    Preds.emplace_back(\n+        Pred, DependencyBlockInfo(TransAddr,\n+                                  MPhi ? MPhi->getIncomingValueForBlock(Pred)\n+                                       : ClobberMA));\n+  }\n+\n+  // We collected the predecessors and stored them in Preds. Now, populate the\n+  // worklist with the predecessors found, and cache the eventual translated\n+  // address for each block.\n+  for (auto &P : Preds) {\n+    [[maybe_unused]] auto It =\n+        Blocks.try_emplace(P.first, std::move(P.second)).first;\n+    Worklist.push_back(P.first);\n+  }\n+\n+  return true;\n+}\n+\n+/// Build a list of MemoryAccesses whose users could potentially alias the\n+/// memory location being queried. Starts from StartInfo's initial clobber,\n+/// walk the use-def chain to the final clobber. If the chain extends beyond\n+/// `BB`, continue into that block but only if it is in the previously collected\n+/// set.\n+void GVNPass::collectClobberList(SmallVectorImpl<MemoryAccess *> &Clobbers,\n+                                 BasicBlock *BB,\n+                                 const DependencyBlockInfo &StartInfo,\n+                                 const DependencyBlockSet &Blocks,\n+                                 MemorySSA &MSSA) {\n+  MemoryAccess *MA = StartInfo.InitialClobberMA;\n+  MemoryAccess *LastMA = StartInfo.ClobberMA;\n+\n+  for (;;) {\n+    while (MA != LastMA) {\n+      Clobbers.push_back(MA);\n+      MA = cast<MemoryUseOrDef>(MA)->getDefiningAccess();\n+    }\n+    Clobbers.push_back(MA);\n+\n+    if (MSSA.isLiveOnEntryDef(MA) ||\n+        (MA->getBlock() == BB && !isa<MemoryPhi>(MA)))\n+      break;\n+\n+    // If the final clobber in the current block is a MemoryPhi, go to the\n+    // immediate dominator; otherwise, just get to the block containing the\n+    // final clobber.\n+    if (MA->getBlock() == BB)\n+      BB = DT->getNode(BB)->getIDom()->getBlock();\n+    else\n+      BB = MA->getBlock();\n+\n+    auto It = Blocks.find(BB);\n+    if (It == Blocks.end())\n+      break;\n+\n+    MA = It->second.InitialClobberMA;\n+    LastMA = It->second.ClobberMA;\n+    if (MA == Clobbers.back())\n+      Clobbers.pop_back();\n+  }\n+}\n+\n+/// Entrypoint for the MemorySSA-based redundant load elimination algorithm.\n+/// Given as input a load instruction, the function computes the set of reaching\n+/// memory values, one per predecessor path, that AnalyzeLoadAvailability can\n+/// later use to establish whether the load may be eliminated. A reaching value\n+/// may be of the following descriptor kind:\n+/// * Def: a precise instruction that produces the exact bits the load would\n+/// read (e.g., an equivalent load or a MustAlias store);\n+/// * Clobber: a write that clobbers a superset of the bits the load would read\n+/// (e.g., a memset over a larger region);\n+/// * Other: we know which block defines the memory location in some way, but\n+/// could not identify a precise instruction (e.g., memory already live at\n+/// function entry).\n+bool GVNPass::findReachingValuesForLoad(LoadInst *L,\n+                                        SmallVectorImpl<ReachingMemVal> &Values,\n+                                        MemorySSA &MSSA, AAResults &AAR) {\n+  EarliestEscapeAnalysis EA(*DT, LI);\n+  BatchAAResults AA(AAR, &EA);\n+  BasicBlock *StartBlock = L->getParent();\n+  bool IsInvariantLoad = L->hasMetadata(LLVMContext::MD_invariant_load);\n+  // TODO: Simplify later work by just getClobberingMemoryAccess().\n+  MemoryAccess *ClobberMA = MSSA.getMemoryAccess(L)->getDefiningAccess();\n+  const MemoryLocation Loc = MemoryLocation::get(L);\n+\n+  // Fast path for load tagged with !invariant.group.\n+  if (L->hasMetadata(LLVMContext::MD_invariant_group)) {\n+    if (Instruction *G = findInvariantGroupValue(L, *DT)) {\n+      Values.emplace_back(\n+          ReachingMemVal::getDef(getLoadStorePointerOperand(G), G));\n+      return true;\n+    }\n+  }\n+\n+  // Phase 1. First off, look for a local dependency to avoid having to\n+  // disambiguate between before the load and after the load of the starting\n+  // block (as the load may be visited from a backedge).\n+  do {\n+    // Scan users of the clobbering memory access.\n+    if (auto RMV = scanMemoryAccessesUsers(\n+            Loc, IsInvariantLoad, StartBlock,\n+            SmallVector<MemoryAccess *, 1>{ClobberMA}, MSSA, AA, L)) {\n+      Values.emplace_back(*RMV);\n+      return true;\n+    }\n+\n+    // Exit from here, and proceed visiting predecessors if the clobbering\n+    // access is non-local or is a MemoryPhi.\n+    if (ClobberMA->getBlock() != StartBlock || isa<MemoryPhi>(ClobberMA))\n+      break;\n+\n+    // Check if the clobber actually aliases the load location.\n+    if (auto RMV = accessMayModifyLocation(ClobberMA, Loc, IsInvariantLoad,\n+                                           StartBlock, MSSA, AA)) {\n+      Values.emplace_back(*RMV);\n+      return true;\n+    }\n+\n+    // It may happen that the clobbering memory access does not actually\n+    // clobber our load location, transition to its defining memory access.\n+    ClobberMA = cast<MemoryUseOrDef>(ClobberMA)->getDefiningAccess();\n+  } while (ClobberMA->getBlock() == StartBlock);\n+\n+  // Non-local speculations are not allowed under ASan.\n+  if (L->getFunction()->hasFnAttribute(Attribute::SanitizeAddress) ||\n+      L->getFunction()->hasFnAttribute(Attribute::SanitizeHWAddress))\n+    return false;\n+\n+  // Phase 2. Walk backwards through the CFG, collecting all the blocks that\n+  // contain an instruction that modifies the load memory location, or that lie\n+  // on a path between a clobbering block and our load. Start off by collecting\n+  // the predecessors of `StartBlock`. All the visited blocks are stored in a\n+  // the set `Blocks`. If possible, the memory address maintained for the block\n+  // visited does get phi-translated.\n+  DependencyBlockSet Blocks;\n+  SmallVector<BasicBlock *, 16> InitialWorklist;\n+  const DataLayout &DL = L->getModule()->getDataLayout();\n+  if (!collectPredecessors(StartBlock,\n+                           PHITransAddr(L->getPointerOperand(), DL, AC),\n+                           ClobberMA, Blocks, InitialWorklist))\n+    return false;\n+\n+  // Do a bottom-up DFS.\n+  auto Worklist = InitialWorklist;\n+  while (!Worklist.empty()) {\n+    auto *BB = Worklist.pop_back_val();\n+    DependencyBlockInfo &Info = Blocks.find(BB)->second;\n+\n+    // Phi-translation may have failed.\n+    if (!Info.Addr.getAddr())\n+      continue;\n+\n+    // If the clobbering memory access is in the current block and it indeed\n+    // clobbers our load location, record the dependency and do not visit the\n+    // predecessors of this block further, continue with the blocks in the\n+    // worklist.\n+    if (Info.ClobberMA->getBlock() == BB && !isa<MemoryPhi>(Info.ClobberMA)) {\n+      if (auto RMV = accessMayModifyLocation(\n+              Info.ClobberMA, Loc.getWithNewPtr(Info.Addr.getAddr()),\n+              IsInvariantLoad, BB, MSSA, AA)) {\n+        Info.MemVal = RMV;\n+        continue;\n+      }\n+      assert(!MSSA.isLiveOnEntryDef(Info.ClobberMA) &&\n+             \"LiveOnEntry aliases everything\");\n+\n+      // If, however, the clobbering memory access does not actually clobber\n+      // our load location, transition to its defining memory access, but\n+      // keep examining the same basic block.\n+      Info.ClobberMA =\n+          cast<MemoryUseOrDef>(Info.ClobberMA)->getDefiningAccess();\n+      Worklist.emplace_back(BB);\n+      continue;\n+    }\n+\n+    // At this point we know the current block is \"transparent\", i.e. the memory\n+    // location is not modified when execution goes through this block.\n+    // Continue to its predecessors, unless a predecessor has already been\n+    // visited with a different address. We currently cannot represent such a\n+    // dependency.\n+    if (BB == StartBlock && Info.Addr.getAddr() != L->getPointerOperand()) {\n+      Info.ForceUnknown = true;\n+      continue;\n+    }\n+    if (BB != StartBlock &&\n+        !collectPredecessors(BB, Info.Addr, Info.ClobberMA, Blocks, Worklist))\n+      Info.ForceUnknown = true;\n+  }\n+\n+  // Phase 3. We have collected all the blocks that either write a value to the\n+  // memory location of the load, or there exists a path to the load, along\n+  // which the memory location is not modified. Perform a second DFS to find\n+  // load-to-load dependencies; namely, look at the dominating memory reads,\n+  // that alias our load. These are the MemoryUses that are users of the\n+  // MemoryDefs we previously identified. If no memory read is encountered,\n+  // either confirm the clobbering write found before or set to unknown.\n+  Worklist = InitialWorklist;\n+  for (BasicBlock *BB : Worklist) {\n+    DependencyBlockInfo &Info = Blocks.find(BB)->second;\n+    Info.Visited = true;\n+  }\n+\n+  SmallVector<MemoryAccess *> Clobbers;\n+  while (!Worklist.empty()) {\n+    auto *BB = Worklist.pop_back_val();\n+    DependencyBlockInfo &Info = Blocks.find(BB)->second;\n+\n+    // If phi-translation failed, assume the memory location is modified in\n+    // unknown way.\n+    if (!Info.Addr.getAddr()) {\n+      Values.push_back(ReachingMemVal::getUnknown(BB, nullptr));\n+      continue;\n+    }\n+\n+    Clobbers.clear();\n+    collectClobberList(Clobbers, BB, Info, Blocks, MSSA);\n+    if (auto RMV =\n+            scanMemoryAccessesUsers(Loc.getWithNewPtr(Info.Addr.getAddr()),\n+                                    IsInvariantLoad, BB, Clobbers, MSSA, AA)) {\n+      Values.push_back(*RMV);\n+      continue;\n+    }\n+\n+    // If no reusable memory use was found, and the current block is not\n+    // transparent, use the already established memory def.\n+    if (Info.MemVal) {\n+      Values.push_back(*Info.MemVal);\n+      continue;\n+    }\n+\n+    if (Info.ForceUnknown) {\n+      Values.push_back(ReachingMemVal::getUnknown(BB, Info.Addr.getAddr()));\n+      continue;\n+    }\n+\n+    // If the current block is transparent, continue to its predecessors.\n+    for (BasicBlock *Pred : predecessors(BB)) {\n+      auto It = Blocks.find(Pred);\n+      if (It == Blocks.end())\n+        continue;\n+      DependencyBlockInfo &PredInfo = It->second;\n+      if (PredInfo.Visited)\n+        continue;\n+      PredInfo.Visited = true;\n+      Worklist.push_back(Pred);\n+    }\n+  }\n+\n+  return true;\n+}\n+\n /// Attempt to eliminate a load, first by eliminating it\n /// locally, and then attempting non-local elimination if that fails.\n bool GVNPass::processLoad(LoadInst *L) {\n-  if (!MD)\n+  if (!MD && !isMemorySSAEnabled())\n     return false;\n \n   // This code hasn't been audited for ordered or volatile memory access.\n@@ -2171,15 +2759,33 @@ bool GVNPass::processLoad(LoadInst *L) {\n     return true;\n   }\n \n-  // ... to a pointer that has been loaded from before...\n-  MemDepResult Dep = MD->getDependency(L);\n+  ReachingMemVal MemVal = ReachingMemVal::getUnknown(nullptr, nullptr);\n+  if (!isMemorySSAEnabled()) {\n+    // ... to a pointer that has been loaded from before...\n+    MemDepResult Dep = MD->getDependency(L);\n+\n+    // If it is defined in another block, try harder.\n+    if (Dep.isNonLocal())\n+      return processNonLocalLoad(L);\n \n-  // If it is defined in another block, try harder.\n-  if (Dep.isNonLocal())\n-    return processNonLocalLoad(L);\n+    // Only handle the local case below.\n+    if (Dep.isDef())\n+      MemVal = ReachingMemVal::getDef(L->getPointerOperand(), Dep.getInst());\n+    else if (Dep.isClobber())\n+      MemVal =\n+          ReachingMemVal::getClobber(L->getPointerOperand(), Dep.getInst());\n+  } else {\n+    SmallVector<ReachingMemVal, 8> MemVals;\n+    if (!findReachingValuesForLoad(L, MemVals, *MSSAU->getMemorySSA(), *AA))\n+      return false; // Too many dependencies.\n+    assert(MemVals.size() && \"Expected at least an unknown value\");\n+    if (MemVals.size() > 1 || MemVals[0].Block != L->getParent())\n+      return processNonLocalLoad(L, MemVals);\n+\n+    MemVal = MemVals[0];\n+  }\n \n-  // Only handle the local case below.\n-  if (!Dep.isLocal()) {\n+  if (MemVal.Kind == DepKind::Other) {\n     // This might be a NonFuncLocal or an Unknown.\n     LLVM_DEBUG(\n         // fast print dep, using operator<< on instruction is too slow.\n@@ -2188,7 +2794,7 @@ bool GVNPass::processLoad(LoadInst *L) {\n     return false;\n   }\n \n-  auto AV = AnalyzeLoadAvailability(L, Dep, L->getPointerOperand());\n+  auto AV = AnalyzeLoadAvailability(L, MemVal, L->getPointerOperand());\n   if (!AV)\n     return false;\n \n@@ -2803,6 +3409,7 @@ bool GVNPass::runImpl(Function &F, AssumptionCache &RunAC, DominatorTree &RunDT,\n   DT = &RunDT;\n   VN.setDomTree(DT);\n   TLI = &RunTLI;\n+  AA = &RunAA;\n   VN.setAliasAnalysis(&RunAA);\n   MD = RunMD;\n   ImplicitControlFlowTracking ImplicitCFT;\n",
+  "components": [
+    "GVN"
+  ],
+  "description": "Introduce the main algorithm performing redundant load elimination via MemorySSA in GVN. The entry point is `findReachingValuesForLoad`, which, given as input a possibly redundant load `L`, it attempts to provide as output a set of reaching memory values (`ReachingMemVal`), i.e., which values (defs or equivalent reads) can reach `L` along at least one path where that memory location is not modified meanwhile (if non-local, PRE will establish whether the load may be eliminated).\r\n\r\nSpecifically, a reaching value may be of the following descriptor kind (`DepKind`):\r\n* Def: found a new instruction that produces exactly the bits the load would read. For example, a must-alias store (which defines the load memory location), or a must-alias read (exactly reads the same memory location, found, e.g., after a phi-translation fixup);\r\n* Clobber: found a write that clobbers a superset of the bits the load would read. For example, a memset call over a memory region, whose value read overlaps such a region (and may be forwarded to the load), or a generic call clobbering the load that cannot be reused;\r\n* Other: a precise instruction could not be found, but know the block where the dependency exists (e.g., a memory location already live at function entry).\r\n\r\nWe start off by looking for the users of the defining memory access of the given load within the same block, searching for local dependencies. We may need to iteratively follow the use-def chain of the defining memory access to find the actual clobbering access, while staying within the scope of the load. If an actual local def/clobber (or liveOnEntry) is found, we are done and return that one. Otherwise, we move visiting the predecessors of the load's block, considering the incoming value from the MemoryPhi as a potential clobbering access. Hence, we search for dependencies within the predecessor block itself. If the new potential clobbering access is a MemoryPhi, we continue visiting the transitive closure of the predecessor, recording its new potential clobbering access. In this phase, as we are exploring non-local definitions, the load itself may be considered a must-alias def as well when being examined from a backedge path.\r\n \r\nA detailed description of the algorithm from the original patch follows.\r\n\r\n---\r\n\r\nThe algorithm consists of three parts:\r\n1. Quick check for a local dependency;\r\n2. Discover the set of basic blocks (and MemoryDefs, a.k.a clobbers) which could affect the load location, as well as all the blocks that lie on a path from a clobbering block to the load instruction, but do not modify the memory location (_transparent_ blocks);\r\n3. Examine the uses of the clobbers which belong to one of the basic blocks found in the previous step and find ones which alias the memory location.\r\n\r\nFirst, we do a quick check for a local dependency, i.e., a memory read or write within the same basic block as the initial load instruction. Doing this first allows us to avoid having to disambiguate between the parts of the initial basic block\r\nbefore and after the original load instruction (when entered from a backedge).\r\n\r\nWe find the clobbering set of blocks by doing a walk of the reverse CFG (iterative DFS with a worklist), stopping (i.e., not visiting the predecessors further) at blocks/instructions which definitely modify the memory location. With each basic block, we maintain the following associated information:\r\n\r\n* A memory address;\r\n* A initial clobbering memory access;\r\n* A final clobbering memory access.\r\n\r\nThe worklist is seeded with the predecessors of the starting basic block (the one that contains the initial load instruction). For each of these blocks, the memory address is the pointer operand of the load, possibly phi-translated and\r\nthe initial clobbering memory access is the defining access of the load, again, possibly phi-translated. The final clobbering memory access is at first the same as the initial one. These blocks are added to the set.\r\n\r\nOn each iteration we fetch and examine the next basic block. There are a few cases to consider:\r\n\r\n* If the memory address is unknown, it means phi-translation failed; do nothing at this point, later the block will be thought of as modifying the memory location in unknown way;\r\n* We have a (final) clobbering memory access that is an actual instruction (not a MemoryPhi) in the current block and indeed clobbers the memory address; we record the dependency information for later use, stop further traversal from this block and continue with the next iteration;\r\n* We have a (final) clobbering memory access that is an actual instruction (not a MemoryPhi) in the current block and does not actually clobber the memory address; we record its defining memory access as the new final clobbering memory access, re-queue the block, and continue to the next iteration;\r\n* If none of the above clauses hold, we know that block is _transparent_, i.e. the memory location is not modified when execution passes through this block. We add the predecessors of the block to the set. If needed, phi-translate the address and the final clobbering memory access. Then add the predecessors to the worklist and proceed to the next iteration.\r\n\r\nThere are a few subtle moments when transitioning to predecessors:\r\n\r\n* If the address needs to be phi-translated, but cannot to, we consider the memory location as modified in an unknown way just before entering the block; since we know the block is transparent, for uniformity and without loss of information we can treat this situation as if the memory location was modified immediately after exiting the block;\r\n* If a predecessor is a block already visited with a different address we mark the current block as modifying the memory location in an unknown way. The dependency information that RLE in GVN expects is per block and it cannot represent dependencies coming from the same block;\r\n* If a predecessor is an already visited (with the same address) block, just skip it at this point;\r\n\r\nAt this phase of the algorithm, the set we're building serves as the visited set so as to prevent infinite loops.\r\n\r\nOnce this first phase of the algorithm completes, we have obtained the needed set of the basic block as well as the memory writing instructions that could modify our location. For each block, the initial clobbering memory access is the\r\none we enter the block with, and there is a use-def chain to the final clobbering memory access where every access is non-aliasing, except for the final one.\r\n\r\nWe still have to determine if there are memory reads that act as definitions (see above). Once again we do an iterative DFS on the reverse CFG.\r\n\r\nOn each iteration we look for memory uses in the current block. For this we first construct a list of the memory clobbers that could be a defining memory access for our memory location. This list begins with the initial clobbering memory access for the current block, following the clobbers along the use-def chain up to the final clobbering memory access. If the final clobbering memory access belongs to the same block and is not a MemoryPhi that finishes building\r\nthe list \u2013 we cannot have an aliasing use in the block, that is not a use of the final clobbering memory access. Otherwise, we look to extend the list in a couple of ways:\r\n\r\n* If the final clobbering memory access is in another block, we transition to this other block and repeat the procedure;\r\n* If the final clobbering memory access is in the same block and it's a MemoryPhi, we transition to the immediate dominator of the current block and repeat the procedure.\r\n\r\nIn both cases, transition occurs if and only if the new block is already among the collected set of clobbering blocks.\r\n\r\nOnce we have the list of clobbers, we look in turn at uses of each clobber in the list, that are in the current block, looking for memory reads which could provide (a superset of) the bits of the memory location. For those reads, we choose the one closest to the end of the block. A following (dominating) clobber in the list is processed only if no usable memory read was found so far.\r\n\r\nIf an interesting memory use was not found, we look for a clobber in the current block. This was already determined in the phase which collected the set of clobbering block. If there is a clobber, we include it in the list of the results, otherwise the block is _transparent_, and we can add it to the worklist.\r\n\r\n---\r\n\r\nOriginal patch: https://reviews.llvm.org/D116825, incrementally moved towards https://reviews.llvm.org/D130489 (primary change involves moving from a linear scan of the whole memory accesses of each basic block via getBlockAccesses() to building a list of potential clobbers and following their use-def chain.)\r\n\r\nMinor additions wrt the latest original version encompass style, improved naming, further comments, code hoisting / rearrangement opportunities, APIs update, discontinued API removal, partial tests update (complete tests update prior to turning on MSSA).",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/TypeBasedAliasAnalysis/gvn-nonlocal-type-mismatch.ll",
+      "commands": [
+        "opt -aa-pipeline=tbaa,basic-aa -passes=gvn -S < %s",
+        "opt -aa-pipeline=tbaa,basic-aa -passes='gvn<memoryssa>' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "yes",
+          "test_body": "target datalayout = \"e-p:64:64:64\"\n\n; Function Attrs: nounwind\ndefine void @yes(i1 %c, ptr %p, ptr %p1, ptr %q) #0 {\nentry:\n  store i32 0, ptr %p, align 4, !tbaa !0\n  store i32 1, ptr %p1, align 4, !tbaa !3\n  br i1 %c, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %t = load i32, ptr %p, align 4, !tbaa !0\n  store i32 %t, ptr %q, align 4\n  ret void\n\nif.else:                                          ; preds = %entry\n  ret void\n}\n\nattributes #0 = { nounwind }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"red\", !2}\n!2 = !{}\n!3 = !{!4, !4, i64 0}\n!4 = !{!\"blu\", !2}\n"
+        },
+        {
+          "test_name": "watch_out_for_type_change",
+          "test_body": "target datalayout = \"e-p:64:64:64\"\n\n; Function Attrs: nounwind\ndefine void @watch_out_for_type_change(i1 %c, ptr %p, ptr %p1, ptr %q) #0 {\nentry:\n  store i32 0, ptr %p, align 4, !tbaa !0\n  store i32 1, ptr %p1, align 4, !tbaa !3\n  br i1 %c, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %t = load i32, ptr %p, align 4, !tbaa !5\n  store i32 %t, ptr %q, align 4\n  ret void\n\nif.else:                                          ; preds = %entry\n  %u = load i32, ptr %p, align 4, !tbaa !8\n  store i32 %u, ptr %q, align 4\n  ret void\n}\n\nattributes #0 = { nounwind }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"red\", !2}\n!2 = !{}\n!3 = !{!4, !4, i64 0}\n!4 = !{!\"blu\", !2}\n!5 = !{!6, !6, i64 0}\n!6 = !{!\"outer space\", !7}\n!7 = !{!\"observable universe\"}\n!8 = !{!9, !9, i64 0}\n!9 = !{!\"brick red\", !1}\n"
+        },
+        {
+          "test_name": "watch_out_for_another_type_change",
+          "test_body": "target datalayout = \"e-p:64:64:64\"\n\n; Function Attrs: nounwind\ndefine void @watch_out_for_another_type_change(i1 %c, ptr %p, ptr %p1, ptr %q) #0 {\nentry:\n  store i32 0, ptr %p, align 4, !tbaa !0\n  store i32 1, ptr %p1, align 4, !tbaa !3\n  br i1 %c, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %t = load i32, ptr %p, align 4, !tbaa !5\n  store i32 %t, ptr %q, align 4\n  ret void\n\nif.else:                                          ; preds = %entry\n  %u = load i32, ptr %p, align 4, !tbaa !7\n  store i32 %u, ptr %q, align 4\n  ret void\n}\n\nattributes #0 = { nounwind }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"red\", !2}\n!2 = !{}\n!3 = !{!4, !4, i64 0}\n!4 = !{!\"blu\", !2}\n!5 = !{!6, !6, i64 0}\n!6 = !{!\"brick red\", !1}\n!7 = !{!8, !8, i64 0}\n!8 = !{!\"outer space\", !9}\n!9 = !{!\"observable universe\"}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/load-metadata.ll",
+      "commands": [
+        "opt -S -passes=gvn < %s",
+        "opt -S -passes='gvn<memoryssa>' < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "nofpclass",
+          "test_body": "define float @nofpclass(ptr %p, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  store float 0.000000e+00, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %PRE = load float, ptr %p, align 4, !nofpclass !0\n  ret float %PRE\n}\n\n!0 = !{i32 3}\n"
+        },
+        {
+          "test_name": "test1",
+          "test_body": "define i32 @test1(ptr %p, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  store i32 0, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %PRE = load i32, ptr %p, align 4, !range !0, !invariant.group !1\n  ret i32 %PRE\n}\n\n!0 = !{i32 40, i32 100}\n!1 = !{!\"magic ptr\"}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/lpre-call-wrap.ll",
+      "commands": [
+        "opt -S -passes=gvn -enable-load-pre < %s",
+        "opt -S -passes='gvn<memoryssa>' -enable-load-pre < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "_Z12testfunctionR1A",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128\"\n\n%struct.A = type { i32, i32 }\n\ndefine void @_Z12testfunctionR1A(ptr %iter) {\nentry:\n  %0 = getelementptr %struct.A, ptr %iter, i32 0, i32 0\n  %1 = load i32, ptr %0, align 4\n  %2 = icmp eq i32 %1, 0\n  br i1 %2, label %return, label %bb.nph\n\nbb.nph:                                           ; preds = %entry\n  %3 = getelementptr %struct.A, ptr %iter, i32 0, i32 1\n  br label %bb\n\nbb:                                               ; preds = %bb3.backedge, %bb.nph\n  %.rle = phi i32 [ %1, %bb.nph ], [ %7, %bb3.backedge ]\n  %4 = add i32 %.rle, 1\n  store i32 %4, ptr %0, align 4\n  %5 = load i32, ptr %3, align 4\n  %6 = icmp eq i32 %4, %5\n  br i1 %6, label %bb1, label %bb3.backedge\n\nbb1:                                              ; preds = %bb\n  tail call void @_Z1gv()\n  br label %bb3.backedge\n\nbb3.backedge:                                     ; preds = %bb1, %bb\n  %7 = load i32, ptr %0, align 4\n  %8 = icmp eq i32 %7, 0\n  br i1 %8, label %return, label %bb\n\nreturn:                                           ; preds = %bb3.backedge, %entry\n  ret void\n}\n\ndeclare void @_Z1gv()\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/phi-translate-2.ll",
+      "commands": [
+        "opt < %s -passes=gvn -S",
+        "opt < %s -passes='gvn<memoryssa>' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test6",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine void @test6(ptr %ptr, i1 %arg) {\nentry:\n  br label %while\n\nwhile:                                            ; preds = %if.end, %entry\n  %i = phi i64 [ 1, %entry ], [ %i.next, %if.end ]\n  %arrayidx1 = getelementptr inbounds i32, ptr %ptr, i64 %i\n  %0 = load i32, ptr %arrayidx1, align 4\n  %i.next = add nuw nsw i64 %i, 1\n  %arrayidx2 = getelementptr inbounds i32, ptr %ptr, i64 %i.next\n  %1 = load i32, ptr %arrayidx2, align 4\n  %cmp = icmp sgt i32 %0, %1\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %while\n  store i32 %1, ptr %arrayidx1, align 4\n  store i32 %0, ptr %arrayidx2, align 4\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %while\n  br i1 %arg, label %while.end, label %while\n\nwhile.end:                                        ; preds = %if.end\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test2",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\n@a = external global [100 x i64], align 16\n@b = external global [100 x i64], align 16\n@g1 = external global i64, align 8\n@g2 = external global i64, align 8\n@g3 = external global i64, align 8\n\ndeclare i64 @goo(...) local_unnamed_addr\n\ndefine void @test2(i64 %i) {\nentry:\n  %arrayidx = getelementptr inbounds [100 x i64], ptr @a, i64 0, i64 %i\n  %t0 = load i64, ptr %arrayidx, align 8\n  %arrayidx1 = getelementptr inbounds [100 x i64], ptr @b, i64 0, i64 %i\n  %t1 = load i64, ptr %arrayidx1, align 8\n  %mul = mul nsw i64 %t1, %t0\n  store i64 %mul, ptr @g1, align 8\n  %cmp = icmp sgt i64 %mul, 3\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  %call = tail call i64 (...) @goo()\n  store i64 %call, ptr @g2, align 8\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  %i.addr.0 = phi i64 [ 3, %if.then ], [ %i, %entry ]\n  %arrayidx3 = getelementptr inbounds [100 x i64], ptr @a, i64 0, i64 %i.addr.0\n  %t2 = load i64, ptr %arrayidx3, align 8\n  %arrayidx4 = getelementptr inbounds [100 x i64], ptr @b, i64 0, i64 %i.addr.0\n  %t3 = load i64, ptr %arrayidx4, align 8\n  %mul5 = mul nsw i64 %t3, %t2\n  store i64 %mul5, ptr @g3, align 8\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test7",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\ndefine i32 @test7(ptr noalias %ptr1, ptr noalias %ptr2, i32 %i, i1 %cond) {\nentry:\n  br i1 %cond, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  %arrayidx = getelementptr inbounds i32, ptr %ptr1, i32 %i\n  %tmp = load i32, ptr %arrayidx, align 4\n  store i32 %tmp, ptr %ptr2, align 4\n  %idx.ext = sext i32 %i to i64\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  %idx = phi i64 [ 0, %entry ], [ %idx.ext, %if.then ]\n  %idx.trunc = trunc i64 %idx to i32\n  %arrayidx2 = getelementptr inbounds i32, ptr %ptr1, i32 %idx.trunc\n  %res = load i32, ptr %arrayidx2, align 4\n  ret i32 %res\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/phi-translate-add.ll",
+      "commands": [
+        "opt -passes=gvn -gvn-add-phi-translation=true  -S < %s",
+        "opt -passes='gvn<memoryssa>' -gvn-add-phi-translation=true  -S < %s",
+        "opt -passes=gvn -gvn-add-phi-translation=false -S < %s",
+        "opt -passes='gvn<memoryssa>' -gvn-add-phi-translation=false -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "phi_translation_hoists_add",
+          "test_body": "define double @phi_translation_hoists_add(ptr %a, i64 %idx) {\nentry:\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %add = add nuw nsw i64 %idx, 1\n  %gep = getelementptr inbounds double, ptr %a, i64 %add\n  %load = load double, ptr %gep, align 8\n  %cmp = fcmp ole double %load, 1.000000e+00\n  br i1 %cmp, label %exit, label %for.body\n\nexit:                                             ; preds = %for.body\n  ret double %load\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/phi-translate.ll",
+      "commands": [
+        "opt -passes=gvn -S < %s",
+        "opt -passes='gvn<memoryssa>' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "foo",
+          "test_body": "target datalayout = \"e-p:64:64:64\"\n\n@G = external global [100 x i32]\n\ndefine i32 @foo(i32 %x, i32 %z) !dbg !5 {\nentry:\n  %tobool = icmp eq i32 %z, 0, !dbg !8\n  br i1 %tobool, label %end, label %then, !dbg !8\n\nthen:                                             ; preds = %entry\n  %i = sext i32 %x to i64, !dbg !9\n  %p = getelementptr [100 x i32], ptr @G, i64 0, i64 %i, !dbg !9\n  store i32 %z, ptr %p, align 4, !dbg !9\n  br label %end, !dbg !9\n\nend:                                              ; preds = %then, %entry\n  %j = sext i32 %x to i64, !dbg !10\n  %q = getelementptr [100 x i32], ptr @G, i64 0, i64 %j, !dbg !11\n  %n = load i32, ptr %q, align 4, !dbg !12\n  ret i32 %n, !dbg !12\n}\n\n!llvm.module.flags = !{!0, !1, !2}\n!llvm.dbg.cu = !{!3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 8, !\"PIC Level\", i32 2}\n!3 = distinct !DICompileUnit(language: DW_LANG_C99, file: !4, producer: \"clang\", isOptimized: true, flags: \"-O2\", runtimeVersion: 0, splitDebugFilename: \"abc.debug\", emissionKind: LineTablesOnly)\n!4 = !DIFile(filename: \"a.cc\", directory: \"/tmp\")\n!5 = distinct !DISubprogram(name: \"foo\", scope: !4, file: !4, line: 42, type: !6, scopeLine: 43, flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !3, retainedNodes: !7)\n!6 = !DISubroutineType(types: !7)\n!7 = !{}\n!8 = !DILocation(line: 43, column: 1, scope: !5)\n!9 = !DILocation(line: 44, column: 1, scope: !5)\n!10 = !DILocation(line: 45, column: 1, scope: !5)\n!11 = !DILocation(line: 46, column: 1, scope: !5)\n!12 = !DILocation(line: 47, column: 1, scope: !5)\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-after-rle.ll",
+      "commands": [
+        "opt -passes='require<phi-values>,gvn' -S < %s",
+        "opt -passes='require<phi-values>,gvn<memoryssa>' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fn1",
+          "test_body": "declare noalias ptr @malloc(i64)\n\ndefine void @fn1(ptr noalias %start, ptr %width, i32 %h) {\nentry:\n  %call = tail call noalias ptr @malloc(i64 1024)\n  store ptr %call, ptr %start, align 8\n  br label %preheader\n\npreheader:                                        ; preds = %body, %entry\n  %cmp = icmp slt i32 1, %h\n  br i1 %cmp, label %body, label %exit\n\nbody:                                             ; preds = %body, %preheader\n  %j = phi i32 [ 0, %preheader ], [ %j.next, %body ]\n  %s = load ptr, ptr %start, align 8\n  store i32 0, ptr %s, align 4\n  %j.next = add nuw nsw i32 %j, 1\n  %w = load i32, ptr %width, align 8\n  %cmp3 = icmp slt i32 %j.next, %w\n  br i1 %cmp3, label %body, label %preheader\n\nexit:                                             ; preds = %preheader\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fn2",
+          "test_body": "declare noalias ptr @malloc(i64)\n\ndefine void @fn2(ptr noalias %start, ptr %width, i32 %h, i32 %arg) {\nentry:\n  %call = tail call noalias ptr @malloc(i64 1024)\n  %cmp1 = icmp slt i32 %arg, 0\n  br i1 %cmp1, label %if, label %else\n\nif:                                               ; preds = %entry\n  store ptr %call, ptr %start, align 8\n  br label %preheader\n\nelse:                                             ; preds = %entry\n  %gep = getelementptr inbounds i32, ptr %call, i32 %arg\n  store ptr %gep, ptr %start, align 8\n  br label %preheader\n\npreheader:                                        ; preds = %body, %else, %if\n  %cmp = icmp slt i32 1, %h\n  br i1 %cmp, label %body, label %exit\n\nbody:                                             ; preds = %body, %preheader\n  %j = phi i32 [ 0, %preheader ], [ %j.next, %body ]\n  %s = load ptr, ptr %start, align 8\n  store i32 0, ptr %s, align 4\n  %j.next = add nuw nsw i32 %j, 1\n  %w = load i32, ptr %width, align 8\n  %cmp3 = icmp slt i32 %j.next, %w\n  br i1 %cmp3, label %body, label %preheader\n\nexit:                                             ; preds = %preheader\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-aliasning-path.ll",
+      "commands": [
+        "opt -enable-load-pre -enable-scalar-pre -passes=gvn -S < %s",
+        "opt -enable-load-pre -enable-scalar-pre -passes='gvn<memoryssa>' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_03",
+          "test_body": "; Function Attrs: memory(read)\ndeclare void @no_side_effect() #0\n\ndefine i32 @test_03(ptr %p) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %x = load i32, ptr %p, align 4\n  %cond = icmp ult i32 %x, 100\n  br i1 %cond, label %hot_path, label %cold_path\n\nhot_path:                                         ; preds = %loop\n  br label %backedge\n\ncold_path:                                        ; preds = %loop\n  call void @no_side_effect()\n  br label %backedge\n\nbackedge:                                         ; preds = %cold_path, %hot_path\n  %iv.next = add i32 %iv, %x\n  %loop.cond = icmp ult i32 %iv.next, 1000\n  br i1 %loop.cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge\n  ret i32 %x\n}\n\nattributes #0 = { memory(read) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-load-dbg.ll",
+      "commands": [
+        "opt < %s -passes=gvn -gvn-max-num-insns=22 -S",
+        "opt < %s -passes='gvn<memoryssa>' -gvn-max-num-insns=22 -S"
+      ],
+      "tests": [
+        {
+          "test_name": "withdbg",
+          "test_body": "%struct.a = type { i16 }\n\n@f = external local_unnamed_addr global i16, align 1\n@m = external local_unnamed_addr global ptr, align 1\n@h = external global %struct.a, align 1\n\ndefine void @withdbg() {\nentry:\n  %agg.tmp.ensured.sroa.0.i = alloca i16, align 1\n  %cmp = icmp ne ptr @withdbg, null\n  br i1 %cmp, label %lor.end, label %lor.rhs\n\nlor.rhs:                                          ; preds = %entry\n    #dbg_declare(ptr undef, !4, !DIExpression(), !14)\n    #dbg_declare(ptr undef, !10, !DIExpression(), !14)\n    #dbg_declare(ptr undef, !11, !DIExpression(), !14)\n    #dbg_declare(ptr undef, !12, !DIExpression(), !14)\n    #dbg_declare(ptr undef, !13, !DIExpression(), !14)\n  %agg.tmp.ensured.sroa.0.0.copyload.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.1.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.1.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.2.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.2.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.3.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.3.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.4.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.4.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.5.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.5.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.6.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.6.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.7.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.7.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.8.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.8.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %fvalue = load i16, ptr @f, align 1\n  %mvalue = load ptr, ptr @m, align 1\n  br label %lor.end\n\nlor.end:                                          ; preds = %lor.rhs, %entry\n  %tmp11 = load i16, ptr @f, align 1\n  %conv.i.i6 = sext i16 %tmp11 to i32\n  %tmp12 = load ptr, ptr @m, align 1\n  store i32 %conv.i.i6, ptr %tmp12, align 1\n  ret void\n}\n\n!llvm.dbg.cu = !{!0}\n!llvm.module.flags = !{!2, !3}\n\n!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, producer: \"clang version 17.0.0.prerel\", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug, splitDebugInlining: false, nameTableKind: None)\n!1 = !DIFile(filename: \"bbi-78272.c\", directory: \"/tmp\")\n!2 = !{i32 7, !\"Dwarf Version\", i32 4}\n!3 = !{i32 2, !\"Debug Info Version\", i32 3}\n!4 = !DILocalVariable(name: \"t\", scope: !5, file: !1, line: 15, type: !8)\n!5 = distinct !DISubprogram(name: \"x\", scope: !1, file: !1, line: 14, type: !6, scopeLine: 14, flags: DIFlagAllCallsDescribed, spFlags: DISPFlagLocalToUnit | DISPFlagDefinition | DISPFlagOptimized, unit: !0, retainedNodes: !9)\n!6 = !DISubroutineType(types: !7)\n!7 = !{!8}\n!8 = !DIBasicType(name: \"int\", size: 16, encoding: DW_ATE_signed)\n!9 = !{!4, !10, !11, !12, !13}\n!10 = !DILocalVariable(name: \"c\", scope: !5, file: !1, line: 15, type: !8)\n!11 = !DILocalVariable(name: \"v\", scope: !5, file: !1, line: 15, type: !8)\n!12 = !DILocalVariable(name: \"d\", scope: !5, file: !1, line: 15, type: !8)\n!13 = !DILocalVariable(name: \"u\", scope: !5, file: !1, line: 16, type: !8)\n!14 = !DILocation(line: 15, column: 7, scope: !5)\n"
+        },
+        {
+          "test_name": "lessdbg",
+          "test_body": "%struct.a = type { i16 }\n\n@f = external local_unnamed_addr global i16, align 1\n@m = external local_unnamed_addr global ptr, align 1\n@h = external global %struct.a, align 1\n\ndefine void @lessdbg() {\nentry:\n  %agg.tmp.ensured.sroa.0.i = alloca i16, align 1\n  %cmp = icmp ne ptr @lessdbg, null\n  br i1 %cmp, label %lor.end, label %lor.rhs\n\nlor.rhs:                                          ; preds = %entry\n  %agg.tmp.ensured.sroa.0.0.copyload.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.1.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.1.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.2.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.2.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.3.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.3.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.4.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.4.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.5.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.5.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.6.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.6.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.7.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.7.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %agg.tmp.ensured.sroa.0.0.copyload.8.i = load volatile i16, ptr @h, align 1\n  store i16 %agg.tmp.ensured.sroa.0.0.copyload.8.i, ptr %agg.tmp.ensured.sroa.0.i, align 1\n  %fvalue = load i16, ptr @f, align 1\n  %mvalue = load ptr, ptr @m, align 1\n  br label %lor.end\n\nlor.end:                                          ; preds = %lor.rhs, %entry\n  %tmp11 = load i16, ptr @f, align 1\n  %conv.i.i6 = sext i16 %tmp11 to i32\n  %tmp12 = load ptr, ptr @m, align 1\n  store i32 %conv.i.i6, ptr %tmp12, align 1\n  ret void\n}\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1}\n\n!0 = !{i32 7, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-load-guards.ll",
+      "commands": [
+        "opt < %s -passes=gvn -enable-load-pre -S",
+        "opt < %s -passes='gvn<memoryssa>' -enable-load-pre -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_guard_02",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndeclare void @llvm.experimental.guard(i1, ...)\n\ndefine i32 @test_guard_02(ptr %p, ptr %q, i1 %C, i1 %G) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  store i32 0, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %P2 = phi ptr [ %p, %block3 ], [ %q, %block2 ]\n  %PRE = load i32, ptr %P2, align 4\n  call void (i1, ...) @llvm.experimental.guard(i1 %G) [ \"deopt\"() ]\n  ret i32 %PRE\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-load-implicit-cf-updates.ll",
+      "commands": [
+        "opt -S -passes=gvn -enable-load-pre < %s",
+        "opt -S -passes='gvn<memoryssa>' -enable-load-pre < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_03",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\n; Function Attrs: memory(none)\ndeclare i32 @foo(i32) #0\n\ndefine hidden void @test_03(i32 %x, i32 %y) {\nentry:\n  %c1 = call i32 @foo(i32 %x)\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %c2 = call i32 @foo(i32 %x)\n  %val = load i32, ptr null, align 8\n  %c3 = call i32 @foo(i32 %y)\n  %val2 = load i32, ptr null, align 8\n  %c4 = call i32 @foo(i32 %y)\n  %c5 = call i32 @foo(i32 %val)\n  br label %loop\n}\n\nattributes #0 = { memory(none) }\n"
+        },
+        {
+          "test_name": "test_01",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n\n; Function Attrs: memory(none)\ndeclare i32 @foo(i32) #0\n\ndefine hidden void @test_01(i32 %x, i32 %y) {\nentry:\n  %c1 = call i32 @foo(i32 %x)\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %c2 = call i32 @foo(i32 %x)\n  %val = load i32, ptr null, align 8\n  %c3 = call i32 @foo(i32 %val)\n  br label %loop\n}\n\nattributes #0 = { memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-load.ll",
+      "commands": [
+        "opt < %s -passes=gvn -enable-load-pre -S",
+        "opt < %s -passes='gvn<memoryssa>' -enable-load-pre -S",
+        "opt < %s -aa-pipeline=basic-aa -passes=\"gvn<load-pre>\" -enable-load-pre=false -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test5",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\n; Function Attrs: nounwind ssp\ndefine void @test5(i32 %N, ptr captures(none) %G) #0 {\nentry:\n  %0 = add i32 %N, -1\n  %1 = icmp sgt i32 %0, 0\n  br i1 %1, label %bb.nph, label %return\n\nbb.nph:                                           ; preds = %entry\n  %tmp = zext i32 %0 to i64\n  br label %bb\n\nbb:                                               ; preds = %bb, %bb.nph\n  %indvar = phi i64 [ 0, %bb.nph ], [ %tmp6, %bb ]\n  %tmp6 = add i64 %indvar, 1\n  %scevgep = getelementptr double, ptr %G, i64 %tmp6\n  %scevgep7 = getelementptr double, ptr %G, i64 %indvar\n  %2 = load double, ptr %scevgep7, align 8\n  %3 = load double, ptr %scevgep, align 8\n  %4 = fadd double %2, %3\n  store double %4, ptr %scevgep7, align 8\n  %exitcond = icmp eq i64 %tmp6, %tmp\n  br i1 %exitcond, label %return, label %bb\n\nreturn:                                           ; preds = %bb, %entry\n  ret void\n}\n\nattributes #0 = { nounwind ssp }\n"
+        },
+        {
+          "test_name": "test15",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndeclare void @f()\n\n; Function Attrs: nofree nosync\ndefine i32 @test15(ptr noalias readonly align 4 captures(none) dereferenceable(8) %x, ptr noalias captures(none) %r, i32 %a) #0 {\nentry:\n  %tobool = icmp eq i32 %a, 0\n  br i1 %tobool, label %if.end, label %if.then\n\nif.then:                                          ; preds = %entry\n  %uu = load i32, ptr %x, align 4\n  store i32 %uu, ptr %r, align 4\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  call void @f()\n  %vv = load i32, ptr %x, align 4\n  ret i32 %vv\n}\n\nattributes #0 = { nofree nosync }\n"
+        },
+        {
+          "test_name": "test1",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test1(ptr %p, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  store i32 0, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %PRE = load i32, ptr %p, align 4\n  ret i32 %PRE\n}\n"
+        },
+        {
+          "test_name": "test22",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndeclare i1 @foo()\n\ndefine void @test22(i1 %cond, ptr %p1, ptr %p2) {\nentry:\n  br i1 %cond, label %if.then, label %if.else\n\nif.then:                                          ; preds = %entry\n  %v1 = load i64, ptr %p1, align 8\n  %dec = add i64 %v1, -1\n  store i64 %dec, ptr %p1, align 8\n  br label %if.end\n\nif.end:                                           ; preds = %if.else, %if.then\n  %v2 = load i64, ptr %p1, align 8\n  store i64 %v2, ptr %p2, align 8\n  ret void\n\nif.else:                                          ; preds = %entry\n  %cond2 = call i1 @foo()\n  br i1 %cond2, label %if.end, label %exit\n\nexit:                                             ; preds = %if.else\n  %_ = call i1 @maybethrow()\n  %v3 = load i64, ptr %p1, align 8\n  store i64 %v3, ptr %p2, align 8\n  ret void\n}\n\n; Function Attrs: memory(none)\ndeclare void @maybethrow() #0\n\nattributes #0 = { memory(none) }\n"
+        },
+        {
+          "test_name": "test17",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndeclare i1 @foo()\n\ndeclare i1 @bar()\n\ndefine void @test17(ptr %p1, ptr %p2, ptr %p3, ptr %p4) {\nentry:\n  %v1 = load i64, ptr %p1, align 8\n  %cond1 = icmp sgt i64 %v1, 200\n  br i1 %cond1, label %bb200, label %bb1\n\nbb1:                                              ; preds = %entry\n  %cond2 = icmp sgt i64 %v1, 100\n  br i1 %cond2, label %bb100, label %bb2\n\nbb2:                                              ; preds = %bb1\n  %v2 = add nsw i64 %v1, 1\n  store i64 %v2, ptr %p1, align 8\n  br label %bb3\n\nbb3:                                              ; preds = %bb200, %bb100, %bb2\n  %v3 = load i64, ptr %p1, align 8\n  store i64 %v3, ptr %p2, align 8\n  ret void\n\nbb100:                                            ; preds = %bb1\n  %cond3 = call i1 @foo()\n  br i1 %cond3, label %bb3, label %bb101\n\nbb101:                                            ; preds = %bb100\n  %v4 = load i64, ptr %p1, align 8\n  store i64 %v4, ptr %p3, align 8\n  ret void\n\nbb200:                                            ; preds = %entry\n  %cond4 = call i1 @bar()\n  br i1 %cond4, label %bb3, label %bb201\n\nbb201:                                            ; preds = %bb200\n  %v5 = load i64, ptr %p1, align 8\n  store i64 %v5, ptr %p4, align 8\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test2",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test2(ptr %p, ptr %q, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  store i32 0, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %P2 = phi ptr [ %p, %block3 ], [ %q, %block2 ]\n  %PRE = load i32, ptr %P2, align 4\n  ret i32 %PRE\n}\n"
+        },
+        {
+          "test_name": "test19",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndeclare void @f()\n\ndeclare i32 @__CxxFrameHandler3(...)\n\ndefine void @test19(i1 %cond, ptr %p1, ptr %p2) personality ptr @__CxxFrameHandler3 {\nentry:\n  br i1 %cond, label %then, label %else\n\nthen:                                             ; preds = %entry\n  %v2 = load i64, ptr %p2, align 8\n  %add = add i64 %v2, 1\n  store i64 %add, ptr %p1, align 8\n  br label %end\n\nelse:                                             ; preds = %entry\n  invoke void @f()\n          to label %end unwind label %lpad\n\nend:                                              ; preds = %else, %then\n  %v1 = load i64, ptr %p1, align 8\n  %and = and i64 %v1, 100\n  store i64 %and, ptr %p2, align 8\n  ret void\n\nlpad:                                             ; preds = %else\n  %lp = landingpad { ptr, i32 }\n          cleanup\n  %v3 = load i64, ptr %p1, align 8\n  %or = or i64 %v3, 200\n  store i64 %or, ptr %p1, align 8\n  resume { ptr, i32 } %lp\n}\n"
+        },
+        {
+          "test_name": "test6",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\n; Function Attrs: nounwind ssp\ndefine void @test6(i32 %N, ptr captures(none) %G) #0 {\nentry:\n  %0 = add i32 %N, -1\n  %1 = icmp sgt i32 %0, 0\n  br i1 %1, label %bb.nph, label %return\n\nbb.nph:                                           ; preds = %entry\n  %tmp = zext i32 %0 to i64\n  br label %bb\n\nbb:                                               ; preds = %bb, %bb.nph\n  %indvar = phi i64 [ 0, %bb.nph ], [ %tmp6, %bb ]\n  %tmp6 = add i64 %indvar, 1\n  %scevgep = getelementptr double, ptr %G, i64 %tmp6\n  %scevgep7 = getelementptr double, ptr %G, i64 %indvar\n  %2 = load double, ptr %scevgep7, align 8\n  %3 = load double, ptr %scevgep, align 8\n  %4 = fadd double %2, %3\n  store double %4, ptr %scevgep, align 8\n  %exitcond = icmp eq i64 %tmp6, %tmp\n  br i1 %exitcond, label %return, label %bb\n\nreturn:                                           ; preds = %bb, %entry\n  ret void\n}\n\nattributes #0 = { nounwind ssp }\n"
+        },
+        {
+          "test_name": "test3",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test3(ptr %p, ptr %q, ptr %Hack, i1 %C) {\nblock1:\n  %B = getelementptr i32, ptr %q, i32 1\n  store ptr %B, ptr %Hack, align 8\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  %A = getelementptr i32, ptr %p, i32 1\n  store i32 0, ptr %A, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %P2 = phi ptr [ %p, %block3 ], [ %q, %block2 ]\n  %P3 = getelementptr i32, ptr %P2, i32 1\n  %PRE = load i32, ptr %P3, align 4\n  ret i32 %PRE\n}\n"
+        },
+        {
+          "test_name": "test24",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test24(ptr noalias %p, ptr noalias %q, i1 %c) {\nentry:\n  br i1 %c, label %if.end, label %if.then\n\nif.then:                                          ; preds = %entry\n  call void @opaque(ptr %p)\n  %identical.l = load i32, ptr %p, align 4\n  store i32 %identical.l, ptr %q, align 4\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  %l = load i32, ptr %p, align 4\n  ret i32 %l\n}\n\n; Function Attrs: nounwind willreturn\ndeclare void @opaque(ptr) #0\n\nattributes #0 = { nounwind willreturn }\n"
+        },
+        {
+          "test_name": "test8",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test8(ptr %p, ptr %q, ptr %Hack, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  %A = getelementptr i32, ptr %p, i32 1\n  store i32 0, ptr %A, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %P2 = phi ptr [ %p, %block3 ], [ %q, %block2 ]\n  %P3 = getelementptr i32, ptr %P2, i32 1\n  %PRE = load i32, ptr %P3, align 4\n  ret i32 %PRE\n}\n"
+        },
+        {
+          "test_name": "test23",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\n@B = external global i64, align 8\n\ndefine void @test23(i1 %cond1, i1 %cond2) {\nentry:\n  %G = alloca i64, align 8\n  br i1 %cond2, label %then, label %wrong\n\nthen:                                             ; preds = %entry\n  %val2 = load i64, ptr @B, align 8\n  br i1 %cond1, label %store, label %exit\n\nstore:                                            ; preds = %then\n  store i64 %val2, ptr @B, align 8\n  br label %wrong\n\nwrong:                                            ; preds = %store, %entry\n  %val1 = load i64, ptr @B, align 8\n  store i64 %val1, ptr %G, align 8\n  ret void\n\nexit:                                             ; preds = %then\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test11",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test11(ptr %p, i1 %C, i32 %N) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  %cond = icmp sgt i32 %N, 1\n  br i1 %cond, label %block4, label %block5\n\nblock3:                                           ; preds = %block1\n  store i32 0, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %PRE = load i32, ptr %p, align 4\n  br label %block5\n\nblock5:                                           ; preds = %block4, %block2\n  %ret = phi i32 [ 0, %block2 ], [ %PRE, %block4 ]\n  ret i32 %ret\n}\n"
+        },
+        {
+          "test_name": "test16",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndeclare void @f()\n\n; Function Attrs: nofree nosync\ndefine i32 @test16(ptr noalias readonly align 4 captures(none) dereferenceable(8) %x, ptr noalias captures(none) %r, i32 %a) #0 {\nentry:\n  %tobool = icmp eq i32 %a, 0\n  br i1 %tobool, label %if.end, label %if.then\n\nif.then:                                          ; preds = %entry\n  %uu = load i32, ptr %x, align 4\n  store i32 %uu, ptr %r, align 4\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  call void @f()\n  br label %follow_1\n\nfollow_1:                                         ; preds = %if.end\n  br label %follow_2\n\nfollow_2:                                         ; preds = %follow_1\n  %vv = load i32, ptr %x, align 4\n  ret i32 %vv\n}\n\nattributes #0 = { nofree nosync }\n"
+        },
+        {
+          "test_name": "test4_nuw",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test4_nuw(ptr %p, ptr %q, ptr %Hack, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  %B = getelementptr i32, ptr %q, i32 1\n  store ptr %B, ptr %Hack, align 8\n  %A = getelementptr i32, ptr %p, i32 1\n  store i32 0, ptr %A, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %P2 = phi ptr [ %p, %block3 ], [ %q, %block2 ]\n  %P3 = getelementptr nuw i32, ptr %P2, i32 1\n  %PRE = load i32, ptr %P3, align 4\n  ret i32 %PRE\n}\n"
+        },
+        {
+          "test_name": "test18",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine void @test18(i1 %cond, ptr %p1, ptr %p2) {\nentry:\n  br i1 %cond, label %if.end, label %if.then\n\nif.then:                                          ; preds = %entry\n  %v1 = load i16, ptr %p1, align 2\n  %dec = add i16 %v1, -1\n  store i16 %dec, ptr %p1, align 2\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  %v2 = load i16, ptr %p1, align 2\n  store i16 %v2, ptr %p2, align 2\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test4",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\ndefine i32 @test4(ptr %p, ptr %q, ptr %Hack, i1 %C) {\nblock1:\n  br i1 %C, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  %B = getelementptr i32, ptr %q, i32 1\n  store ptr %B, ptr %Hack, align 8\n  %A = getelementptr i32, ptr %p, i32 1\n  store i32 0, ptr %A, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %P2 = phi ptr [ %p, %block3 ], [ %q, %block2 ]\n  %P3 = getelementptr i32, ptr %P2, i32 1\n  %PRE = load i32, ptr %P3, align 4\n  ret i32 %PRE\n}\n"
+        },
+        {
+          "test_name": "test9",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\n; Function Attrs: nounwind ssp\ndefine void @test9(i32 %N, ptr captures(none) %G) #0 {\nentry:\n  %0 = add i32 0, 0\n  %1 = add i32 %N, -1\n  %2 = icmp sgt i32 %1, 1\n  br i1 %2, label %bb.nph, label %return\n\nbb.nph:                                           ; preds = %entry\n  %tmp = sext i32 %1 to i64\n  %tmp7 = add i64 %tmp, -1\n  br label %bb\n\nbb:                                               ; preds = %bb, %bb.nph\n  %indvar = phi i64 [ 0, %bb.nph ], [ %tmp9, %bb ]\n  %tmp8 = add i64 %indvar, 2\n  %scevgep = getelementptr double, ptr %G, i64 %tmp8\n  %tmp9 = add i64 %indvar, 1\n  %scevgep10 = getelementptr double, ptr %G, i64 %tmp9\n  %3 = load double, ptr %scevgep10, align 8\n  %4 = load double, ptr %scevgep, align 8\n  %5 = fadd double %3, %4\n  store double %5, ptr %scevgep, align 8\n  %exitcond = icmp eq i64 %tmp9, %tmp7\n  br i1 %exitcond, label %return, label %bb\n\nreturn:                                           ; preds = %bb, %entry\n  ret void\n}\n\nattributes #0 = { nounwind ssp }\n"
+        },
+        {
+          "test_name": "test10",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\n; Function Attrs: nounwind ssp\ndefine void @test10(i32 %N, ptr captures(none) %G) #0 {\nentry:\n  %0 = add i32 %N, -1\n  %1 = icmp sgt i32 %0, 1\n  br i1 %1, label %bb.nph, label %return\n\nbb.nph:                                           ; preds = %entry\n  %tmp = sext i32 %0 to i64\n  %tmp8 = add i64 %tmp, -1\n  br label %bb\n\nbb:                                               ; preds = %bb, %bb.nph\n  %indvar = phi i64 [ 0, %bb.nph ], [ %tmp11, %bb ]\n  %scevgep = getelementptr double, ptr %G, i64 %indvar\n  %tmp9 = add i64 %indvar, 2\n  %scevgep10 = getelementptr double, ptr %G, i64 %tmp9\n  %tmp11 = add i64 %indvar, 1\n  %scevgep12 = getelementptr double, ptr %G, i64 %tmp11\n  %2 = load double, ptr %scevgep12, align 8\n  %3 = load double, ptr %scevgep10, align 8\n  %4 = fadd double %2, %3\n  %5 = load double, ptr %scevgep, align 8\n  %6 = fadd double %4, %5\n  store double %6, ptr %scevgep12, align 8\n  %exitcond = icmp eq i64 %tmp11, %tmp8\n  br i1 %exitcond, label %return, label %bb\n\nreturn:                                           ; preds = %bb, %entry\n  ret void\n}\n\nattributes #0 = { nounwind ssp }\n"
+        },
+        {
+          "test_name": "test7",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64\"\n\n; Function Attrs: nounwind ssp\ndefine void @test7(i32 %N, ptr captures(none) %G) #0 {\nentry:\n  %0 = getelementptr inbounds double, ptr %G, i64 1\n  store double 1.000000e+00, ptr %0, align 8\n  %1 = add i32 %N, -1\n  %2 = icmp sgt i32 %1, 1\n  br i1 %2, label %bb.nph, label %return\n\nbb.nph:                                           ; preds = %entry\n  %tmp = sext i32 %1 to i64\n  %tmp7 = add i64 %tmp, -1\n  br label %bb\n\nbb:                                               ; preds = %bb, %bb.nph\n  %indvar = phi i64 [ 0, %bb.nph ], [ %tmp9, %bb ]\n  %tmp8 = add i64 %indvar, 2\n  %scevgep = getelementptr double, ptr %G, i64 %tmp8\n  %tmp9 = add i64 %indvar, 1\n  %scevgep10 = getelementptr double, ptr %G, i64 %tmp9\n  %3 = load double, ptr %scevgep10, align 8\n  %4 = load double, ptr %scevgep, align 8\n  %5 = fadd double %3, %4\n  store double %5, ptr %scevgep, align 8\n  %exitcond = icmp eq i64 %tmp9, %tmp7\n  br i1 %exitcond, label %return, label %bb\n\nreturn:                                           ; preds = %bb, %entry\n  ret void\n}\n\nattributes #0 = { nounwind ssp }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-single-pred.ll",
+      "commands": [
+        "opt < %s -passes=gvn -enable-load-pre -S",
+        "opt < %s -passes='gvn<memoryssa>' -enable-load-pre -S",
+        "opt < %s -passes=\"gvn<load-pre>\" -enable-load-pre=false -S"
+      ],
+      "tests": [
+        {
+          "test_name": "f",
+          "test_body": "@p = external global i32\n\n; Function Attrs: nounwind\ndefine i32 @f(i32 %n) #0 {\nentry:\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.inc, %entry\n  %i.0 = phi i32 [ 0, %entry ], [ %indvar.next, %for.inc ]\n  %cmp = icmp slt i32 %i.0, %n\n  br i1 %cmp, label %for.body, label %for.cond.for.end_crit_edge\n\nfor.cond.for.end_crit_edge:                       ; preds = %for.cond\n  br label %for.end\n\nfor.body:                                         ; preds = %for.cond\n  %tmp3 = load i32, ptr @p, align 4\n  %dec = add i32 %tmp3, -1\n  store i32 %dec, ptr @p, align 4\n  %cmp6 = icmp slt i32 %dec, 0\n  br i1 %cmp6, label %for.body.for.end_crit_edge, label %for.inc\n\nfor.body.for.end_crit_edge:                       ; preds = %for.body\n  br label %for.end\n\nfor.inc:                                          ; preds = %for.body\n  %indvar.next = add i32 %i.0, 1\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.body.for.end_crit_edge, %for.cond.for.end_crit_edge\n  %tmp9 = load i32, ptr @p, align 4\n  ret i32 %tmp9\n}\n\nattributes #0 = { nounwind }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/preserve-tbaa.ll",
+      "commands": [
+        "opt -passes=gvn -S < %s",
+        "opt -passes='gvn<memoryssa>' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "target datalayout = \"e-p:64:64:64\"\n\n; Function Attrs: nounwind\ndefine void @test(ptr %P, ptr %Q, i1 %arg) #0 {\nentry:\n  br i1 %arg, label %bb.nph, label %for.end\n\nbb.nph:                                           ; preds = %entry\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %bb.nph\n  %tmp33 = load i16, ptr %P, align 2, !tbaa !0\n  store i16 %tmp33, ptr %Q, align 2\n  store i16 0, ptr %P, align 2, !tbaa !0\n  br i1 false, label %for.end, label %for.body\n\nfor.end:                                          ; preds = %for.body, %entry\n  ret void\n}\n\nattributes #0 = { nounwind }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"short\", !2}\n!2 = !{!\"omnipotent char\", !3}\n!3 = !{!\"Simple C/C++ TBAA\"}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/rle-addrspace-cast.ll",
+      "commands": [
+        "opt < %s -data-layout=\"e-p:32:32:32-p1:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-n8:16:32\" -passes=gvn,dce -S",
+        "opt < %s -data-layout=\"e-p:32:32:32-p1:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-n8:16:32\" -passes='gvn<memoryssa>',dce -S"
+      ],
+      "tests": [
+        {
+          "test_name": "coerce_offset0_addrspacecast",
+          "test_body": "define i8 @coerce_offset0_addrspacecast(i32 %V, ptr %P) {\n  store i32 %V, ptr %P, align 4\n  %P2 = addrspacecast ptr %P to ptr addrspace(1)\n  %P3 = getelementptr i8, ptr addrspace(1) %P2, i32 2\n  %A = load i8, ptr addrspace(1) %P3, align 1\n  ret i8 %A\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/rle-semidominated.ll",
+      "commands": [
+        "opt < %s -passes=gvn -S",
+        "opt < %s -passes='gvn<memoryssa>' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "main",
+          "test_body": "define i32 @main(ptr %p, i32 %x, i32 %y) {\nblock1:\n  %z = load i32, ptr %p, align 4\n  %cmp = icmp eq i32 %x, %y\n  br i1 %cmp, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  %b = bitcast i32 0 to i32\n  store i32 %b, ptr %p, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %DEAD = load i32, ptr %p, align 4\n  ret i32 %DEAD\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/rle.ll",
+      "commands": [
+        "opt < %s -data-layout=\"e-p:32:32:32-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-n8:16:32\" -passes=gvn,dce -enable-split-backedge-in-load-pre -S",
+        "opt < %s -data-layout=\"e-p:32:32:32-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-n8:16:32\" -passes='gvn<memoryssa>',dce -enable-split-backedge-in-load-pre -S",
+        "opt < %s -data-layout=\"E-p:32:32:32-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:64:64-n32\" -passes=gvn,dce -enable-split-backedge-in-load-pre -S",
+        "opt < %s -data-layout=\"E-p:32:32:32-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:64:64-n32\" -passes='gvn<memoryssa>',dce -enable-split-backedge-in-load-pre -S"
+      ],
+      "tests": [
+        {
+          "test_name": "coerce_mustalias_nonlocal0",
+          "test_body": "define i8 @coerce_mustalias_nonlocal0(ptr %P, i1 %cond) {\n  br i1 %cond, label %T, label %F\n\nT:                                                ; preds = %0\n  store i32 42, ptr %P, align 4\n  br label %Cont\n\nF:                                                ; preds = %0\n  store float 1.000000e+00, ptr %P, align 4\n  br label %Cont\n\nCont:                                             ; preds = %F, %T\n  %A = load i8, ptr %P, align 1\n  ret i8 %A\n}\n"
+        },
+        {
+          "test_name": "load_load_partial_alias",
+          "test_body": "; Function Attrs: nounwind ssp\ndefine i32 @load_load_partial_alias(ptr %P) #0 {\nentry:\n  %ttmp2 = load i32, ptr %P, align 4\n  %add.ptr = getelementptr inbounds i8, ptr %P, i64 1\n  %ttmp5 = load i8, ptr %add.ptr, align 1\n  %conv = zext i8 %ttmp5 to i32\n  %add = add nsw i32 %ttmp2, %conv\n  ret i32 %add\n}\n\nattributes #0 = { nounwind ssp }\n"
+        },
+        {
+          "test_name": "coerce_offset_nonlocal0",
+          "test_body": "define i8 @coerce_offset_nonlocal0(ptr %P, i1 %cond) {\n  %P4 = getelementptr i8, ptr %P, i32 2\n  br i1 %cond, label %T, label %F\n\nT:                                                ; preds = %0\n  store i32 57005, ptr %P, align 4\n  br label %Cont\n\nF:                                                ; preds = %0\n  store float 1.000000e+00, ptr %P, align 4\n  br label %Cont\n\nCont:                                             ; preds = %F, %T\n  %A = load i8, ptr %P4, align 1\n  ret i8 %A\n}\n"
+        },
+        {
+          "test_name": "load_load_partial_alias_loop",
+          "test_body": "define void @load_load_partial_alias_loop(ptr %P) {\nentry:\n  %P.1 = getelementptr i8, ptr %P, i64 1\n  %v.1 = load i8, ptr %P.1, align 1\n  call void @use.i8(i8 %v.1)\n  %v.1.32 = load i32, ptr %P.1, align 4\n  call void @use.i32(i32 %v.1.32)\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i64 [ 1, %entry ], [ %i.inc, %loop ]\n  %P.i = getelementptr i8, ptr %P, i64 %i\n  %v.i = load i8, ptr %P.i, align 1\n  call void @use.i8(i8 %v.i)\n  %v.i.32 = load i32, ptr %P.i, align 4\n  call void @use.i32(i32 %v.i.32)\n  %i.inc = add i64 %i, 1\n  %cmp = icmp ne i64 %i.inc, 64\n  br i1 %cmp, label %loop, label %exit\n\nexit:                                             ; preds = %loop\n  ret void\n}\n\n; Function Attrs: memory(none)\ndeclare void @use.i8(i8) #0\n\n; Function Attrs: memory(none)\ndeclare void @use.i32(i32) #0\n\nattributes #0 = { memory(none) }\n"
+        },
+        {
+          "test_name": "coerce_mustalias1",
+          "test_body": "define float @coerce_mustalias1(i32 %V, ptr %P) {\n  store i32 %V, ptr %P, align 4\n  %A = load float, ptr %P, align 4\n  ret float %A\n}\n"
+        },
+        {
+          "test_name": "memset_to_load",
+          "test_body": "; Function Attrs: nounwind memory(none)\ndefine i32 @memset_to_load() #0 {\nentry:\n  %x = alloca [256 x i32], align 4\n  call void @llvm.memset.p0.i64(ptr align 4 %x, i8 0, i64 1024, i1 false)\n  %arraydecay = getelementptr inbounds [256 x i32], ptr %x, i32 0, i32 0\n  %ttmp1 = load i32, ptr %arraydecay, align 4\n  ret i32 %ttmp1\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #1\n\nattributes #0 = { nounwind memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }\n"
+        },
+        {
+          "test_name": "crash1",
+          "test_body": "declare void @helper()\n\ndefine void @crash1() {\n  tail call void @llvm.memcpy.p0.p0.i64(ptr undef, ptr undef, i64 undef, i1 false) #1\n  %ttmp = load i8, ptr @helper, align 1\n  %x = icmp eq i8 %ttmp, 15\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\nattributes #1 = { nounwind }\n"
+        },
+        {
+          "test_name": "test0",
+          "test_body": "define i32 @test0(i32 %V, ptr %P) {\n  store i32 %V, ptr %P, align 4\n  %A = load i32, ptr %P, align 4\n  ret i32 %A\n}\n"
+        },
+        {
+          "test_name": "phi_trans7",
+          "test_body": "; Function Attrs: memory(read)\ndeclare void @use_i32(i32) #0\n\ndefine i32 @phi_trans7(ptr noalias readonly captures(none) %x, i1 %cond) {\nentry:\n  %l0 = load i32, ptr %x, align 4\n  call void @use_i32(i32 %l0)\n  br label %header\n\nheader:                                           ; preds = %latch, %entry\n  %iv = phi i32 [ 2, %entry ], [ %iv.next, %latch ]\n  %offset = add i32 %iv, -2\n  indirectbr ptr blockaddress(@phi_trans7, %latch), [label %latch]\n\nlatch:                                            ; preds = %header\n  %gep.1 = getelementptr i32, ptr %x, i32 %offset\n  %l1 = load i32, ptr %gep.1, align 4\n  %iv.next = add i32 %iv, 1\n  br i1 %cond, label %exit, label %header\n\nexit:                                             ; preds = %latch\n  ret i32 %l1\n}\n\nattributes #0 = { memory(read) }\n"
+        },
+        {
+          "test_name": "coerce_mustalias7",
+          "test_body": "define ptr @coerce_mustalias7(i64 %V, ptr %P) {\n  store i64 %V, ptr %P, align 4\n  %A = load ptr, ptr %P, align 8\n  ret ptr %A\n}\n"
+        },
+        {
+          "test_name": "phi_trans5",
+          "test_body": "; Function Attrs: memory(read)\ndeclare i1 @cond2() #0\n\ndefine i8 @phi_trans5(ptr %p) {\nentry:\n  %X4 = getelementptr i8, ptr %p, i32 2\n  store i8 19, ptr %X4, align 1\n  %X = getelementptr i8, ptr %p, i32 4\n  %Y = load i8, ptr %X, align 1\n  br label %loop\n\nloop:                                             ; preds = %cont, %entry\n  %i = phi i32 [ 4, %entry ], [ 3, %cont ]\n  %X2 = getelementptr i8, ptr %p, i32 %i\n  %Y2 = load i8, ptr %X2, align 1\n  %cond = call i1 @cond2()\n  br i1 %cond, label %cont, label %out\n\ncont:                                             ; preds = %loop\n  %Z = getelementptr i8, ptr %X2, i32 -1\n  store i32 50462976, ptr %Z, align 4\n  br label %loop\n\nout:                                              ; preds = %loop\n  %R = add i8 %Y, %Y2\n  ret i8 %R\n}\n\nattributes #0 = { memory(read) }\n"
+        },
+        {
+          "test_name": "coerce_mustalias4",
+          "test_body": "define float @coerce_mustalias4(ptr %P, i1 %cond) {\n  %A = load i32, ptr %P, align 4\n  %B = load float, ptr %P, align 4\n  br i1 %cond, label %T, label %F\n\nT:                                                ; preds = %0\n  ret float %B\n\nF:                                                ; preds = %0\n  %X = bitcast i32 %A to float\n  ret float %X\n}\n"
+        },
+        {
+          "test_name": "phi_trans3",
+          "test_body": "define i32 @phi_trans3(ptr %p, i32 %x, i32 %y, i32 %z) {\nblock1:\n  %cmpxy = icmp eq i32 %x, %y\n  br i1 %cmpxy, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  store i32 87, ptr %p, align 4\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  %p2 = getelementptr i32, ptr %p, i32 43\n  store i32 97, ptr %p2, align 4\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %A = phi i32 [ -1, %block2 ], [ 42, %block3 ]\n  br i1 %cmpxy, label %block5, label %exit\n\nblock5:                                           ; preds = %block4\n  %B = add i32 %A, 1\n  br i1 %cmpxy, label %block6, label %exit\n\nblock6:                                           ; preds = %block5\n  %C = getelementptr i32, ptr %p, i32 %B\n  br i1 %cmpxy, label %block7, label %exit\n\nblock7:                                           ; preds = %block6\n  %D = load i32, ptr %C, align 4\n  ret i32 %D\n\nexit:                                             ; preds = %block6, %block5, %block4\n  ret i32 -1\n}\n"
+        },
+        {
+          "test_name": "load_load_partial_alias_cross_block",
+          "test_body": "; Function Attrs: nounwind ssp\ndefine i32 @load_load_partial_alias_cross_block(ptr %P) #0 {\nentry:\n  %x1 = load i32, ptr %P, align 4\n  %cmp = icmp eq i32 %x1, 127\n  br i1 %cmp, label %land.lhs.true, label %if.end\n\nland.lhs.true:                                    ; preds = %entry\n  %arrayidx4 = getelementptr inbounds i8, ptr %P, i64 1\n  %ttmp5 = load i8, ptr %arrayidx4, align 1\n  %conv6 = zext i8 %ttmp5 to i32\n  ret i32 %conv6\n\nif.end:                                           ; preds = %entry\n  ret i32 52\n}\n\nattributes #0 = { nounwind ssp }\n"
+        },
+        {
+          "test_name": "coerce_mustalias3",
+          "test_body": "define ptr @coerce_mustalias3(float %V, ptr %P) {\n  store float %V, ptr %P, align 4\n  %A = load ptr, ptr %P, align 8\n  ret ptr %A\n}\n"
+        },
+        {
+          "test_name": "load_load_partial_alias_cross_block_phi_trans",
+          "test_body": "; Function Attrs: nounwind\ndefine i32 @load_load_partial_alias_cross_block_phi_trans(ptr %P) #0 {\nentry:\n  %x1 = load i32, ptr %P, align 4\n  %cmp = icmp eq i32 %x1, 127\n  br i1 %cmp, label %if, label %else\n\nif:                                               ; preds = %entry\n  %arrayidx.if = getelementptr inbounds i8, ptr %P, i64 1\n  br label %join\n\nelse:                                             ; preds = %entry\n  %arrayidx.else = getelementptr inbounds i8, ptr %P, i64 2\n  br label %join\n\njoin:                                             ; preds = %else, %if\n  %idx = phi i64 [ 1, %if ], [ 2, %else ]\n  %arrayidx4 = getelementptr inbounds i8, ptr %P, i64 %idx\n  %ttmp5 = load i8, ptr %arrayidx4, align 1\n  %conv6 = zext i8 %ttmp5 to i32\n  ret i32 %conv6\n\nif.end:                                           ; No predecessors!\n  ret i32 52\n}\n\nattributes #0 = { nounwind }\n"
+        },
+        {
+          "test_name": "coerce_offset0",
+          "test_body": "define i8 @coerce_offset0(i32 %V, ptr %P) {\n  store i32 %V, ptr %P, align 4\n  %P3 = getelementptr i8, ptr %P, i32 2\n  %A = load i8, ptr %P3, align 1\n  ret i8 %A\n}\n"
+        },
+        {
+          "test_name": "memset_to_i16_nonlocal0",
+          "test_body": "define i16 @memset_to_i16_nonlocal0(ptr %P, i1 %cond) {\n  br i1 %cond, label %T, label %F\n\nT:                                                ; preds = %0\n  tail call void @llvm.memset.p0.i64(ptr %P, i8 1, i64 400, i1 false)\n  br label %Cont\n\nF:                                                ; preds = %0\n  tail call void @llvm.memset.p0.i64(ptr %P, i8 2, i64 400, i1 false)\n  br label %Cont\n\nCont:                                             ; preds = %F, %T\n  %P2 = getelementptr i16, ptr %P, i32 4\n  %A = load i16, ptr %P2, align 2\n  ret i16 %A\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }\n"
+        },
+        {
+          "test_name": "memset_to_i16_local",
+          "test_body": "; Function Attrs: nounwind ssp\ndefine signext i16 @memset_to_i16_local(ptr %A) #0 {\nentry:\n  tail call void @llvm.memset.p0.i64(ptr %A, i8 1, i64 200, i1 false)\n  %arrayidx = getelementptr inbounds i16, ptr %A, i64 42\n  %ttmp2 = load i16, ptr %arrayidx, align 2\n  ret i16 %ttmp2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #1\n\nattributes #0 = { nounwind ssp }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }\n"
+        },
+        {
+          "test_name": "phi_trans4",
+          "test_body": "; Function Attrs: memory(read)\ndeclare i1 @cond2() #0\n\ndefine i8 @phi_trans4(ptr %p) {\nentry:\n  %X3 = getelementptr i8, ptr %p, i32 192\n  store i8 -64, ptr %X3, align 1\n  %X = getelementptr i8, ptr %p, i32 4\n  %Y = load i8, ptr %X, align 1\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %i = phi i32 [ 4, %entry ], [ 192, %loop ]\n  %X2 = getelementptr i8, ptr %p, i32 %i\n  %Y2 = load i8, ptr %X2, align 1\n  %cond = call i1 @cond2()\n  store i32 0, ptr %X3, align 4\n  br i1 %cond, label %loop, label %out\n\nout:                                              ; preds = %loop\n  %R = add i8 %Y, %Y2\n  ret i8 %R\n}\n\nattributes #0 = { memory(read) }\n"
+        },
+        {
+          "test_name": "coerce_mustalias5",
+          "test_body": "define i8 @coerce_mustalias5(i32 %V, ptr %P) {\n  store i32 %V, ptr %P, align 4\n  %A = load i8, ptr %P, align 1\n  ret i8 %A\n}\n"
+        },
+        {
+          "test_name": "memcpy_to_float_local",
+          "test_body": "@GCst = external constant { i32, float, i32 }\n\n; Function Attrs: nounwind ssp\ndefine float @memcpy_to_float_local(ptr %A) #0 {\nentry:\n  tail call void @llvm.memcpy.p0.p0.i64(ptr %A, ptr @GCst, i64 12, i1 false)\n  %arrayidx = getelementptr inbounds float, ptr %A, i64 1\n  %ttmp2 = load float, ptr %arrayidx, align 4\n  ret float %ttmp2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #1\n\nattributes #0 = { nounwind ssp }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "load_load_partial_alias_atomic",
+          "test_body": "@global = external local_unnamed_addr global i8, align 4\n\ndefine void @load_load_partial_alias_atomic(ptr %arg) {\nbb:\n  %tmp2.1 = getelementptr inbounds i8, ptr %arg, i64 1\n  %tmp2.3 = load i64, ptr %tmp2.1, align 4\n  %tmp2.4 = icmp ugt i64 %tmp2.3, 1\n  %tmp3.1 = getelementptr inbounds i8, ptr %arg, i64 2\n  br label %bb5\n\nbb5:                                              ; preds = %bb5, %bb\n  %tmp4.1 = load i8, ptr %tmp3.1, align 4\n  %tmp6.1 = load atomic i8, ptr @global acquire, align 4\n  %tmp7.1 = add i8 %tmp6.1, %tmp4.1\n  store i8 %tmp7.1, ptr %arg, align 1\n  br label %bb5\n}\n"
+        },
+        {
+          "test_name": "coerce_mustalias_pre0",
+          "test_body": "define i8 @coerce_mustalias_pre0(ptr %P, i1 %cond) {\n  br i1 %cond, label %T, label %F\n\nT:                                                ; preds = %0\n  store i32 42, ptr %P, align 4\n  br label %Cont\n\nF:                                                ; preds = %0\n  br label %Cont\n\nCont:                                             ; preds = %F, %T\n  %A = load i8, ptr %P, align 1\n  ret i8 %A\n}\n"
+        },
+        {
+          "test_name": "coerce_mustalias6",
+          "test_body": "define float @coerce_mustalias6(i64 %V, ptr %P) {\n  store i64 %V, ptr %P, align 4\n  %A = load float, ptr %P, align 4\n  ret float %A\n}\n"
+        },
+        {
+          "test_name": "memcpy_to_float_local_as1",
+          "test_body": "@GCst_as1 = external addrspace(1) constant { i32, float, i32 }\n\n; Function Attrs: nounwind ssp\ndefine float @memcpy_to_float_local_as1(ptr %A) #0 {\nentry:\n  tail call void @llvm.memcpy.p0.p1.i64(ptr %A, ptr addrspace(1) @GCst_as1, i64 12, i1 false)\n  %arrayidx = getelementptr inbounds float, ptr %A, i64 1\n  %ttmp2 = load float, ptr %arrayidx, align 4\n  ret float %ttmp2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.memcpy.p0.p1.i64(ptr noalias writeonly captures(none), ptr addrspace(1) noalias readonly captures(none), i64, i1 immarg) #1\n\nattributes #0 = { nounwind ssp }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        },
+        {
+          "test_name": "chained_load",
+          "test_body": "define i32 @chained_load(ptr %p, i32 %x, i32 %y) {\nblock1:\n  %A = alloca ptr, align 8\n  %z = load ptr, ptr %p, align 8\n  store ptr %z, ptr %A, align 8\n  %cmp = icmp eq i32 %x, %y\n  br i1 %cmp, label %block2, label %block3\n\nblock2:                                           ; preds = %block1\n  %a = load ptr, ptr %p, align 8\n  br label %block4\n\nblock3:                                           ; preds = %block1\n  %b = load ptr, ptr %p, align 8\n  br label %block4\n\nblock4:                                           ; preds = %block3, %block2\n  %c = load ptr, ptr %p, align 8\n  %d = load i32, ptr %c, align 4\n  ret i32 %d\n}\n"
+        },
+        {
+          "test_name": "memset_to_float_local",
+          "test_body": "; Function Attrs: nounwind ssp\ndefine float @memset_to_float_local(ptr %A, i8 %Val) #0 {\nentry:\n  tail call void @llvm.memset.p0.i64(ptr %A, i8 %Val, i64 400, i1 false)\n  %arrayidx = getelementptr inbounds float, ptr %A, i64 42\n  %ttmp2 = load float, ptr %arrayidx, align 4\n  ret float %ttmp2\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #1\n\nattributes #0 = { nounwind ssp }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }\n"
+        },
+        {
+          "test_name": "phi_trans6",
+          "test_body": "; Function Attrs: memory(read)\ndeclare void @use_i32(i32) #0\n\ndefine i32 @phi_trans6(ptr noalias readonly captures(none) %x, i1 %cond) {\nentry:\n  %l0 = load i32, ptr %x, align 4\n  call void @use_i32(i32 %l0)\n  br label %header\n\nheader:                                           ; preds = %latch, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %latch ]\n  indirectbr ptr blockaddress(@phi_trans6, %latch), [label %latch]\n\nlatch:                                            ; preds = %header\n  %gep.1 = getelementptr i32, ptr %x, i32 %iv\n  %l1 = load i32, ptr %gep.1, align 4\n  %iv.next = add i32 %iv, 1\n  br i1 %cond, label %exit, label %header\n\nexit:                                             ; preds = %latch\n  ret i32 %l1\n}\n\nattributes #0 = { memory(read) }\n"
+        },
+        {
+          "test_name": "coerce_offset_pre0",
+          "test_body": "define i8 @coerce_offset_pre0(ptr %P, i1 %cond) {\n  %P4 = getelementptr i8, ptr %P, i32 2\n  br i1 %cond, label %T, label %F\n\nT:                                                ; preds = %0\n  store i32 42, ptr %P, align 4\n  br label %Cont\n\nF:                                                ; preds = %0\n  br label %Cont\n\nCont:                                             ; preds = %F, %T\n  %A = load i8, ptr %P4, align 1\n  ret i8 %A\n}\n"
+        },
+        {
+          "test_name": "phi_trans8",
+          "test_body": "; Function Attrs: memory(read)\ndeclare void @use_i32(i32) #0\n\ndefine i32 @phi_trans8(ptr noalias readonly captures(none) %x, i1 %cond) {\nentry:\n  %l0 = load i32, ptr %x, align 4\n  call void @use_i32(i32 %l0)\n  br label %header\n\nheader:                                           ; preds = %latch, %entry\n  %iv = phi i32 [ 2, %entry ], [ %iv.next, %latch ]\n  indirectbr ptr blockaddress(@phi_trans8, %latch), [label %latch]\n\nlatch:                                            ; preds = %header\n  %offset = add i32 %iv, -2\n  %gep.1 = getelementptr i32, ptr %x, i32 %offset\n  %l1 = load i32, ptr %gep.1, align 4\n  %iv.next = add i32 %iv, 1\n  br i1 %cond, label %exit, label %header\n\nexit:                                             ; preds = %latch\n  ret i32 %l1\n}\n\nattributes #0 = { memory(read) }\n"
+        },
+        {
+          "test_name": "test_escape1",
+          "test_body": "@_ZTV1X = external constant [5 x ptr]\n\ndeclare void @use()\n\ndeclare void @use3(ptr, ptr)\n\n; Function Attrs: nounwind\ndefine void @test_escape1() #0 {\n  %x = alloca ptr, align 8\n  store ptr getelementptr inbounds ([5 x ptr], ptr @_ZTV1X, i64 0, i64 2), ptr %x, align 8\n  call void @use() #0\n  %DEAD = load ptr, ptr %x, align 8\n  call void @use3(ptr %x, ptr %DEAD) #0\n  ret void\n}\n\nattributes #0 = { nounwind }\n"
+        },
+        {
+          "test_name": "coerce_mustalias2",
+          "test_body": "define float @coerce_mustalias2(ptr %V, ptr %P) {\n  store ptr %V, ptr %P, align 8\n  %A = load float, ptr %P, align 4\n  ret float %A\n}\n"
+        },
+        {
+          "test_name": "coerce_mustalias_nonlocal1",
+          "test_body": "define i8 @coerce_mustalias_nonlocal1(ptr %P, i1 %cond) {\n  br i1 %cond, label %T, label %F\n\nT:                                                ; preds = %0\n  store i32 42, ptr %P, align 4\n  br label %Cont\n\nF:                                                ; preds = %0\n  store float 1.000000e+00, ptr %P, align 4\n  br label %Cont\n\nCont:                                             ; preds = %F, %T\n  %A = load i8, ptr %P, align 1\n  ret i8 %A\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/nonescaping.ll",
+      "commands": [
+        "opt < %s -S -passes=gvn 2>&1",
+        "opt < %s -S -passes='gvn<memoryssa>' 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "test_malloc",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\n\n; Function Attrs: nounwind allockind(\"alloc,uninitialized\") allocsize(0) memory(inaccessiblemem: readwrite)\ndeclare noalias ptr @malloc(i64) #0\n\ndeclare void @escape(ptr)\n\ndefine i8 @test_malloc(ptr %p) {\n  %v1 = load i8, ptr %p, align 1\n  %obj = call ptr @malloc(i64 16)\n  %v2 = load i8, ptr %p, align 1\n  %sub = sub i8 %v1, %v2\n  call void @escape(ptr %obj)\n  ret i8 %sub\n}\n\nattributes #0 = { nounwind allockind(\"alloc,uninitialized\") allocsize(0) memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "test_calloc",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\n\n; Function Attrs: allockind(\"alloc,zeroed\") allocsize(0,1) memory(inaccessiblemem: readwrite)\ndeclare noalias ptr @calloc(i64, i64) #0\n\ndeclare void @escape(ptr)\n\ndefine i8 @test_calloc(ptr %p) {\n  %v1 = load i8, ptr %p, align 1\n  %obj = call ptr @calloc(i64 1, i64 16)\n  %v2 = load i8, ptr %p, align 1\n  %sub = sub i8 %v1, %v2\n  call void @escape(ptr %obj)\n  ret i8 %sub\n}\n\nattributes #0 = { allockind(\"alloc,zeroed\") allocsize(0,1) memory(inaccessiblemem: readwrite) }\n"
+        },
+        {
+          "test_name": "test_opnew",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\n\ndeclare noalias ptr @_Znwm(i64)\n\ndeclare void @escape(ptr)\n\ndefine i8 @test_opnew(ptr %p) {\n  %v1 = load i8, ptr %p, align 1\n  %obj = call ptr @_Znwm(i64 16)\n  %v2 = load i8, ptr %p, align 1\n  %sub = sub i8 %v1, %v2\n  call void @escape(ptr %obj)\n  ret i8 %sub\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/pr14166.ll",
+      "commands": [
+        "opt -disable-basic-aa -passes=gvn -S < %s",
+        "opt -disable-basic-aa -passes='gvn<memoryssa>' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test1",
+          "test_body": "target datalayout = \"e-p:32:32:32\"\n\ndefine <2 x i32> @test1() {\n  %v1 = alloca <2 x i32>, align 8\n  call void @anything(ptr %v1)\n  %v2 = load <2 x i32>, ptr %v1, align 8\n  %v3 = inttoptr <2 x i32> %v2 to <2 x ptr>\n  store <2 x ptr> %v3, ptr %v1, align 8\n  %v5 = load <2 x i32>, ptr %v1, align 8\n  ret <2 x i32> %v5\n}\n\ndeclare void @anything(ptr)\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/readattrs.ll",
+      "commands": [
+        "opt -passes=gvn -S -o - < %s",
+        "opt -passes='gvn<memoryssa>' -S -o - < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndeclare void @use(ptr readonly captures(none))\n\ndefine i8 @test() {\n  %a = alloca i8, align 1\n  store i8 1, ptr %a, align 1\n  call void @use(ptr %a)\n  %b = load i8, ptr %a, align 1\n  ret i8 %b\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/setjmp.ll",
+      "commands": [
+        "opt -S -passes=gvn < %s",
+        "opt -S -passes='gvn<memoryssa>' -verify-analysis-invalidation < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_alloca",
+          "test_body": "; Function Attrs: returns_twice\ndeclare i32 @setjmp() #0\n\ndeclare void @longjmp()\n\ndefine i32 @test_alloca() {\n  %alloc = alloca i43, align 8\n  store i32 10, ptr %alloc, align 4\n  %sj = call i32 @setjmp()\n  %cmp = icmp eq i32 %sj, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %0\n  store i32 20, ptr %alloc, align 4\n  call void @longjmp()\n  unreachable\n\nif.end:                                           ; preds = %0\n  %res = load i32, ptr %alloc, align 4\n  ret i32 %res\n}\n\nattributes #0 = { returns_twice }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/tbaa.ll",
+      "commands": [
+        "opt -passes=gvn -S < %s",
+        "opt -passes='gvn<memoryssa>' -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test8",
+          "test_body": "define i32 @test8(ptr %p, ptr %q) {\n  %a = load i32, ptr %q, align 4, !tbaa !0\n  store i32 15, ptr %p, align 4\n  %b = load i32, ptr %q, align 4, !tbaa !0\n  %c = sub i32 %a, %b\n  ret i32 %c\n}\n\n!0 = !{!1, !1, i64 0, i64 1}\n!1 = !{!\"node\", !2}\n!2 = !{!\"yet another root\"}\n"
+        },
+        {
+          "test_name": "test9",
+          "test_body": "define i32 @test9(ptr %p, ptr %q) {\n  %a = load i32, ptr %q, align 4, !tbaa !0\n  call void @clobber()\n  %b = load i32, ptr %q, align 4, !tbaa !0\n  %c = sub i32 %a, %b\n  ret i32 %c\n}\n\ndeclare void @clobber()\n\n!0 = !{!1, !1, i64 0, i64 1}\n!1 = !{!\"node\", !2}\n!2 = !{!\"yet another root\"}\n"
+        },
+        {
+          "test_name": "test7",
+          "test_body": "define i32 @test7(ptr %p, ptr %q) {\n  %a = call i32 @foo(ptr %p), !tbaa !0\n  %b = call i32 @foo(ptr %p), !tbaa !3\n  %c = add i32 %a, %b\n  ret i32 %c\n}\n\n; Function Attrs: memory(read)\ndeclare i32 @foo(ptr) #0\n\nattributes #0 = { memory(read) }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"scalar type\", !2}\n!2 = !{!\"another root\"}\n!3 = !{!4, !4, i64 0}\n!4 = !{!\"B\", !5}\n!5 = !{!\"A\", !6}\n!6 = !{!\"tbaa root\"}\n"
+        },
+        {
+          "test_name": "test10",
+          "test_body": "define i32 @test10(ptr %p, ptr %q) {\n  %a = call i32 @foo(ptr %p), !tbaa !0\n  %b = call i32 @foo(ptr %p), !tbaa !5\n  %c = add i32 %a, %b\n  ret i32 %c\n}\n\n; Function Attrs: memory(read)\ndeclare i32 @foo(ptr) #0\n\nattributes #0 = { memory(read) }\n\n!0 = !{!1, !2, i64 0}\n!1 = !{!\"struct X\", !2, i64 0}\n!2 = !{!\"int\", !3, i64 0}\n!3 = !{!\"char\", !4, i64 0}\n!4 = !{!\"tbaa root\"}\n!5 = !{!6, !2, i64 0}\n!6 = !{!\"struct Y\", !1, i64 0}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/vscale.ll",
+      "commands": [
+        "opt -S < %s -passes=gvn,dce",
+        "opt -S < %s -passes='gvn<memoryssa>',dce"
+      ],
+      "tests": [
+        {
+          "test_name": "load_clobber_load_sideeffect",
+          "test_body": "define <vscale x 4 x i32> @load_clobber_load_sideeffect(ptr %p) {\n  %load1 = load <vscale x 4 x i32>, ptr %p, align 16\n  call void asm sideeffect \"\", \"\"()\n  %load2 = load <vscale x 4 x i32>, ptr %p, align 16\n  %add = add <vscale x 4 x i32> %load1, %load2\n  ret <vscale x 4 x i32> %add\n}\n"
+        },
+        {
+          "test_name": "load_v16i8_store_v4i32_forward_load",
+          "test_body": "define <vscale x 16 x i8> @load_v16i8_store_v4i32_forward_load(ptr %p, <vscale x 4 x i32> %x) {\n  store <vscale x 4 x i32> %x, ptr %p, align 16\n  %load = load <vscale x 16 x i8>, ptr %p, align 16\n  ret <vscale x 16 x i8> %load\n}\n"
+        },
+        {
+          "test_name": "load_store_clobber_load_noalias",
+          "test_body": "define <vscale x 4 x i32> @load_store_clobber_load_noalias(ptr noalias %p, ptr noalias %p2) {\n  %load1 = load <vscale x 4 x i32>, ptr %p, align 16\n  store <vscale x 4 x i32> zeroinitializer, ptr %p2, align 16\n  %load2 = load <vscale x 4 x i32>, ptr %p, align 16\n  %add = add <vscale x 4 x i32> %load1, %load2\n  ret <vscale x 4 x i32> %add\n}\n"
+        },
+        {
+          "test_name": "scalable_store_to_fixed_load_only_lower_bound",
+          "test_body": "; Function Attrs: vscale_range(4,4)\ndefine <vscale x 4 x float> @scalable_store_to_fixed_load_only_lower_bound(<vscale x 4 x float> %a) #0 {\nentry:\n  %retval = alloca { <vscale x 4 x float> }, align 16\n  store <vscale x 4 x float> %a, ptr %retval, align 16\n  %0 = load <16 x float>, ptr %retval, align 64\n  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> %0, i64 0)\n  ret <vscale x 4 x float> %cast.scalable\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float>, <16 x float>, i64 immarg) #1\n\nattributes #0 = { vscale_range(4,4) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "memset_clobber_load",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #0\n\ndefine i32 @memset_clobber_load(ptr %p) {\n  tail call void @llvm.memset.p0.i64(ptr %p, i8 1, i64 200, i1 false)\n  %gep = getelementptr <vscale x 4 x i32>, ptr %p, i64 0, i64 5\n  %load = load i32, ptr %gep, align 4\n  ret i32 %load\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }\n"
+        },
+        {
+          "test_name": "store_clobber_load",
+          "test_body": "define i32 @store_clobber_load() {\n  %alloc = alloca <vscale x 4 x i32>, align 16\n  store <vscale x 4 x i32> undef, ptr %alloc, align 16\n  %ptr = getelementptr <vscale x 4 x i32>, ptr %alloc, i32 0, i32 1\n  %load = load i32, ptr %ptr, align 4\n  ret i32 %load\n}\n"
+        },
+        {
+          "test_name": "load_v2i64_store_v2p0_forward_load",
+          "test_body": "define <vscale x 2 x i64> @load_v2i64_store_v2p0_forward_load(ptr %p, <vscale x 2 x ptr> %x) {\n  store <vscale x 2 x ptr> %x, ptr %p, align 16\n  %load = load <vscale x 2 x i64>, ptr %p, align 16\n  ret <vscale x 2 x i64> %load\n}\n"
+        },
+        {
+          "test_name": "memset_clobber_load_nonconst_index",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)\ndeclare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg) #0\n\ndefine i32 @memset_clobber_load_nonconst_index(ptr %p, i64 %idx1, i64 %idx2) {\n  tail call void @llvm.memset.p0.i64(ptr %p, i8 1, i64 200, i1 false)\n  %gep = getelementptr <vscale x 4 x i32>, ptr %p, i64 %idx1, i64 %idx2\n  %load = load i32, ptr %gep, align 4\n  ret i32 %load\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }\n"
+        },
+        {
+          "test_name": "redundant_load_elimination_zero_index_1",
+          "test_body": "define void @redundant_load_elimination_zero_index_1(i1 %c, ptr %p, ptr %q, i64 %i) {\nentry:\n  %j = add i64 %i, 1\n  %gep1 = getelementptr <vscale x 4 x i32>, ptr %p, i64 0, i64 %j\n  store i32 0, ptr %gep1, align 4\n  %gep2 = getelementptr <vscale x 4 x i32>, ptr %p, i64 0, i64 %i\n  store i32 1, ptr %gep2, align 4\n  br i1 %c, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %t = load i32, ptr %gep1, align 4\n  store i32 %t, ptr %q, align 4\n  ret void\n\nif.else:                                          ; preds = %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "load_store_clobber_load_mayalias",
+          "test_body": "define <vscale x 4 x i32> @load_store_clobber_load_mayalias(ptr %p, ptr %p2) {\n  %load1 = load <vscale x 4 x i32>, ptr %p, align 16\n  store <vscale x 4 x i32> zeroinitializer, ptr %p2, align 16\n  %load2 = load <vscale x 4 x i32>, ptr %p, align 16\n  %sub = sub <vscale x 4 x i32> %load1, %load2\n  ret <vscale x 4 x i32> %sub\n}\n"
+        },
+        {
+          "test_name": "load_v16i8_store_v4i32_forward_constant",
+          "test_body": "define <vscale x 16 x i8> @load_v16i8_store_v4i32_forward_constant(ptr %p) {\n  store <vscale x 4 x i32> splat (i32 4), ptr %p, align 16\n  %load = load <vscale x 16 x i8>, ptr %p, align 16\n  ret <vscale x 16 x i8> %load\n}\n"
+        },
+        {
+          "test_name": "load_store_clobber_load",
+          "test_body": "define <vscale x 4 x i32> @load_store_clobber_load(ptr %p) {\n  %load1 = load <vscale x 4 x i32>, ptr %p, align 16\n  store <vscale x 4 x i32> zeroinitializer, ptr undef, align 16\n  %load2 = load <vscale x 4 x i32>, ptr %p, align 16\n  %add = add <vscale x 4 x i32> %load1, %load2\n  ret <vscale x 4 x i32> %add\n}\n"
+        },
+        {
+          "test_name": "load_from_alloc_replaced_with_undef",
+          "test_body": "define ptr @load_from_alloc_replaced_with_undef() {\nentry:\n  %a = alloca <vscale x 4 x i32>, align 16\n  %gep = getelementptr <vscale x 4 x i32>, ptr %a, i64 0, i64 1\n  %load = load i32, ptr %gep, align 4\n  %tobool = icmp eq i32 %load, 0\n  br i1 %tobool, label %if.end, label %if.then\n\nif.then:                                          ; preds = %entry\n  store <vscale x 4 x i32> zeroinitializer, ptr %a, align 16\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  ret ptr %a\n}\n"
+        },
+        {
+          "test_name": "load_v4f32_store_v16i8_forward_load",
+          "test_body": "define <vscale x 4 x float> @load_v4f32_store_v16i8_forward_load(ptr %p, <vscale x 16 x i8> %x) {\n  store <vscale x 16 x i8> %x, ptr %p, align 16\n  %load = load <vscale x 4 x float>, ptr %p, align 16\n  ret <vscale x 4 x float> %load\n}\n"
+        },
+        {
+          "test_name": "load_v4f32_store_v4i32_forward_load",
+          "test_body": "define <vscale x 4 x float> @load_v4f32_store_v4i32_forward_load(ptr %p, <vscale x 4 x i32> %x) {\n  store <vscale x 4 x i32> %x, ptr %p, align 16\n  %load = load <vscale x 4 x float>, ptr %p, align 16\n  ret <vscale x 4 x float> %load\n}\n"
+        },
+        {
+          "test_name": "redundant_load_elimination_zero_index",
+          "test_body": "define void @redundant_load_elimination_zero_index(i1 %c, ptr %p, ptr %q) {\nentry:\n  %gep1 = getelementptr <vscale x 4 x i32>, ptr %p, i64 0, i64 1\n  store i32 0, ptr %gep1, align 4\n  store i32 1, ptr %p, align 4\n  br i1 %c, label %if.else, label %if.then\n\nif.then:                                          ; preds = %entry\n  %t = load i32, ptr %gep1, align 4\n  store i32 %t, ptr %q, align 4\n  ret void\n\nif.else:                                          ; preds = %entry\n  ret void\n}\n"
+        },
+        {
+          "test_name": "load_v16i8_store_nxv4i32_forward_load",
+          "test_body": "define <16 x i8> @load_v16i8_store_nxv4i32_forward_load(ptr %p, <vscale x 4 x i32> %x) {\n  store <vscale x 4 x i32> %x, ptr %p, align 16\n  %load = load <16 x i8>, ptr %p, align 16\n  ret <16 x i8> %load\n}\n"
+        },
+        {
+          "test_name": "scalable_store_to_small_fixed_load",
+          "test_body": "define <4 x float> @scalable_store_to_small_fixed_load(<vscale x 4 x float> %a) {\nentry:\n  %ptr = alloca <vscale x 4 x float>, align 16\n  store <vscale x 4 x float> %a, ptr %ptr, align 16\n  %0 = load <4 x float>, ptr %ptr, align 16\n  ret <4 x float> %0\n}\n"
+        },
+        {
+          "test_name": "load_v16i8_store_v4i32_struct_forward_load",
+          "test_body": "define { <vscale x 16 x i8> } @load_v16i8_store_v4i32_struct_forward_load(ptr %p, <vscale x 4 x i32> %x) {\n  store <vscale x 4 x i32> %x, ptr %p, align 16\n  %load = load { <vscale x 16 x i8> }, ptr %p, align 16\n  ret { <vscale x 16 x i8> } %load\n}\n"
+        },
+        {
+          "test_name": "scalable_store_to_fixed_load",
+          "test_body": "; Function Attrs: vscale_range(4,4)\ndefine <vscale x 4 x float> @scalable_store_to_fixed_load(<vscale x 4 x float> %.coerce) #0 {\nentry:\n  %retval = alloca { <16 x float> }, align 64\n  %0 = fadd <vscale x 4 x float> %.coerce, %.coerce\n  store <vscale x 4 x float> %0, ptr %retval, align 16\n  %1 = load <16 x float>, ptr %retval, align 64\n  %cast.scalable = tail call <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float> poison, <16 x float> %1, i64 0)\n  ret <vscale x 4 x float> %cast.scalable\n}\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <vscale x 4 x float> @llvm.vector.insert.nxv4f32.v16f32(<vscale x 4 x float>, <16 x float>, i64 immarg) #1\n\nattributes #0 = { vscale_range(4,4) }\nattributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "load_v2p0_store_v4i32_forward_load",
+          "test_body": "define <vscale x 2 x ptr> @load_v2p0_store_v4i32_forward_load(ptr %p, <vscale x 4 x i32> %x) {\n  store <vscale x 4 x i32> %x, ptr %p, align 16\n  %load = load <vscale x 2 x ptr>, ptr %p, align 16\n  ret <vscale x 2 x ptr> %load\n}\n"
+        },
+        {
+          "test_name": "load_v4i32_store_v4f32_forward_load",
+          "test_body": "define <vscale x 4 x i32> @load_v4i32_store_v4f32_forward_load(ptr %p, <vscale x 4 x float> %x) {\n  store <vscale x 4 x float> %x, ptr %p, align 16\n  %load = load <vscale x 4 x i32>, ptr %p, align 16\n  ret <vscale x 4 x i32> %load\n}\n"
+        },
+        {
+          "test_name": "bigexample",
+          "test_body": "; Function Attrs: vscale_range(1,16)\ndefine { <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8> } @bigexample({ <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32> } %a) #0 {\nentry:\n  %ref.tmp = alloca { <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32> }, align 16\n  call void @llvm.lifetime.start.p0(ptr nonnull %ref.tmp)\n  %a.elt = extractvalue { <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32> } %a, 0\n  store <vscale x 4 x i32> %a.elt, ptr %ref.tmp, align 16\n  %0 = call i64 @llvm.vscale.i64()\n  %1 = shl i64 %0, 4\n  %ref.tmp.repack1 = getelementptr inbounds i8, ptr %ref.tmp, i64 %1\n  %a.elt2 = extractvalue { <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32> } %a, 1\n  store <vscale x 4 x i32> %a.elt2, ptr %ref.tmp.repack1, align 16\n  %2 = call i64 @llvm.vscale.i64()\n  %3 = shl i64 %2, 5\n  %ref.tmp.repack3 = getelementptr inbounds i8, ptr %ref.tmp, i64 %3\n  %a.elt4 = extractvalue { <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32> } %a, 2\n  store <vscale x 4 x i32> %a.elt4, ptr %ref.tmp.repack3, align 16\n  %4 = call i64 @llvm.vscale.i64()\n  %5 = mul i64 %4, 48\n  %ref.tmp.repack5 = getelementptr inbounds i8, ptr %ref.tmp, i64 %5\n  %a.elt6 = extractvalue { <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32>, <vscale x 4 x i32> } %a, 3\n  store <vscale x 4 x i32> %a.elt6, ptr %ref.tmp.repack5, align 16\n  %.unpack = load <vscale x 16 x i8>, ptr %ref.tmp, align 16\n  %6 = insertvalue { <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8> } poison, <vscale x 16 x i8> %.unpack, 0\n  %7 = call i64 @llvm.vscale.i64()\n  %8 = shl i64 %7, 4\n  %.elt7 = getelementptr inbounds i8, ptr %ref.tmp, i64 %8\n  %.unpack8 = load <vscale x 16 x i8>, ptr %.elt7, align 16\n  %9 = insertvalue { <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8> } %6, <vscale x 16 x i8> %.unpack8, 1\n  %10 = call i64 @llvm.vscale.i64()\n  %11 = shl i64 %10, 5\n  %.elt9 = getelementptr inbounds i8, ptr %ref.tmp, i64 %11\n  %.unpack10 = load <vscale x 16 x i8>, ptr %.elt9, align 16\n  %12 = insertvalue { <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8> } %9, <vscale x 16 x i8> %.unpack10, 2\n  %13 = call i64 @llvm.vscale.i64()\n  %14 = mul i64 %13, 48\n  %.elt11 = getelementptr inbounds i8, ptr %ref.tmp, i64 %14\n  %.unpack12 = load <vscale x 16 x i8>, ptr %.elt11, align 16\n  %15 = insertvalue { <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8> } %12, <vscale x 16 x i8> %.unpack12, 3\n  call void @llvm.lifetime.end.p0(ptr nonnull %ref.tmp)\n  ret { <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8>, <vscale x 16 x i8> } %15\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr captures(none)) #1\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr captures(none)) #1\n\n; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.vscale.i64() #2\n\nattributes #0 = { vscale_range(1,16) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\nattributes #2 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "load_clobber_load_gep1",
+          "test_body": "define i32 @load_clobber_load_gep1(ptr %p) {\n  %gep1 = getelementptr <vscale x 4 x i32>, ptr %p, i64 0, i64 1\n  %load1 = load i32, ptr %gep1, align 4\n  %gep2 = getelementptr i32, ptr %p, i64 1\n  %load2 = load i32, ptr %gep2, align 4\n  %add = add i32 %load1, %load2\n  ret i32 %add\n}\n"
+        },
+        {
+          "test_name": "load_v2i32_store_v4i32_forward_load_offsetc",
+          "test_body": "define <vscale x 2 x i32> @load_v2i32_store_v4i32_forward_load_offsetc(ptr %p, <vscale x 4 x i32> %x) {\n  store <vscale x 4 x i32> %x, ptr %p, align 16\n  %q = getelementptr <2 x i32>, ptr %p, i64 1\n  %load = load <vscale x 2 x i32>, ptr %q, align 8\n  ret <vscale x 2 x i32> %load\n}\n"
+        },
+        {
+          "test_name": "store_forward_to_load",
+          "test_body": "define <vscale x 4 x i32> @store_forward_to_load(ptr %p) {\n  store <vscale x 4 x i32> zeroinitializer, ptr %p, align 16\n  %load = load <vscale x 4 x i32>, ptr %p, align 16\n  ret <vscale x 4 x i32> %load\n}\n"
+        },
+        {
+          "test_name": "redundant_load_elimination_1",
+          "test_body": "define i32 @redundant_load_elimination_1(ptr %p) {\nentry:\n  %gep = getelementptr <vscale x 4 x i32>, ptr %p, i64 1, i64 1\n  %load1 = load i32, ptr %gep, align 4\n  %cmp = icmp eq i32 %load1, 0\n  br i1 %cmp, label %if.then, label %if.end\n\nif.then:                                          ; preds = %entry\n  %load2 = load i32, ptr %gep, align 4\n  %add = add i32 %load1, %load2\n  br label %if.end\n\nif.end:                                           ; preds = %if.then, %entry\n  %result = phi i32 [ %add, %if.then ], [ %load1, %entry ]\n  ret i32 %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {undef deprecator}-->\n\n\n:warning: undef deprecator found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit diff -U0 --pickaxe-regex -S '([^a-zA-Z0-9#_-]undef([^a-zA-Z0-9_-]|$)|UndefValue::get)' 'HEAD~1' HEAD llvm/include/llvm/Transforms/Scalar/GVN.h llvm/lib/Transforms/Scalar/GVN.cpp llvm/test/Analysis/TypeBasedAliasAnalysis/gvn-nonlocal-type-mismatch.ll llvm/test/Transforms/GVN/PRE/load-metadata.ll llvm/test/Transforms/GVN/PRE/lpre-call-wrap.ll llvm/test/Transforms/GVN/PRE/phi-translate-2.ll llvm/test/Transforms/GVN/PRE/phi-translate-add.ll llvm/test/Transforms/GVN/PRE/phi-translate.ll llvm/test/Transforms/GVN/PRE/pre-after-rle.ll llvm/test/Transforms/GVN/PRE/pre-aliasning-path.ll llvm/test/Transforms/GVN/PRE/pre-load-dbg.ll llvm/test/Transforms/GVN/PRE/pre-load-guards.ll llvm/test/Transforms/GVN/PRE/pre-load-implicit-cf-updates.ll llvm/test/Transforms/GVN/PRE/pre-load.ll llvm/test/Transforms/GVN/PRE/pre-single-pred.ll llvm/test/Transforms/GVN/PRE/preserve-tbaa.ll llvm/test/Transforms/GVN/PRE/rle-addrspace-cast.ll llvm/test/Transforms/GVN/PRE/rle-semidominated.ll llvm/test/Transforms/GVN/PRE/rle.ll llvm/test/Transforms/GVN/nonescaping.ll llvm/test/Transforms/GVN/pr14166.ll llvm/test/Transforms/GVN/readattrs.ll llvm/test/Transforms/GVN/setjmp.ll llvm/test/Transforms/GVN/tbaa.ll llvm/test/Transforms/GVN/vscale.ll\n``````````\n\n</details>\n\n\nThe following files introduce new uses of undef:\n - llvm/test/Transforms/GVN/PRE/pre-load-dbg.ll\n - llvm/test/Transforms/GVN/vscale.ll\n\n[Undef](https://llvm.org/docs/LangRef.html#undefined-values) is now deprecated and should only be used in the rare cases where no replacement is possible. For example, a load of uninitialized memory yields `undef`. You should use `poison` values for placeholders instead.\n\nIn tests, avoid using `undef` and having tests that trigger undefined behavior. If you need an operand with some unimportant value, you can add a new argument to the function and use that instead.\n\nFor example, this is considered a bad practice:\n```llvm\ndefine void @fn() {\n  ...\n  br i1 undef, ...\n}\n```\n\nPlease use the following instead:\n```llvm\ndefine void @fn(i1 %cond) {\n  ...\n  br i1 %cond, ...\n}\n```\n\nPlease refer to the [Undefined Behavior Manual](https://llvm.org/docs/UndefinedBehavior.html) for more information.\n\n"
+    },
+    {
+      "author": "madhur13490",
+      "body": "Did you run clang-format on the patch? I think there are a couple of places where I see coding violation."
+    },
+    {
+      "author": "antoniofrighetto",
+      "body": "> Did you run clang-format on the patch? I think there are a couple of places where I see coding violation.\r\n\r\nclang-format run correctly, CI complains due to the introduction of new test checks containing undef. In this case is fine, as those checks were already there before (we simply updated them, showing that MemDep and MSSA converge on the same result).\r\n\r\nCompile-time impact of the change: https://llvm-compile-time-tracker.com/compare.php?from=7e1f79c9935fe86b072119fdbb01ee25a80060e6&to=bb3e1cc8b54af17bb360432359eb2ecca3bd7bd2&stat=instructions:u. Some little regressions in stage1-ReleaseLTO-g. Picking CMakeFiles/consumer-typeset.dir/z06.c.o (which has one of the largest regression, +0.35%), putting it under callgrind, and it looks like the new extra time is mostly spent in `SmallVectorImpl<GVNPass::ReachingMemVal>::emplace_back()`, when copying the MemDepAnalysis-populated deps vector (`NonLocalDepResult`) to the new one (`ReachingMemVal`), before processing the non-local load. Reserving the capacity upfront and preventing possible reallocations seems to have some little benefit: https://llvm-compile-time-tracker.com/compare.php?from=7e1f79c9935fe86b072119fdbb01ee25a80060e6&to=bbe0dd87bcc45a0a73a0fd04a06143ea7682222b&stat=instructions:u.\r\n\r\nConsidering that the regression doesn't look that excessive, and this whole happens on code that is meant to live temporarily (till we turn on MemorySSA), I believe this may be moved forward if on track."
+    }
+  ],
+  "knowledge_cutoff": "2025-08-09T14:39:41Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Scalar/GVN.h": [
+      [
+        19,
+        24
+      ],
+      [
+        37,
+        44
+      ],
+      [
+        255,
+        260
+      ],
+      [
+        360,
+        380
+      ]
+    ],
+    "llvm/lib/Transforms/Scalar/GVN.cpp": [
+      [
+        117,
+        122
+      ],
+      [
+        1322,
+        1336
+      ],
+      [
+        1355,
+        1371
+      ],
+      [
+        1396,
+        1402
+      ],
+      [
+        1464,
+        1470
+      ],
+      [
+        1472,
+        1479
+      ],
+      [
+        1482,
+        1488
+      ],
+      [
+        1490,
+        1496
+      ],
+      [
+        1546,
+        1557
+      ],
+      [
+        1611,
+        1617
+      ],
+      [
+        1641,
+        1647
+      ],
+      [
+        1996,
+        2008
+      ],
+      [
+        2013,
+        2022
+      ],
+      [
+        2034,
+        2040
+      ],
+      [
+        2044,
+        2050
+      ],
+      [
+        2066,
+        2072
+      ],
+      [
+        2074,
+        2080
+      ],
+      [
+        2153,
+        2162
+      ],
+      [
+        2171,
+        2185
+      ],
+      [
+        2188,
+        2194
+      ],
+      [
+        2803,
+        2808
+      ]
+    ],
+    "llvm/test/Analysis/TypeBasedAliasAnalysis/gvn-nonlocal-type-mismatch.ll": [
+      [
+        8,
+        71
+      ],
+      [
+        74,
+        120
+      ],
+      [
+        122,
+        127
+      ],
+      [
+        163,
+        168
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/load-metadata.ll": [
+      [
+        3,
+        34
+      ],
+      [
+        46,
+        77
+      ],
+      [
+        92,
+        104
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/lpre-call-wrap.ll": [
+      [
+        19,
+        74
+      ],
+      [
+        103,
+        106
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/phi-translate-2.ll": [
+      [
+        51,
+        106
+      ],
+      [
+        277,
+        326
+      ],
+      [
+        350,
+        389
+      ],
+      [
+        402,
+        404
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/phi-translate-add.ll": [
+      [
+        7,
+        35
+      ],
+      [
+        57,
+        63
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/phi-translate.ll": [
+      [
+        8,
+        52
+      ],
+      [
+        85,
+        111
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-after-rle.ll": [
+      [
+        1,
+        52
+      ],
+      [
+        74,
+        134
+      ],
+      [
+        160,
+        162
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-aliasning-path.ll": [
+      [
+        103,
+        147
+      ],
+      [
+        167,
+        169
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-load-dbg.ll": [
+      [
+        13,
+        97
+      ],
+      [
+        136,
+        210
+      ],
+      [
+        265,
+        297
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-load-guards.ll": [
+      [
+        95,
+        130
+      ],
+      [
+        187,
+        189
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-load-implicit-cf-updates.ll": [
+      [
+        13,
+        37
+      ],
+      [
+        73,
+        100
+      ],
+      [
+        139,
+        141
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-load.ll": [
+      [
+        5,
+        34
+      ],
+      [
+        47,
+        78
+      ],
+      [
+        92,
+        131
+      ],
+      [
+        150,
+        190
+      ],
+      [
+        209,
+        249
+      ],
+      [
+        273,
+        322
+      ],
+      [
+        353,
+        402
+      ],
+      [
+        435,
+        491
+      ],
+      [
+        521,
+        557
+      ],
+      [
+        579,
+        633
+      ],
+      [
+        668,
+        729
+      ],
+      [
+        760,
+        799
+      ],
+      [
+        955,
+        984
+      ],
+      [
+        1005,
+        1034
+      ],
+      [
+        1063,
+        1129
+      ],
+      [
+        1168,
+        1198
+      ],
+      [
+        1211,
+        1266
+      ],
+      [
+        1373,
+        1422
+      ],
+      [
+        1450,
+        1487
+      ],
+      [
+        1509,
+        1540
+      ],
+      [
+        1551,
+        1553
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-single-pred.ll": [
+      [
+        14,
+        69
+      ],
+      [
+        95,
+        98
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/preserve-tbaa.ll": [
+      [
+        7,
+        44
+      ],
+      [
+        62,
+        76
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/rle-addrspace-cast.ll": [
+      [
+        3,
+        22
+      ],
+      [
+        27,
+        30
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/rle-semidominated.ll": [
+      [
+        3,
+        37
+      ],
+      [
+        52,
+        55
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/rle.ll": [
+      [
+        6,
+        32
+      ],
+      [
+        73,
+        101
+      ],
+      [
+        106,
+        136
+      ],
+      [
+        141,
+        171
+      ],
+      [
+        176,
+        222
+      ],
+      [
+        233,
+        262
+      ],
+      [
+        267,
+        298
+      ],
+      [
+        303,
+        334
+      ],
+      [
+        339,
+        371
+      ],
+      [
+        376,
+        420
+      ],
+      [
+        425,
+        483
+      ],
+      [
+        500,
+        532
+      ],
+      [
+        537,
+        569
+      ],
+      [
+        574,
+        630
+      ],
+      [
+        645,
+        701
+      ],
+      [
+        715,
+        769
+      ],
+      [
+        787,
+        819
+      ],
+      [
+        825,
+        883
+      ],
+      [
+        898,
+        956
+      ],
+      [
+        968,
+        1038
+      ],
+      [
+        1120,
+        1242
+      ],
+      [
+        1274,
+        1350
+      ],
+      [
+        1371,
+        1467
+      ],
+      [
+        1497,
+        1575
+      ],
+      [
+        1592,
+        1672
+      ],
+      [
+        1690,
+        1770
+      ],
+      [
+        1790,
+        1824
+      ],
+      [
+        1834,
+        1878
+      ],
+      [
+        1886,
+        1946
+      ],
+      [
+        1984,
+        1998
+      ],
+      [
+        2024,
+        2038
+      ],
+      [
+        2063,
+        2166
+      ],
+      [
+        2191,
+        2253
+      ],
+      [
+        2352,
+        2390
+      ],
+      [
+        2393,
+        2398
+      ]
+    ],
+    "llvm/test/Transforms/GVN/nonescaping.ll": [
+      [
+        10,
+        27
+      ],
+      [
+        32,
+        49
+      ],
+      [
+        54,
+        71
+      ],
+      [
+        75,
+        78
+      ]
+    ],
+    "llvm/test/Transforms/GVN/pr14166.ll": [
+      [
+        3,
+        25
+      ],
+      [
+        32,
+        35
+      ]
+    ],
+    "llvm/test/Transforms/GVN/readattrs.ll": [
+      [
+        8,
+        25
+      ],
+      [
+        28,
+        31
+      ]
+    ],
+    "llvm/test/Transforms/GVN/setjmp.ll": [
+      [
+        38,
+        69
+      ],
+      [
+        111,
+        113
+      ]
+    ],
+    "llvm/test/Transforms/GVN/tbaa.ll": [
+      [
+        94,
+        111
+      ],
+      [
+        118,
+        135
+      ],
+      [
+        144,
+        160
+      ],
+      [
+        188,
+        223
+      ]
+    ],
+    "llvm/test/Transforms/GVN/vscale.ll": [
+      [
+        5,
+        22
+      ],
+      [
+        41,
+        58
+      ],
+      [
+        63,
+        80
+      ],
+      [
+        154,
+        167
+      ],
+      [
+        201,
+        215
+      ],
+      [
+        247,
+        274
+      ],
+      [
+        286,
+        314
+      ],
+      [
+        359,
+        388
+      ],
+      [
+        400,
+        433
+      ],
+      [
+        478,
+        492
+      ],
+      [
+        494,
+        508
+      ],
+      [
+        510,
+        524
+      ],
+      [
+        526,
+        540
+      ],
+      [
+        601,
+        616
+      ],
+      [
+        618,
+        632
+      ],
+      [
+        656,
+        669
+      ],
+      [
+        693,
+        757
+      ],
+      [
+        795,
+        815
+      ],
+      [
+        822,
+        840
+      ],
+      [
+        921,
+        939
+      ],
+      [
+        941,
+        943
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Scalar/GVN.cpp": [
+      "GVNPass::AnalyzeLoadAvailability",
+      "GVNPass::eliminatePartiallyRedundantLoad",
+      "GVNPass::findLoadToHoistIntoPred",
+      "GVNPass::processLoad",
+      "GVNPass::processNonLocalLoad",
+      "GVNPass::runImpl",
+      "patchAndReplaceAllUsesWith"
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-load-guards.ll": [
+      "above"
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-load.ll": [
+      "nosync",
+      "test24"
+    ],
+    "llvm/test/Transforms/GVN/readattrs.ll": [
+      "test"
+    ],
+    "llvm/test/Transforms/GVN/setjmp.ll": [
+      "test_alloca_volatile"
+    ],
+    "llvm/test/Transforms/GVN/vscale.ll": [
+      "load_from_alloc_replaced_with_undef",
+      "store_clobber_load"
+    ]
+  }
+}

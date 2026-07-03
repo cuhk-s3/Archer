@@ -1,0 +1,264 @@
+{
+  "pr_id": 184328,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/184328",
+  "state": "open",
+  "title": "[InstCombine] Fold patterns which uses <2N x iM> type for comparisons on <N x i2M> vector types",
+  "author": "fuad1502",
+  "base_commit": "e80604a6418404934a47bb3bfc14b4a21c1de626",
+  "fix_commit": "42e95371b902cf44b6f8a88b9762acdd536f170c",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex 073f094639fa0..803f9f5aaf053 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -2898,6 +2898,9 @@ Instruction *InstCombinerImpl::visitAnd(BinaryOperator &I) {\n                                       /*SimplifyOnly*/ false, *this))\n     return BinaryOperator::CreateAnd(Op0, V);\n \n+  if (Instruction *Folded = foldVecCmpOnHalfElementSize(I))\n+    return Folded;\n+\n   return nullptr;\n }\n \n@@ -4649,6 +4652,9 @@ Instruction *InstCombinerImpl::visitOr(BinaryOperator &I) {\n   if (Value *Res = FoldOrOfSelectSmaxToAbs(I, Builder))\n     return replaceInstUsesWith(I, Res);\n \n+  if (Instruction *Folded = foldVecCmpOnHalfElementSize(I))\n+    return Folded;\n+\n   return nullptr;\n }\n \ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\nindex 2f3c9c6a083bd..f6acf95a07e4a 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp\n@@ -21,6 +21,7 @@\n #include \"llvm/IR/DataLayout.h\"\n #include \"llvm/IR/DebugInfo.h\"\n #include \"llvm/IR/Instruction.h\"\n+#include \"llvm/IR/Instructions.h\"\n #include \"llvm/IR/PatternMatch.h\"\n #include \"llvm/IR/Type.h\"\n #include \"llvm/IR/Value.h\"\n@@ -1895,6 +1896,9 @@ Instruction *InstCombinerImpl::visitSExt(SExtInst &Sext) {\n     }\n   }\n \n+  if (Instruction *Folded = foldVecCmpOnHalfElementSize(Sext))\n+    return Folded;\n+\n   return nullptr;\n }\n \ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 2e7758e952eaf..b2f588daa32f2 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -423,6 +423,8 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   Value *foldAndOrOfICmpsUsingRanges(ICmpInst *ICmp1, ICmpInst *ICmp2,\n                                      bool IsAnd);\n \n+  Instruction *foldVecCmpOnHalfElementSize(Instruction &I);\n+\n   /// Optimize (fcmp)&(fcmp) or (fcmp)|(fcmp).\n   /// NOTE: Unlike most of instcombine, this returns a Value which should\n   /// already be inserted into the function.\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 6707d1abf5ca0..d1c0cd3433b8c 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -4982,5 +4982,8 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n     return CallInst::Create(Scmp, {CmpLHS, ConstantInt::get(SI.getType(), 0)});\n   }\n \n+  if (Instruction *Folded = foldVecCmpOnHalfElementSize(SI))\n+    return Folded;\n+\n   return nullptr;\n }\ndiff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\nindex 0ca5da1bbf251..136b88608a046 100644\n--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp\n@@ -1296,6 +1296,201 @@ Value *InstCombinerImpl::foldUsingDistributiveLaws(BinaryOperator &I) {\n   return SimplifySelectsFeedingBinaryOp(I, LHS, RHS);\n }\n \n+// Folds patterns which uses comparisons on <2N x iM> type for a <N x i2M>\n+// equality comparison.\n+//\n+// (A1, ..., AN) -> (A1Lower, A1Upper, ..., ANLower, ANUpper)\n+// (B1, ..., BN) -> (B1Lower, B1Upper, ..., BNLower, BNUpper)\n+// (Result1, ..., ResultN) -> (Result1, Result1, ..., ResultN, ResultN)\n+//\n+// where,\n+//\n+// ResultX = EqLowerX & EqUpperX\n+// EqLowerX = AXLower == BXLower\n+// EqUpperX = AXUpper == BXUpper\n+//\n+// Bitwise AND between the upper and lower parts can be achived by performing\n+// the operation between the original and shuffled equality vector.\n+static Value *foldVecCmpEqOnHalfElementSize(Instruction &I,\n+                                            FixedVectorType *ResultVecType,\n+                                            InstCombiner::BuilderTy &Builder) {\n+  // Check pattern existance\n+  Value *L, *R;\n+  CmpPredicate Pred;\n+  ArrayRef<int> Mask;\n+\n+  auto Equal = m_SExtOrSelf(m_ICmp(Pred, m_Value(L), m_Value(R)));\n+  auto Shuffle = m_SExtOrSelf(m_Shuffle(Equal, m_Poison(), m_Mask(Mask)));\n+  if (!match(&I,\n+             m_SExtOrSelf(m_CombineOr(m_c_And(Equal, Shuffle),\n+                                      m_Select(Equal, Shuffle, m_Zero())))) ||\n+      Pred != CmpInst::ICMP_EQ)\n+    return nullptr;\n+\n+  auto *OldVecType = cast<FixedVectorType>(L->getType());\n+\n+  if (OldVecType != ResultVecType)\n+    return nullptr;\n+\n+  // Example shuffle mask: {1, 0, 3, 2}\n+  for (int I = 0; I < static_cast<int>(Mask.size()); I += 2)\n+    if (Mask[I] != I + 1 || Mask[I + 1] != I)\n+      return nullptr;\n+\n+  LLVM_DEBUG(dbgs() << \"IC: Folding Vn2im CmpEq using V2nim CmpEq pattern\"\n+                    << '\\n');\n+\n+  // Perform folding\n+  unsigned int OldElementCount = OldVecType->getElementCount().getFixedValue();\n+  unsigned int OldElementWidth = OldVecType->getScalarSizeInBits();\n+  Type *NewElementType = IntegerType::get(I.getContext(), OldElementWidth * 2);\n+  Type *NewVecType =\n+      VectorType::get(NewElementType, OldElementCount / 2, false);\n+  Value *BitCastL = Builder.CreateBitCast(L, NewVecType);\n+  Value *BitCastR = Builder.CreateBitCast(R, NewVecType);\n+  Value *Cmp = Builder.CreateICmp(Pred, BitCastL, BitCastR);\n+  Value *SExt = Builder.CreateSExt(Cmp, NewVecType);\n+  Value *BitCastCmp = Builder.CreateBitCast(SExt, OldVecType);\n+\n+  return BitCastCmp;\n+}\n+\n+// Folds patterns which uses comparisons on <2N x iM> type for a <N x i2M>\n+// greater / less than comparison.\n+//\n+// (A1, ..., AN) -> (A1Lower, A1Upper, ..., ANLower, ANUpper)\n+// (B1, ..., BN) -> (B1Lower, B1Upper, ..., BNLower, BNUpper)\n+// (Result1, ..., ResultN) -> (Result1, Result1, ..., ResultN, ResultN)\n+//\n+// where,\n+//\n+// ResultX = (GtLowerX & EqUpperX) | (GtUpperX)\n+// GtLowerX = AXLower OP BXLower\n+// GtUpperX = AXUpper OP BXUpper\n+// EqUpperX = AXUpper EQ BXUpper\n+//\n+// Upper and lower parts are obtained through vector shuffles.\n+//\n+// Note that comparison of the lower parts are always unsigned comparisons\n+// regardless of the resulting signedness. Also note that, unsigned comparison\n+// can be derived from signed comparison by flipping the MSB of both operands.\n+static Value *foldVecCmpGtOnHalfElementSize(Instruction &I,\n+                                            FixedVectorType *ResultVecType,\n+                                            bool IsBigEndian,\n+                                            InstCombiner::BuilderTy &Builder) {\n+  // Check pattern existance\n+  Value *A, *B, *Greater1, *Greater2;\n+  CmpPredicate PredEq;\n+  ArrayRef<int> MaskLower, MaskUpper1, MaskUpper2;\n+\n+  auto GreaterLower = m_SExtOrSelf(m_Shuffle(m_SExtOrSelf(m_Value(Greater1)),\n+                                             m_Poison(), m_Mask(MaskLower)));\n+  auto GreaterUpper = m_SExtOrSelf(m_Shuffle(m_SExtOrSelf(m_Value(Greater2)),\n+                                             m_Poison(), m_Mask(MaskUpper1)));\n+  auto EqUpper = m_SExtOrSelf(\n+      m_Shuffle(m_SExtOrSelf(m_c_ICmp(PredEq, m_Value(A), m_Value(B))),\n+                m_Poison(), m_Mask(MaskUpper2)));\n+  auto And =\n+      m_SExtOrSelf(m_CombineOr(m_c_And(GreaterLower, EqUpper),\n+                               m_Select(EqUpper, GreaterLower, m_Zero())));\n+  auto Or = m_SExtOrSelf(m_c_Or(And, GreaterUpper));\n+\n+  if (!match(&I, Or) || Greater1 != Greater2 || MaskUpper1 != MaskUpper2 ||\n+      PredEq != ICmpInst::ICMP_EQ)\n+    return nullptr;\n+\n+  auto *OldVecType = cast<FixedVectorType>(A->getType());\n+\n+  if (OldVecType != ResultVecType)\n+    return nullptr;\n+\n+  // For little endian,\n+  // example lower shuffle mask: {0, 0, 2, 2},\n+  // example upper shuffle mask: {1, 1, 3, 3}\n+  for (int I = 0; I < static_cast<int>(MaskLower.size()); I += 2) {\n+    int LowerIdx = IsBigEndian ? I + 1 : I;\n+    int UpperIdx = IsBigEndian ? I : I + 1;\n+    if (MaskLower[I] != LowerIdx || MaskLower[I + 1] != LowerIdx ||\n+        MaskUpper1[I] != UpperIdx || MaskUpper1[I + 1] != UpperIdx)\n+      return nullptr;\n+  }\n+\n+  // Check greater comparison\n+  unsigned int OldElementWidth = OldVecType->getScalarSizeInBits();\n+  ConstantInt *Zero = ConstantInt::get(\n+      IntegerType::getIntNTy(I.getContext(), OldElementWidth), 0);\n+  ConstantInt *MsbFlip =\n+      ConstantInt::get(IntegerType::getIntNTy(I.getContext(), OldElementWidth),\n+                       1ll << (OldElementWidth - 1));\n+  Value *MsbFlipLower1 = nullptr, *MsbFlipLower2 = nullptr;\n+  CmpPredicate PredGt;\n+\n+  auto UGt = m_c_ICmp(PredGt, m_Specific(A), m_Specific(B));\n+  auto UGtAlt = m_c_ICmp(\n+      PredGt, m_c_Xor(m_Specific(A), m_ConstantSplat(m_ConstantInt(MsbFlip))),\n+      m_c_Xor(m_Specific(B), m_ConstantSplat(m_ConstantInt(MsbFlip))));\n+  auto SGt = m_c_ICmp(PredGt, m_c_Xor(m_Specific(A), m_Value(MsbFlipLower1)),\n+                      m_c_Xor(m_Specific(B), m_Value(MsbFlipLower2)));\n+\n+  if (!(match(Greater1, UGt) &&\n+        (PredGt == ICmpInst::ICMP_UGT || PredGt == ICmpInst::ICMP_ULT)) &&\n+      !((match(Greater1, SGt) || match(Greater1, UGtAlt)) &&\n+        (PredGt == ICmpInst::ICMP_SGT || PredGt == ICmpInst::ICMP_SLT)))\n+    return nullptr;\n+\n+  unsigned int OldElementCount = OldVecType->getElementCount().getFixedValue();\n+\n+  if (MsbFlipLower1) {\n+    auto *MsbFlipLower = dyn_cast<ConstantDataVector>(MsbFlipLower1);\n+    if (!MsbFlipLower || MsbFlipLower2 != MsbFlipLower)\n+      return nullptr;\n+\n+    // For little endian,\n+    // example MSB flip lower mask: {0x80000000, 0, 0x80000000, 0}\n+    for (int I = 0; I < static_cast<int>(OldElementCount); I += 2) {\n+      int LowerIdx = IsBigEndian ? I + 1 : I;\n+      int UpperIdx = IsBigEndian ? I : I + 1;\n+      if (MsbFlipLower->getAggregateElement(LowerIdx) != MsbFlip ||\n+          MsbFlipLower->getAggregateElement(UpperIdx) != Zero)\n+        return nullptr;\n+    }\n+  }\n+\n+  LLVM_DEBUG(dbgs() << \"IC: Folding Vn2im CmpGt using V2nim CmpGt pattern\"\n+                    << '\\n');\n+\n+  // Perform folding\n+  Type *NewElementType = IntegerType::get(I.getContext(), OldElementWidth * 2);\n+  Type *NewVecType =\n+      VectorType::get(NewElementType, OldElementCount / 2, false);\n+  Value *BitCastA = Builder.CreateBitCast(A, NewVecType);\n+  Value *BitCastB = Builder.CreateBitCast(B, NewVecType);\n+  Value *Cmp = Builder.CreateICmp(PredGt, BitCastA, BitCastB);\n+  Value *SExt = Builder.CreateSExt(Cmp, NewVecType);\n+  Value *BitCastCmp = Builder.CreateBitCast(SExt, OldVecType);\n+\n+  return BitCastCmp;\n+}\n+\n+// Folds patterns which uses comparisons on <2N x iM> type for a <N x i2M>\n+// comparison.\n+Instruction *InstCombinerImpl::foldVecCmpOnHalfElementSize(Instruction &I) {\n+  auto *ResultVecType = dyn_cast<FixedVectorType>(I.getType());\n+\n+  if (!ResultVecType || !ResultVecType->getElementType()->isIntegerTy() ||\n+      ResultVecType->getElementCount().getFixedValue() % 2 != 0)\n+    return nullptr;\n+\n+  if (Value *V = foldVecCmpEqOnHalfElementSize(I, ResultVecType, Builder))\n+    return replaceInstUsesWith(I, V);\n+\n+  if (Value *V = foldVecCmpGtOnHalfElementSize(I, ResultVecType,\n+                                               DL.isBigEndian(), Builder))\n+    return replaceInstUsesWith(I, V);\n+\n+  return nullptr;\n+}\n+\n static std::optional<std::pair<Value *, Value *>>\n matchSymmetricPhiNodesPair(PHINode *LHS, PHINode *RHS) {\n   if (LHS->getParent() != RHS->getParent())\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This PR recognizes and folds v2i64 comparison patterns described in #32961. In addition, this PR generalizes the transform to comparisons on <N x i2M> using <2N x iM> comparisons.\r\n\r\nThe recognized patterns along with the transformation proof can be seen here: https://alive2.llvm.org/ce/z/SGp4d3 (little-endian) and https://alive2.llvm.org/ce/z/Z_SXUJ (big-endian)\r\n\r\nNew lit tests:\r\n- llvm/test/Transforms/InstCombine/fold-vni2m-cmpeq-using-v2nim-pattern.ll\r\n- llvm/test/Transforms/InstCombine/fold-vni2m-cmpgt-using-v2nim-pattern.ll\r\n- llvm/test/Transforms/InstCombine/fold-vni2m-cmpgt-using-v2nim-pattern-big-endian.ll",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/fold-vni2m-cmpeq-using-v2nim-pattern.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32_with_wrong_shuffle_vec",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32_with_wrong_shuffle_vec(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp eq <4 x i32> %a, %b\n  %sext = sext <4 x i1> %cmp to <4 x i32>\n  %shuffle = shufflevector <4 x i32> %sext, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %select = select <4 x i1> %cmp, <4 x i32> %shuffle, <4 x i32> zeroinitializer\n  ret <4 x i32> %select\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32_with_and",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32_with_and(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp eq <4 x i32> %a, %b\n  %sext = sext <4 x i1> %cmp to <4 x i32>\n  %shuffle = shufflevector <4 x i32> %sext, <4 x i32> poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %and = and <4 x i32> %sext, %shuffle\n  ret <4 x i32> %and\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v4i64_using_v8i32",
+          "test_body": "define <8 x i32> @icmp_eq_v4i64_using_v8i32(<8 x i32> noundef %a, <8 x i32> noundef %b) {\n  %cmp = icmp eq <8 x i32> %a, %b\n  %sext = sext <8 x i1> %cmp to <8 x i32>\n  %shuffle = shufflevector <8 x i32> %sext, <8 x i32> poison, <8 x i32> <i32 1, i32 0, i32 3, i32 2, i32 5, i32 4, i32 7, i32 6>\n  %and = and <8 x i32> %sext, %shuffle\n  ret <8 x i32> %and\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp eq <4 x i32> %a, %b\n  %sext = sext <4 x i1> %cmp to <4 x i32>\n  %shuffle = shufflevector <4 x i32> %sext, <4 x i32> poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %select = select <4 x i1> %cmp, <4 x i32> %shuffle, <4 x i32> zeroinitializer\n  ret <4 x i32> %select\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32_with_commutated_and",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32_with_commutated_and(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp eq <4 x i32> %a, %b\n  %sext = sext <4 x i1> %cmp to <4 x i32>\n  %shuffle = shufflevector <4 x i32> %sext, <4 x i32> poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %and = and <4 x i32> %shuffle, %sext\n  ret <4 x i32> %and\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32_with_sext_put_last",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32_with_sext_put_last(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp eq <4 x i32> %a, %b\n  %shuffle = shufflevector <4 x i1> %cmp, <4 x i1> poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %and = and <4 x i1> %shuffle, %cmp\n  %sext = sext <4 x i1> %and to <4 x i32>\n  ret <4 x i32> %sext\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v3i64_using_v6i32",
+          "test_body": "define <6 x i32> @icmp_eq_v3i64_using_v6i32(<6 x i32> noundef %a, <6 x i32> noundef %b) {\n  %cmp = icmp eq <6 x i32> %a, %b\n  %sext = sext <6 x i1> %cmp to <6 x i32>\n  %shuffle = shufflevector <6 x i32> %sext, <6 x i32> poison, <6 x i32> <i32 1, i32 0, i32 3, i32 2, i32 5, i32 4>\n  %and = and <6 x i32> %sext, %shuffle\n  ret <6 x i32> %and\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32_with_wrong_ext_signedness",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32_with_wrong_ext_signedness(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp eq <4 x i32> %a, %b\n  %sext = zext <4 x i1> %cmp to <4 x i32>\n  %shuffle = shufflevector <4 x i32> %sext, <4 x i32> poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %and = and <4 x i32> %sext, %shuffle\n  ret <4 x i32> %and\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v4i32_using_v8i16",
+          "test_body": "define <8 x i16> @icmp_eq_v4i32_using_v8i16(<8 x i16> noundef %a, <8 x i16> noundef %b) {\n  %cmp = icmp eq <8 x i16> %a, %b\n  %sext = sext <8 x i1> %cmp to <8 x i16>\n  %shuffle = shufflevector <8 x i16> %sext, <8 x i16> poison, <8 x i32> <i32 1, i32 0, i32 3, i32 2, i32 5, i32 4, i32 7, i32 6>\n  %and = and <8 x i16> %sext, %shuffle\n  ret <8 x i16> %and\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32_with_wrong_and_using_select",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32_with_wrong_and_using_select(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp eq <4 x i32> %a, %b\n  %sext = sext <4 x i1> %cmp to <4 x i32>\n  %shuffle = shufflevector <4 x i32> %sext, <4 x i32> poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %select = select <4 x i1> %cmp, <4 x i32> %shuffle, <4 x i32> splat (i32 1)\n  ret <4 x i32> %select\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v1i64_using_v2i32",
+          "test_body": "define <2 x i32> @icmp_eq_v1i64_using_v2i32(<2 x i32> noundef %a, <2 x i32> noundef %b) {\n  %cmp = icmp eq <2 x i32> %a, %b\n  %sext = sext <2 x i1> %cmp to <2 x i32>\n  %shuffle = shufflevector <2 x i32> %sext, <2 x i32> poison, <2 x i32> <i32 1, i32 0>\n  %and = and <2 x i32> %sext, %shuffle\n  ret <2 x i32> %and\n}\n"
+        },
+        {
+          "test_name": "icmp_eq_v2i64_using_v4i32_with_wrong_icmp_cond_code",
+          "test_body": "define <4 x i32> @icmp_eq_v2i64_using_v4i32_with_wrong_icmp_cond_code(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %cmp = icmp sgt <4 x i32> %a, %b\n  %sext = sext <4 x i1> %cmp to <4 x i32>\n  %shuffle = shufflevector <4 x i32> %sext, <4 x i32> poison, <4 x i32> <i32 1, i32 0, i32 3, i32 2>\n  %select = select <4 x i1> %cmp, <4 x i32> %shuffle, <4 x i32> zeroinitializer\n  ret <4 x i32> %select\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fold-vni2m-cmpgt-using-v2nim-pattern.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "| opt -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_ugt_v2i64_using_v4i32_with_wrong_xor_mask",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_ugt_v2i64_using_v4i32_with_wrong_xor_mask(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 0, i32 -2147483648, i32 -2147483648, i32 -2147483648>\n  %xor.b = xor <4 x i32> %b, splat (i32 -2147483648)\n  %gt = icmp sgt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v1i64_using_v2i32",
+          "test_body": "target datalayout = \"e\"\n\ndefine <2 x i32> @icmp_sgt_v1i64_using_v2i32(<2 x i32> noundef %a, <2 x i32> noundef %b) {\n  %xor.a = xor <2 x i32> %a, <i32 -2147483648, i32 0>\n  %xor.b = xor <2 x i32> %b, <i32 -2147483648, i32 0>\n  %gt = icmp sgt <2 x i32> %xor.a, %xor.b\n  %sext.gt = sext <2 x i1> %gt to <2 x i32>\n  %gt.0 = shufflevector <2 x i32> %sext.gt, <2 x i32> poison, <2 x i32> zeroinitializer\n  %gt.1 = shufflevector <2 x i32> %sext.gt, <2 x i32> poison, <2 x i32> <i32 1, i32 1>\n  %eq = icmp eq <2 x i32> %a, %b\n  %eq.0 = shufflevector <2 x i1> %eq, <2 x i1> poison, <2 x i32> <i32 1, i32 1>\n  %select = select <2 x i1> %eq.0, <2 x i32> %gt.0, <2 x i32> zeroinitializer\n  %or = or <2 x i32> %select, %gt.1\n  ret <2 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_v2i64_using_v4i32",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_ugt_v2i64_using_v4i32(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %gt = icmp ugt <4 x i32> %a, %b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_v2i64_using_v4i32",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_slt_v2i64_using_v4i32(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp slt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_v2i64_using_v4i32_with_commutated_gt",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_slt_v2i64_using_v4i32_with_commutated_gt(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <4 x i32> %xor.b, %xor.a\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32_with_sext_put_last",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32_with_sext_put_last(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <4 x i32> %xor.a, %xor.b\n  %gt.0 = shufflevector <4 x i1> %gt, <4 x i1> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i1> %gt, <4 x i1> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %eq.0 = shufflevector <4 x i1> %eq, <4 x i1> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %select = select <4 x i1> %eq.0, <4 x i1> %gt.0, <4 x i1> zeroinitializer\n  %or = or <4 x i1> %select, %gt.1\n  %sext.or = sext <4 x i1> %or to <4 x i32>\n  ret <4 x i32> %sext.or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32_for_big_endian_machine",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32_for_big_endian_machine(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 0, i32 -2147483648, i32 0, i32 -2147483648>\n  %xor.b = xor <4 x i32> %b, <i32 0, i32 -2147483648, i32 0, i32 -2147483648>\n  %gt = icmp sgt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v4i64_using_v6i32",
+          "test_body": "target datalayout = \"e\"\n\ndefine <8 x i32> @icmp_sgt_v4i64_using_v6i32(<8 x i32> noundef %a, <8 x i32> noundef %b) {\n  %xor.a = xor <8 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0, i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <8 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0, i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <8 x i32> %xor.a, %xor.b\n  %sext.gt = sext <8 x i1> %gt to <8 x i32>\n  %gt.0 = shufflevector <8 x i32> %sext.gt, <8 x i32> poison, <8 x i32> <i32 0, i32 0, i32 2, i32 2, i32 4, i32 4, i32 6, i32 6>\n  %gt.1 = shufflevector <8 x i32> %sext.gt, <8 x i32> poison, <8 x i32> <i32 1, i32 1, i32 3, i32 3, i32 5, i32 5, i32 7, i32 7>\n  %eq = icmp eq <8 x i32> %a, %b\n  %eq.0 = shufflevector <8 x i1> %eq, <8 x i1> poison, <8 x i32> <i32 1, i32 1, i32 3, i32 3, i32 5, i32 5, i32 7, i32 7>\n  %select = select <8 x i1> %eq.0, <8 x i32> %gt.0, <8 x i32> zeroinitializer\n  %or = or <8 x i32> %select, %gt.1\n  ret <8 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v4i32_using_v8i16",
+          "test_body": "target datalayout = \"e\"\n\ndefine <8 x i16> @icmp_sgt_v4i32_using_v8i16(<8 x i16> noundef %a, <8 x i16> noundef %b) {\n  %xor.a = xor <8 x i16> %a, <i16 -32768, i16 0, i16 -32768, i16 0, i16 -32768, i16 0, i16 -32768, i16 0>\n  %xor.b = xor <8 x i16> %b, <i16 -32768, i16 0, i16 -32768, i16 0, i16 -32768, i16 0, i16 -32768, i16 0>\n  %gt = icmp sgt <8 x i16> %xor.a, %xor.b\n  %sext.gt = sext <8 x i1> %gt to <8 x i16>\n  %gt.0 = shufflevector <8 x i16> %sext.gt, <8 x i16> poison, <8 x i32> <i32 0, i32 0, i32 2, i32 2, i32 4, i32 4, i32 6, i32 6>\n  %gt.1 = shufflevector <8 x i16> %sext.gt, <8 x i16> poison, <8 x i32> <i32 1, i32 1, i32 3, i32 3, i32 5, i32 5, i32 7, i32 7>\n  %eq = icmp eq <8 x i16> %a, %b\n  %eq.0 = shufflevector <8 x i1> %eq, <8 x i1> poison, <8 x i32> <i32 1, i32 1, i32 3, i32 3, i32 5, i32 5, i32 7, i32 7>\n  %select = select <8 x i1> %eq.0, <8 x i16> %gt.0, <8 x i16> zeroinitializer\n  %or = or <8 x i16> %select, %gt.1\n  ret <8 x i16> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32_with_wrong_xor_mask",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32_with_wrong_xor_mask(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 -2147483648, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32_with_wrong_icmp_cond_code",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32_with_wrong_icmp_cond_code(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp ugt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32_with_wrong_and_or_args",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32_with_wrong_and_or_args(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <4 x i32> %xor.b, %xor.a\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.1, %eq.0\n  %or = or <4 x i32> %and, %gt.0\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32_with_wrong_shuffle_vector",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32_with_wrong_shuffle_vector(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <4 x i32> %xor.b, %xor.a\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v2i64_using_v4i32_with_select",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_sgt_v2i64_using_v4i32_with_select(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <4 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %eq.0 = shufflevector <4 x i1> %eq, <4 x i1> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %select = select <4 x i1> %eq.0, <4 x i32> %gt.0, <4 x i32> zeroinitializer\n  %or = or <4 x i32> %select, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_ugt_v2i64_using_v4i32_with_sgt",
+          "test_body": "target datalayout = \"e\"\n\ndefine <4 x i32> @icmp_ugt_v2i64_using_v4i32_with_sgt(<4 x i32> noundef %a, <4 x i32> noundef %b) {\n  %xor.a = xor <4 x i32> %a, splat (i32 -2147483648)\n  %xor.b = xor <4 x i32> %b, splat (i32 -2147483648)\n  %gt = icmp sgt <4 x i32> %xor.a, %xor.b\n  %sext.gt = sext <4 x i1> %gt to <4 x i32>\n  %gt.0 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 0, i32 0, i32 2, i32 2>\n  %gt.1 = shufflevector <4 x i32> %sext.gt, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %eq = icmp eq <4 x i32> %a, %b\n  %sext.eq = sext <4 x i1> %eq to <4 x i32>\n  %eq.0 = shufflevector <4 x i32> %sext.eq, <4 x i32> poison, <4 x i32> <i32 1, i32 1, i32 3, i32 3>\n  %and = and <4 x i32> %gt.0, %eq.0\n  %or = or <4 x i32> %and, %gt.1\n  ret <4 x i32> %or\n}\n"
+        },
+        {
+          "test_name": "icmp_sgt_v3i64_using_v6i32",
+          "test_body": "target datalayout = \"e\"\n\ndefine <6 x i32> @icmp_sgt_v3i64_using_v6i32(<6 x i32> noundef %a, <6 x i32> noundef %b) {\n  %xor.a = xor <6 x i32> %a, <i32 -2147483648, i32 0, i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %xor.b = xor <6 x i32> %b, <i32 -2147483648, i32 0, i32 -2147483648, i32 0, i32 -2147483648, i32 0>\n  %gt = icmp sgt <6 x i32> %xor.a, %xor.b\n  %sext.gt = sext <6 x i1> %gt to <6 x i32>\n  %gt.0 = shufflevector <6 x i32> %sext.gt, <6 x i32> poison, <6 x i32> <i32 0, i32 0, i32 2, i32 2, i32 4, i32 4>\n  %gt.1 = shufflevector <6 x i32> %sext.gt, <6 x i32> poison, <6 x i32> <i32 1, i32 1, i32 3, i32 3, i32 5, i32 5>\n  %eq = icmp eq <6 x i32> %a, %b\n  %eq.0 = shufflevector <6 x i1> %eq, <6 x i1> poison, <6 x i32> <i32 1, i32 1, i32 3, i32 3, i32 5, i32 5>\n  %select = select <6 x i1> %eq.0, <6 x i32> %gt.0, <6 x i32> zeroinitializer\n  %or = or <6 x i32> %select, %gt.1\n  ret <6 x i32> %or\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "fuad1502",
+      "body": "Hi @RKSimon, I just want to make sure, should I handle the other comparison patterns in this PR too or is it okay to handle them in a separate PR? \ud83d\ude4f"
+    },
+    {
+      "author": "fuad1502",
+      "body": "Sorry, I just realized I haven't handled the `ne` comparison pattern correctly, therefore I re-marked the PR as draft. However feel free to review it now :smiley: I am sure there are many more things I haven't properly implemented \ud83d\ude05"
+    },
+    {
+      "author": "RKSimon",
+      "body": "VectorCombine is typically just used for cost driven vector folds, while this is a more standard simplification - InstCombine might be a better place to host it."
+    },
+    {
+      "author": "RKSimon",
+      "body": "> Hi @RKSimon, I just want to make sure, should I handle the other comparison patterns in this PR too or is it okay to handle them in a separate PR? \ud83d\ude4f\r\n\r\nPutting in all the comparisons in a single file makes sense to me"
+    },
+    {
+      "author": "fuad1502",
+      "body": "> VectorCombine is typically just used for cost driven vector folds, while this is a more standard simplification - InstCombine might be a better place to host it.\r\n\r\n> Putting in all the comparisons in a single file makes sense to me\r\n\r\n@RKSimon After looking into the `Transforms/InstCombine/` directory, I think I can implement all comparison patterns in the `InstructionCombining.cpp` file, and then plug in the functions to the relevant `visitXXX` functions in the various other files. Does that sound okay?\r\n\r\nAlso I was wondering, from your experience, does adding rarely occuring pattern checks such as this in `instcombine` will significantly effect compilation time using LLVM?"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {undef deprecator}-->\n\n:white_check_mark: With the latest revision this PR passed the undef deprecator."
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "> VectorCombine is typically just used for cost driven vector folds, while this is a more standard simplification - InstCombine might be a better place to host it.\r\n\r\nIs this transformation always profitable? `i2M` may be illegal on the target platform. InstCombine is very conservative in changing vector types (See comments for `InstCombinerImpl::shouldChangeType(Type *From, Type *To)`).\r\n"
+    },
+    {
+      "author": "fuad1502",
+      "body": "> Is this transformation always profitable? `i2M` may be illegal on the target platform. InstCombine is very conservative in changing vector types (See comments for `InstCombinerImpl::shouldChangeType(Type *From, Type *To)`).\r\n\r\nIt's profitable when: the target has no SIMD support (e.g. `-mattr=-sse`), or it has an intrinsic for comparing `<N x i2M>` directly (e.g. `-mattr=sse4.2` for `icmp gt <2 x i64>` will use `_mm_cmpgt_epi64`). Otherwise, the generated code will be the same. CMIIW @RKSimon\r\n\r\nI am not sure how we could use `shouldChangeType` here. Should we only check the element bit-width (e.g. 32 to 64)? If we instead compare the total sizes (e.g. <2 x 64> / <4 x 32> = 128), wouldn't that be useless?"
+    },
+    {
+      "author": "fuad1502",
+      "body": "> It's profitable when: the target has no SIMD support (e.g. -mattr=-sse), or it has an intrinsic for comparing <N x i2M> directly (e.g. -mattr=sse4.2 for icmp gt <2 x i64> will use _mm_cmpgt_epi64). Otherwise, the generated code will be the same.\n\nOverall, IMHO I still think it's profitable regardless of the target, since it simplifies the IR, better show the intention / context to the CodeGen, and possibly allow more optimizations down the pipeline. CMIIW \ud83d\ude4f\n\nOutside uses shouldn't affect profitability either, since it effectively only generates a single instruction."
+    },
+    {
+      "author": "fuad1502",
+      "body": "Ping @RKSimon @dtcxzyw \ud83d\ude4f"
+    },
+    {
+      "author": "fuad1502",
+      "body": "Ping"
+    },
+    {
+      "author": "fuad1502",
+      "body": "Ping"
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "> > VectorCombine is typically just used for cost driven vector folds, while this is a more standard simplification - InstCombine might be a better place to host it.\r\n> \r\n> Is this transformation always profitable? `i2M` may be illegal on the target platform. InstCombine is very conservative in changing vector types (See comments for `InstCombinerImpl::shouldChangeType(Type *From, Type *To)`).\r\n\r\n> Overall, IMHO I still think it's profitable regardless of the target, since it simplifies the IR, better show the intention / context to the CodeGen, and possibly allow more optimizations down the pipeline. CMIIW \ud83d\ude4f\r\nOutside uses shouldn't affect profitability either, since it effectively only generates a single instruction.\r\n\r\n@RKSimon Any comments?"
+    }
+  ],
+  "knowledge_cutoff": "2026-03-03T11:50:33Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+      [
+        2898,
+        2903
+      ],
+      [
+        4649,
+        4654
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+      [
+        21,
+        26
+      ],
+      [
+        1895,
+        1900
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+      [
+        423,
+        428
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        4982,
+        4986
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      [
+        1296,
+        1301
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+      "InstCombinerImpl::visitAnd",
+      "InstCombinerImpl::visitOr"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp": [
+      "InstCombinerImpl::visitSExt"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::visitSelectInst"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstructionCombining.cpp": [
+      "matchSymmetricPhiNodesPair"
+    ]
+  }
+}

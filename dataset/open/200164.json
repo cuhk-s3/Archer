@@ -1,0 +1,61 @@
+{
+  "pr_id": 200164,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/200164",
+  "state": "open",
+  "title": "[SimplifyCFG] Look at all uses when checking phi incoming for UB",
+  "author": "igogo-x86",
+  "base_commit": "5b32c6e99e8dba8d1415b2d65f38650e3cff9951",
+  "fix_commit": "927f6e1451a95a76c73d061bfc9e65ac609f656c",
+  "patch": "diff --git a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\nindex a8fd9f4a10064..116ca6b4a5392 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n@@ -8754,8 +8754,12 @@ static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I, bool PtrValu\n   if (C->isNullValue() || isa<UndefValue>(C)) {\n     // Only look at the first use we can handle, avoid hurting compile time with\n     // long uselists\n-    auto FindUse = llvm::find_if(I->uses(), [](auto &U) {\n+    auto FindUse = llvm::find_if(I->uses(), [I](auto &U) {\n       auto *Use = cast<Instruction>(U.getUser());\n+      // Only same-block uses after I can witness UB at I's program point.\n+      // Self-uses and before-I uses can occur when I is a PHI node.\n+      if (Use->getParent() != I->getParent() || Use == I || Use->comesBefore(I))\n+        return false;\n       // Change this list when we want to add new instructions.\n       switch (Use->getOpcode()) {\n       default:\n@@ -8782,12 +8786,6 @@ static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I, bool PtrValu\n       return false;\n     auto &Use = *FindUse;\n     auto *User = cast<Instruction>(Use.getUser());\n-    // Bail out if User is not in the same BB as I or User == I or User comes\n-    // before I in the block. The latter two can be the case if User is a\n-    // PHI node.\n-    if (User->getParent() != I->getParent() || User == I ||\n-        User->comesBefore(I))\n-      return false;\n \n     // Now make sure that there are no instructions in between that can alter\n     // control flow (eg. calls)\n",
+  "components": [
+    "SimplifyCFG"
+  ],
+  "description": "passingValueIsAlwaysUndefined only looks at the first use of the phi that has a UB-candidate opcode. If that use is in a different block, the function gives up, even when another use in the same block would prove UB. Use-list order is not guaranteed, so this happens in practice.\r\n\r\nMove the same-block check into the find_if lambda so the scan keeps going past cross-block uses.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SimplifyCFG/phi-undef-loadstore.ll",
+      "commands": [
+        "opt -passes=simplifycfg -simplifycfg-require-and-preserve-domtree=1 -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test5_several_uses",
+          "test_body": "; Function Attrs: nounwind null_pointer_is_valid\ndefine i64 @test5_several_uses(i1 %c, i1 %branch, ptr %p) #0 {\nentry:\n  br i1 %c, label %acquire, label %join\n\nacquire:                                          ; preds = %entry\n  br label %join\n\njoin:                                             ; preds = %acquire, %entry\n  %obj = phi ptr [ null, %entry ], [ %p, %acquire ]\n  %g_in_block = getelementptr i8, ptr %obj, i64 48\n  %v = load i64, ptr %g_in_block, align 8\n  br i1 %branch, label %ret_direct, label %use\n\nret_direct:                                       ; preds = %join\n  ret i64 %v\n\nuse:                                              ; preds = %join\n  %g_cross = getelementptr i8, ptr %obj, i64 16\n  %x = load i64, ptr %g_cross, align 8\n  %sum = add i64 %v, %x\n  ret i64 %sum\n}\n\nattributes #0 = { nounwind null_pointer_is_valid }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Igor Kirillov (igogo-x86)\n\n<details>\n<summary>Changes</summary>\n\npassingValueIsAlwaysUndefined only looks at the first use of the phi that has a UB-candidate opcode. If that use is in a different block, the function gives up, even when another use in the same block would prove UB. Use-list order is not guaranteed, so this happens in practice.\r\n\r\nMove the same-block check into the find_if lambda so the scan keeps going past cross-block uses.\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/200164.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Transforms/Utils/SimplifyCFG.cpp (+5-7) \n- (modified) llvm/test/Transforms/SimplifyCFG/phi-undef-loadstore.ll (+39) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\nindex a8fd9f4a10064..116ca6b4a5392 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp\n@@ -8754,8 +8754,12 @@ static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I, bool PtrValu\n   if (C->isNullValue() || isa<UndefValue>(C)) {\n     // Only look at the first use we can handle, avoid hurting compile time with\n     // long uselists\n-    auto FindUse = llvm::find_if(I->uses(), [](auto &U) {\n+    auto FindUse = llvm::find_if(I->uses(), [I](auto &U) {\n       auto *Use = cast<Instruction>(U.getUser());\n+      // Only same-block uses after I can witness UB at I's program point.\n+      // Self-uses and before-I uses can occur when I is a PHI node.\n+      if (Use->getParent() != I->getParent() || Use == I || Use->comesBefore(I))\n+        return false;\n       // Change this list when we want to add new instructions.\n       switch (Use->getOpcode()) {\n       default:\n@@ -8782,12 +8786,6 @@ static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I, bool PtrValu\n       return false;\n     auto &Use = *FindUse;\n     auto *User = cast<Instruction>(Use.getUser());\n-    // Bail out if User is not in the same BB as I or User == I or User comes\n-    // before I in the block. The latter two can be the case if User is a\n-    // PHI node.\n-    if (User->getParent() != I->getParent() || User == I ||\n-        User->comesBefore(I))\n-      return false;\n \n     // Now make sure that there are no instructions in between that can alter\n     // control flow (eg. calls)\ndiff --git a/llvm/test/Transforms/SimplifyCFG/phi-undef-loadstore.ll b/llvm/test/Transforms/SimplifyCFG/phi-undef-loadstore.ll\nindex 2fe57e429808c..7d43ff4732f69 100644\n--- a/llvm/test/Transforms/SimplifyCFG/phi-undef-loadstore.ll\n+++ b/llvm/test/Transforms/SimplifyCFG/phi-undef-loadstore.ll\n@@ -349,4 +349,43 @@ if.end7:                                          ; preds = %if.else, %if.then4,\n   ret i32 %tmp9\n }\n \n+define i64 @test5_several_uses(i1 %c, i1 %branch, ptr %p) nounwind #0 {\n+; CHECK-LABEL: define i64 @test5_several_uses\n+; CHECK-SAME: (i1 [[C:%.*]], i1 [[BRANCH:%.*]], ptr [[P:%.*]]) #[[ATTR1]] {\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[SPEC_SELECT:%.*]] = select i1 [[C]], ptr [[P]], ptr null\n+; CHECK-NEXT:    [[G_IN_BLOCK:%.*]] = getelementptr i8, ptr [[SPEC_SELECT]], i64 48\n+; CHECK-NEXT:    [[V:%.*]] = load i64, ptr [[G_IN_BLOCK]], align 8\n+; CHECK-NEXT:    br i1 [[BRANCH]], label [[COMMON_RET:%.*]], label [[USE:%.*]]\n+; CHECK:       common.ret:\n+; CHECK-NEXT:    [[COMMON_RET_OP:%.*]] = phi i64 [ [[SUM:%.*]], [[USE]] ], [ [[V]], [[ENTRY:%.*]] ]\n+; CHECK-NEXT:    ret i64 [[COMMON_RET_OP]]\n+; CHECK:       use:\n+; CHECK-NEXT:    [[G_CROSS:%.*]] = getelementptr i8, ptr [[SPEC_SELECT]], i64 16\n+; CHECK-NEXT:    [[X:%.*]] = load i64, ptr [[G_CROSS]], align 8\n+; CHECK-NEXT:    [[SUM]] = add i64 [[V]], [[X]]\n+; CHECK-NEXT:    br label [[COMMON_RET]]\n+;\n+entry:\n+  br i1 %c, label %acquire, label %join\n+\n+acquire:\n+  br label %join\n+\n+join:\n+  %obj = phi ptr [ null, %entry ], [ %p, %acquire ]\n+  %g_in_block = getelementptr i8, ptr %obj, i64 48\n+  %v = load i64, ptr %g_in_block, align 8\n+  br i1 %branch, label %ret_direct, label %use\n+\n+ret_direct:\n+  ret i64 %v\n+\n+use:\n+  %g_cross = getelementptr i8, ptr %obj, i64 16\n+  %x = load i64, ptr %g_cross, align 8\n+  %sum = add i64 %v, %x\n+  ret i64 %sum\n+}\n+\n attributes #0 = { null_pointer_is_valid }\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-28T12:03:15Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Utils/SimplifyCFG.cpp": [
+      [
+        8754,
+        8761
+      ],
+      [
+        8782,
+        8793
+      ]
+    ],
+    "llvm/test/Transforms/SimplifyCFG/phi-undef-loadstore.ll": [
+      [
+        349,
+        352
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Utils/SimplifyCFG.cpp": [
+      "passingValueIsAlwaysUndefined"
+    ]
+  }
+}

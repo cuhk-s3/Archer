@@ -1,0 +1,121 @@
+{
+  "pr_id": 200263,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/200263",
+  "state": "open",
+  "title": "[VectorCombine] Preserve atomicity when scalarizing vector loads",
+  "author": "jlebar",
+  "base_commit": "810e67f50d8f149c0c88cbda1707b52b7ae9936f",
+  "fix_commit": "9e8e20b3a4e16f272025216b5f62de02481b67cf",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 45330e548bc29..17f43c0d960bd 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -175,6 +175,17 @@ class VectorCombine {\n     }\n   }\n \n+  // Erase an already-dead instruction, keeping run()'s iteration cursor valid.\n+  // Unlike eraseInstruction(), does not recursively delete operands, so callers\n+  // can erase a group of related instructions in a fixed order.\n+  void eraseDeadInstruction(Instruction &I) {\n+    assert(I.use_empty() && \"erasing instruction with remaining uses\");\n+    if (NextInst == &I)\n+      NextInst = NextInst->getNextNode();\n+    Worklist.remove(&I);\n+    I.eraseFromParent();\n+  }\n+\n   void eraseInstruction(Instruction &I) {\n     LLVM_DEBUG(dbgs() << \"VC: Erasing: \" << I << '\\n');\n     SmallVector<Value *> Ops(I.operands());\n@@ -2067,6 +2078,11 @@ bool VectorCombine::scalarizeLoadExtract(LoadInst *LI, VectorType *VecTy,\n   if (!TTI.allowVectorElementIndexingUsingGEP())\n     return false;\n \n+  Type *ElemType = VecTy->getElementType();\n+  // Do not turn one atomic load into multiple atomic loads.\n+  if (LI->isAtomic() && !LI->hasOneUse())\n+    return false;\n+\n   DenseMap<ExtractElementInst *, ScalarizationResult> NeedFreeze;\n   llvm::scope_exit FailureGuard([&]() {\n     // If the transform is aborted, discard the ScalarizationResults.\n@@ -2109,13 +2125,8 @@ bool VectorCombine::scalarizeLoadExtract(LoadInst *LI, VectorType *VecTy,\n   if (ScalarizedCost >= OriginalCost)\n     return false;\n \n-  // Ensure we add the load back to the worklist BEFORE its users so they can\n-  // erased in the correct order.\n-  Worklist.push(LI);\n-\n-  Type *ElemType = VecTy->getElementType();\n-\n   // Replace extracts with narrow scalar loads.\n+  SmallVector<Instruction *> ToErase;\n   for (User *U : LI->users()) {\n     auto *EI = cast<ExtractElementInst>(U);\n     Value *Idx = EI->getIndexOperand();\n@@ -2134,6 +2145,8 @@ bool VectorCombine::scalarizeLoadExtract(LoadInst *LI, VectorType *VecTy,\n     Align ScalarOpAlignment =\n         computeAlignmentAfterScalarization(LI->getAlign(), ElemType, Idx, *DL);\n     NewLoad->setAlignment(ScalarOpAlignment);\n+    if (LI->isAtomic())\n+      NewLoad->setAtomic(LI->getOrdering(), LI->getSyncScopeID());\n \n     if (auto *ConstIdx = dyn_cast<ConstantInt>(Idx)) {\n       size_t Offset = ConstIdx->getZExtValue() * DL->getTypeStoreSize(ElemType);\n@@ -2142,8 +2155,15 @@ bool VectorCombine::scalarizeLoadExtract(LoadInst *LI, VectorType *VecTy,\n     }\n \n     replaceValue(*EI, *NewLoad, false);\n+    ToErase.push_back(EI);\n   }\n \n+  // Erase explicitly; an ordered atomic load is not trivially dead, so worklist\n+  // DCE would leave it behind, duplicating the original atomic access.\n+  for (Instruction *EI : ToErase)\n+    eraseDeadInstruction(*EI);\n+  eraseDeadInstruction(*LI);\n+\n   FailureGuard.release();\n   return true;\n }\n@@ -2195,22 +2215,28 @@ bool VectorCombine::scalarizeLoadBitcast(LoadInst *LI, VectorType *VecTy,\n   if (ScalarizedCost >= OriginalCost)\n     return false;\n \n-  // Ensure we add the load back to the worklist BEFORE its users so they can\n-  // erased in the correct order.\n-  Worklist.push(LI);\n-\n   Builder.SetInsertPoint(LI);\n   auto *ScalarLoad =\n       Builder.CreateLoad(TargetScalarType, Ptr, LI->getName() + \".scalar\");\n   ScalarLoad->setAlignment(LI->getAlign());\n+  if (LI->isAtomic())\n+    ScalarLoad->setAtomic(LI->getOrdering(), LI->getSyncScopeID());\n   ScalarLoad->copyMetadata(*LI);\n \n   // Replace all bitcast users with the scalar load.\n+  SmallVector<Instruction *> ToErase;\n   for (User *U : LI->users()) {\n     auto *BC = cast<BitCastInst>(U);\n     replaceValue(*BC, *ScalarLoad, false);\n+    ToErase.push_back(BC);\n   }\n \n+  // Erase explicitly; an ordered atomic load is not trivially dead, so worklist\n+  // DCE would leave it behind, duplicating the original atomic access.\n+  for (Instruction *BC : ToErase)\n+    eraseDeadInstruction(*BC);\n+  eraseDeadInstruction(*LI);\n+\n   return true;\n }\n \n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "scalarizeLoadExtract tries to convert e.g.\n\n  %a = load <2 x i32> %ptr\n  %b = extractelement %a, 1\n\ninto a scalar load.  Problem is, if the original load is atomic, the new\nload was not.\n\nMoreover, if the original load was an ordered atomic, it would not be\nDCE'd after we created the new load. The pass would repeatedly visit the\noriginal load, hitting an infinite loop.\n\nThis bug was found by a large run of Opus 4.7 looking for bugs in LLVM.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/VectorCombine/AArch64/load-extractelement-scalarization.ll",
+      "commands": [
+        "opt -passes=vector-combine -mtriple=arm64-apple-darwinos -S %s",
+        "opt -passes=vector-combine -mtriple=arm64-apple-darwinos -vector-combine-max-scan-instrs=2 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "load_multiple_extracts_with_unique_variable_indices_large_vector_valid_by_and",
+          "test_body": "define i32 @load_multiple_extracts_with_unique_variable_indices_large_vector_valid_by_and(ptr %x, ptr %y, i64 %idx) {\n  %idx.clamped = and i64 %idx, 15\n  %lx = load <16 x i32>, ptr %x, align 64\n  %ly = load <16 x i32>, ptr %y, align 64\n  %e.0 = extractelement <16 x i32> %lx, i64 %idx.clamped\n  %e.1 = extractelement <16 x i32> %ly, i64 %idx.clamped\n  %res = add i32 %e.0, %e.1\n  ret i32 %res\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/load-extractelement-scalarization.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=sse2",
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=avx2"
+      ],
+      "tests": [
+        {
+          "test_name": "dont_scalarize_atomic_multiple_extracts",
+          "test_body": "define void @dont_scalarize_atomic_multiple_extracts(ptr %p, ptr %q) {\n  %load = load atomic <2 x i32>, ptr %p seq_cst, align 8\n  %extract0 = extractelement <2 x i32> %load, i64 0\n  %extract1 = extractelement <2 x i32> %load, i64 1\n  store i32 %extract0, ptr %q, align 4\n  %q1 = getelementptr inbounds nuw i8, ptr %q, i64 4\n  store i32 %extract1, ptr %q1, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "scalarize_atomic_extract_monotonic",
+          "test_body": "define i32 @scalarize_atomic_extract_monotonic(ptr %p) {\n  %load = load atomic <2 x i32>, ptr %p monotonic, align 8\n  %extract = extractelement <2 x i32> %load, i64 0\n  ret i32 %extract\n}\n"
+        },
+        {
+          "test_name": "scalarize_atomic_extract_syncscope",
+          "test_body": "define i32 @scalarize_atomic_extract_syncscope(ptr %p) {\n  %load = load atomic <2 x i32>, ptr %p syncscope(\"singlethread\") acquire, align 8\n  %extract = extractelement <2 x i32> %load, i64 0\n  ret i32 %extract\n}\n"
+        },
+        {
+          "test_name": "unused_extract",
+          "test_body": "define void @unused_extract(ptr %p) {\n  %load = load <4 x float>, ptr %p, align 8\n  %shuffle0 = shufflevector <4 x float> zeroinitializer, <4 x float> %load, <4 x i32> <i32 0, i32 4, i32 1, i32 5>\n  %shuffle1 = shufflevector <4 x float> %shuffle0, <4 x float> zeroinitializer, <4 x i32> <i32 0, i32 4, i32 poison, i32 poison>\n  %extract = extractelement <4 x float> %load, i64 1\n  ret void\n}\n"
+        },
+        {
+          "test_name": "scalarize_atomic_bitcast",
+          "test_body": "define i64 @scalarize_atomic_bitcast(ptr %p) {\n  %load = load atomic <2 x i32>, ptr %p seq_cst, align 8\n  %bitcast = bitcast <2 x i32> %load to i64\n  ret i64 %bitcast\n}\n"
+        },
+        {
+          "test_name": "scalarize_atomic_bitcast_monotonic",
+          "test_body": "define i64 @scalarize_atomic_bitcast_monotonic(ptr %p) {\n  %load = load atomic <2 x i32>, ptr %p syncscope(\"singlethread\") monotonic, align 8\n  %bitcast = bitcast <2 x i32> %load to i64\n  ret i64 %bitcast\n}\n"
+        },
+        {
+          "test_name": "scalarize_atomic_extract",
+          "test_body": "define i32 @scalarize_atomic_extract(ptr %p) {\n  %load = load atomic <2 x i32>, ptr %p seq_cst, align 8\n  %extract = extractelement <2 x i32> %load, i64 0\n  ret i32 %extract\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [],
+  "knowledge_cutoff": "2026-05-28T20:14:19Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        175,
+        180
+      ],
+      [
+        2067,
+        2072
+      ],
+      [
+        2109,
+        2121
+      ],
+      [
+        2134,
+        2139
+      ],
+      [
+        2142,
+        2149
+      ],
+      [
+        2195,
+        2216
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/AArch64/load-extractelement-scalarization.ll": [
+      [
+        825,
+        849
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/X86/load-extractelement-scalarization.ll": [
+      [
+        37,
+        39
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::scalarizeLoadBitcast",
+      "VectorCombine::scalarizeLoadExtract",
+      "eraseInstruction",
+      "replaceValue"
+    ]
+  }
+}

@@ -1,0 +1,128 @@
+{
+  "pr_id": 188226,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/188226",
+  "state": "open",
+  "title": "[InstCombine] Fold fcmp eq over min/max-like select into compare on input",
+  "author": "Nathiyaa-Sengodan",
+  "base_commit": "b3c15dbae051e29cfbd8b4110ac190528fb563a7",
+  "fix_commit": "aaf43750f279da45d72e2cc3b9accc6d7454a256",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\nindex 0b1f683e10408..d44ce7e5185b0 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp\n@@ -8980,6 +8980,120 @@ static Instruction *foldFCmpWithFloorAndCeil(FCmpInst &I,\n   return nullptr;\n }\n \n+/// Fold equality compares against floating min/max-like select patterns.\n+///\n+/// This handles:\n+///   fcmp oeq/ueq (select (fcmp Pred X, K), X, K), C\n+///   fcmp oeq/ueq (select (fcmp Pred X, K), K, X), C\n+///\n+/// when the select is recognized as an fmaxnum/fminnum-like operation and one\n+/// operand is the constant bound K. The result can be expressed as a\n+/// direct comparison against X based on the relation between C and K:\n+///\n+///   fmaxnum-like:\n+///     C > K  -> X == C\n+///     C == K -> X <= K\n+///\n+///   fminnum-like:\n+///     C < K  -> X == C\n+///     C == K -> X >= K\n+///\n+static Instruction *foldFCmpEqWithMinMaxLikeSelect(FCmpInst &I,\n+                                                   Instruction *LHSI,\n+                                                   Constant *RHSC,\n+                                                   InstCombinerImpl &CI) {\n+\n+  const FCmpInst::Predicate Pred = I.getPredicate();\n+  if (Pred != FCmpInst::FCMP_OEQ && Pred != FCmpInst::FCMP_UEQ)\n+    return nullptr;\n+\n+  auto *SI = dyn_cast<SelectInst>(LHSI);\n+  const APFloat *C;\n+  if (!SI || !match(RHSC, m_APFloat(C)))\n+    return nullptr;\n+\n+  Value *A, *B;\n+  SelectPatternResult SPR = matchSelectPattern(SI, A, B);\n+  if (SPR.Flavor != SPF_FMAXNUM && SPR.Flavor != SPF_FMINNUM)\n+    return nullptr;\n+\n+  if (SPR.NaNBehavior == SPNB_NA)\n+    return nullptr;\n+\n+  bool Ordered = FCmpInst::isOrdered(Pred);\n+  auto getPred = [&](FCmpInst::Predicate OrderedPred,\n+                     FCmpInst::Predicate UnorderedPred,\n+                     bool IsEqualCase) -> FCmpInst::Predicate {\n+    switch (SPR.NaNBehavior) {\n+    case SPNB_RETURNS_NAN:\n+      return Ordered ? OrderedPred : UnorderedPred;\n+\n+    case SPNB_RETURNS_OTHER:\n+    case SPNB_RETURNS_ANY:\n+      // Different vs equal case matters here\n+      return IsEqualCase ? UnorderedPred : OrderedPred;\n+\n+    default:\n+      llvm_unreachable(\"Unsupported NaN behavior\");\n+    }\n+  };\n+\n+  Constant *CmpBoundC;\n+  if (!match(B, m_Constant(CmpBoundC)))\n+    return nullptr;\n+\n+  // Supports only splat vector constants\n+  auto *Val = CmpBoundC->getType()->isVectorTy() ? CmpBoundC->getSplatValue()\n+                                                 : CmpBoundC;\n+  auto *CmpBoundFP = dyn_cast_or_null<ConstantFP>(Val);\n+  if (!CmpBoundFP)\n+    return nullptr;\n+\n+  const SimplifyQuery Q = CI.getSimplifyQuery().getWithInstruction(&I);\n+  auto CreateFCmp = [&](FCmpInst::Predicate NewPred) -> FCmpInst * {\n+    auto *NewCmp = new FCmpInst(NewPred, A, RHSC);\n+    FastMathFlags FMF;\n+    if (isKnownNeverNaN(A, Q) && isKnownNeverNaN(RHSC, Q))\n+      FMF.setNoNaNs();\n+    if (isKnownNeverInfinity(A, Q) && isKnownNeverInfinity(RHSC, Q))\n+      FMF.setNoInfs();\n+\n+    NewCmp->setFastMathFlags(FMF);\n+    return NewCmp;\n+  };\n+\n+  APFloat::cmpResult CmpVsBound = C->compare(CmpBoundFP->getValueAPF());\n+  if (SPR.Flavor == SPF_FMAXNUM) {\n+    // max(X, K) == C:\n+    //  C > K  -> X == C\n+    //  C == K -> X <= K\n+\n+    if (CmpVsBound == APFloat::cmpGreaterThan)\n+      return CreateFCmp(getPred(FCmpInst::FCMP_OEQ, FCmpInst::FCMP_UEQ,\n+                                /*IsEqualCase=*/false));\n+\n+    if (CmpVsBound == APFloat::cmpEqual)\n+      return CreateFCmp(getPred(FCmpInst::FCMP_OLE, FCmpInst::FCMP_ULE,\n+                                /*IsEqualCase=*/true));\n+\n+    return nullptr;\n+  }\n+\n+  // min(X, K) == C:\n+  //   C < K  -> X == C\n+  //   C == K -> X >= K\n+\n+  if (CmpVsBound == APFloat::cmpLessThan)\n+    return CreateFCmp(\n+        getPred(FCmpInst::FCMP_OEQ, FCmpInst::FCMP_UEQ, /*IsEqualCase=*/false));\n+\n+  if (CmpVsBound == APFloat::cmpEqual)\n+    return CreateFCmp(\n+        getPred(FCmpInst::FCMP_OGE, FCmpInst::FCMP_UGE, /*IsEqualCase=*/true));\n+\n+  return nullptr;\n+}\n+\n /// Returns true if a select that implements a min/max is redundant and\n /// select result can be replaced with its non-constant operand, e.g.,\n ///   select ( (si/ui-to-fp A) <= C ), C, (si/ui-to-fp A)\n@@ -9181,6 +9295,10 @@ Instruction *InstCombinerImpl::visitFCmpInst(FCmpInst &I) {\n         return replaceOperand(I, 0, X);\n       if (Instruction *NV = FoldOpIntoSelect(I, cast<SelectInst>(LHSI)))\n         return NV;\n+      if (LHSI->hasOneUse())\n+        if (Instruction *NV =\n+                foldFCmpEqWithMinMaxLikeSelect(I, LHSI, RHSC, *this))\n+          return NV;\n       break;\n     case Instruction::FSub:\n       if (LHSI->hasOneUse())\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Fold equality compares against floating min/max-like select patterns.\r\n\r\nThis handles:\r\nfcmp oeq/ueq (select (fcmp Pred X, K), X, K), C\r\nfcmp oeq/ueq (select (fcmp Pred X, K), K, X), C\r\n\r\nwhen the select is recognized as an fmaxnum/fminnum-like operation and one\r\noperand is the constant bound K. The result can be expressed as a\r\ndirect comparison against X based on the relation between C and K:\r\n    \r\n  For max-like patterns:\r\n  \r\n  max(X, K) == C:\r\n  \r\n  C > K  -> X == C\r\n  C == K -> X <= K\r\n  \r\n  For min-like patterns:\r\n  \r\n  min(X, K) == C:\r\n  \r\n  C < K  -> X == C\r\n  C == K -> X >= K\r\n\r\nAlive2 - https://alive2.llvm.org/ce/z/GmSEB2\r\nFixes  https://github.com/llvm/llvm-project/issues/185734 ",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/fcmp-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fold_fcmp_max_clamp_small_const",
+          "test_body": "define i1 @fold_fcmp_max_clamp_small_const(double nofpclass(inf) %x) {\n  %min_cmp = fcmp olt double %x, 5.000000e+00\n  %clamp = select i1 %min_cmp, double %x, double 5.000000e+00\n  %cmp = fcmp nnan ueq double %clamp, 3.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_max_clamp_same_constant",
+          "test_body": "define i1 @fold_fcmp_max_clamp_same_constant(double %x) {\n  %min_cmp = fcmp ogt double %x, 5.000000e+00\n  %clamp = select i1 %min_cmp, double 5.000000e+00, double %x\n  %cmp = fcmp nnan ninf oeq double %clamp, 5.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_max_clamp_neg_test_vect",
+          "test_body": "define <2 x i1> @fold_fcmp_max_clamp_neg_test_vect(<2 x float> %x) {\n  %min_cmp = fcmp olt <2 x float> %x, splat (float 5.000000e+00)\n  %clamp = select <2 x i1> %min_cmp, <2 x float> %x, <2 x float> splat (float 5.000000e+00)\n  %cmp = fcmp nnan ueq <2 x float> %clamp, <float 3.000000e+00, float 2.000000e+00>\n  ret <2 x i1> %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_min_clamp_same_constant",
+          "test_body": "define i1 @fold_fcmp_min_clamp_same_constant(double %x) {\n  %max_cmp = fcmp ult double %x, 2.000000e+00\n  %clamp = select i1 %max_cmp, double 2.000000e+00, double %x\n  %cmp = fcmp ueq double %clamp, 2.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_full_clamp_oeq_hi",
+          "test_body": "define i1 @fold_fcmp_full_clamp_oeq_hi(double %x) {\n  %min_cmp = fcmp ogt double %x, 5.000000e+00\n  %min = select i1 %min_cmp, double 5.000000e+00, double %x\n  %max_cmp = fcmp olt double %min, 2.000000e+00\n  %clamp = select nnan i1 %max_cmp, double 2.000000e+00, double %min\n  %cmp = fcmp nnan ueq double %clamp, 5.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "test_select_fcmp_uitofp_min",
+          "test_body": "define float @test_select_fcmp_uitofp_min(i8 %x) {\n  %f = uitofp i8 %x to float\n  %cmp = fcmp oge float %f, 2.550000e+02\n  %sel = select i1 %cmp, float 2.550000e+02, float %f\n  ret float %sel\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_full_clamp_mid_const",
+          "test_body": "define i1 @fold_fcmp_full_clamp_mid_const(double %x) {\n  %min_cmp = fcmp ogt double %x, 5.000000e+00\n  %min = select i1 %min_cmp, double 5.000000e+00, double %x\n  %max_cmp = fcmp olt double %min, 2.000000e+00\n  %clamp = select i1 %max_cmp, double 2.000000e+00, double %min\n  %cmp = fcmp oeq double %clamp, 4.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_two_clamp_hi",
+          "test_body": "define i1 @fold_two_clamp_hi(float %arg0, float %arg1) {\n  %v0 = fcmp olt float %arg1, 1.000000e+00\n  %v1 = select i1 %v0, float %arg1, float 1.000000e+00\n  %v2 = fcmp olt float %v1, 0.000000e+00\n  %v3 = select i1 %v2, float 0.000000e+00, float %v1\n  %v4 = fcmp ogt float %arg0, 2.000000e+00\n  %v5 = select i1 %v4, float 2.000000e+00, float %arg0\n  %v6 = fcmp olt float %v5, 3.000000e+00\n  %v7 = select i1 %v6, float %v5, float 3.000000e+00\n  %v8 = fcmp nnan ueq float %v3, 1.000000e+00\n  %v9 = fcmp nnan ueq float %v7, 2.000000e+00\n  %v10 = and i1 %v8, %v9\n  ret i1 %v10\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_non_minmax_shape",
+          "test_body": "define i1 @fold_fcmp_non_minmax_shape(double %x, double %y) {\n  %cmp = fcmp ogt double %x, 2.000000e+00\n  %clamp = select i1 %cmp, double %x, double %y\n  %res = fcmp oeq double %clamp, 5.000000e+00\n  ret i1 %res\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_max_clamp_bigger_const_no_fold",
+          "test_body": "define i1 @fold_fcmp_max_clamp_bigger_const_no_fold(double %x) {\n  %min_cmp = fcmp ugt double %x, 5.000000e+00\n  %clamp = select i1 %min_cmp, double 5.000000e+00, double %x\n  %cmp = fcmp oeq double %clamp, 6.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_clamp_minmax_alt_oeq_hi",
+          "test_body": "define i1 @fold_fcmp_clamp_minmax_alt_oeq_hi(double %x) {\n  %max_cmp = fcmp ogt double %x, 2.000000e+00\n  %max = select i1 %max_cmp, double %x, double 2.000000e+00\n  %min_cmp = fcmp ogt double %max, 5.000000e+00\n  %clamp = select i1 %min_cmp, double 5.000000e+00, double %max\n  %cmp = fcmp nnan ueq double %clamp, 5.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_two_clamp_hi_vec",
+          "test_body": "define <2 x i1> @fold_two_clamp_hi_vec(<2 x float> %arg0, <2 x float> %arg1) {\n  %v0 = fcmp ogt <2 x float> %arg1, splat (float 1.000000e+00)\n  %v1 = select <2 x i1> %v0, <2 x float> splat (float 1.000000e+00), <2 x float> %arg1\n  %v2 = fcmp ogt <2 x float> %v1, zeroinitializer\n  %v3 = select <2 x i1> %v2, <2 x float> %v1, <2 x float> zeroinitializer\n  %v4 = fcmp olt <2 x float> %arg0, splat (float 5.000000e+00)\n  %v5 = select <2 x i1> %v4, <2 x float> %arg0, <2 x float> splat (float 5.000000e+00)\n  %v6 = fcmp ogt <2 x float> %v5, splat (float 1.000000e+00)\n  %v7 = select <2 x i1> %v6, <2 x float> %v5, <2 x float> splat (float 1.000000e+00)\n  %v8 = fcmp oeq <2 x float> %v3, splat (float 1.000000e+00)\n  %v9 = fcmp ueq <2 x float> %v7, splat (float 3.000000e+00)\n  %v10 = and <2 x i1> %v8, %v9\n  ret <2 x i1> %v10\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_full_clamp_oeq_lo",
+          "test_body": "define i1 @fold_fcmp_full_clamp_oeq_lo(double %x) {\n  %min_cmp = fcmp ogt double %x, 5.000000e+00\n  %min = select i1 %min_cmp, double 5.000000e+00, double %x\n  %max_cmp = fcmp olt double %min, 2.000000e+00\n  %clamp = select i1 %max_cmp, double 2.000000e+00, double %min\n  %cmp = fcmp oeq double %clamp, 2.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_min_clamp_big_const",
+          "test_body": "define i1 @fold_fcmp_min_clamp_big_const(double nofpclass(nan inf) %x) {\n  %max_cmp = fcmp ogt double %x, 2.000000e+00\n  %clamp = select i1 %max_cmp, double %x, double 2.000000e+00\n  %cmp = fcmp oeq double %clamp, 5.000000e+00\n  ret i1 %cmp\n}\n"
+        },
+        {
+          "test_name": "fold_fcmp_min_clamp_smaller_const_no_fold",
+          "test_body": "define i1 @fold_fcmp_min_clamp_smaller_const_no_fold(double %x) {\n  %max_cmp = fcmp ogt double %x, 2.000000e+00\n  %clamp = select i1 %max_cmp, double %x, double 2.000000e+00\n  %cmp = fcmp nnan oeq double %clamp, 1.000000e+00\n  ret i1 %cmp\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "floating-point",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "Nathiyaa-Sengodan",
+      "body": "Gentle ping @dtcxzyw @nikic "
+    },
+    {
+      "author": "Nathiyaa-Sengodan",
+      "body": "> I'd like to decompose this transformation into two parts, each of which eliminates one min/max pattern. For example: https://alive2.llvm.org/ce/z/qDhMki\r\n> \r\n> ```\r\n> max(min(x, 5.0), 2.0) == 5.0 ->\r\n> min(x, 5.0) == 5.0 ->\r\n> x >= 5.0\r\n> ```\r\n\r\nThanks. \r\nI have updated the PR, so that we decompose this into two parts, instead of folding the entire clamp pattern. \r\nUpdated the tests also accordingly. "
+    }
+  ],
+  "knowledge_cutoff": "2026-03-24T11:30:09Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      [
+        8980,
+        8985
+      ],
+      [
+        9181,
+        9186
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fcmp-select.ll": [
+      [
+        595,
+        597
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCompares.cpp": [
+      "InstCombinerImpl::visitFCmpInst",
+      "foldFCmpWithFloorAndCeil"
+    ]
+  }
+}

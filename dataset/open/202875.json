@@ -1,0 +1,78 @@
+{
+  "pr_id": 202875,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/202875",
+  "state": "open",
+  "title": "[IR] Allocas cannot be freed",
+  "author": "nikic",
+  "base_commit": "2865ba749a8b7612b3b22fdb498b392e814c2e84",
+  "fix_commit": "05d8cf16f17cd6f30bc8a4737fb7c23af800f873",
+  "patch": "diff --git a/llvm/lib/IR/Value.cpp b/llvm/lib/IR/Value.cpp\nindex 69f0a9a5a6dec..6f71a5093e4a3 100644\n--- a/llvm/lib/IR/Value.cpp\n+++ b/llvm/lib/IR/Value.cpp\n@@ -832,6 +832,12 @@ bool Value::canBeFreed() const {\n   if (isa<Constant>(this))\n     return false;\n \n+  // Allocas cannot be freed: They remain dereferenceable after lifetime.end,\n+  // in the sense that they can be loaded from without UB. They only become\n+  // non-writable, which is not tracked by this API.\n+  if (isa<AllocaInst>(this))\n+    return false;\n+\n   // Handle byval/byref/sret/inalloca/preallocated arguments.  The storage\n   // lifetime is guaranteed to be longer than the callee's lifetime.\n   if (auto *A = dyn_cast<Argument>(this)) {\n",
+  "components": [
+    "IR"
+  ],
+  "description": "Make canBeFreed() return false for alloca instructions. This matches the modelling in getPointerDereferenceableBytes(), and as such only affects the single other caller, which is loop load PRE (resolving the TODO there).\r\n\r\nallocas remain dereferenceable after lifetime.end, in the sense that it's safe to speculatively load from them. They only become non-writable, and I don't think this API is responsible for tracking that (that would be isWritableObject, where unconditionally returning true for allocas is technically incorrect and it already has a TODO to that effect). To the best of my knowledge, the only transform that is affected by lifetime.end making allocas non-writable is scalar promotion with store speculation in LICM, so a fix to this issue will either be localized there, or be part of a full lifetime redesign. In any case, it should not infect the canBeFreed() API.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/GVN/PRE/pre-loop-load.ll",
+      "commands": [
+        "opt -enable-load-pre -enable-scalar-pre -passes=lcssa,gvn -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_load_on_exiting_cold_path_02",
+          "test_body": "; Function Attrs: nofree\ndeclare void @side_effect() #0\n\ndeclare i32 @personality_function()\n\ndefine i32 @test_load_on_exiting_cold_path_02(ptr %p) gc \"statepoint-example\" personality ptr @personality_function {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %x = load i32, ptr %p, align 4\n  %cond = icmp ne i32 %x, 0\n  br i1 %cond, label %hot_path, label %cold_path\n\nhot_path:                                         ; preds = %loop\n  br label %backedge\n\ncold_path:                                        ; preds = %loop\n  invoke void @side_effect()\n          to label %backedge unwind label %cold_exit\n\nbackedge:                                         ; preds = %cold_path, %hot_path\n  %iv.next = add i32 %iv, %x\n  %loop.cond = icmp ult i32 %iv.next, 1000\n  br i1 %loop.cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge\n  ret i32 %x\n\ncold_exit:                                        ; preds = %cold_path\n  %landing_pad = landingpad token\n          cleanup\n  ret i32 -1\n}\n\nattributes #0 = { nofree }\n"
+        },
+        {
+          "test_name": "test_inner_loop",
+          "test_body": "; Function Attrs: nofree\ndeclare void @side_effect() #0\n\ndefine i32 @test_inner_loop(ptr %p, i1 %arg) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %x = load i32, ptr %p, align 4\n  %cond = icmp ne i32 %x, 0\n  br i1 %cond, label %hot_path, label %cold_path\n\nhot_path:                                         ; preds = %loop\n  br label %backedge\n\ncold_path:                                        ; preds = %loop\n  br label %inner_loop\n\ninner_loop:                                       ; preds = %inner_loop, %cold_path\n  call void @side_effect() #0\n  br i1 %arg, label %inner_loop, label %backedge\n\nbackedge:                                         ; preds = %inner_loop, %hot_path\n  %iv.next = add i32 %iv, %x\n  %loop.cond = icmp ult i32 %iv.next, 1000\n  br i1 %loop.cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge\n  ret i32 %x\n}\n\nattributes #0 = { nofree }\n"
+        },
+        {
+          "test_name": "test_load_on_cold_path_may_free_memory_alloca",
+          "test_body": "declare void @may_modify_or_free_pointer(ptr)\n\ndefine i32 @test_load_on_cold_path_may_free_memory_alloca() {\nentry:\n  %p = alloca i32, align 4\n  call void @may_modify_or_free_pointer(ptr %p)\n  br label %loop\n\nloop:                                             ; preds = %backedge, %entry\n  %iv = phi i32 [ 0, %entry ], [ %iv.next, %backedge ]\n  %x = load i32, ptr %p, align 4\n  %cond = icmp ne i32 %x, 0\n  br i1 %cond, label %hot_path, label %cold_path\n\nhot_path:                                         ; preds = %loop\n  br label %backedge\n\ncold_path:                                        ; preds = %loop\n  call void @may_modify_or_free_pointer(ptr %p)\n  br label %backedge\n\nbackedge:                                         ; preds = %cold_path, %hot_path\n  %iv.next = add i32 %iv, %x\n  %loop.cond = icmp ult i32 %iv.next, 1000\n  br i1 %loop.cond, label %loop, label %exit\n\nexit:                                             ; preds = %backedge\n  ret i32 %x\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n@llvm/pr-subscribers-llvm-transforms\n\n@llvm/pr-subscribers-llvm-ir\n\nAuthor: Nikita Popov (nikic)\n\n<details>\n<summary>Changes</summary>\n\nMake canBeFreed() return false for alloca instructions. This matches the modelling in getPointerDereferenceableBytes(), and as such only affects the single other caller, which is loop load PRE (resolving the TODO there).\r\n\r\nallocas remain dereferenceable after lifetime.end, in the sense that it's safe to speculatively load from them. They only become non-writable, and I don't think this API is responsible for tracking that (that would be isWritableObject, where unconditionally returning true for allocas is technically incorrect and it already has a TODO to that effect). To the best of my knowledge, the only transform that is affected by lifetime.end making allocas non-writable is scalar promotion with store speculation in LICM, so a fix to this issue will either be localized there, or be part of a full lifetime redesign. In any case, it should not infect the canBeFreed() API.\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/202875.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/IR/Value.cpp (+6) \n- (modified) llvm/test/Transforms/GVN/PRE/pre-loop-load.ll (+8-7) \n\n\n``````````diff\ndiff --git a/llvm/lib/IR/Value.cpp b/llvm/lib/IR/Value.cpp\nindex 69f0a9a5a6dec..6f71a5093e4a3 100644\n--- a/llvm/lib/IR/Value.cpp\n+++ b/llvm/lib/IR/Value.cpp\n@@ -832,6 +832,12 @@ bool Value::canBeFreed() const {\n   if (isa<Constant>(this))\n     return false;\n \n+  // Allocas cannot be freed: They remain dereferenceable after lifetime.end,\n+  // in the sense that they can be loaded from without UB. They only become\n+  // non-writable, which is not tracked by this API.\n+  if (isa<AllocaInst>(this))\n+    return false;\n+\n   // Handle byval/byref/sret/inalloca/preallocated arguments.  The storage\n   // lifetime is guaranteed to be longer than the callee's lifetime.\n   if (auto *A = dyn_cast<Argument>(this)) {\ndiff --git a/llvm/test/Transforms/GVN/PRE/pre-loop-load.ll b/llvm/test/Transforms/GVN/PRE/pre-loop-load.ll\nindex 9cd6274100c2a..8f1b73ad8383d 100644\n--- a/llvm/test/Transforms/GVN/PRE/pre-loop-load.ll\n+++ b/llvm/test/Transforms/GVN/PRE/pre-loop-load.ll\n@@ -204,25 +204,26 @@ exit:\n \n declare void @may_modify_or_free_pointer(ptr %p)\n \n-; TODO: Despite the fact that the function may free memory in general, it\n-; cannot free memory allocated by alloca.\n define i32 @test_load_on_cold_path_may_free_memory_alloca() {\n ; CHECK-LABEL: @test_load_on_cold_path_may_free_memory_alloca(\n ; CHECK-NEXT:  entry:\n ; CHECK-NEXT:    [[P:%.*]] = alloca i32, align 4\n ; CHECK-NEXT:    call void @may_modify_or_free_pointer(ptr [[P]])\n+; CHECK-NEXT:    [[X_PRE1:%.*]] = load i32, ptr [[P]], align 4\n ; CHECK-NEXT:    br label [[LOOP:%.*]]\n ; CHECK:       loop:\n-; CHECK-NEXT:    [[IV:%.*]] = phi i32 [ 0, [[ENTRY:%.*]] ], [ [[IV_NEXT:%.*]], [[BACKEDGE:%.*]] ]\n-; CHECK-NEXT:    [[X:%.*]] = load i32, ptr [[P]], align 4\n+; CHECK-NEXT:    [[X:%.*]] = phi i32 [ [[X_PRE1]], [[ENTRY:%.*]] ], [ [[X2:%.*]], [[BACKEDGE:%.*]] ]\n+; CHECK-NEXT:    [[IV:%.*]] = phi i32 [ 0, [[ENTRY]] ], [ [[IV_NEXT:%.*]], [[BACKEDGE]] ]\n ; CHECK-NEXT:    [[COND:%.*]] = icmp ne i32 [[X]], 0\n ; CHECK-NEXT:    br i1 [[COND]], label [[HOT_PATH:%.*]], label [[COLD_PATH:%.*]]\n ; CHECK:       hot_path:\n ; CHECK-NEXT:    br label [[BACKEDGE]]\n ; CHECK:       cold_path:\n ; CHECK-NEXT:    call void @may_modify_or_free_pointer(ptr [[P]])\n+; CHECK-NEXT:    [[X_PRE:%.*]] = load i32, ptr [[P]], align 4\n ; CHECK-NEXT:    br label [[BACKEDGE]]\n ; CHECK:       backedge:\n+; CHECK-NEXT:    [[X2]] = phi i32 [ [[X_PRE]], [[COLD_PATH]] ], [ [[X]], [[HOT_PATH]] ]\n ; CHECK-NEXT:    [[IV_NEXT]] = add i32 [[IV]], [[X]]\n ; CHECK-NEXT:    [[LOOP_COND:%.*]] = icmp ult i32 [[IV_NEXT]], 1000\n ; CHECK-NEXT:    br i1 [[LOOP_COND]], label [[LOOP]], label [[EXIT:%.*]]\n@@ -420,7 +421,7 @@ define i32 @test_load_on_exiting_cold_path_02(ptr %p) gc \"statepoint-example\" pe\n ; CHECK-NEXT:    br label [[BACKEDGE]]\n ; CHECK:       cold_path:\n ; CHECK-NEXT:    invoke void @side_effect()\n-; CHECK-NEXT:    to label [[BACKEDGE]] unwind label [[COLD_EXIT:%.*]]\n+; CHECK-NEXT:            to label [[BACKEDGE]] unwind label [[COLD_EXIT:%.*]]\n ; CHECK:       backedge:\n ; CHECK-NEXT:    [[IV_NEXT]] = add i32 [[IV]], [[X]]\n ; CHECK-NEXT:    [[LOOP_COND:%.*]] = icmp ult i32 [[IV_NEXT]], 1000\n@@ -429,7 +430,7 @@ define i32 @test_load_on_exiting_cold_path_02(ptr %p) gc \"statepoint-example\" pe\n ; CHECK-NEXT:    ret i32 [[X]]\n ; CHECK:       cold_exit:\n ; CHECK-NEXT:    [[LANDING_PAD:%.*]] = landingpad token\n-; CHECK-NEXT:    cleanup\n+; CHECK-NEXT:            cleanup\n ; CHECK-NEXT:    ret i32 -1\n ;\n entry:\n@@ -651,7 +652,7 @@ define i32 @test_inner_loop(ptr %p, i1 %arg) {\n ; CHECK-NEXT:    br label [[INNER_LOOP:%.*]]\n ; CHECK:       inner_loop:\n ; CHECK-NEXT:    call void @side_effect() #[[ATTR0]]\n-; CHECK-NEXT:    br i1 %arg, label [[INNER_LOOP]], label [[BACKEDGE]]\n+; CHECK-NEXT:    br i1 [[ARG:%.*]], label [[INNER_LOOP]], label [[BACKEDGE]]\n ; CHECK:       backedge:\n ; CHECK-NEXT:    [[IV_NEXT]] = add i32 [[IV]], [[X]]\n ; CHECK-NEXT:    [[LOOP_COND:%.*]] = icmp ult i32 [[IV_NEXT]], 1000\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-06-10T07:32:45Z",
+  "patch_location_lineno": {
+    "llvm/lib/IR/Value.cpp": [
+      [
+        832,
+        837
+      ]
+    ],
+    "llvm/test/Transforms/GVN/PRE/pre-loop-load.ll": [
+      [
+        204,
+        228
+      ],
+      [
+        420,
+        426
+      ],
+      [
+        429,
+        435
+      ],
+      [
+        651,
+        657
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/IR/Value.cpp": [
+      "Value::canBeFreed"
+    ]
+  }
+}

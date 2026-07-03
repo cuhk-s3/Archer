@@ -1,0 +1,147 @@
+{
+  "pr_id": 198225,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/198225",
+  "state": "open",
+  "title": "[InstCombine] Fold select of neg/not into sext-sub",
+  "author": "sweiglbosker",
+  "base_commit": "e9122d11ff92f2f343668cc759081496a130a943",
+  "fix_commit": "990d533d3369d091df4ff4424f7fdfe0481fe82d",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex a064aa1016399..0377a81481eb0 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -4417,6 +4417,47 @@ static Value *foldSelectBitTest(SelectInst &Sel, Value *CondVal, Value *TrueVal,\n   return nullptr;\n }\n \n+// This function makes the following folds:\n+// select C, (sub 0, X), (xor X, -1)\n+//   -> sub (sext !C), X\n+// select C, (xor X, -1), (sub 0, X)\n+//   -> sub (sext C), X\n+static Instruction *foldSelectNegNot(SelectInst &SI, InstCombiner::BuilderTy &Builder) {\n+  auto *CondVal = SI.getCondition();\n+  auto *TrueVal = SI.getTrueValue();\n+  auto *FalseVal = SI.getFalseValue();\n+  auto *SelTy = SI.getType();\n+\n+  if (!SelTy->isIntOrIntVectorTy() || SelTy->isIntOrIntVectorTy(1))\n+    return nullptr;\n+\n+  if (CondVal->getType()->isVectorTy() != SelTy->isVectorTy())\n+    return nullptr;\n+\n+  auto matchNegNot = [&](Value *Neg, Value *Not, Value *&X) -> bool {\n+    return match(Neg, m_OneUse(m_Sub(m_Zero(), m_Value(X)))) &&\n+           match(Not, m_OneUse(m_c_Xor(m_Specific(X), m_AllOnes())));\n+  };\n+\n+  Value *X;\n+  Value *Mask;\n+\n+  // select C, (sub 0, X), (xor X, -1) -> sub (sext !C), X\n+  if (matchNegNot(TrueVal, FalseVal, X)) {\n+    Value *NotCond = Builder.CreateNot(CondVal, \"not.\" + CondVal->getName());\n+    Mask = Builder.CreateSExt(NotCond, SelTy);\n+    return BinaryOperator::CreateSub(Mask, X);\n+  }\n+\n+  // select C, (xor X, -1), (sub 0, X) -> sub (sext C), X\n+  if (matchNegNot(FalseVal, TrueVal, X)) {\n+    Mask = Builder.CreateSExt(CondVal, SelTy);\n+    return BinaryOperator::CreateSub(Mask, X);\n+  }\n+\n+  return nullptr;\n+}\n+\n Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n   Value *CondVal = SI.getCondition();\n   Value *TrueVal = SI.getTrueValue();\n@@ -4505,6 +4546,9 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n     }\n   }\n \n+  if (Instruction *I = foldSelectNegNot(SI, Builder))\n+    return I;\n+\n   auto *SIFPOp = dyn_cast<FPMathOperator>(&SI);\n \n   if (auto *FCmp = dyn_cast<FCmpInst>(CondVal)) {\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Adds the following folds:\r\n- `select C, (sub 0, Y), (xor Y, -1) -> sub (sext !C), Y`\r\n- `select C, (xor Y, -1), (sub 0, Y) -> sub (sext C), Y`\r\n\r\nThe original motivation is the high half of a two-word negation (See #198179 for more details):\r\n\r\n```ll\r\ndefine i64 @f(i64 %lo, i64 %hi) {\r\nentry:\r\n  %not.hi = xor i64 %hi, -1\r\n  %lo.is.zero = icmp eq i64 %lo, 0\r\n  %neg.hi = sub i64 0, %hi\r\n  %r = select i1 %lo.is.zero, i64 %neg.hi, i64 %not.hi\r\n  ret i64 %r\r\n}\r\n```\r\n\r\nWhich can be folded to:\r\n\r\n```ll\r\ndefine i64 @f(i64 %lo, i64 %hi) {\r\nentry:\r\n  %lo.not.zero = icmp ne i64 %lo, 0\r\n  %mask = sext i1 %lo.not.zero to i64\r\n  %r = sub i64 %mask, %hi\r\n  ret i64 %r\r\n}\r\n```\r\n\r\nProofs: https://alive2.llvm.org/ce/z/DATqof\r\nFixes: #198179",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "select_freeze_icmp_else",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @select_freeze_icmp_else(i32 %x, i32 %y) {\n  %c = icmp ult i32 %x, %y\n  %c.fr = freeze i1 %c\n  %v = select i1 %c.fr, i32 %x, i32 %y\n  ret i32 %v\n}\n"
+        },
+        {
+          "test_name": "select_freeze_icmp_multuses",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndeclare void @use_i1_i32(i1, i32)\n\ndefine void @select_freeze_icmp_multuses(i32 %x, i32 %y) {\n  %c = icmp ne i32 %x, %y\n  %c.fr = freeze i1 %c\n  %v = select i1 %c.fr, i32 %x, i32 %y\n  call void @use_i1_i32(i1 %c.fr, i32 %v)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fold_select_neg_not_eq",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @fold_select_neg_not_eq(i64 %lo, i64 %hi) {\nentry:\n  %not.hi = xor i64 %hi, -1\n  %lo.is.zero = icmp eq i64 %lo, 0\n  %neg.hi = sub i64 0, %hi\n  %r = select i1 %lo.is.zero, i64 %neg.hi, i64 %not.hi\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "no_fold_wrong_not_constant",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @no_fold_wrong_not_constant(i1 %c, i64 %y) {\nentry:\n  %neg = sub i64 0, %y\n  %notish = xor i64 %y, 123\n  %r = select i1 %c, i64 %neg, i64 %notish\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_twoword_neg_hi",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @fold_select_twoword_neg_hi(i64 %lo, i64 %hi) {\nentry:\n  %neg.lo = sub i64 0, %lo\n  %lo.is.zero = icmp eq i64 %lo, 0\n  %neg.hi = sub i64 0, %hi\n  %not.hi = xor i64 %hi, -1\n  %new.hi = select i1 %lo.is.zero, i64 %neg.hi, i64 %not.hi\n  %sum = add i64 %neg.lo, %new.hi\n  ret i64 %sum\n}\n"
+        },
+        {
+          "test_name": "no_fold_wrong_neg_operand",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @no_fold_wrong_neg_operand(i1 %c, i64 %x, i64 %y) {\nentry:\n  %neg = sub i64 0, %x\n  %not = xor i64 %y, -1\n  %r = select i1 %c, i64 %neg, i64 %not\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "no_fold_vec_mismatch",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine <2 x i64> @no_fold_vec_mismatch(<2 x i1> %c, <2 x i64> %x, <2 x i64> %y) {\nentry:\n  %neg = sub <2 x i64> zeroinitializer, %x\n  %not = xor <2 x i64> %y, splat (i64 -1)\n  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n  ret <2 x i64> %r\n}\n"
+        },
+        {
+          "test_name": "no_fold_vec_multuse",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndeclare void @use_v2i64(<2 x i64>)\n\ndefine <2 x i64> @no_fold_vec_multuse(<2 x i1> %c, <2 x i64> %y) {\nentry:\n  %neg = sub <2 x i64> zeroinitializer, %y\n  %not = xor <2 x i64> %y, splat (i64 -1)\n  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n  call void @use_v2i64(<2 x i64> %neg)\n  ret <2 x i64> %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_not_neg_i8",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i8 @fold_select_not_neg_i8(i1 %c, i8 %y) {\nentry:\n  %neg = sub i8 0, %y\n  %not = xor i8 %y, -1\n  %r = select i1 %c, i8 %not, i8 %neg\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_neg_not_nsw",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @fold_select_neg_not_nsw(i1 %c, i64 %y) {\nentry:\n  %neg = sub nsw i64 0, %y\n  %not = xor i64 %y, -1\n  %r = select i1 %c, i64 %neg, i64 %not\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "no_fold_select_neg_not_vec_non_splat",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine <2 x i64> @no_fold_select_neg_not_vec_non_splat(<2 x i1> %c, <2 x i64> %y) {\nentry:\n  %neg = sub <2 x i64> zeroinitializer, %y\n  %not = xor <2 x i64> %y, <i64 -1, i64 0>\n  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n  ret <2 x i64> %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_neg_not_vec_splat",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine <2 x i64> @fold_select_neg_not_vec_splat(<2 x i1> %c, <2 x i64> %y) {\nentry:\n  %neg = sub <2 x i64> zeroinitializer, %y\n  %not = xor <2 x i64> %y, splat (i64 -1)\n  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n  ret <2 x i64> %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_neg_not_i32",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i32 @fold_select_neg_not_i32(i1 %c, i32 %y) {\nentry:\n  %neg = sub i32 0, %y\n  %not = xor i32 %y, -1\n  %r = select i1 %c, i32 %neg, i32 %not\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_neg_not_nuw_nsw",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @fold_select_neg_not_nuw_nsw(i1 %c, i64 %y) {\nentry:\n  %neg = sub nuw nsw i64 0, %y\n  %not = xor i64 %y, -1\n  %r = select i1 %c, i64 %neg, i64 %not\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_not_neg_ne",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @fold_select_not_neg_ne(i64 %lo, i64 %hi) {\nentry:\n  %not.hi = xor i64 %hi, -1\n  %lo.not.zero = icmp ne i64 %lo, 0\n  %neg.hi = sub i64 0, %hi\n  %r = select i1 %lo.not.zero, i64 %not.hi, i64 %neg.hi\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "no_fold_wrong_neg_shape",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @no_fold_wrong_neg_shape(i1 %c, i64 %y) {\nentry:\n  %negish = sub i64 1, %y\n  %not = xor i64 %y, -1\n  %r = select i1 %c, i64 %negish, i64 %not\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_neg_not_commuted_xor",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @fold_select_neg_not_commuted_xor(i1 %c, i64 %y) {\nentry:\n  %neg = sub i64 0, %y\n  %not = xor i64 -1, %y\n  %r = select i1 %c, i64 %neg, i64 %not\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "no_fold_multuse_neg",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndeclare void @use_i64(i64)\n\ndefine i64 @no_fold_multuse_neg(i1 %c, i64 %y) {\nentry:\n  %neg = sub i64 0, %y\n  %not = xor i64 %y, -1\n  %r = select i1 %c, i64 %neg, i64 %not\n  call void @use_i64(i64 %neg)\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "fold_select_neg_not_nuw",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndefine i64 @fold_select_neg_not_nuw(i1 %c, i64 %y) {\nentry:\n  %neg = sub nuw i64 0, %y\n  %not = xor i64 %y, -1\n  %r = select i1 %c, i64 %neg, i64 %not\n  ret i64 %r\n}\n"
+        },
+        {
+          "test_name": "no_fold_multuse_not",
+          "test_body": "target datalayout = \"e-p:64:64-p1:16:16-p2:32:32:32-p3:64:64:64\"\n\ndeclare void @use_i64(i64)\n\ndefine i64 @no_fold_multuse_not(i1 %c, i64 %y) {\nentry:\n  %neg = sub i64 0, %y\n  %not = xor i64 %y, -1\n  %r = select i1 %c, i64 %neg, i64 %not\n  call void @use_i64(i64 %not)\n  ret i64 %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Stefan Weigl-Bosker (sweiglbosker)\n\n<details>\n<summary>Changes</summary>\n\nAdds the following folds:\r\n- `select C, (sub 0, Y), (xor Y, -1) -&gt; sub (sext !C), Y`\r\n- `select C, (xor Y, -1), (sub 0, Y) -&gt; sub (sext C), Y`\r\n\r\nThe original motivation is the high half of a two-word negation (See #<!-- -->198179 for more details):\r\n\r\n```ll\r\ndefine i64 @<!-- -->f(i64 %lo, i64 %hi) {\r\nentry:\r\n  %not.hi = xor i64 %hi, -1\r\n  %lo.is.zero = icmp eq i64 %lo, 0\r\n  %neg.hi = sub i64 0, %hi\r\n  %r = select i1 %lo.is.zero, i64 %neg.hi, i64 %not.hi\r\n  ret i64 %r\r\n}\r\n```\r\n\r\nWhich can be folded to:\r\n\r\n```ll\r\ndefine i64 @<!-- -->f(i64 %lo, i64 %hi) {\r\nentry:\r\n  %lo.not.zero = icmp ne i64 %lo, 0\r\n  %mask = sext i1 %lo.not.zero to i64\r\n  %r = sub i64 %mask, %hi\r\n  ret i64 %r\r\n}\r\n```\r\n\r\nProofs: https://alive2.llvm.org/ce/z/DATqof\r\nFixes: #<!-- -->198179\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/198225.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp (+44) \n- (modified) llvm/test/Transforms/InstCombine/select.ll (+301) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex a064aa1016399..0377a81481eb0 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -4417,6 +4417,47 @@ static Value *foldSelectBitTest(SelectInst &Sel, Value *CondVal, Value *TrueVal,\n   return nullptr;\n }\n \n+// This function makes the following folds:\n+// select C, (sub 0, X), (xor X, -1)\n+//   -> sub (sext !C), X\n+// select C, (xor X, -1), (sub 0, X)\n+//   -> sub (sext C), X\n+static Instruction *foldSelectNegNot(SelectInst &SI, InstCombiner::BuilderTy &Builder) {\n+  auto *CondVal = SI.getCondition();\n+  auto *TrueVal = SI.getTrueValue();\n+  auto *FalseVal = SI.getFalseValue();\n+  auto *SelTy = SI.getType();\n+\n+  if (!SelTy->isIntOrIntVectorTy() || SelTy->isIntOrIntVectorTy(1))\n+    return nullptr;\n+\n+  if (CondVal->getType()->isVectorTy() != SelTy->isVectorTy())\n+    return nullptr;\n+\n+  auto matchNegNot = [&](Value *Neg, Value *Not, Value *&X) -> bool {\n+    return match(Neg, m_OneUse(m_Sub(m_Zero(), m_Value(X)))) &&\n+           match(Not, m_OneUse(m_c_Xor(m_Specific(X), m_AllOnes())));\n+  };\n+\n+  Value *X;\n+  Value *Mask;\n+\n+  // select C, (sub 0, X), (xor X, -1) -> sub (sext !C), X\n+  if (matchNegNot(TrueVal, FalseVal, X)) {\n+    Value *NotCond = Builder.CreateNot(CondVal, \"not.\" + CondVal->getName());\n+    Mask = Builder.CreateSExt(NotCond, SelTy);\n+    return BinaryOperator::CreateSub(Mask, X);\n+  }\n+\n+  // select C, (xor X, -1), (sub 0, X) -> sub (sext C), X\n+  if (matchNegNot(FalseVal, TrueVal, X)) {\n+    Mask = Builder.CreateSExt(CondVal, SelTy);\n+    return BinaryOperator::CreateSub(Mask, X);\n+  }\n+\n+  return nullptr;\n+}\n+\n Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n   Value *CondVal = SI.getCondition();\n   Value *TrueVal = SI.getTrueValue();\n@@ -4505,6 +4546,9 @@ Instruction *InstCombinerImpl::visitSelectInst(SelectInst &SI) {\n     }\n   }\n \n+  if (Instruction *I = foldSelectNegNot(SI, Builder))\n+    return I;\n+\n   auto *SIFPOp = dyn_cast<FPMathOperator>(&SI);\n \n   if (auto *FCmp = dyn_cast<FCmpInst>(CondVal)) {\ndiff --git a/llvm/test/Transforms/InstCombine/select.ll b/llvm/test/Transforms/InstCombine/select.ll\nindex 4110f6691a76b..81d3f49b66547 100644\n--- a/llvm/test/Transforms/InstCombine/select.ll\n+++ b/llvm/test/Transforms/InstCombine/select.ll\n@@ -2887,6 +2887,8 @@ define i32 @select_freeze_icmp_else(i32 %x, i32 %y) {\n }\n \n declare void @use_i1_i32(i1, i32)\n+declare void @use_i64(i64)\n+declare void @use_v2i64(<2 x i64>)\n \n define void @select_freeze_icmp_multuses(i32 %x, i32 %y) {\n ; CHECK-LABEL: define void @select_freeze_icmp_multuses(\n@@ -5419,3 +5421,302 @@ exit:\n   store i8 %res, ptr %out, align 1\n   ret void\n }\n+\n+define i64 @fold_select_neg_not_eq(i64 %lo, i64 %hi) {\n+; CHECK-LABEL: define i64 @fold_select_neg_not_eq(\n+; CHECK-SAME: i64 [[LO:%.*]], i64 [[HI:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[LO_IS_ZERO:%.*]] = icmp ne i64 [[LO]], 0\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext i1 [[LO_IS_ZERO]] to i64\n+; CHECK-NEXT:    [[R:%.*]] = sub i64 [[TMP0]], [[HI]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %not.hi = xor i64 %hi, -1\n+  %lo.is.zero = icmp eq i64 %lo, 0\n+  %neg.hi = sub i64 0, %hi\n+  %r = select i1 %lo.is.zero, i64 %neg.hi, i64 %not.hi\n+  ret i64 %r\n+}\n+\n+define i64 @fold_select_not_neg_ne(i64 %lo, i64 %hi) {\n+; CHECK-LABEL: define i64 @fold_select_not_neg_ne(\n+; CHECK-SAME: i64 [[LO:%.*]], i64 [[HI:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[LO_NOT_ZERO_NOT:%.*]] = icmp ne i64 [[LO]], 0\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext i1 [[LO_NOT_ZERO_NOT]] to i64\n+; CHECK-NEXT:    [[R:%.*]] = sub i64 [[TMP0]], [[HI]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %not.hi = xor i64 %hi, -1\n+  %lo.not.zero = icmp ne i64 %lo, 0\n+  %neg.hi = sub i64 0, %hi\n+  %r = select i1 %lo.not.zero, i64 %not.hi, i64 %neg.hi\n+  ret i64 %r\n+}\n+\n+define i32 @fold_select_neg_not_i32(i1 %c, i32 %y) {\n+; CHECK-LABEL: define i32 @fold_select_neg_not_i32(\n+; CHECK-SAME: i1 [[C:%.*]], i32 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NOT_C:%.*]] = xor i1 [[C]], true\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext i1 [[NOT_C]] to i32\n+; CHECK-NEXT:    [[R:%.*]] = sub i32 [[TMP0]], [[Y]]\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+entry:\n+  %neg = sub i32 0, %y\n+  %not = xor i32 %y, -1\n+  %r = select i1 %c, i32 %neg, i32 %not\n+  ret i32 %r\n+}\n+\n+define i8 @fold_select_not_neg_i8(i1 %c, i8 %y) {\n+; CHECK-LABEL: define i8 @fold_select_not_neg_i8(\n+; CHECK-SAME: i1 [[C:%.*]], i8 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext i1 [[C]] to i8\n+; CHECK-NEXT:    [[R:%.*]] = sub i8 [[TMP0]], [[Y]]\n+; CHECK-NEXT:    ret i8 [[R]]\n+;\n+entry:\n+  %neg = sub i8 0, %y\n+  %not = xor i8 %y, -1\n+  %r = select i1 %c, i8 %not, i8 %neg\n+  ret i8 %r\n+}\n+\n+define i64 @fold_select_neg_not_commuted_xor(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @fold_select_neg_not_commuted_xor(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NOT_C:%.*]] = xor i1 [[C]], true\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext i1 [[NOT_C]] to i64\n+; CHECK-NEXT:    [[R:%.*]] = sub i64 [[TMP0]], [[Y]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %neg = sub i64 0, %y\n+  %not = xor i64 -1, %y\n+  %r = select i1 %c, i64 %neg, i64 %not\n+  ret i64 %r\n+}\n+\n+define i64 @fold_select_twoword_neg_hi(i64 %lo, i64 %hi) {\n+; CHECK-LABEL: define i64 @fold_select_twoword_neg_hi(\n+; CHECK-SAME: i64 [[LO:%.*]], i64 [[HI:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[LO_IS_ZERO:%.*]] = icmp ne i64 [[LO]], 0\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext i1 [[LO_IS_ZERO]] to i64\n+; CHECK-NEXT:    [[TMP1:%.*]] = add i64 [[HI]], [[LO]]\n+; CHECK-NEXT:    [[SUM:%.*]] = sub i64 [[TMP0]], [[TMP1]]\n+; CHECK-NEXT:    ret i64 [[SUM]]\n+;\n+entry:\n+  %neg.lo = sub i64 0, %lo\n+  %lo.is.zero = icmp eq i64 %lo, 0\n+  %neg.hi = sub i64 0, %hi\n+  %not.hi = xor i64 %hi, -1\n+  %new.hi = select i1 %lo.is.zero, i64 %neg.hi, i64 %not.hi\n+  %sum = add i64 %neg.lo, %new.hi\n+  ret i64 %sum\n+}\n+\n+define i64 @fold_select_neg_not_nsw(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @fold_select_neg_not_nsw(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NOT_C:%.*]] = xor i1 [[C]], true\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext i1 [[NOT_C]] to i64\n+; CHECK-NEXT:    [[R:%.*]] = sub i64 [[TMP0]], [[Y]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %neg = sub nsw i64 0, %y\n+  %not = xor i64 %y, -1\n+  %r = select i1 %c, i64 %neg, i64 %not\n+  ret i64 %r\n+}\n+\n+define i64 @fold_select_neg_not_nuw(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @fold_select_neg_not_nuw(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor i64 [[Y]], -1\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[C]], i64 0, i64 [[NOT]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %neg = sub nuw i64 0, %y\n+  %not = xor i64 %y, -1\n+  %r = select i1 %c, i64 %neg, i64 %not\n+  ret i64 %r\n+}\n+\n+define i64 @fold_select_neg_not_nuw_nsw(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @fold_select_neg_not_nuw_nsw(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor i64 [[Y]], -1\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[C]], i64 0, i64 [[NOT]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %neg = sub nuw nsw i64 0, %y\n+  %not = xor i64 %y, -1\n+  %r = select i1 %c, i64 %neg, i64 %not\n+  ret i64 %r\n+}\n+\n+define i64 @no_fold_wrong_not_constant(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @no_fold_wrong_not_constant(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEG:%.*]] = sub i64 0, [[Y]]\n+; CHECK-NEXT:    [[NOTISH:%.*]] = xor i64 [[Y]], 123\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[C]], i64 [[NEG]], i64 [[NOTISH]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %neg = sub i64 0, %y\n+  %notish = xor i64 %y, 123\n+  %r = select i1 %c, i64 %neg, i64 %notish\n+  ret i64 %r\n+}\n+\n+define i64 @no_fold_wrong_neg_operand(i1 %c, i64 %x, i64 %y) {\n+; CHECK-LABEL: define i64 @no_fold_wrong_neg_operand(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[X:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEG:%.*]] = sub i64 0, [[X]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor i64 [[Y]], -1\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[C]], i64 [[NEG]], i64 [[NOT]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %neg = sub i64 0, %x\n+  %not = xor i64 %y, -1\n+  %r = select i1 %c, i64 %neg, i64 %not\n+  ret i64 %r\n+}\n+\n+define i64 @no_fold_wrong_neg_shape(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @no_fold_wrong_neg_shape(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEGISH:%.*]] = sub i64 1, [[Y]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor i64 [[Y]], -1\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[C]], i64 [[NEGISH]], i64 [[NOT]]\n+; CHECK-NEXT:    ret i64 [[R]]\n+;\n+entry:\n+  %negish = sub i64 1, %y\n+  %not = xor i64 %y, -1\n+  %r = select i1 %c, i64 %negish, i64 %not\n+  ret i64 %r\n+}\n+\n+define i64 @no_fold_multuse_neg(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @no_fold_multuse_neg(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEG:%.*]] = sub i64 0, [[Y]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor i64 [[Y]], -1\n+; CHECK-NEXT:    [[SUM:%.*]] = select i1 [[C]], i64 [[NEG]], i64 [[NOT]]\n+; CHECK-NEXT:    call void @use_i64(i64 [[NEG]])\n+; CHECK-NEXT:    ret i64 [[SUM]]\n+;\n+entry:\n+  %neg = sub i64 0, %y\n+  %not = xor i64 %y, -1\n+  %r = select i1 %c, i64 %neg, i64 %not\n+  call void @use_i64(i64 %neg)\n+  ret i64 %r\n+}\n+\n+define i64 @no_fold_multuse_not(i1 %c, i64 %y) {\n+; CHECK-LABEL: define i64 @no_fold_multuse_not(\n+; CHECK-SAME: i1 [[C:%.*]], i64 [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEG:%.*]] = sub i64 0, [[Y]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor i64 [[Y]], -1\n+; CHECK-NEXT:    [[SUM:%.*]] = select i1 [[C]], i64 [[NEG]], i64 [[NOT]]\n+; CHECK-NEXT:    call void @use_i64(i64 [[NOT]])\n+; CHECK-NEXT:    ret i64 [[SUM]]\n+;\n+entry:\n+  %neg = sub i64 0, %y\n+  %not = xor i64 %y, -1\n+  %r = select i1 %c, i64 %neg, i64 %not\n+  call void @use_i64(i64 %not)\n+  ret i64 %r\n+}\n+\n+define <2 x i64> @fold_select_neg_not_vec_splat(<2 x i1> %c, <2 x i64> %y) {\n+; CHECK-LABEL: define <2 x i64> @fold_select_neg_not_vec_splat(\n+; CHECK-SAME: <2 x i1> [[C:%.*]], <2 x i64> [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NOT_C:%.*]] = xor <2 x i1> [[C]], splat (i1 true)\n+; CHECK-NEXT:    [[TMP0:%.*]] = sext <2 x i1> [[NOT_C]] to <2 x i64>\n+; CHECK-NEXT:    [[R:%.*]] = sub <2 x i64> [[TMP0]], [[Y]]\n+; CHECK-NEXT:    ret <2 x i64> [[R]]\n+;\n+entry:\n+  %neg = sub <2 x i64> zeroinitializer, %y\n+  %not = xor <2 x i64> %y, <i64 -1, i64 -1>\n+  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n+  ret <2 x i64> %r\n+}\n+\n+define <2 x i64> @no_fold_select_neg_not_vec_non_splat(<2 x i1> %c,\n+; CHECK-LABEL: define <2 x i64> @no_fold_select_neg_not_vec_non_splat(\n+; CHECK-SAME: <2 x i1> [[C:%.*]], <2 x i64> [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEG:%.*]] = sub <2 x i64> zeroinitializer, [[Y]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor <2 x i64> [[Y]], <i64 -1, i64 0>\n+; CHECK-NEXT:    [[R:%.*]] = select <2 x i1> [[C]], <2 x i64> [[NEG]], <2 x i64> [[NOT]]\n+; CHECK-NEXT:    ret <2 x i64> [[R]]\n+;\n+  <2 x i64> %y) {\n+entry:\n+  %neg = sub <2 x i64> zeroinitializer, %y\n+  %not = xor <2 x i64> %y, <i64 -1, i64 0>\n+  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n+  ret <2 x i64> %r\n+}\n+\n+define <2 x i64> @no_fold_vec_mismatch(<2 x i1> %c, <2 x i64> %x,\n+; CHECK-LABEL: define <2 x i64> @no_fold_vec_mismatch(\n+; CHECK-SAME: <2 x i1> [[C:%.*]], <2 x i64> [[X:%.*]], <2 x i64> [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEG:%.*]] = sub <2 x i64> zeroinitializer, [[X]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor <2 x i64> [[Y]], splat (i64 -1)\n+; CHECK-NEXT:    [[R:%.*]] = select <2 x i1> [[C]], <2 x i64> [[NEG]], <2 x i64> [[NOT]]\n+; CHECK-NEXT:    ret <2 x i64> [[R]]\n+;\n+  <2 x i64> %y) {\n+entry:\n+  %neg = sub <2 x i64> zeroinitializer, %x\n+  %not = xor <2 x i64> %y, <i64 -1, i64 -1>\n+  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n+  ret <2 x i64> %r\n+}\n+\n+define <2 x i64> @no_fold_vec_multuse(<2 x i1> %c, <2 x i64> %y) {\n+; CHECK-LABEL: define <2 x i64> @no_fold_vec_multuse(\n+; CHECK-SAME: <2 x i1> [[C:%.*]], <2 x i64> [[Y:%.*]]) {\n+; CHECK-NEXT:  [[ENTRY:.*:]]\n+; CHECK-NEXT:    [[NEG:%.*]] = sub <2 x i64> zeroinitializer, [[Y]]\n+; CHECK-NEXT:    [[NOT:%.*]] = xor <2 x i64> [[Y]], splat (i64 -1)\n+; CHECK-NEXT:    [[SUM:%.*]] = select <2 x i1> [[C]], <2 x i64> [[NEG]], <2 x i64> [[NOT]]\n+; CHECK-NEXT:    call void @use_v2i64(<2 x i64> [[NEG]])\n+; CHECK-NEXT:    ret <2 x i64> [[SUM]]\n+;\n+entry:\n+  %neg = sub <2 x i64> zeroinitializer, %y\n+  %not = xor <2 x i64> %y, <i64 -1, i64 -1>\n+  %r = select <2 x i1> %c, <2 x i64> %neg, <2 x i64> %not\n+  call void @use_v2i64(<2 x i64> %neg)\n+  ret <2 x i64> %r\n+}\n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n\n:warning: C/C++ code formatter, clang-format found issues in your code. :warning:\n\n<details>\n<summary>\nYou can test this locally with the following command:\n</summary>\n\n``````````bash\ngit-clang-format --diff origin/main HEAD --extensions cpp -- llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp --diff_from_common_commit\n``````````\n\n:warning:\nThe reproduction instructions above might return results for more than one PR\nin a stack if you are using a stacked PR workflow. You can limit the results by\nchanging `origin/main` to the base branch/commit you want to compare against.\n:warning:\n\n</details>\n\n<details>\n<summary>\nView the diff from clang-format here.\n</summary>\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 86722e3f4..71aa13d0a 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -4430,7 +4430,8 @@ static Value *foldSelectBitTest(SelectInst &Sel, Value *CondVal, Value *TrueVal,\n //   -> sub (sext !C), X\n // select C, (xor X, -1), (sub 0, X)\n //   -> sub (sext C), X\n-static Instruction *foldSelectNegNot(SelectInst &SI, InstCombiner::BuilderTy &Builder) {\n+static Instruction *foldSelectNegNot(SelectInst &SI,\n+                                     InstCombiner::BuilderTy &Builder) {\n   auto *CondVal = SI.getCondition();\n   auto *TrueVal = SI.getTrueValue();\n   auto *FalseVal = SI.getFalseValue();\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-18T02:56:40Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        4417,
+        4422
+      ],
+      [
+        4505,
+        4510
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/select.ll": [
+      [
+        2887,
+        2892
+      ],
+      [
+        5419,
+        5421
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::visitSelectInst",
+      "foldSelectBitTest"
+    ]
+  }
+}

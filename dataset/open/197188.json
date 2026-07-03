@@ -1,0 +1,97 @@
+{
+  "pr_id": 197188,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/197188",
+  "state": "open",
+  "title": "[LV] Fix the cost model for freeze instructions",
+  "author": "david-arm",
+  "base_commit": "dc713c371eb137a2f9c86abe4377e87fcbc4d180",
+  "fix_commit": "30a51c3101639aeccde5173101f31b29473c9f89",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 1ace2275e2b6d..24d51f9d75940 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -5529,6 +5529,8 @@ LoopVectorizationCostModel::getInstructionCost(Instruction *I,\n     if (VF.isScalable())\n       return InstructionCost::getInvalid();\n     return TTI.getArithmeticInstrCost(Instruction::Mul, RetTy, Config.CostKind);\n+  case Instruction::Freeze:\n+    return TTI.getInstructionCost(I, Config.CostKind);\n   default:\n     // This opcode is unknown. Assume that it is the same as 'mul'.\n     return TTI.getArithmeticInstrCost(Instruction::Mul, VectorTy,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 11a91dcd46867..225acfcc5c408 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -992,9 +992,10 @@ InstructionCost VPRecipeWithIRFlags::getCostForRecipeWithOpcode(\n         RHSInfo, Operands, CtxI, &Ctx.TLI);\n   }\n   case Instruction::Freeze:\n-    // This opcode is unknown. Assume that it is the same as 'mul'.\n-    return Ctx.TTI.getArithmeticInstrCost(Instruction::Mul, ResultTy,\n-                                          Ctx.CostKind);\n+    // NOTE: The only way to ask for the cost is via getInstructionCost, which\n+    // requires the actual vector instruction. Instead, I've simply mirrored\n+    // the behaviour in llvm/Analysis/TargetTransformInfoImpl.h.\n+    return TTI::TCC_Free;\n   case Instruction::ExtractValue:\n     return Ctx.TTI.getInsertExtractValueCost(Instruction::ExtractValue,\n                                              Ctx.CostKind);\n",
+  "components": [
+    "LoopVectorize"
+  ],
+  "description": "While working on a PR to add a cost model for VPDerivedIV recipes I noticed that a loop in or_reduction_with_freeze:\r\n\r\ntest/Transforms/LoopVectorize/AArch64/reduction-cost.ll\r\n\r\nstopped vectorising because the cost model decided it was no longer worth it. However, the main cause of this was the incredibly high cost (14) of freeze for VF=2. We were using the cost of a vector mul instruction as a proxy for the freeze cost, which is incredibly bad for an AArch64 target without SVE since the operation needs scalarising.\r\n\r\nAs far as I understand, the freeze instruction does not lead to any actual code being generated and acts merely as a barrier to potentially unsafe optimisations. As such, I've updated the cost model to return 0 instead.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/AArch64/reduction-cost.ll",
+      "commands": [
+        "opt -passes=\"loop-vectorize\" -mtriple=arm64-apple-macosx -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "or_reduction_with_freeze",
+          "test_body": "define i32 @or_reduction_with_freeze(ptr %dst, ptr %src) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %mask = phi i64 [ 0, %entry ], [ %or, %loop ]\n  %ptr.iv = phi ptr [ %src, %entry ], [ %incdec.ptr, %loop ]\n  %l.src = load i64, ptr %ptr.iv, align 8\n  store i64 0, ptr %ptr.iv, align 8\n  %l.dst = load i64, ptr %dst, align 8\n  %or.1 = or i64 %l.src, %l.dst\n  %fr = freeze i64 %or.1\n  %or = or i64 %fr, %mask\n  %incdec.ptr = getelementptr i8, ptr %ptr.iv, i64 8\n  %cmp = icmp eq ptr %ptr.iv, %dst\n  br i1 %cmp, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  %cast = trunc i64 %or to i32\n  ret i32 %cast\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/X86/CostModel/vpinstruction-cost.ll",
+      "commands": [
+        "opt -S -passes=loop-vectorize -mcpu=skylake-avx512 -mtriple=x86_64-apple-macosx -debug -disable-output -S %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "test_vpinstruction_freeze_cost",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\ndefine void @test_vpinstruction_freeze_cost(ptr %src, ptr noalias %dst) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n  %g.src = getelementptr inbounds i64, ptr %src, i64 %iv\n  %l = load i64, ptr %g.src, align 8\n  %fr = freeze i64 %l\n  %g.dst = getelementptr inbounds i64, ptr %dst, i64 %iv\n  store i64 %fr, ptr %g.dst, align 8\n  %iv.next = add nuw nsw i64 %iv, 1\n  %ec = icmp eq i64 %iv.next, 32\n  br i1 %ec, label %exit, label %loop\n\nexit:                                             ; preds = %loop\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n@llvm/pr-subscribers-llvm-transforms\n\n@llvm/pr-subscribers-vectorizers\n\nAuthor: David Sherwood (david-arm)\n\n<details>\n<summary>Changes</summary>\n\nWhile working on a PR to add a cost model for VPDerivedIV recipes I noticed that a loop in or_reduction_with_freeze:\r\n\r\ntest/Transforms/LoopVectorize/AArch64/reduction-cost.ll\r\n\r\nstopped vectorising because the cost model decided it was no longer worth it. However, the main cause of this was the incredibly high cost (14) of freeze for VF=2. We were using the cost of a vector mul instruction as a proxy for the freeze cost, which is incredibly bad for an AArch64 target without SVE since the operation needs scalarising.\r\n\r\nAs far as I understand, the freeze instruction does not lead to any actual code being generated and acts merely as a barrier to potentially unsafe optimisations. As such, I've updated the cost model to return 0 instead.\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/197188.diff\n\n\n4 Files Affected:\n\n- (modified) llvm/lib/Transforms/Vectorize/LoopVectorize.cpp (+4) \n- (modified) llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp (+3-3) \n- (modified) llvm/test/Transforms/LoopVectorize/AArch64/reduction-cost.ll (+1-1) \n- (modified) llvm/test/Transforms/LoopVectorize/X86/CostModel/vpinstruction-cost.ll (+3-3) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\nindex 1ace2275e2b6d..a91ebaeaaff28 100644\n--- a/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n+++ b/llvm/lib/Transforms/Vectorize/LoopVectorize.cpp\n@@ -5529,6 +5529,10 @@ LoopVectorizationCostModel::getInstructionCost(Instruction *I,\n     if (VF.isScalable())\n       return InstructionCost::getInvalid();\n     return TTI.getArithmeticInstrCost(Instruction::Mul, RetTy, Config.CostKind);\n+  case Instruction::Freeze:\n+    // This will never lead to any real code being generated. It acts purely\n+    // as a blocker for optimizations.\n+    return 0;\n   default:\n     // This opcode is unknown. Assume that it is the same as 'mul'.\n     return TTI.getArithmeticInstrCost(Instruction::Mul, VectorTy,\ndiff --git a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\nindex 11a91dcd46867..f699403de65d5 100644\n--- a/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp\n@@ -992,9 +992,9 @@ InstructionCost VPRecipeWithIRFlags::getCostForRecipeWithOpcode(\n         RHSInfo, Operands, CtxI, &Ctx.TLI);\n   }\n   case Instruction::Freeze:\n-    // This opcode is unknown. Assume that it is the same as 'mul'.\n-    return Ctx.TTI.getArithmeticInstrCost(Instruction::Mul, ResultTy,\n-                                          Ctx.CostKind);\n+    // This will never lead to any real code being generated. It acts purely\n+    // as a blocker for optimizations.\n+    return 0;\n   case Instruction::ExtractValue:\n     return Ctx.TTI.getInsertExtractValueCost(Instruction::ExtractValue,\n                                              Ctx.CostKind);\ndiff --git a/llvm/test/Transforms/LoopVectorize/AArch64/reduction-cost.ll b/llvm/test/Transforms/LoopVectorize/AArch64/reduction-cost.ll\nindex 92e75f26fffcb..66e6585ceece4 100644\n--- a/llvm/test/Transforms/LoopVectorize/AArch64/reduction-cost.ll\n+++ b/llvm/test/Transforms/LoopVectorize/AArch64/reduction-cost.ll\n@@ -75,7 +75,7 @@ define i32 @or_reduction_with_freeze(ptr %dst, ptr %src) {\n ; CHECK-NEXT:    [[TMP0:%.*]] = sub i64 [[DST6]], [[SRC7]]\n ; CHECK-NEXT:    [[TMP1:%.*]] = lshr i64 [[TMP0]], 3\n ; CHECK-NEXT:    [[TMP2:%.*]] = add nuw nsw i64 [[TMP1]], 1\n-; CHECK-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i64 [[TMP2]], 18\n+; CHECK-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i64 [[TMP2]], 10\n ; CHECK-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_SCEVCHECK:.*]]\n ; CHECK:       [[VECTOR_SCEVCHECK]]:\n ; CHECK-NEXT:    [[TMP3:%.*]] = trunc i64 [[DST1]] to i3\ndiff --git a/llvm/test/Transforms/LoopVectorize/X86/CostModel/vpinstruction-cost.ll b/llvm/test/Transforms/LoopVectorize/X86/CostModel/vpinstruction-cost.ll\nindex 12d32872e1453..aeb222e677e63 100644\n--- a/llvm/test/Transforms/LoopVectorize/X86/CostModel/vpinstruction-cost.ll\n+++ b/llvm/test/Transforms/LoopVectorize/X86/CostModel/vpinstruction-cost.ll\n@@ -104,7 +104,7 @@ define void @test_vpinstruction_freeze_cost(ptr %src, ptr noalias %dst) {\n ; CHECK:  LV: Found an estimated cost of 0 for VF 1 For instruction: %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop ]\n ; CHECK:  LV: Found an estimated cost of 0 for VF 1 For instruction: %g.src = getelementptr inbounds i64, ptr %src, i64 %iv\n ; CHECK:  LV: Found an estimated cost of 1 for VF 1 For instruction: %l = load i64, ptr %g.src, align 8\n-; CHECK:  LV: Found an estimated cost of 1 for VF 1 For instruction: %fr = freeze i64 %l\n+; CHECK:  LV: Found an estimated cost of 0 for VF 1 For instruction: %fr = freeze i64 %l\n ; CHECK:  LV: Found an estimated cost of 0 for VF 1 For instruction: %g.dst = getelementptr inbounds i64, ptr %dst, i64 %iv\n ; CHECK:  LV: Found an estimated cost of 1 for VF 1 For instruction: store i64 %fr, ptr %g.dst, align 8\n ; CHECK:  LV: Found an estimated cost of 1 for VF 1 For instruction: %iv.next = add nuw nsw i64 %iv, 1\n@@ -117,7 +117,7 @@ define void @test_vpinstruction_freeze_cost(ptr %src, ptr noalias %dst) {\n ; CHECK:  Cost of 0 for VF 2: CLONE ir<%g.src> = getelementptr inbounds ir<%src>, vp<[[VP4]]>\n ; CHECK:  Cost of 0 for VF 2: vp<[[VP5:%[0-9]+]]> = vector-pointer inbounds ir<%g.src>\n ; CHECK:  Cost of 1 for VF 2: WIDEN ir<%l> = load vp<[[VP5]]>\n-; CHECK:  Cost of 2 for VF 2: WIDEN ir<%fr> = freeze ir<%l>\n+; CHECK:  Cost of 0 for VF 2: WIDEN ir<%fr> = freeze ir<%l>\n ; CHECK:  Cost of 0 for VF 2: CLONE ir<%g.dst> = getelementptr inbounds ir<%dst>, vp<[[VP4]]>\n ; CHECK:  Cost of 0 for VF 2: vp<[[VP6:%[0-9]+]]> = vector-pointer inbounds ir<%g.dst>\n ; CHECK:  Cost of 1 for VF 2: WIDEN store vp<[[VP6]]>, ir<%fr>\n@@ -142,7 +142,7 @@ define void @test_vpinstruction_freeze_cost(ptr %src, ptr noalias %dst) {\n ; CHECK:  Cost of 0 for VF 4: CLONE ir<%g.src> = getelementptr inbounds ir<%src>, vp<[[VP4]]>\n ; CHECK:  Cost of 0 for VF 4: vp<[[VP5]]> = vector-pointer inbounds ir<%g.src>\n ; CHECK:  Cost of 1 for VF 4: WIDEN ir<%l> = load vp<[[VP5]]>\n-; CHECK:  Cost of 2 for VF 4: WIDEN ir<%fr> = freeze ir<%l>\n+; CHECK:  Cost of 0 for VF 4: WIDEN ir<%fr> = freeze ir<%l>\n ; CHECK:  Cost of 0 for VF 4: CLONE ir<%g.dst> = getelementptr inbounds ir<%dst>, vp<[[VP4]]>\n ; CHECK:  Cost of 0 for VF 4: vp<[[VP6]]> = vector-pointer inbounds ir<%g.dst>\n ; CHECK:  Cost of 1 for VF 4: WIDEN store vp<[[VP6]]>, ir<%fr>\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-12T13:14:30Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      [
+        5529,
+        5534
+      ]
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      [
+        992,
+        1000
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/AArch64/reduction-cost.ll": [
+      [
+        60,
+        67
+      ],
+      [
+        75,
+        81
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/X86/CostModel/vpinstruction-cost.ll": [
+      [
+        104,
+        110
+      ],
+      [
+        117,
+        123
+      ],
+      [
+        142,
+        148
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp": [
+      "LoopVectorizationCostModel::getInstructionCost"
+    ],
+    "llvm/lib/Transforms/Vectorize/VPlanRecipes.cpp": [
+      "VPRecipeWithIRFlags::getCostForRecipeWithOpcode"
+    ]
+  }
+}

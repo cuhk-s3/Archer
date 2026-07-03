@@ -1,0 +1,116 @@
+{
+  "pr_id": 199962,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/199962",
+  "state": "open",
+  "title": "[SLP] Fix extract-cost scale using NCD of all external-user sites",
+  "author": "alexey-bataev",
+  "base_commit": "ed11d7a52a505ff53523c2c635f114d865273f24",
+  "fix_commit": "887d9122181d2419a69509eb53eb53c91a3d36e8",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex 9d7821d2760f2..2e28efad2e1ff 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -19551,6 +19551,56 @@ InstructionCost BoUpSLP::getTreeCost(InstructionCost TreeCost,\n     }\n   }\n   AllUsersGEPSWithStoresLoads &= UsedLanes.all();\n+\n+  // Pre-pass: for each externally-used scalar, find the basic block at which\n+  // the extractelement will be placed by codegen. This mirrors what\n+  // vectorizeTree does: the extract is placed at the nearest common dominator\n+  // of all effective use sites. For a non-PHI user the effective site is the\n+  // user's own block; for a PHI user it is the incoming block for the scalar\n+  // operand (the predecessor of the PHI on the edge that carries the scalar).\n+  // Using the NCD of all effective sites rather than the first-encountered\n+  // user's block makes the extract-cost scale order-independent and correct\n+  // even when users live in different loop nests.\n+  SmallDenseMap<Value *, BasicBlock *> ScalarToExtractBlock;\n+  for (const ExternalUser &EU : ExternalUses) {\n+    if (!EU.User || isa<InsertElementInst>(EU.User))\n+      continue;\n+    if (EphValues.count(EU.User))\n+      continue;\n+    BasicBlock *UserParent = cast<Instruction>(EU.User)->getParent();\n+    if (!DT->isReachableFromEntry(UserParent) || UserParent->isEHPad() ||\n+        isa_and_present<UnreachableInst>(UserParent->getTerminator()))\n+      continue;\n+    BasicBlock *UseBlock = nullptr;\n+    if (auto *PHI = dyn_cast<PHINode>(EU.User)) {\n+      // When the PHI itself is inside a loop, the extractelement is placed\n+      // in the incoming block for the scalar operand (the predecessor edge),\n+      // not in the PHI's own block.  This applies to LCSSA phis at an inner-\n+      // loop exit that are still inside an outer loop: the incoming block is\n+      // in the inner loop while the PHI block is in the outer loop.\n+      // When the PHI is outside all loops (a true loop-exit phi), codegen\n+      // uses a vector phi at the exit block and the extract stays there\n+      // (scale = 1), so we keep the PHI's own block as the effective site.\n+      if (LI->getLoopFor(PHI->getParent())) {\n+        for (unsigned Idx = 0, E = PHI->getNumIncomingValues(); Idx != E;\n+             ++Idx) {\n+          if (PHI->getIncomingValue(Idx) != EU.Scalar)\n+            continue;\n+          BasicBlock *InBB = PHI->getIncomingBlock(Idx);\n+          UseBlock =\n+              UseBlock ? DT->findNearestCommonDominator(UseBlock, InBB) : InBB;\n+        }\n+      }\n+      if (!UseBlock)\n+        UseBlock = cast<Instruction>(EU.User)->getParent();\n+    } else {\n+      UseBlock = cast<Instruction>(EU.User)->getParent();\n+    }\n+    auto [It, Inserted] = ScalarToExtractBlock.try_emplace(EU.Scalar, UseBlock);\n+    if (!Inserted && It->second && UseBlock)\n+      It->second = DT->findNearestCommonDominator(It->second, UseBlock);\n+  }\n+\n   SmallDenseSet<std::pair<Value *, Value *>, 8> CheckedScalarUser;\n   for (ExternalUser &EU : ExternalUses) {\n     LLVM_DEBUG(dbgs() << \"SLP: Computing cost for external use of TreeEntry \"\n@@ -19836,8 +19886,29 @@ InstructionCost BoUpSLP::getTreeCost(InstructionCost TreeCost,\n       }\n     }\n \n-    ExtraCost = ScaleCost(ExtraCost, *Entry, EU.Scalar,\n-                          cast_or_null<Instruction>(EU.User));\n+    // Scale the extract cost by the execution frequency of the block where\n+    // codegen will place the extractelement. That block is the nearest common\n+    // dominator of all effective use sites (precomputed in ScalarToExtractBlock\n+    // above), which is order-independent. For scalars kept as originals the\n+    // existing ScaleCost path (user-block based) remains correct, since the\n+    // scalar instruction executes at its definition site's frequency.\n+    if (!ExternalUsesAsOriginalScalar.contains(EU.Scalar)) {\n+      if (ExtraCost.isValid() && ExtraCost != 0) {\n+        BasicBlock *ExtractBB = ScalarToExtractBlock.lookup(EU.Scalar);\n+        const Loop *L = ExtractBB ? LI->getLoopFor(ExtractBB) : nullptr;\n+        if (L) {\n+          uint64_t Scale = getLoopNestScale(\n+              findInnermostNonInvariantLoop(L, ArrayRef<Value *>(EU.Scalar)));\n+          LLVM_DEBUG(dbgs()\n+                     << \"SLP: Extract scale \" << Scale << \" (NCD block) for \"\n+                     << EU.Scalar->getNameOrAsOperand() << \"\\n\");\n+          ExtraCost *= Scale;\n+        }\n+      }\n+    } else {\n+      ExtraCost = ScaleCost(ExtraCost, *Entry, EU.Scalar,\n+                            cast_or_null<Instruction>(EU.User));\n+    }\n \n     ExtractCost += ExtraCost;\n   }\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "ExtractCostCalculated deduplicates by scalar so only the first\nExternalUser determines the scale, making the cost depend on IR block\nordering via LLVM's reverse-insertion use-list order.\nAdd a pre-pass computing ScalarToExtractBlock - the nearest common\ndominator of all effective extract sites per scalar. For PHI users inside\na loop the effective site is the incoming block; for PHI users outside\nall loops it is the PHI's own block (scale = 1). The extract cost is\nthen scaled by getLoopNestScale of the NCD block, which is fully\norder-independent.\n\nFixes #199548\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/AArch64/lcssa-phi-extract-scale.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -mtriple=aarch64-none-linux-gnu -mcpu=neoverse-n1 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test",
+          "test_body": "declare void @sink_use(i32, i32, i32)\n\ndefine double @test(ptr %obj, ptr %arr, i32 %n) {\nentry:\n  %pos1 = getelementptr inbounds i8, ptr %obj, i64 44\n  %pos2 = getelementptr inbounds i8, ptr %obj, i64 48\n  %cond.enter = icmp sgt i32 %n, 0\n  br i1 %cond.enter, label %outer.preheader, label %exit\n\nouter.preheader:                                  ; preds = %entry\n  br label %outer.header\n\nouter.header:                                     ; preds = %outer.latch, %outer.preheader\n  %\"$vphi.1\" = phi i32 [ 16, %outer.preheader ], [ %.sink6.i.lcssa, %outer.latch ]\n  %\"$vphi.0\" = phi i32 [ 4, %outer.preheader ], [ %.sink.i.lcssa, %outer.latch ]\n  %local_4_128 = phi i32 [ 0, %outer.preheader ], [ %lcssa.iv, %outer.latch ]\n  %local_3_127 = phi i32 [ 0, %outer.preheader ], [ %local_3_16.lcssa, %outer.latch ]\n  br label %inner.header\n\ninner.header:                                     ; preds = %inner.body, %outer.header\n  %\"$vphi.1418\" = phi i32 [ %\"$vphi.1\", %outer.header ], [ %.sink6.i, %inner.body ]\n  %\"$vphi.0419\" = phi i32 [ %\"$vphi.0\", %outer.header ], [ %.sink.i, %inner.body ]\n  %local_4_128420 = phi i32 [ %local_4_128, %outer.header ], [ %inc, %inner.body ]\n  %local_3_127421 = phi i32 [ %local_3_127, %outer.header ], [ %local_3_16, %inner.body ]\n  %chunk.iv = phi i64 [ 0, %outer.header ], [ %chunk.iv.next, %inner.body ]\n  %c27 = icmp ult i32 %\"$vphi.0419\", 17\n  %c28 = icmp ult i32 %\"$vphi.1418\", 17\n  %wide.chk = and i1 %c28, %c27\n  %.not3.i17 = icmp eq i32 %\"$vphi.0419\", 0\n  %v29 = add i32 %\"$vphi.0419\", -1\n  %.sink.i18 = select i1 %.not3.i17, i32 16, i32 %v29\n  %c30 = icmp ult i32 %.sink.i18, 17\n  %wide.chk354 = and i1 %wide.chk, %c30\n  %.not4.i19 = icmp eq i32 %\"$vphi.1418\", 0\n  %v31 = add i32 %\"$vphi.1418\", -1\n  %.sink6.i20 = select i1 %.not4.i19, i32 16, i32 %v31\n  %c32 = icmp ult i32 %.sink6.i20, 17\n  %wide.chk355 = and i1 %c32, %wide.chk354\n  br i1 %wide.chk355, label %inner.body, label %deopt\n\ninner.body:                                       ; preds = %inner.header\n  %chunk.iv.next = add nuw nsw i64 %chunk.iv, 1\n  %v34 = zext nneg i32 %\"$vphi.0419\" to i64\n  %v35 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v34\n  %v36 = load i32, ptr %v35, align 4\n  %v37 = zext nneg i32 %\"$vphi.1418\" to i64\n  %v38 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v37\n  %v39 = load i32, ptr %v38, align 4\n  %v40 = sub i32 %v36, %v39\n  %v41 = add nsw i32 %v40, 2147483647\n  %v42 = icmp slt i32 %v40, 0\n  %spec.select.i13 = select i1 %v42, i32 %v41, i32 %v40\n  store i32 %spec.select.i13, ptr %v38, align 4\n  %v43 = sitofp i32 %spec.select.i13 to double\n  %v44 = fmul nnan double %v43, f0x3E00000000200000\n  %v45 = zext nneg i32 %.sink.i18 to i64\n  %v46 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v45\n  %v47 = load i32, ptr %v46, align 4\n  %v48 = zext nneg i32 %.sink6.i20 to i64\n  %v49 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v48\n  %v50 = load i32, ptr %v49, align 4\n  %v51 = sub i32 %v47, %v50\n  %v52 = add nsw i32 %v51, 2147483647\n  %v53 = icmp slt i32 %v51, 0\n  %spec.select.i = select i1 %v53, i32 %v52, i32 %v51\n  store i32 %spec.select.i, ptr %v49, align 4\n  %.not3.i = icmp eq i32 %.sink.i18, 0\n  %v54 = add nsw i32 %.sink.i18, -1\n  %.sink.i = select i1 %.not3.i, i32 16, i32 %v54\n  store i32 %.sink.i, ptr %pos1, align 4\n  %.not4.i = icmp eq i32 %.sink6.i20, 0\n  %v55 = add nsw i32 %.sink6.i20, -1\n  %.sink6.i = select i1 %.not4.i, i32 16, i32 %v55\n  store i32 %.sink6.i, ptr %pos2, align 8\n  %v56 = sitofp i32 %spec.select.i to double\n  %v57 = fmul nnan double %v56, f0x3E00000000200000\n  %v58 = fmul nnan double %v44, %v44\n  %v59 = fmul nnan double %v57, %v57\n  %v60 = fadd double %v58, %v59\n  %v61 = fcmp ole double %v60, 1.000000e+00\n  %v62 = zext i1 %v61 to i32\n  %local_3_16 = add i32 %v62, %local_3_127421\n  %inc = add nuw nsw i32 %local_4_128420, 1\n  %.not = icmp slt i32 %inc, %n\n  %chunk.cond = icmp samesign ult i64 %chunk.iv, 32\n  %v64 = and i1 %.not, %chunk.cond\n  br i1 %v64, label %inner.header, label %outer.latch\n\ndeopt:                                            ; preds = %inner.header\n  %\"$vphi.0419.lcssa\" = phi i32 [ %\"$vphi.0419\", %inner.header ]\n  %local_4_128420.lcssa = phi i32 [ %local_4_128420, %inner.header ]\n  %local_3_127421.lcssa = phi i32 [ %local_3_127421, %inner.header ]\n  call void @sink_use(i32 %\"$vphi.0419.lcssa\", i32 %local_4_128420.lcssa, i32 %local_3_127421.lcssa)\n  ret double 0.000000e+00\n\nouter.latch:                                      ; preds = %inner.body\n  %.sink.i.lcssa = phi i32 [ %.sink.i, %inner.body ]\n  %.sink6.i.lcssa = phi i32 [ %.sink6.i, %inner.body ]\n  %local_3_16.lcssa = phi i32 [ %local_3_16, %inner.body ]\n  %lcssa.iv = phi i32 [ %inc, %inner.body ]\n  %.not.lcssa = phi i1 [ %.not, %inner.body ]\n  br i1 %.not.lcssa, label %outer.header, label %exit.loop\n\nexit.loop:                                        ; preds = %outer.latch\n  %final = phi i32 [ %local_3_16.lcssa, %outer.latch ]\n  %result = sitofp i32 %final to double\n  br label %exit\n\nexit:                                             ; preds = %exit.loop, %entry\n  %ret.val = phi double [ 0.000000e+00, %entry ], [ %result, %exit.loop ]\n  %nfp = sitofp i32 %n to double\n  %div = fdiv double %ret.val, %nfp\n  %mul = fmul double %div, 4.000000e+00\n  ret double %mul\n}\n"
+        },
+        {
+          "test_name": "test_inloop_first",
+          "test_body": "declare void @sink_use(i32, i32, i32)\n\ndefine double @test_inloop_first(ptr %obj, ptr %arr, i32 %n) {\nentry:\n  %pos1 = getelementptr inbounds i8, ptr %obj, i64 44\n  %pos2 = getelementptr inbounds i8, ptr %obj, i64 48\n  %cond.enter = icmp sgt i32 %n, 0\n  br i1 %cond.enter, label %outer.preheader, label %exit\n\nouter.preheader:                                  ; preds = %entry\n  br label %outer.header\n\nouter.header:                                     ; preds = %outer.latch, %outer.preheader\n  %\"$vphi.1\" = phi i32 [ 16, %outer.preheader ], [ %.sink6.i.lcssa, %outer.latch ]\n  %\"$vphi.0\" = phi i32 [ 4, %outer.preheader ], [ %.sink.i.lcssa, %outer.latch ]\n  %local_4_128 = phi i32 [ 0, %outer.preheader ], [ %lcssa.iv, %outer.latch ]\n  %local_3_127 = phi i32 [ 0, %outer.preheader ], [ %local_3_16.lcssa, %outer.latch ]\n  br label %inner.header\n\ninner.header:                                     ; preds = %inner.body, %outer.header\n  %\"$vphi.1418\" = phi i32 [ %\"$vphi.1\", %outer.header ], [ %.sink6.i, %inner.body ]\n  %\"$vphi.0419\" = phi i32 [ %\"$vphi.0\", %outer.header ], [ %.sink.i, %inner.body ]\n  %local_4_128420 = phi i32 [ %local_4_128, %outer.header ], [ %inc, %inner.body ]\n  %local_3_127421 = phi i32 [ %local_3_127, %outer.header ], [ %local_3_16, %inner.body ]\n  %chunk.iv = phi i64 [ 0, %outer.header ], [ %chunk.iv.next, %inner.body ]\n  %c27 = icmp ult i32 %\"$vphi.0419\", 17\n  %c28 = icmp ult i32 %\"$vphi.1418\", 17\n  %wide.chk = and i1 %c28, %c27\n  %.not3.i17 = icmp eq i32 %\"$vphi.0419\", 0\n  %v29 = add i32 %\"$vphi.0419\", -1\n  %.sink.i18 = select i1 %.not3.i17, i32 16, i32 %v29\n  %c30 = icmp ult i32 %.sink.i18, 17\n  %wide.chk354 = and i1 %wide.chk, %c30\n  %.not4.i19 = icmp eq i32 %\"$vphi.1418\", 0\n  %v31 = add i32 %\"$vphi.1418\", -1\n  %.sink6.i20 = select i1 %.not4.i19, i32 16, i32 %v31\n  %c32 = icmp ult i32 %.sink6.i20, 17\n  %wide.chk355 = and i1 %c32, %wide.chk354\n  br i1 %wide.chk355, label %inner.body, label %deopt\n\nouter.latch:                                      ; preds = %inner.body\n  %.sink.i.lcssa = phi i32 [ %.sink.i, %inner.body ]\n  %.sink6.i.lcssa = phi i32 [ %.sink6.i, %inner.body ]\n  %local_3_16.lcssa = phi i32 [ %local_3_16, %inner.body ]\n  %lcssa.iv = phi i32 [ %inc, %inner.body ]\n  %.not.lcssa = phi i1 [ %.not, %inner.body ]\n  br i1 %.not.lcssa, label %outer.header, label %exit.loop\n\nexit.loop:                                        ; preds = %outer.latch\n  %final = phi i32 [ %local_3_16.lcssa, %outer.latch ]\n  %result = sitofp i32 %final to double\n  br label %exit\n\ninner.body:                                       ; preds = %inner.header\n  %chunk.iv.next = add nuw nsw i64 %chunk.iv, 1\n  %v34 = zext nneg i32 %\"$vphi.0419\" to i64\n  %v35 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v34\n  %v36 = load i32, ptr %v35, align 4\n  %v37 = zext nneg i32 %\"$vphi.1418\" to i64\n  %v38 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v37\n  %v39 = load i32, ptr %v38, align 4\n  %v40 = sub i32 %v36, %v39\n  %v41 = add nsw i32 %v40, 2147483647\n  %v42 = icmp slt i32 %v40, 0\n  %spec.select.i13 = select i1 %v42, i32 %v41, i32 %v40\n  store i32 %spec.select.i13, ptr %v38, align 4\n  %v43 = sitofp i32 %spec.select.i13 to double\n  %v44 = fmul nnan double %v43, f0x3E00000000200000\n  %v45 = zext nneg i32 %.sink.i18 to i64\n  %v46 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v45\n  %v47 = load i32, ptr %v46, align 4\n  %v48 = zext nneg i32 %.sink6.i20 to i64\n  %v49 = getelementptr inbounds nuw [4 x i8], ptr %arr, i64 %v48\n  %v50 = load i32, ptr %v49, align 4\n  %v51 = sub i32 %v47, %v50\n  %v52 = add nsw i32 %v51, 2147483647\n  %v53 = icmp slt i32 %v51, 0\n  %spec.select.i = select i1 %v53, i32 %v52, i32 %v51\n  store i32 %spec.select.i, ptr %v49, align 4\n  %.not3.i = icmp eq i32 %.sink.i18, 0\n  %v54 = add nsw i32 %.sink.i18, -1\n  %.sink.i = select i1 %.not3.i, i32 16, i32 %v54\n  store i32 %.sink.i, ptr %pos1, align 4\n  %.not4.i = icmp eq i32 %.sink6.i20, 0\n  %v55 = add nsw i32 %.sink6.i20, -1\n  %.sink6.i = select i1 %.not4.i, i32 16, i32 %v55\n  store i32 %.sink6.i, ptr %pos2, align 8\n  %v56 = sitofp i32 %spec.select.i to double\n  %v57 = fmul nnan double %v56, f0x3E00000000200000\n  %v58 = fmul nnan double %v44, %v44\n  %v59 = fmul nnan double %v57, %v57\n  %v60 = fadd double %v58, %v59\n  %v61 = fcmp ole double %v60, 1.000000e+00\n  %v62 = zext i1 %v61 to i32\n  %local_3_16 = add i32 %v62, %local_3_127421\n  %inc = add nuw nsw i32 %local_4_128420, 1\n  %.not = icmp slt i32 %inc, %n\n  %chunk.cond = icmp samesign ult i64 %chunk.iv, 32\n  %v64 = and i1 %.not, %chunk.cond\n  br i1 %v64, label %inner.header, label %outer.latch\n\ndeopt:                                            ; preds = %inner.header\n  %\"$vphi.0419.lcssa\" = phi i32 [ %\"$vphi.0419\", %inner.header ]\n  %local_4_128420.lcssa = phi i32 [ %local_4_128420, %inner.header ]\n  %local_3_127421.lcssa = phi i32 [ %local_3_127421, %inner.header ]\n  call void @sink_use(i32 %\"$vphi.0419.lcssa\", i32 %local_4_128420.lcssa, i32 %local_3_127421.lcssa)\n  ret double 0.000000e+00\n\nexit:                                             ; preds = %exit.loop, %entry\n  %ret.val = phi double [ 0.000000e+00, %entry ], [ %result, %exit.loop ]\n  %nfp = sitofp i32 %n to double\n  %div = fdiv double %ret.val, %nfp\n  %mul = fmul double %div, 4.000000e+00\n  ret double %mul\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/AArch64/lcssa-phi-inner-loop-scale.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -mtriple=aarch64-none-linux-gnu -mcpu=neoverse-n1 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_correctness",
+          "test_body": "define void @test_correctness(ptr noalias %p, ptr noalias %q, i32 %n) {\nentry:\n  br label %outer.header\n\nouter.header:                                     ; preds = %outer.latch, %entry\n  %j = phi i32 [ 0, %entry ], [ %j.next, %outer.latch ]\n  br label %inner.header\n\ninner.header:                                     ; preds = %inner.body, %outer.header\n  %a = phi i32 [ 10, %outer.header ], [ %a.next, %inner.body ]\n  %b = phi i32 [ 20, %outer.header ], [ %b.next, %inner.body ]\n  %i = phi i32 [ 0, %outer.header ], [ %i.next, %inner.body ]\n  %cond = icmp ult i32 %i, 100\n  br i1 %cond, label %inner.body, label %outer.latch\n\ninner.body:                                       ; preds = %inner.header\n  %a.next = add nsw i32 %a, -1\n  %b.next = add nsw i32 %b, -1\n  %i.next = add nuw nsw i32 %i, 1\n  %i64 = zext i32 %i to i64\n  %i64n = zext i32 %i.next to i64\n  %gep0 = getelementptr inbounds i32, ptr %p, i64 %i64\n  %gep1 = getelementptr inbounds i32, ptr %p, i64 %i64n\n  store i32 %a.next, ptr %gep0, align 4\n  store i32 %b.next, ptr %gep1, align 4\n  br label %inner.header\n\nouter.latch:                                      ; preds = %inner.header\n  %v0.lc = phi i32 [ %a, %inner.header ]\n  %v1.lc = phi i32 [ %b, %inner.header ]\n  %sum = add i32 %v0.lc, %v1.lc\n  store i32 %sum, ptr %q, align 4\n  %j.next = add nuw nsw i32 %j, 1\n  %outer.cond = icmp slt i32 %j.next, %n\n  br i1 %outer.cond, label %outer.header, label %exit\n\nexit:                                             ; preds = %outer.latch\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_ordering_lcssa_first",
+          "test_body": "; Function Attrs: nounwind willreturn memory(none)\ndeclare void @use(i32) #0\n\ndefine void @test_ordering_lcssa_first(ptr noalias %p, ptr noalias %q, i32 %n) {\nentry:\n  br label %outer.header\n\nouter.header:                                     ; preds = %outer.latch, %entry\n  %j = phi i32 [ 0, %entry ], [ %j.next, %outer.latch ]\n  br label %inner.header\n\ninner.header:                                     ; preds = %inner.body, %outer.header\n  %a = phi i32 [ 10, %outer.header ], [ %a.next, %inner.body ]\n  %b = phi i32 [ 20, %outer.header ], [ %b.next, %inner.body ]\n  %i = phi i32 [ 0, %outer.header ], [ %i.next, %inner.body ]\n  %cond = icmp ult i32 %i, 100\n  br i1 %cond, label %inner.body, label %outer.latch\n\ninner.body:                                       ; preds = %inner.header\n  call void @use(i32 %a)\n  call void @use(i32 %b)\n  %a.next = add nsw i32 %a, -1\n  %b.next = add nsw i32 %b, -1\n  %i.next = add nuw nsw i32 %i, 1\n  %i64 = zext i32 %i to i64\n  %i64n = zext i32 %i.next to i64\n  %gep0 = getelementptr inbounds i32, ptr %p, i64 %i64\n  %gep1 = getelementptr inbounds i32, ptr %p, i64 %i64n\n  store i32 %a.next, ptr %gep0, align 4\n  store i32 %b.next, ptr %gep1, align 4\n  br label %inner.header\n\nouter.latch:                                      ; preds = %inner.header\n  %v0.lc = phi i32 [ %a, %inner.header ]\n  %v1.lc = phi i32 [ %b, %inner.header ]\n  %sum = add i32 %v0.lc, %v1.lc\n  store i32 %sum, ptr %q, align 4\n  %j.next = add nuw nsw i32 %j, 1\n  %outer.cond = icmp slt i32 %j.next, %n\n  br i1 %outer.cond, label %outer.header, label %exit\n\nexit:                                             ; preds = %outer.latch\n  ret void\n}\n\nattributes #0 = { nounwind willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [],
+  "comments": [],
+  "knowledge_cutoff": "2026-05-27T11:39:28Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        19551,
+        19556
+      ],
+      [
+        19836,
+        19843
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/AArch64/lcssa-phi-extract-scale.ll": [
+      [
+        9,
+        43
+      ],
+      [
+        47,
+        57
+      ],
+      [
+        60,
+        69
+      ],
+      [
+        78,
+        93
+      ],
+      [
+        218,
+        250
+      ],
+      [
+        252,
+        262
+      ],
+      [
+        266,
+        276
+      ],
+      [
+        279,
+        288
+      ],
+      [
+        297,
+        303
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/AArch64/lcssa-phi-inner-loop-scale.ll": [
+      [
+        12,
+        32
+      ],
+      [
+        87,
+        111
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "BoUpSLP::getTreeCost"
+    ]
+  }
+}

@@ -1,0 +1,206 @@
+{
+  "pr_id": 200040,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/200040",
+  "state": "open",
+  "title": "Replace mask{Is,Contains}All{Zero,One}OrUndef with pattern matching on poison",
+  "author": "xarkenz",
+  "base_commit": "c315c662cd2d33e0c7f962fed742ee53626d8005",
+  "fix_commit": "f9224bd56f6d18a9c7fec872eab6b36b38fbd2f4",
+  "patch": "diff --git a/llvm/include/llvm/Analysis/VectorUtils.h b/llvm/include/llvm/Analysis/VectorUtils.h\nindex 3fd4de926683c..d640f21304d5b 100644\n--- a/llvm/include/llvm/Analysis/VectorUtils.h\n+++ b/llvm/include/llvm/Analysis/VectorUtils.h\n@@ -477,21 +477,6 @@ LLVM_ABI llvm::SmallVector<int, 16> createUnaryMask(ArrayRef<int> Mask,\n LLVM_ABI Value *concatenateVectors(IRBuilderBase &Builder,\n                                    ArrayRef<Value *> Vecs);\n \n-/// Given a mask vector of i1, Return true if all of the elements of this\n-/// predicate mask are known to be false or undef.  That is, return true if all\n-/// lanes can be assumed inactive.\n-LLVM_ABI bool maskIsAllZeroOrUndef(Value *Mask);\n-\n-/// Given a mask vector of i1, Return true if all of the elements of this\n-/// predicate mask are known to be true or undef.  That is, return true if all\n-/// lanes can be assumed active.\n-LLVM_ABI bool maskIsAllOneOrUndef(Value *Mask);\n-\n-/// Given a mask vector of i1, Return true if any of the elements of this\n-/// predicate mask are known to be true or undef.  That is, return true if at\n-/// least one lane can be assumed active.\n-LLVM_ABI bool maskContainsAllOneOrUndef(Value *Mask);\n-\n /// Given a mask vector of the form <Y x i1>, return an APInt (of bitwidth Y)\n /// for each lane which may be active.\n LLVM_ABI APInt possiblyDemandedEltsInMask(Value *Mask);\ndiff --git a/llvm/lib/Analysis/InstructionSimplify.cpp b/llvm/lib/Analysis/InstructionSimplify.cpp\nindex dbbb5f2eee6a1..406997157c5a7 100644\n--- a/llvm/lib/Analysis/InstructionSimplify.cpp\n+++ b/llvm/lib/Analysis/InstructionSimplify.cpp\n@@ -7266,8 +7266,9 @@ static Value *simplifyIntrinsic(CallBase *Call, Value *Callee,\n   case Intrinsic::masked_gather: {\n     Value *MaskArg = Args[1];\n     Value *PassthruArg = Args[2];\n-    // If the mask is all zeros or undef, the \"passthru\" argument is the result.\n-    if (maskIsAllZeroOrUndef(MaskArg))\n+    // If the mask is all zeros or poisons, the \"passthru\" argument is the\n+    // result.\n+    if (match(MaskArg, m_Zero()) || match(MaskArg, m_Poison()))\n       return PassthruArg;\n     return nullptr;\n   }\ndiff --git a/llvm/lib/Analysis/VectorUtils.cpp b/llvm/lib/Analysis/VectorUtils.cpp\nindex 402bef65c2f13..e6e49f0b7bfb2 100644\n--- a/llvm/lib/Analysis/VectorUtils.cpp\n+++ b/llvm/lib/Analysis/VectorUtils.cpp\n@@ -1256,83 +1256,6 @@ Value *llvm::concatenateVectors(IRBuilderBase &Builder,\n   return ResList[0];\n }\n \n-bool llvm::maskIsAllZeroOrUndef(Value *Mask) {\n-  assert(isa<VectorType>(Mask->getType()) &&\n-         isa<IntegerType>(Mask->getType()->getScalarType()) &&\n-         cast<IntegerType>(Mask->getType()->getScalarType())->getBitWidth() ==\n-             1 &&\n-         \"Mask must be a vector of i1\");\n-\n-  auto *ConstMask = dyn_cast<Constant>(Mask);\n-  if (!ConstMask)\n-    return false;\n-  if (ConstMask->isNullValue() || isa<UndefValue>(ConstMask))\n-    return true;\n-  if (isa<ScalableVectorType>(ConstMask->getType()))\n-    return false;\n-  for (unsigned\n-           I = 0,\n-           E = cast<FixedVectorType>(ConstMask->getType())->getNumElements();\n-       I != E; ++I) {\n-    if (auto *MaskElt = ConstMask->getAggregateElement(I))\n-      if (MaskElt->isNullValue() || isa<UndefValue>(MaskElt))\n-        continue;\n-    return false;\n-  }\n-  return true;\n-}\n-\n-bool llvm::maskIsAllOneOrUndef(Value *Mask) {\n-  assert(isa<VectorType>(Mask->getType()) &&\n-         isa<IntegerType>(Mask->getType()->getScalarType()) &&\n-         cast<IntegerType>(Mask->getType()->getScalarType())->getBitWidth() ==\n-             1 &&\n-         \"Mask must be a vector of i1\");\n-\n-  auto *ConstMask = dyn_cast<Constant>(Mask);\n-  if (!ConstMask)\n-    return false;\n-  if (ConstMask->isAllOnesValue() || isa<UndefValue>(ConstMask))\n-    return true;\n-  if (isa<ScalableVectorType>(ConstMask->getType()))\n-    return false;\n-  for (unsigned\n-           I = 0,\n-           E = cast<FixedVectorType>(ConstMask->getType())->getNumElements();\n-       I != E; ++I) {\n-    if (auto *MaskElt = ConstMask->getAggregateElement(I))\n-      if (MaskElt->isAllOnesValue() || isa<UndefValue>(MaskElt))\n-        continue;\n-    return false;\n-  }\n-  return true;\n-}\n-\n-bool llvm::maskContainsAllOneOrUndef(Value *Mask) {\n-  assert(isa<VectorType>(Mask->getType()) &&\n-         isa<IntegerType>(Mask->getType()->getScalarType()) &&\n-         cast<IntegerType>(Mask->getType()->getScalarType())->getBitWidth() ==\n-             1 &&\n-         \"Mask must be a vector of i1\");\n-\n-  auto *ConstMask = dyn_cast<Constant>(Mask);\n-  if (!ConstMask)\n-    return false;\n-  if (ConstMask->isAllOnesValue() || isa<UndefValue>(ConstMask))\n-    return true;\n-  if (isa<ScalableVectorType>(ConstMask->getType()))\n-    return false;\n-  for (unsigned\n-           I = 0,\n-           E = cast<FixedVectorType>(ConstMask->getType())->getNumElements();\n-       I != E; ++I) {\n-    if (auto *MaskElt = ConstMask->getAggregateElement(I))\n-      if (MaskElt->isAllOnesValue() || isa<UndefValue>(MaskElt))\n-        return true;\n-  }\n-  return false;\n-}\n-\n /// TODO: This is a lot like known bits, but for\n /// vectors.  Is there something we can common this with?\n APInt llvm::possiblyDemandedEltsInMask(Value *Mask) {\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 8d1984d4e1463..0167fc653d4e0 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -292,10 +292,11 @@ Instruction *InstCombinerImpl::SimplifyAnyMemSet(AnyMemSetInst *MI) {\n Value *InstCombinerImpl::simplifyMaskedLoad(IntrinsicInst &II) {\n   Value *LoadPtr = II.getArgOperand(0);\n   const Align Alignment = II.getParamAlign(0).valueOrOne();\n+  Value *Mask = II.getArgOperand(1);\n \n-  // If the mask is all ones or undefs, this is a plain vector load of the 1st\n+  // If the mask is all ones or poisons, this is a plain vector load of the 1st\n   // argument.\n-  if (maskIsAllOneOrUndef(II.getArgOperand(1))) {\n+  if (match(Mask, m_AllOnes()) || match(Mask, m_Poison())) {\n     LoadInst *L = Builder.CreateAlignedLoad(II.getType(), LoadPtr, Alignment,\n                                             \"unmaskedload\");\n     L->copyMetadata(II);\n@@ -325,12 +326,13 @@ Instruction *InstCombinerImpl::simplifyMaskedStore(IntrinsicInst &II) {\n   if (!ConstMask)\n     return nullptr;\n \n-  // If the mask is all zeros, this instruction does nothing.\n-  if (maskIsAllZeroOrUndef(ConstMask))\n+  // If the mask is all zeros or poisons, this instruction does nothing.\n+  if (match(ConstMask, m_Zero()) || match(ConstMask, m_Poison()))\n     return eraseInstFromFunction(II);\n \n-  // If the mask is all ones, this is a plain vector store of the 1st argument.\n-  if (maskIsAllOneOrUndef(ConstMask)) {\n+  // If the mask is all ones or poisons, this is a plain vector store of the 1st\n+  // argument.\n+  if (match(ConstMask, m_AllOnes())) {\n     StoreInst *S =\n         new StoreInst(II.getArgOperand(0), StorePtr, false, Alignment);\n     S->copyMetadata(II);\n@@ -388,21 +390,19 @@ Instruction *InstCombinerImpl::simplifyMaskedScatter(IntrinsicInst &II) {\n   if (!ConstMask)\n     return nullptr;\n \n-  // If the mask is all zeros, a scatter does nothing.\n-  if (maskIsAllZeroOrUndef(ConstMask))\n+  // If the mask is all zeros or poisons, a scatter does nothing.\n+  if (match(ConstMask, m_Zero()) || match(ConstMask, m_Poison()))\n     return eraseInstFromFunction(II);\n \n   // Vector splat address -> scalar store\n   if (auto *SplatPtr = getSplatValue(II.getArgOperand(1))) {\n     // scatter(splat(value), splat(ptr), non-zero-mask) -> store value, ptr\n     if (auto *SplatValue = getSplatValue(II.getArgOperand(0))) {\n-      if (maskContainsAllOneOrUndef(ConstMask)) {\n-        Align Alignment = II.getParamAlign(1).valueOrOne();\n-        StoreInst *S = new StoreInst(SplatValue, SplatPtr, /*IsVolatile=*/false,\n-                                     Alignment);\n-        S->copyMetadata(II);\n-        return S;\n-      }\n+      Align Alignment = II.getParamAlign(1).valueOrOne();\n+      StoreInst *S =\n+          new StoreInst(SplatValue, SplatPtr, /*IsVolatile=*/false, Alignment);\n+      S->copyMetadata(II);\n+      return S;\n     }\n     // scatter(vector, splat(ptr), splat(true)) -> store extract(vector,\n     // lastlane), ptr\n",
+  "components": [
+    "InstCombine",
+    "InstructionSimplify",
+    "VectorUtils"
+  ],
+  "description": "As part of the ongoing effort to deprecate UndefValue, and also to take better advantage of pattern matching, eliminate the VectorUtils functions `maskIsAllZeroOrUndef`, `maskIsAllOneOrUndef`, and `maskContainsAllOneOrUndef`; and replace their uses with equivalent pattern matching, but matching poison instead of undef.\r\n\r\nThis affects InstCombine/InstSimplify with a mask containing `undef` for the intrinsics `llvm.masked.load`, `llvm.masked.store`, `llvm.masked.gather`, and `llvm.masked.scatter`.\r\n\r\nThe lone use of `maskContainsAllOneOrUndef` (in `InstCombinerImpl::simplifyMaskedScatter`) was simply removed. There is a prior match for the mask being all zero or poison, the negation of which I think would be sufficient to imply that at least one lane of the mask is active.\r\n\r\nSome relevant tests were altered to use poison instead of undef. I may need some guidance on whether the updated test checks in Transforms/InstCombine/pr83947.ll are correct, since they deviate from previous behavior.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/masked_intrinsics-inseltpoison.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "load_onemask",
+          "test_body": "define <2 x double> @load_onemask(ptr %ptr, <2 x double> %passthru) {\n  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr align 2 %ptr, <2 x i1> splat (i1 true), <2 x double> %passthru)\n  ret <2 x double> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <2 x double> @llvm.masked.load.v2f64.p0(ptr captures(none), <2 x i1>, <2 x double>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        },
+        {
+          "test_name": "load_cemask",
+          "test_body": "@G = external global i8\n\ndefine <2 x double> @load_cemask(ptr %ptr, <2 x double> %passthru) {\n  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr align 2 %ptr, <2 x i1> <i1 true, i1 ptrtoint (ptr @G to i1)>, <2 x double> %passthru)\n  ret <2 x double> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <2 x double> @llvm.masked.load.v2f64.p0(ptr captures(none), <2 x i1>, <2 x double>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/masked_intrinsics.ll",
+      "commands": [
+        "opt -passes=instcombine -S < %s",
+        "opt -passes=instcombine -use-constant-int-for-fixed-length-splat -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "load_one_withpoison_mask",
+          "test_body": "define <2 x double> @load_one_withpoison_mask(ptr %ptr, <2 x double> %passthru) {\n  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr align 2 %ptr, <2 x i1> <i1 true, i1 poison>, <2 x double> %passthru)\n  ret <2 x double> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <2 x double> @llvm.masked.load.v2f64.p0(ptr captures(none), <2 x i1>, <2 x double>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        },
+        {
+          "test_name": "load_zeromask",
+          "test_body": "define <2 x double> @load_zeromask(ptr %ptr, <2 x double> %passthru) {\n  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr align 1 %ptr, <2 x i1> zeroinitializer, <2 x double> %passthru)\n  ret <2 x double> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <2 x double> @llvm.masked.load.v2f64.p0(ptr captures(none), <2 x i1>, <2 x double>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        },
+        {
+          "test_name": "load_onemask",
+          "test_body": "define <2 x double> @load_onemask(ptr %ptr, <2 x double> %passthru) {\n  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr align 2 %ptr, <2 x i1> splat (i1 true), <2 x double> %passthru)\n  ret <2 x double> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <2 x double> @llvm.masked.load.v2f64.p0(ptr captures(none), <2 x i1>, <2 x double>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        },
+        {
+          "test_name": "load_poisonmask",
+          "test_body": "define <2 x double> @load_poisonmask(ptr %ptr, <2 x double> %passthru) {\n  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr align 1 %ptr, <2 x i1> poison, <2 x double> %passthru)\n  ret <2 x double> %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <2 x double> @llvm.masked.load.v2f64.p0(ptr captures(none), <2 x i1>, <2 x double>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/pr83947.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "masked_scatter1",
+          "test_body": "@c = external global i32, align 4\n@b = external global i32, align 4\n\ndefine void @masked_scatter1() {\n  call void @llvm.masked.scatter.nxv4i32.nxv4p0(<vscale x 4 x i32> zeroinitializer, <vscale x 4 x ptr> align 4 shufflevector (<vscale x 4 x ptr> insertelement (<vscale x 4 x ptr> poison, ptr @c, i64 0), <vscale x 4 x ptr> poison, <vscale x 4 x i32> zeroinitializer), <vscale x 4 x i1> shufflevector (<vscale x 4 x i1> insertelement (<vscale x 4 x i1> poison, i1 ptrtoint (ptr @b to i1), i64 0), <vscale x 4 x i1> poison, <vscale x 4 x i32> zeroinitializer))\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(write)\ndeclare void @llvm.masked.scatter.nxv4i32.nxv4p0(<vscale x 4 x i32>, <vscale x 4 x ptr>, <vscale x 4 x i1>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(write) }\n"
+        },
+        {
+          "test_name": "masked_scatter6",
+          "test_body": "@c = external global i32, align 4\n\ndefine void @masked_scatter6() {\n  call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> align 4 <ptr @c, ptr @c>, <2 x i1> <i1 poison, i1 false>)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(write)\ndeclare void @llvm.masked.scatter.v2i32.v2p0(<2 x i32>, <2 x ptr>, <2 x i1>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(write) }\n"
+        },
+        {
+          "test_name": "masked_scatter3",
+          "test_body": "@c = external global i32, align 4\n\ndefine void @masked_scatter3() {\n  call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> align 4 <ptr @c, ptr @c>, <2 x i1> poison)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(write)\ndeclare void @llvm.masked.scatter.v2i32.v2p0(<2 x i32>, <2 x ptr>, <2 x i1>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(write) }\n"
+        },
+        {
+          "test_name": "masked_scatter7",
+          "test_body": "@c = external global i32, align 4\n@b = external global i32, align 4\n\ndefine void @masked_scatter7() {\n  call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> align 4 <ptr @c, ptr @c>, <2 x i1> <i1 ptrtoint (ptr @b to i1), i1 ptrtoint (ptr @b to i1)>)\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(write)\ndeclare void @llvm.masked.scatter.v2i32.v2p0(<2 x i32>, <2 x ptr>, <2 x i1>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstSimplify/call.ll",
+      "commands": [
+        "opt < %s -passes=instsimplify -S"
+      ],
+      "tests": [
+        {
+          "test_name": "masked_load_poison_mask",
+          "test_body": "define <8 x i32> @masked_load_poison_mask(ptr %V) {\n  %masked.load = call <8 x i32> @llvm.masked.load.v8i32.p0(ptr align 4 %V, <8 x i1> poison, <8 x i32> <i32 1, i32 0, i32 1, i32 0, i32 1, i32 0, i32 1, i32 0>)\n  ret <8 x i32> %masked.load\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <8 x i32> @llvm.masked.load.v8i32.p0(ptr captures(none), <8 x i1>, <8 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        },
+        {
+          "test_name": "partial_masked_load",
+          "test_body": "@GV = external hidden constant [8 x i32]\n\ndefine <8 x i32> @partial_masked_load() {\n  %masked.load = call <8 x i32> @llvm.masked.load.v8i32.p0(ptr align 4 getelementptr ([8 x i32], ptr @GV, i64 0, i64 -2), <8 x i1> <i1 false, i1 false, i1 true, i1 true, i1 true, i1 true, i1 true, i1 true>, <8 x i32> undef)\n  ret <8 x i32> %masked.load\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)\ndeclare <8 x i32> @llvm.masked.load.v8i32.p0(ptr captures(none), <8 x i1>, <8 x i32>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM NEW CONTRIBUTOR COMMENT-->\n\nHello @xarkenz :wave:\n\nThank you for submitting a Pull Request (PR) to the LLVM Project. Since this is your first PR, here are a few useful links covering our main contribution policies and review practices.\n\n* All contributions to LLVM must follow our [LLVM AI Tool Use Policy](https://llvm.org/docs/AIToolPolicy.html). In particular, if you used AI while working on this PR, remember to add a note to the PR description.\n* The [LLVM Code-Review Policy and Practices](https://llvm.org/docs/CodeReview.html) document contains practical information about the PR process, including how patches are reviewed and accepted, and who can review a PR.\n* Our [LLVM Developer Policy](https://llvm.org/docs/DeveloperPolicy.html) describes our expectations for code quality, commit summaries and contains notes on our CI system.\n\nPlease reply to this message to confirm that you have read these policies, especially the LLVM AI Tool Use Policy, and that any AI tool usage has been noted in the PR description.\n\n---\n\n### Frequently asked questions\n\n**How do I add reviewers?**\n\nThis PR will be automatically labeled, and the relevant teams will be notified. For some parts of the project, reviewers may also be added automatically.\n\nYou can also add reviewers manually using the **Reviewers** section on this page. If you cannot use that section, it is probably because you do not have write permissions for the repository. In that case, you can request a review by tagging reviewers in a comment using `@` followed by their GitHub username.\n\n**What if there are no comments?**\n\nIf you have not received any comments on your PR after a week, you can request a review by pinging the PR with a comment such as \u201cPing\u201d. The common courtesy ping rate is once a week. Please remember that you are asking for volunteer time from other developers.\n\n**Are any special GitHub settings required to contribute to LLVM?**\n\nWe only require contributors to have a public email address associated with their GitHub commits, see this [section](https://llvm.org/docs/DeveloperPolicy.html#email-addresses) of LLVM Developer Policy for details.\n\n---\n\nIf you have questions, feel free to leave a comment on this PR, or ask on [LLVM Discord](https://discord.com/invite/xS7Z362) or [LLVM Discourse](https://discourse.llvm.org/).\n\nThank you,\nThe LLVM Community"
+    },
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n@llvm/pr-subscribers-llvm-transforms\n\n@llvm/pr-subscribers-llvm-analysis\n\nAuthor: Sean Clarke (xarkenz)\n\n<details>\n<summary>Changes</summary>\n\nAs part of the ongoing effort to deprecate UndefValue, and also to take better advantage of pattern matching, eliminate the VectorUtils functions `maskIsAllZeroOrUndef`, `maskIsAllOneOrUndef`, and `maskContainsAllOneOrUndef`; and replace their uses with equivalent pattern matching, but matching poison instead of undef.\r\n\r\nThis affects InstCombine/InstSimplify with a mask containing `undef` for the intrinsics `llvm.masked.load`, `llvm.masked.store`, `llvm.masked.gather`, and `llvm.masked.scatter`.\r\n\r\nThe lone use of `maskContainsAllOneOrUndef` (in `InstCombinerImpl::simplifyMaskedScatter`) was simply removed. There is a prior match for the mask being all zero or poison, the negation of which I think would be sufficient to imply that at least one lane of the mask is active.\r\n\r\nSome relevant tests were altered to use poison instead of undef. I may need some guidance on whether the updated test checks in Transforms/InstCombine/pr83947.ll are correct, since they deviate from previous behavior.\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/200040.diff\n\n\n8 Files Affected:\n\n- (modified) llvm/include/llvm/Analysis/VectorUtils.h (-15) \n- (modified) llvm/lib/Analysis/InstructionSimplify.cpp (+3-2) \n- (modified) llvm/lib/Analysis/VectorUtils.cpp (-77) \n- (modified) llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp (+15-15) \n- (modified) llvm/test/Transforms/InstCombine/masked_intrinsics-inseltpoison.ll (-9) \n- (modified) llvm/test/Transforms/InstCombine/masked_intrinsics.ll (+6-6) \n- (modified) llvm/test/Transforms/InstCombine/pr83947.ll (+4-4) \n- (modified) llvm/test/Transforms/InstSimplify/call.ll (+3-3) \n\n\n``````````diff\ndiff --git a/llvm/include/llvm/Analysis/VectorUtils.h b/llvm/include/llvm/Analysis/VectorUtils.h\nindex 3fd4de926683c..d640f21304d5b 100644\n--- a/llvm/include/llvm/Analysis/VectorUtils.h\n+++ b/llvm/include/llvm/Analysis/VectorUtils.h\n@@ -477,21 +477,6 @@ LLVM_ABI llvm::SmallVector<int, 16> createUnaryMask(ArrayRef<int> Mask,\n LLVM_ABI Value *concatenateVectors(IRBuilderBase &Builder,\n                                    ArrayRef<Value *> Vecs);\n \n-/// Given a mask vector of i1, Return true if all of the elements of this\n-/// predicate mask are known to be false or undef.  That is, return true if all\n-/// lanes can be assumed inactive.\n-LLVM_ABI bool maskIsAllZeroOrUndef(Value *Mask);\n-\n-/// Given a mask vector of i1, Return true if all of the elements of this\n-/// predicate mask are known to be true or undef.  That is, return true if all\n-/// lanes can be assumed active.\n-LLVM_ABI bool maskIsAllOneOrUndef(Value *Mask);\n-\n-/// Given a mask vector of i1, Return true if any of the elements of this\n-/// predicate mask are known to be true or undef.  That is, return true if at\n-/// least one lane can be assumed active.\n-LLVM_ABI bool maskContainsAllOneOrUndef(Value *Mask);\n-\n /// Given a mask vector of the form <Y x i1>, return an APInt (of bitwidth Y)\n /// for each lane which may be active.\n LLVM_ABI APInt possiblyDemandedEltsInMask(Value *Mask);\ndiff --git a/llvm/lib/Analysis/InstructionSimplify.cpp b/llvm/lib/Analysis/InstructionSimplify.cpp\nindex dbbb5f2eee6a1..406997157c5a7 100644\n--- a/llvm/lib/Analysis/InstructionSimplify.cpp\n+++ b/llvm/lib/Analysis/InstructionSimplify.cpp\n@@ -7266,8 +7266,9 @@ static Value *simplifyIntrinsic(CallBase *Call, Value *Callee,\n   case Intrinsic::masked_gather: {\n     Value *MaskArg = Args[1];\n     Value *PassthruArg = Args[2];\n-    // If the mask is all zeros or undef, the \"passthru\" argument is the result.\n-    if (maskIsAllZeroOrUndef(MaskArg))\n+    // If the mask is all zeros or poisons, the \"passthru\" argument is the\n+    // result.\n+    if (match(MaskArg, m_Zero()) || match(MaskArg, m_Poison()))\n       return PassthruArg;\n     return nullptr;\n   }\ndiff --git a/llvm/lib/Analysis/VectorUtils.cpp b/llvm/lib/Analysis/VectorUtils.cpp\nindex 402bef65c2f13..e6e49f0b7bfb2 100644\n--- a/llvm/lib/Analysis/VectorUtils.cpp\n+++ b/llvm/lib/Analysis/VectorUtils.cpp\n@@ -1256,83 +1256,6 @@ Value *llvm::concatenateVectors(IRBuilderBase &Builder,\n   return ResList[0];\n }\n \n-bool llvm::maskIsAllZeroOrUndef(Value *Mask) {\n-  assert(isa<VectorType>(Mask->getType()) &&\n-         isa<IntegerType>(Mask->getType()->getScalarType()) &&\n-         cast<IntegerType>(Mask->getType()->getScalarType())->getBitWidth() ==\n-             1 &&\n-         \"Mask must be a vector of i1\");\n-\n-  auto *ConstMask = dyn_cast<Constant>(Mask);\n-  if (!ConstMask)\n-    return false;\n-  if (ConstMask->isNullValue() || isa<UndefValue>(ConstMask))\n-    return true;\n-  if (isa<ScalableVectorType>(ConstMask->getType()))\n-    return false;\n-  for (unsigned\n-           I = 0,\n-           E = cast<FixedVectorType>(ConstMask->getType())->getNumElements();\n-       I != E; ++I) {\n-    if (auto *MaskElt = ConstMask->getAggregateElement(I))\n-      if (MaskElt->isNullValue() || isa<UndefValue>(MaskElt))\n-        continue;\n-    return false;\n-  }\n-  return true;\n-}\n-\n-bool llvm::maskIsAllOneOrUndef(Value *Mask) {\n-  assert(isa<VectorType>(Mask->getType()) &&\n-         isa<IntegerType>(Mask->getType()->getScalarType()) &&\n-         cast<IntegerType>(Mask->getType()->getScalarType())->getBitWidth() ==\n-             1 &&\n-         \"Mask must be a vector of i1\");\n-\n-  auto *ConstMask = dyn_cast<Constant>(Mask);\n-  if (!ConstMask)\n-    return false;\n-  if (ConstMask->isAllOnesValue() || isa<UndefValue>(ConstMask))\n-    return true;\n-  if (isa<ScalableVectorType>(ConstMask->getType()))\n-    return false;\n-  for (unsigned\n-           I = 0,\n-           E = cast<FixedVectorType>(ConstMask->getType())->getNumElements();\n-       I != E; ++I) {\n-    if (auto *MaskElt = ConstMask->getAggregateElement(I))\n-      if (MaskElt->isAllOnesValue() || isa<UndefValue>(MaskElt))\n-        continue;\n-    return false;\n-  }\n-  return true;\n-}\n-\n-bool llvm::maskContainsAllOneOrUndef(Value *Mask) {\n-  assert(isa<VectorType>(Mask->getType()) &&\n-         isa<IntegerType>(Mask->getType()->getScalarType()) &&\n-         cast<IntegerType>(Mask->getType()->getScalarType())->getBitWidth() ==\n-             1 &&\n-         \"Mask must be a vector of i1\");\n-\n-  auto *ConstMask = dyn_cast<Constant>(Mask);\n-  if (!ConstMask)\n-    return false;\n-  if (ConstMask->isAllOnesValue() || isa<UndefValue>(ConstMask))\n-    return true;\n-  if (isa<ScalableVectorType>(ConstMask->getType()))\n-    return false;\n-  for (unsigned\n-           I = 0,\n-           E = cast<FixedVectorType>(ConstMask->getType())->getNumElements();\n-       I != E; ++I) {\n-    if (auto *MaskElt = ConstMask->getAggregateElement(I))\n-      if (MaskElt->isAllOnesValue() || isa<UndefValue>(MaskElt))\n-        return true;\n-  }\n-  return false;\n-}\n-\n /// TODO: This is a lot like known bits, but for\n /// vectors.  Is there something we can common this with?\n APInt llvm::possiblyDemandedEltsInMask(Value *Mask) {\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 8d1984d4e1463..0167fc653d4e0 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -292,10 +292,11 @@ Instruction *InstCombinerImpl::SimplifyAnyMemSet(AnyMemSetInst *MI) {\n Value *InstCombinerImpl::simplifyMaskedLoad(IntrinsicInst &II) {\n   Value *LoadPtr = II.getArgOperand(0);\n   const Align Alignment = II.getParamAlign(0).valueOrOne();\n+  Value *Mask = II.getArgOperand(1);\n \n-  // If the mask is all ones or undefs, this is a plain vector load of the 1st\n+  // If the mask is all ones or poisons, this is a plain vector load of the 1st\n   // argument.\n-  if (maskIsAllOneOrUndef(II.getArgOperand(1))) {\n+  if (match(Mask, m_AllOnes()) || match(Mask, m_Poison())) {\n     LoadInst *L = Builder.CreateAlignedLoad(II.getType(), LoadPtr, Alignment,\n                                             \"unmaskedload\");\n     L->copyMetadata(II);\n@@ -325,12 +326,13 @@ Instruction *InstCombinerImpl::simplifyMaskedStore(IntrinsicInst &II) {\n   if (!ConstMask)\n     return nullptr;\n \n-  // If the mask is all zeros, this instruction does nothing.\n-  if (maskIsAllZeroOrUndef(ConstMask))\n+  // If the mask is all zeros or poisons, this instruction does nothing.\n+  if (match(ConstMask, m_Zero()) || match(ConstMask, m_Poison()))\n     return eraseInstFromFunction(II);\n \n-  // If the mask is all ones, this is a plain vector store of the 1st argument.\n-  if (maskIsAllOneOrUndef(ConstMask)) {\n+  // If the mask is all ones or poisons, this is a plain vector store of the 1st\n+  // argument.\n+  if (match(ConstMask, m_AllOnes())) {\n     StoreInst *S =\n         new StoreInst(II.getArgOperand(0), StorePtr, false, Alignment);\n     S->copyMetadata(II);\n@@ -388,21 +390,19 @@ Instruction *InstCombinerImpl::simplifyMaskedScatter(IntrinsicInst &II) {\n   if (!ConstMask)\n     return nullptr;\n \n-  // If the mask is all zeros, a scatter does nothing.\n-  if (maskIsAllZeroOrUndef(ConstMask))\n+  // If the mask is all zeros or poisons, a scatter does nothing.\n+  if (match(ConstMask, m_Zero()) || match(ConstMask, m_Poison()))\n     return eraseInstFromFunction(II);\n \n   // Vector splat address -> scalar store\n   if (auto *SplatPtr = getSplatValue(II.getArgOperand(1))) {\n     // scatter(splat(value), splat(ptr), non-zero-mask) -> store value, ptr\n     if (auto *SplatValue = getSplatValue(II.getArgOperand(0))) {\n-      if (maskContainsAllOneOrUndef(ConstMask)) {\n-        Align Alignment = II.getParamAlign(1).valueOrOne();\n-        StoreInst *S = new StoreInst(SplatValue, SplatPtr, /*IsVolatile=*/false,\n-                                     Alignment);\n-        S->copyMetadata(II);\n-        return S;\n-      }\n+      Align Alignment = II.getParamAlign(1).valueOrOne();\n+      StoreInst *S =\n+          new StoreInst(SplatValue, SplatPtr, /*IsVolatile=*/false, Alignment);\n+      S->copyMetadata(II);\n+      return S;\n     }\n     // scatter(vector, splat(ptr), splat(true)) -> store extract(vector,\n     // lastlane), ptr\ndiff --git a/llvm/test/Transforms/InstCombine/masked_intrinsics-inseltpoison.ll b/llvm/test/Transforms/InstCombine/masked_intrinsics-inseltpoison.ll\nindex 10a80cc89dbb9..03ed3740ca3da 100644\n--- a/llvm/test/Transforms/InstCombine/masked_intrinsics-inseltpoison.ll\n+++ b/llvm/test/Transforms/InstCombine/masked_intrinsics-inseltpoison.ll\n@@ -24,15 +24,6 @@ define <2 x double> @load_onemask(ptr %ptr, <2 x double> %passthru)  {\n   ret <2 x double> %res\n }\n \n-define <2 x double> @load_undefmask(ptr %ptr, <2 x double> %passthru)  {\n-; CHECK-LABEL: @load_undefmask(\n-; CHECK-NEXT:    [[UNMASKEDLOAD:%.*]] = load <2 x double>, ptr [[PTR:%.*]], align 2\n-; CHECK-NEXT:    ret <2 x double> [[UNMASKEDLOAD]]\n-;\n-  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr %ptr, i32 2, <2 x i1> <i1 1, i1 undef>, <2 x double> %passthru)\n-  ret <2 x double> %res\n-}\n-\n @G = external global i8\n \n define <2 x double> @load_cemask(ptr %ptr, <2 x double> %passthru)  {\ndiff --git a/llvm/test/Transforms/InstCombine/masked_intrinsics.ll b/llvm/test/Transforms/InstCombine/masked_intrinsics.ll\nindex 625c979cf794d..22ef1f6cdbf3f 100644\n--- a/llvm/test/Transforms/InstCombine/masked_intrinsics.ll\n+++ b/llvm/test/Transforms/InstCombine/masked_intrinsics.ll\n@@ -16,11 +16,11 @@ define <2 x double> @load_zeromask(ptr %ptr, <2 x double> %passthru)  {\n   ret <2 x double> %res\n }\n \n-define <2 x double> @load_zero_withpoison_mask(ptr %ptr, <2 x double> %passthru)  {\n-; CHECK-LABEL: @load_zero_withpoison_mask(\n+define <2 x double> @load_poisonmask(ptr %ptr, <2 x double> %passthru)  {\n+; CHECK-LABEL: @load_poisonmask(\n ; CHECK-NEXT:    ret <2 x double> [[PASSTHRU:%.*]]\n ;\n-  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr %ptr, i32 1, <2 x i1> <i1 0, i1 poison>, <2 x double> %passthru)\n+  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr %ptr, i32 1, <2 x i1> splat(i1 poison), <2 x double> %passthru)\n   ret <2 x double> %res\n }\n \n@@ -33,12 +33,12 @@ define <2 x double> @load_onemask(ptr %ptr, <2 x double> %passthru)  {\n   ret <2 x double> %res\n }\n \n-define <2 x double> @load_undefmask(ptr %ptr, <2 x double> %passthru)  {\n-; CHECK-LABEL: @load_undefmask(\n+define <2 x double> @load_one_withpoison_mask(ptr %ptr, <2 x double> %passthru)  {\n+; CHECK-LABEL: @load_one_withpoison_mask(\n ; CHECK-NEXT:    [[UNMASKEDLOAD:%.*]] = load <2 x double>, ptr [[PTR:%.*]], align 2\n ; CHECK-NEXT:    ret <2 x double> [[UNMASKEDLOAD]]\n ;\n-  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr %ptr, i32 2, <2 x i1> <i1 1, i1 undef>, <2 x double> %passthru)\n+  %res = call <2 x double> @llvm.masked.load.v2f64.p0(ptr %ptr, i32 2, <2 x i1> <i1 1, i1 poison>, <2 x double> %passthru)\n   ret <2 x double> %res\n }\n \ndiff --git a/llvm/test/Transforms/InstCombine/pr83947.ll b/llvm/test/Transforms/InstCombine/pr83947.ll\nindex 18468d10ba6fe..36893b733ce5e 100644\n--- a/llvm/test/Transforms/InstCombine/pr83947.ll\n+++ b/llvm/test/Transforms/InstCombine/pr83947.ll\n@@ -6,7 +6,7 @@\n \n define void @masked_scatter1() {\n ; CHECK-LABEL: define void @masked_scatter1() {\n-; CHECK-NEXT:    call void @llvm.masked.scatter.nxv4i32.nxv4p0(<vscale x 4 x i32> zeroinitializer, <vscale x 4 x ptr> align 4 shufflevector (<vscale x 4 x ptr> insertelement (<vscale x 4 x ptr> poison, ptr @c, i64 0), <vscale x 4 x ptr> poison, <vscale x 4 x i32> zeroinitializer), <vscale x 4 x i1> shufflevector (<vscale x 4 x i1> insertelement (<vscale x 4 x i1> poison, i1 ptrtoint (ptr @b to i1), i64 0), <vscale x 4 x i1> poison, <vscale x 4 x i32> zeroinitializer))\n+; CHECK-NEXT:    store i32 0, ptr @c, align 4\n ; CHECK-NEXT:    ret void\n ;\n   call void @llvm.masked.scatter.nxv4i32.nxv4p0(<vscale x 4 x i32> zeroinitializer, <vscale x 4 x ptr> splat (ptr @c), i32 4, <vscale x 4 x i1> splat (i1 ptrtoint (ptr @b to i1)))\n@@ -26,7 +26,7 @@ define void @masked_scatter3() {\n ; CHECK-LABEL: define void @masked_scatter3() {\n ; CHECK-NEXT:    ret void\n ;\n-  call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> splat (ptr @c), i32 4, <2 x i1> undef)\n+  call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> splat (ptr @c), i32 4, <2 x i1> poison)\n   ret void\n }\n \n@@ -51,13 +51,13 @@ define void @masked_scatter6() {\n ; CHECK-LABEL: define void @masked_scatter6() {\n ; CHECK-NEXT:    ret void\n ;\n-  call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> splat (ptr @c), i32 4, <2 x i1> <i1 undef, i1 false>)\n+  call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> splat (ptr @c), i32 4, <2 x i1> <i1 poison, i1 false>)\n   ret void\n }\n \n define void @masked_scatter7() {\n ; CHECK-LABEL: define void @masked_scatter7() {\n-; CHECK-NEXT:    call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> align 4 <ptr @c, ptr @c>, <2 x i1> <i1 ptrtoint (ptr @b to i1), i1 ptrtoint (ptr @b to i1)>)\n+; CHECK-NEXT:    store i32 0, ptr @c, align 4\n ; CHECK-NEXT:    ret void\n ;\n   call void @llvm.masked.scatter.v2i32.v2p0(<2 x i32> zeroinitializer, <2 x ptr> splat (ptr @c), i32 4, <2 x i1> splat (i1 ptrtoint (ptr @b to i1)))\ndiff --git a/llvm/test/Transforms/InstSimplify/call.ll b/llvm/test/Transforms/InstSimplify/call.ll\nindex 10ccb082d9b6d..300c27c98ef99 100644\n--- a/llvm/test/Transforms/InstSimplify/call.ll\n+++ b/llvm/test/Transforms/InstSimplify/call.ll\n@@ -488,11 +488,11 @@ define <8 x i32> @partial_masked_load() {\n   ret <8 x i32> %masked.load\n }\n \n-define <8 x i32> @masked_load_undef_mask(ptr %V) {\n-; CHECK-LABEL: @masked_load_undef_mask(\n+define <8 x i32> @masked_load_poison_mask(ptr %V) {\n+; CHECK-LABEL: @masked_load_poison_mask(\n ; CHECK-NEXT:    ret <8 x i32> <i32 1, i32 0, i32 1, i32 0, i32 1, i32 0, i32 1, i32 0>\n ;\n-  %masked.load = call <8 x i32> @llvm.masked.load.v8i32.p0(ptr %V, i32 4, <8 x i1> undef, <8 x i32> <i32 1, i32 0, i32 1, i32 0, i32 1, i32 0, i32 1, i32 0>)\n+  %masked.load = call <8 x i32> @llvm.masked.load.v8i32.p0(ptr %V, i32 4, <8 x i1> poison, <8 x i32> <i32 1, i32 0, i32 1, i32 0, i32 1, i32 0, i32 1, i32 0>)\n   ret <8 x i32> %masked.load\n }\n \n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-27T19:55:38Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Analysis/VectorUtils.h": [
+      [
+        477,
+        497
+      ]
+    ],
+    "llvm/lib/Analysis/InstructionSimplify.cpp": [
+      [
+        7266,
+        7273
+      ]
+    ],
+    "llvm/lib/Analysis/VectorUtils.cpp": [
+      [
+        1256,
+        1338
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        292,
+        301
+      ],
+      [
+        325,
+        336
+      ],
+      [
+        388,
+        408
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/masked_intrinsics-inseltpoison.ll": [
+      [
+        24,
+        38
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/masked_intrinsics.ll": [
+      [
+        16,
+        26
+      ],
+      [
+        33,
+        44
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/pr83947.ll": [
+      [
+        6,
+        12
+      ],
+      [
+        26,
+        32
+      ],
+      [
+        51,
+        63
+      ]
+    ],
+    "llvm/test/Transforms/InstSimplify/call.ll": [
+      [
+        488,
+        498
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/InstructionSimplify.cpp": [
+      "simplifyIntrinsic"
+    ],
+    "llvm/lib/Analysis/VectorUtils.cpp": [
+      "llvm::concatenateVectors",
+      "llvm::maskContainsAllOneOrUndef",
+      "llvm::maskIsAllOneOrUndef",
+      "llvm::maskIsAllZeroOrUndef",
+      "llvm::possiblyDemandedEltsInMask"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::simplifyMaskedLoad",
+      "InstCombinerImpl::simplifyMaskedScatter",
+      "InstCombinerImpl::simplifyMaskedStore"
+    ],
+    "llvm/test/Transforms/InstCombine/pr83947.ll": [
+      "masked_scatter3",
+      "masked_scatter4"
+    ]
+  }
+}

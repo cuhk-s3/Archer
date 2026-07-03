@@ -1,0 +1,164 @@
+{
+  "pr_id": 196828,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/196828",
+  "state": "open",
+  "title": "[InstCombine] Fold or (ashr X, BW-1), zext (icmp ne|sgt X, 0) to scmp(X, 0)",
+  "author": "LumioseSil",
+  "base_commit": "2893aa5d1f31d62a8f1c50e202d7924004792f2b",
+  "fix_commit": "aeef3a9687183a099005038926b3f57a36852148",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex 52d5e28d20915..6fff553635f6e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -4667,6 +4667,22 @@ Instruction *InstCombinerImpl::visitOr(BinaryOperator &I) {\n   if (Value *Res = FoldOrOfSelectSmaxToAbs(I, Builder))\n     return replaceInstUsesWith(I, Res);\n \n+  // signum: or (ashr X, BW-1), zext (icmp ne|sgt X, 0) --> scmp(X, 0)\n+  // The ashr already supplies -1 for negative X, so any predicate that\n+  // produces 1 for positive X and 0 for X == 0 yields the same result here.\n+  {\n+    Value *X;\n+    CmpPredicate SignPred;\n+    unsigned BitWidth = Ty->getScalarSizeInBits();\n+    if (match(&I,\n+              m_c_Or(m_AShr(m_Value(X), m_SpecificIntAllowPoison(BitWidth - 1)),\n+                     m_ZExt(m_ICmp(SignPred, m_Deferred(X), m_ZeroInt())))) &&\n+        (SignPred == ICmpInst::ICMP_NE || SignPred == ICmpInst::ICMP_SGT))\n+      return replaceInstUsesWith(\n+          I, Builder.CreateIntrinsic(Ty, Intrinsic::scmp,\n+                                     {X, Constant::getNullValue(Ty)}));\n+  }\n+\n   return nullptr;\n }\n \n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Recognize the bitwise signum encoding\r\n  or (ashr X, BW-1), zext (icmp ne  X, 0) --> llvm.scmp(X, 0)\r\n  or (ashr X, BW-1), zext (icmp sgt X, 0) --> llvm.scmp(X, 0)\r\n\r\nAlive2: https://alive2.llvm.org/ce/z/UZ7a7Q",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/add.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine -use-constant-int-for-fixed-length-splat -S"
+      ],
+      "tests": [
+        {
+          "test_name": "signum_i8_i8",
+          "test_body": "define i8 @signum_i8_i8(i8 %x) {\n  %sgt0 = icmp sgt i8 %x, 0\n  %zgt0 = zext i1 %sgt0 to i8\n  %signbit = ashr i8 %x, 7\n  %r = add i8 %zgt0, %signbit\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i8_i8_use1",
+          "test_body": "declare void @use(i8)\n\ndefine i8 @signum_i8_i8_use1(i8 %x) {\n  %sgt0 = icmp sgt i8 %x, 0\n  %zgt0 = zext i1 %sgt0 to i8\n  %signbit = ashr i8 %x, 7\n  call void @use(i8 %signbit)\n  %r = add i8 %zgt0, %signbit\n  ret i8 %r\n}\n"
+        },
+        {
+          "test_name": "signum_v2i5_v2i5",
+          "test_body": "define <2 x i5> @signum_v2i5_v2i5(<2 x i5> %x) {\n  %sgt0 = icmp sgt <2 x i5> %x, zeroinitializer\n  %zgt0 = zext <2 x i1> %sgt0 to <2 x i5>\n  %signbit = ashr <2 x i5> %x, <i5 4, i5 poison>\n  %r = add <2 x i5> %signbit, %zgt0\n  ret <2 x i5> %r\n}\n"
+        },
+        {
+          "test_name": "floor_sdiv_using_srem_by_2",
+          "test_body": "define i32 @floor_sdiv_using_srem_by_2(i32 %x) {\n  %d = sdiv i32 %x, 2\n  %r = srem i32 %x, 2\n  %i = icmp ugt i32 %r, -2147483648\n  %s = sext i1 %i to i32\n  %f = add i32 %d, %s\n  ret i32 %f\n}\n"
+        },
+        {
+          "test_name": "signum_i8_i8_use3",
+          "test_body": "declare void @use_i1(i1)\n\ndefine i8 @signum_i8_i8_use3(i8 %x) {\n  %sgt0 = icmp sgt i8 %x, 0\n  call void @use_i1(i1 %sgt0)\n  %zgt0 = zext i1 %sgt0 to i8\n  %signbit = ashr i8 %x, 7\n  %r = add i8 %zgt0, %signbit\n  ret i8 %r\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/and-or-icmps.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "icmp_slt_0_or_icmp_sgt_0_i64_fail0",
+          "test_body": "define i64 @icmp_slt_0_or_icmp_sgt_0_i64_fail0(i64 %x) {\n  %B = icmp slt i64 %x, 0\n  %C = lshr i64 %x, 63\n  %D = zext i1 %B to i64\n  %E = or i64 %C, %D\n  ret i64 %E\n}\n"
+        },
+        {
+          "test_name": "icmp_slt_0_or_icmp_sgt_0_i64_signum",
+          "test_body": "define i64 @icmp_slt_0_or_icmp_sgt_0_i64_signum(i64 %x) {\n  %B = icmp sgt i64 %x, 0\n  %C = ashr i64 %x, 63\n  %D = zext i1 %B to i64\n  %E = or i64 %C, %D\n  ret i64 %E\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/or.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine -S -use-constant-int-for-fixed-length-splat"
+      ],
+      "tests": [
+        {
+          "test_name": "signum_i32_or_sgt_commuted",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i32 @signum_i32_or_sgt_commuted(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  %sgt0 = icmp sgt i32 %x, 0\n  %zgt0 = zext i1 %sgt0 to i32\n  %r = or i32 %zgt0, %signbit\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i32_or_wrong_ext",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i32 @signum_i32_or_wrong_ext(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  %sgt0 = icmp sgt i32 %x, 0\n  %sgt0ext = sext i1 %sgt0 to i32\n  %r = or i32 %signbit, %sgt0ext\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i32_or_sgt_use_ashr",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndeclare void @use(i32)\n\ndefine i32 @signum_i32_or_sgt_use_ashr(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  call void @use(i32 %signbit)\n  %sgt0 = icmp sgt i32 %x, 0\n  %zgt0 = zext i1 %sgt0 to i32\n  %r = or i32 %signbit, %zgt0\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i32_or_ne",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i32 @signum_i32_or_ne(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  %nz = icmp ne i32 %x, 0\n  %znz = zext i1 %nz to i32\n  %r = or i32 %signbit, %znz\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i32_or_sgt_extra_use_zext",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndeclare void @use(i32)\n\ndefine i32 @signum_i32_or_sgt_extra_use_zext(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  %sgt0 = icmp sgt i32 %x, 0\n  %zgt0 = zext i1 %sgt0 to i32\n  call void @use(i32 %zgt0)\n  %r = or i32 %signbit, %zgt0\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i32_or_sgt",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i32 @signum_i32_or_sgt(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  %sgt0 = icmp sgt i32 %x, 0\n  %zgt0 = zext i1 %sgt0 to i32\n  %r = or i32 %signbit, %zgt0\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_v2i5_or_sgt",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine <2 x i5> @signum_v2i5_or_sgt(<2 x i5> %x) {\n  %signbit = ashr <2 x i5> %x, <i5 4, i5 poison>\n  %sgt0 = icmp sgt <2 x i5> %x, zeroinitializer\n  %zgt0 = zext <2 x i1> %sgt0 to <2 x i5>\n  %r = or <2 x i5> %signbit, %zgt0\n  ret <2 x i5> %r\n}\n"
+        },
+        {
+          "test_name": "signum_i32_or_sgt_extra_use_icmp",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndeclare void @use_i1(i1)\n\ndefine i32 @signum_i32_or_sgt_extra_use_icmp(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  %sgt0 = icmp sgt i32 %x, 0\n  call void @use_i1(i1 %sgt0)\n  %zgt0 = zext i1 %sgt0 to i32\n  %r = or i32 %signbit, %zgt0\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "signum_i32_or_wrong_sh_amt",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i32 @signum_i32_or_wrong_sh_amt(i32 %x) {\n  %signbit = ashr i32 %x, 30\n  %sgt0 = icmp sgt i32 %x, 0\n  %zgt0 = zext i1 %sgt0 to i32\n  %r = or i32 %signbit, %zgt0\n  ret i32 %r\n}\n"
+        },
+        {
+          "test_name": "or_select_smax_multi_uses",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine <2 x i8> @or_select_smax_multi_uses(<2 x i8> %a) {\n  %sgt0 = icmp sgt <2 x i8> %a, zeroinitializer\n  %neg = sub <2 x i8> zeroinitializer, %a\n  %sel = select <2 x i1> %sgt0, <2 x i8> zeroinitializer, <2 x i8> %neg\n  %max = call <2 x i8> @llvm.smax.v2i8(<2 x i8> %a, <2 x i8> zeroinitializer)\n  %or = or <2 x i8> %sel, %max\n  %add = add <2 x i8> %or, %max\n  ret <2 x i8> %add\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare <2 x i8> @llvm.smax.v2i8(<2 x i8>, <2 x i8>) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "signum_i32_or_wrong_pred",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i32 @signum_i32_or_wrong_pred(i32 %x) {\n  %signbit = ashr i32 %x, 31\n  %slt0 = icmp slt i32 %x, 0\n  %zlt0 = zext i1 %slt0 to i32\n  %r = or i32 %signbit, %zlt0\n  ret i32 %r\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: LumioseSil (LumioseSil)\n\n<details>\n<summary>Changes</summary>\n\nRecognize the bitwise signum encoding\r\n  or (ashr X, BW-1), zext (icmp ne  X, 0) --&gt; llvm.scmp(X, 0)\r\n  or (ashr X, BW-1), zext (icmp sgt X, 0) --&gt; llvm.scmp(X, 0)\r\n\r\nAlive2: https://alive2.llvm.org/ce/z/UZ7a7Q\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/196828.diff\n\n\n4 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp (+16) \n- (modified) llvm/test/Transforms/InstCombine/add.ll (+3-11) \n- (modified) llvm/test/Transforms/InstCombine/and-or-icmps.ll (+6-6) \n- (modified) llvm/test/Transforms/InstCombine/or.ll (+159) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\nindex 52d5e28d20915..6fff553635f6e 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp\n@@ -4667,6 +4667,22 @@ Instruction *InstCombinerImpl::visitOr(BinaryOperator &I) {\n   if (Value *Res = FoldOrOfSelectSmaxToAbs(I, Builder))\n     return replaceInstUsesWith(I, Res);\n \n+  // signum: or (ashr X, BW-1), zext (icmp ne|sgt X, 0) --> scmp(X, 0)\n+  // The ashr already supplies -1 for negative X, so any predicate that\n+  // produces 1 for positive X and 0 for X == 0 yields the same result here.\n+  {\n+    Value *X;\n+    CmpPredicate SignPred;\n+    unsigned BitWidth = Ty->getScalarSizeInBits();\n+    if (match(&I,\n+              m_c_Or(m_AShr(m_Value(X), m_SpecificIntAllowPoison(BitWidth - 1)),\n+                     m_ZExt(m_ICmp(SignPred, m_Deferred(X), m_ZeroInt())))) &&\n+        (SignPred == ICmpInst::ICMP_NE || SignPred == ICmpInst::ICMP_SGT))\n+      return replaceInstUsesWith(\n+          I, Builder.CreateIntrinsic(Ty, Intrinsic::scmp,\n+                                     {X, Constant::getNullValue(Ty)}));\n+  }\n+\n   return nullptr;\n }\n \ndiff --git a/llvm/test/Transforms/InstCombine/add.ll b/llvm/test/Transforms/InstCombine/add.ll\nindex 4380491f07557..9af2f6aeeb015 100644\n--- a/llvm/test/Transforms/InstCombine/add.ll\n+++ b/llvm/test/Transforms/InstCombine/add.ll\n@@ -3414,10 +3414,7 @@ define i32 @floor_sdiv_using_srem_by_2(i32 %x) {\n \n define i8 @signum_i8_i8(i8 %x) {\n ; CHECK-LABEL: @signum_i8_i8(\n-; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr i8 [[X:%.*]], 7\n-; CHECK-NEXT:    [[ISNOTNULL:%.*]] = icmp ne i8 [[X]], 0\n-; CHECK-NEXT:    [[ISNOTNULL_ZEXT:%.*]] = zext i1 [[ISNOTNULL]] to i8\n-; CHECK-NEXT:    [[R:%.*]] = or i8 [[SIGNBIT]], [[ISNOTNULL_ZEXT]]\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.scmp.i8.i8(i8 [[X:%.*]], i8 0)\n ; CHECK-NEXT:    ret i8 [[R]]\n ;\n   %sgt0 = icmp sgt i8 %x, 0\n@@ -3433,9 +3430,7 @@ define i8 @signum_i8_i8_use1(i8 %x) {\n ; CHECK-LABEL: @signum_i8_i8_use1(\n ; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr i8 [[X:%.*]], 7\n ; CHECK-NEXT:    call void @use(i8 [[SIGNBIT]])\n-; CHECK-NEXT:    [[ISNOTNULL:%.*]] = icmp ne i8 [[X]], 0\n-; CHECK-NEXT:    [[ISNOTNULL_ZEXT:%.*]] = zext i1 [[ISNOTNULL]] to i8\n-; CHECK-NEXT:    [[R:%.*]] = or i8 [[SIGNBIT]], [[ISNOTNULL_ZEXT]]\n+; CHECK-NEXT:    [[R:%.*]] = call i8 @llvm.scmp.i8.i8(i8 [[X]], i8 0)\n ; CHECK-NEXT:    ret i8 [[R]]\n ;\n   %sgt0 = icmp sgt i8 %x, 0\n@@ -3489,10 +3484,7 @@ define i8 @signum_i8_i8_use3(i8 %x) {\n \n define <2 x i5> @signum_v2i5_v2i5(<2 x i5> %x) {\n ; CHECK-LABEL: @signum_v2i5_v2i5(\n-; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr <2 x i5> [[X:%.*]], <i5 4, i5 poison>\n-; CHECK-NEXT:    [[ISNOTNULL:%.*]] = icmp ne <2 x i5> [[X]], zeroinitializer\n-; CHECK-NEXT:    [[ISNOTNULL_ZEXT:%.*]] = zext <2 x i1> [[ISNOTNULL]] to <2 x i5>\n-; CHECK-NEXT:    [[R:%.*]] = or <2 x i5> [[SIGNBIT]], [[ISNOTNULL_ZEXT]]\n+; CHECK-NEXT:    [[R:%.*]] = call <2 x i5> @llvm.scmp.v2i5.v2i5(<2 x i5> [[X:%.*]], <2 x i5> zeroinitializer)\n ; CHECK-NEXT:    ret <2 x i5> [[R]]\n ;\n   %sgt0 = icmp sgt <2 x i5> %x, zeroinitializer\ndiff --git a/llvm/test/Transforms/InstCombine/and-or-icmps.ll b/llvm/test/Transforms/InstCombine/and-or-icmps.ll\nindex 58c1f0038e5df..91b9f702f4575 100644\n--- a/llvm/test/Transforms/InstCombine/and-or-icmps.ll\n+++ b/llvm/test/Transforms/InstCombine/and-or-icmps.ll\n@@ -2661,12 +2661,12 @@ define i64 @icmp_slt_0_or_icmp_sgt_0_i64_fail0(i64 %x) {\n   ret i64 %E\n }\n \n-define i64 @icmp_slt_0_or_icmp_sgt_0_i64_fail1(i64 %x) {\n-; CHECK-LABEL: @icmp_slt_0_or_icmp_sgt_0_i64_fail1(\n-; CHECK-NEXT:    [[B:%.*]] = icmp sgt i64 [[X:%.*]], 0\n-; CHECK-NEXT:    [[C:%.*]] = ashr i64 [[X]], 63\n-; CHECK-NEXT:    [[D:%.*]] = zext i1 [[B]] to i64\n-; CHECK-NEXT:    [[E:%.*]] = or i64 [[C]], [[D]]\n+; ashr (instead of icmp slt 0) on the LHS: not the icmp-or-icmp shape, but\n+; this is the signum idiom and folds to scmp.\n+\n+define i64 @icmp_slt_0_or_icmp_sgt_0_i64_signum(i64 %x) {\n+; CHECK-LABEL: @icmp_slt_0_or_icmp_sgt_0_i64_signum(\n+; CHECK-NEXT:    [[E:%.*]] = call i64 @llvm.scmp.i64.i64(i64 [[X:%.*]], i64 0)\n ; CHECK-NEXT:    ret i64 [[E]]\n ;\n   %B = icmp sgt i64 %x, 0\ndiff --git a/llvm/test/Transforms/InstCombine/or.ll b/llvm/test/Transforms/InstCombine/or.ll\nindex a87dce47489c7..d70ab67488d2f 100644\n--- a/llvm/test/Transforms/InstCombine/or.ll\n+++ b/llvm/test/Transforms/InstCombine/or.ll\n@@ -2207,3 +2207,162 @@ define <2 x i8> @or_select_smax_multi_uses(<2 x i8> %a){\n   %add = add <2 x i8> %or, %max\n   ret <2 x i8> %add\n }\n+\n+declare void @use_i1(i1)\n+\n+; signum encoded with or:\n+; (X s>> (BW - 1)) | (zext (X s> 0)) --> scmp(X, 0)\n+; (X s>> (BW - 1)) | (zext (X != 0)) --> scmp(X, 0)\n+\n+define i32 @signum_i32_or_sgt(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_sgt(\n+; CHECK-NEXT:    [[R:%.*]] = call i32 @llvm.scmp.i32.i32(i32 [[X:%.*]], i32 0)\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  %sgt0 = icmp sgt i32 %x, 0\n+  %zgt0 = zext i1 %sgt0 to i32\n+  %r = or i32 %signbit, %zgt0\n+  ret i32 %r\n+}\n+\n+define i32 @signum_i32_or_ne(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_ne(\n+; CHECK-NEXT:    [[R:%.*]] = call i32 @llvm.scmp.i32.i32(i32 [[X:%.*]], i32 0)\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  %nz = icmp ne i32 %x, 0\n+  %znz = zext i1 %nz to i32\n+  %r = or i32 %signbit, %znz\n+  ret i32 %r\n+}\n+\n+; commuted operands of or\n+\n+define i32 @signum_i32_or_sgt_commuted(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_sgt_commuted(\n+; CHECK-NEXT:    [[R:%.*]] = call i32 @llvm.scmp.i32.i32(i32 [[X:%.*]], i32 0)\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  %sgt0 = icmp sgt i32 %x, 0\n+  %zgt0 = zext i1 %sgt0 to i32\n+  %r = or i32 %zgt0, %signbit\n+  ret i32 %r\n+}\n+\n+; vector\n+\n+define <2 x i5> @signum_v2i5_or_sgt(<2 x i5> %x) {\n+; CHECK-LABEL: @signum_v2i5_or_sgt(\n+; CHECK-NEXT:    [[R:%.*]] = call <2 x i5> @llvm.scmp.v2i5.v2i5(<2 x i5> [[X:%.*]], <2 x i5> zeroinitializer)\n+; CHECK-NEXT:    ret <2 x i5> [[R]]\n+;\n+  %signbit = ashr <2 x i5> %x, <i5 4, i5 poison>\n+  %sgt0 = icmp sgt <2 x i5> %x, zeroinitializer\n+  %zgt0 = zext <2 x i1> %sgt0 to <2 x i5>\n+  %r = or <2 x i5> %signbit, %zgt0\n+  ret <2 x i5> %r\n+}\n+\n+; extra use of the ashr is ok: the ashr stays alive but the or still folds.\n+\n+define i32 @signum_i32_or_sgt_use_ashr(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_sgt_use_ashr(\n+; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr i32 [[X:%.*]], 31\n+; CHECK-NEXT:    call void @use(i32 [[SIGNBIT]])\n+; CHECK-NEXT:    [[R:%.*]] = call i32 @llvm.scmp.i32.i32(i32 [[X]], i32 0)\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  call void @use(i32 %signbit)\n+  %sgt0 = icmp sgt i32 %x, 0\n+  %zgt0 = zext i1 %sgt0 to i32\n+  %r = or i32 %signbit, %zgt0\n+  ret i32 %r\n+}\n+\n+; extra use of the zext is ok: the zext stays alive but the or still folds.\n+\n+define i32 @signum_i32_or_sgt_extra_use_zext(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_sgt_extra_use_zext(\n+; CHECK-NEXT:    [[SGT0:%.*]] = icmp sgt i32 [[X:%.*]], 0\n+; CHECK-NEXT:    [[ZGT0:%.*]] = zext i1 [[SGT0]] to i32\n+; CHECK-NEXT:    call void @use(i32 [[ZGT0]])\n+; CHECK-NEXT:    [[R:%.*]] = call i32 @llvm.scmp.i32.i32(i32 [[X]], i32 0)\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  %sgt0 = icmp sgt i32 %x, 0\n+  %zgt0 = zext i1 %sgt0 to i32\n+  call void @use(i32 %zgt0)\n+  %r = or i32 %signbit, %zgt0\n+  ret i32 %r\n+}\n+\n+; extra use of the icmp is ok: the icmp/zext stay alive but the or still folds.\n+\n+define i32 @signum_i32_or_sgt_extra_use_icmp(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_sgt_extra_use_icmp(\n+; CHECK-NEXT:    [[SGT0:%.*]] = icmp sgt i32 [[X:%.*]], 0\n+; CHECK-NEXT:    call void @use_i1(i1 [[SGT0]])\n+; CHECK-NEXT:    [[R:%.*]] = call i32 @llvm.scmp.i32.i32(i32 [[X]], i32 0)\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  %sgt0 = icmp sgt i32 %x, 0\n+  call void @use_i1(i1 %sgt0)\n+  %zgt0 = zext i1 %sgt0 to i32\n+  %r = or i32 %signbit, %zgt0\n+  ret i32 %r\n+}\n+\n+; negative test - wrong shift amount.\n+\n+define i32 @signum_i32_or_wrong_sh_amt(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_wrong_sh_amt(\n+; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr i32 [[X:%.*]], 30\n+; CHECK-NEXT:    [[SGT0:%.*]] = icmp sgt i32 [[X]], 0\n+; CHECK-NEXT:    [[ZGT0:%.*]] = zext i1 [[SGT0]] to i32\n+; CHECK-NEXT:    [[R:%.*]] = or i32 [[SIGNBIT]], [[ZGT0]]\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 30\n+  %sgt0 = icmp sgt i32 %x, 0\n+  %zgt0 = zext i1 %sgt0 to i32\n+  %r = or i32 %signbit, %zgt0\n+  ret i32 %r\n+}\n+\n+; negative test - wrong predicate (slt does not yield signum here).\n+\n+define i32 @signum_i32_or_wrong_pred(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_wrong_pred(\n+; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr i32 [[X:%.*]], 31\n+; CHECK-NEXT:    [[X_LOBIT:%.*]] = lshr i32 [[X]], 31\n+; CHECK-NEXT:    [[R:%.*]] = or i32 [[SIGNBIT]], [[X_LOBIT]]\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  %slt0 = icmp slt i32 %x, 0\n+  %zlt0 = zext i1 %slt0 to i32\n+  %r = or i32 %signbit, %zlt0\n+  ret i32 %r\n+}\n+\n+; negative test - sext instead of zext.\n+\n+define i32 @signum_i32_or_wrong_ext(i32 %x) {\n+; CHECK-LABEL: @signum_i32_or_wrong_ext(\n+; CHECK-NEXT:    [[SIGNBIT:%.*]] = ashr i32 [[X:%.*]], 31\n+; CHECK-NEXT:    [[SGT0:%.*]] = icmp sgt i32 [[X]], 0\n+; CHECK-NEXT:    [[R:%.*]] = select i1 [[SGT0]], i32 -1, i32 [[SIGNBIT]]\n+; CHECK-NEXT:    ret i32 [[R]]\n+;\n+  %signbit = ashr i32 %x, 31\n+  %sgt0 = icmp sgt i32 %x, 0\n+  %sgt0ext = sext i1 %sgt0 to i32\n+  %r = or i32 %signbit, %sgt0ext\n+  ret i32 %r\n+}\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-10T18:50:02Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+      [
+        4667,
+        4672
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/add.ll": [
+      [
+        3414,
+        3423
+      ],
+      [
+        3433,
+        3441
+      ],
+      [
+        3489,
+        3498
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/and-or-icmps.ll": [
+      [
+        2661,
+        2672
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/or.ll": [
+      [
+        2207,
+        2209
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAndOrXor.cpp": [
+      "InstCombinerImpl::visitOr"
+    ]
+  }
+}

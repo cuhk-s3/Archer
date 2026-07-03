@@ -1,0 +1,439 @@
+{
+  "pr_id": 185080,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/185080",
+  "state": "open",
+  "title": "[Inliner] Keep nonnull information around when inlining",
+  "author": "philnik777",
+  "base_commit": "e5f4d51418fc2f101282a20aafbce3fa3e80ed51",
+  "fix_commit": "15c75b7ecab74f35d59660e790ba4186ce2a0091",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h b/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\nindex 1c0c318c8b0f2..083170bfbea3c 100644\n--- a/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\n+++ b/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\n@@ -47,6 +47,8 @@ LLVM_ABI AssumeInst *buildAssumeFromInst(Instruction *I);\n LLVM_ABI bool salvageKnowledge(Instruction *I, AssumptionCache *AC = nullptr,\n                                DominatorTree *DT = nullptr);\n \n+LLVM_ABI void salvageKnowledgeBeforeInlining(CallBase *CB, AssumptionCache *AC);\n+\n /// This pass attempts to minimize the number of assume without loosing any\n /// information.\n struct AssumeSimplifyPass : public OptionalPassInfoMixin<AssumeSimplifyPass> {\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 19d896227e69a..78b041efba68a 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3725,7 +3725,18 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n           return CallBase::removeOperandBundleAt(II, Idx);\n         }\n \n-        // TODO: apply nonnull return attributes to calls and invokes\n+        // Fold the assume into a nonnull return attribute\n+        // Note that we check the next node, since we care that the assume is\n+        // valid after the CallBase, not before\n+        // TODO: Fold nonnull into invokes\n+        if (auto *CB = dyn_cast<CallBase>(Ptr);\n+            CB && !CB->isTerminator() &&\n+            isValidAssumeForContext(II, CB->getNextNode(), &DT,\n+                                    /*AllowEphemerals=*/true)) {\n+          CB->addRetAttr(Attribute::NonNull);\n+          Worklist.addValue(CB);\n+          return CallBase::removeOperandBundleAt(II, Idx);\n+        }\n         break;\n       }\n \ndiff --git a/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp b/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\nindex 722d04c9ae957..6419836b41967 100644\n--- a/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\n+++ b/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\n@@ -304,6 +304,33 @@ bool llvm::salvageKnowledge(Instruction *I, AssumptionCache *AC,\n   return Changed;\n }\n \n+void llvm::salvageKnowledgeBeforeInlining(CallBase *CB, AssumptionCache *AC) {\n+  if (EnableKnowledgeRetention) {\n+    salvageKnowledge(CB, AC);\n+    return;\n+  }\n+\n+  // TODO: Salvage knowledge from invokes\n+  if (CB->isTerminator())\n+    return;\n+\n+  SmallVector<OperandBundleDef, 1> AfterAttrs;\n+  if (CB->hasRetAttr(Attribute::NonNull))\n+    AfterAttrs.emplace_back(\"nonnull\", CB);\n+\n+  if (AfterAttrs.empty())\n+    return;\n+\n+  Module *M = CB->getModule();\n+  Function *AssumeDecl =\n+      Intrinsic::getOrInsertDeclaration(M, Intrinsic::assume);\n+  AssumeInst *Assume = cast<AssumeInst>(CallInst::Create(\n+      AssumeDecl, ConstantInt::getTrue(M->getContext()), AfterAttrs));\n+  Assume->insertAfter(CB->getIterator());\n+  if (AC)\n+    AC->registerAssumption(Assume);\n+}\n+\n RetainedKnowledge llvm::simplifyRetainedKnowledge(AssumeInst *Assume,\n                                                   RetainedKnowledge RK,\n                                                   AssumptionCache *AC,\ndiff --git a/llvm/lib/Transforms/Utils/InlineFunction.cpp b/llvm/lib/Transforms/Utils/InlineFunction.cpp\nindex be186ffbf7e42..f1d009702fc56 100644\n--- a/llvm/lib/Transforms/Utils/InlineFunction.cpp\n+++ b/llvm/lib/Transforms/Utils/InlineFunction.cpp\n@@ -2837,7 +2837,7 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,\n         IFI.GetAssumptionCache ? &IFI.GetAssumptionCache(*Caller) : nullptr;\n \n     /// Preserve all attributes on of the call and its parameters.\n-    salvageKnowledge(&CB, AC);\n+    salvageKnowledgeBeforeInlining(&CB, AC);\n \n     // We want the inliner to prune the code as it copies.  We would LOVE to\n     // have no dead or constant instructions leftover after inlining occurs\n",
+  "components": [
+    "AssumeBundleBuilder",
+    "InlineFunction",
+    "InstCombine"
+  ],
+  "description": "Fixes #149821",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Inline/cgscc-update.ll",
+      "commands": [
+        "opt < %s -aa-pipeline=basic-aa -passes='cgscc(function-attrs,inline,instcombine)' -S"
+      ],
+      "tests": [
+        {
+          "test_name": "<module>",
+          "test_body": "; This test runs the inliner and the function attribute deduction. It ensures\n; that when the inliner mutates the call graph it correctly updates the CGSCC\n; iteration so that we can compute refined function attributes. In this way it\n; is leveraging function attribute computation to observe correct call graph\n; updates.\n\n; Boring unknown external function call.\ndeclare void @unknown()\n\n; Basic correctness check: this should get annotated as memory(none).\ndeclare void @readnone() readnone nounwind\n\n; The 'test1_' prefixed functions are designed to trigger forming a new direct\n; call in the inlined body of the function. After that, we form a new SCC and\n; using that can deduce precise function attrs.\n\n; This function should no longer exist.\ndefine internal void @test1_f(ptr %p) {\nentry:\n  call void %p()\n  ret void\n}\n\n; This function should have had 'memory(none)' deduced for its SCC.\ndefine void @test1_g() noinline {\nentry:\n  call void @test1_f(ptr @test1_h)\n  ret void\n}\n\n; This function should have had 'memory(none)' deduced for its SCC.\ndefine void @test1_h() noinline {\nentry:\n  call void @test1_g()\n  call void @readnone()\n  ret void\n}\n\n\n; The 'test2_' prefixed functions are designed to trigger forming a new direct\n; call due to RAUW-ing the returned value of a called function into the caller.\n; This too should form a new SCC which can then be reasoned about to compute\n; precise function attrs.\n\n; This function should no longer exist.\ndefine internal ptr @test2_f() {\nentry:\n  ret ptr @test2_h\n}\n\n; This function should have had 'memory(none)' deduced for its SCC.\ndefine void @test2_g() noinline {\nentry:\n  %p = call ptr @test2_f()\n  call void %p()\n  ret void\n}\n\n; This function should have had 'memory(none)' deduced for its SCC.\ndefine void @test2_h() noinline {\nentry:\n  call void @test2_g()\n  call void @readnone()\n  ret void\n}\n\n\n; The 'test3_' prefixed functions are designed to inline in a way that causes\n; call sites to become trivially dead during the middle of inlining callsites of\n; a single function to make sure that the inliner does not get confused by this\n; pattern.\n\ndefine internal void @test3_maybe_unknown(i1 %b) {\nentry:\n  br i1 %b, label %then, label %exit\n\nthen:\n  call void @unknown()\n  br label %exit\n\nexit:\n  ret void\n}\n\ndefine internal i1 @test3_f() {\nentry:\n  ret i1 false\n}\n\ndefine internal i1 @test3_g(i1 %b) {\nentry:\n  br i1 %b, label %then1, label %if2\n\nthen1:\n  call void @test3_maybe_unknown(i1 true)\n  br label %if2\n\nif2:\n  %f = call i1 @test3_f()\n  br i1 %f, label %then2, label %exit\n\nthen2:\n  call void @test3_maybe_unknown(i1 true)\n  br label %exit\n\nexit:\n  ret i1 false\n}\n\n; FIXME: Currently the inliner doesn't successfully mark this as readnone\n; because while it simplifies trivially dead CFGs when inlining callees it\n; doesn't simplify the caller's trivially dead CFG and so we end with a dead\n; block calling @unknown.\ndefine void @test3_h() {\nentry:\n  %g = call i1 @test3_g(i1 false)\n  br i1 %g, label %then, label %exit\n\nthen:\n  call void @test3_maybe_unknown(i1 true)\n  br label %exit\n\nexit:\n  call void @test3_maybe_unknown(i1 false)\n  ret void\n}\n\n\n; The 'test4_' prefixed functions are designed to trigger forming a new direct\n; call in the inlined body of the function similar to 'test1_'. However, after\n; that we continue to inline another edge of the graph forcing us to do a more\n; interesting call graph update for the new call edge. Eventually, we still\n; form a new SCC and should use that can deduce precise function attrs.\n\n; This function should have had 'memory(none)' deduced for its SCC.\ndefine void @test4_f1() noinline {\nentry:\n  call void @test4_h()\n  ret void\n}\n\ndefine internal void @test4_f2() {\nentry:\n  call void @test4_f1()\n  ret void\n}\n\ndefine internal void @test4_g(ptr %p) {\nentry:\n  call void %p()\n  ret void\n}\n\n; This function should have had 'memory(none)' deduced for its SCC.\ndefine void @test4_h() noinline {\nentry:\n  call void @test4_g(ptr @test4_f2)\n  ret void\n}"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Inline/nonnull.ll",
+      "commands": [
+        "opt -S -passes=inline %s",
+        "opt -S -passes='module-inline' %s"
+      ],
+      "tests": [
+        {
+          "test_name": "caller9",
+          "test_body": "declare ptr @callee9()\n\ndefine ptr @caller9() {\n  %r = call nonnull ptr @callee9()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "on_invoke",
+          "test_body": "declare ptr @buz()\n\ndeclare i32 @__gxx_personality_v0(...)\n\ndeclare ptr @simple_func(ptr)\n\ndefine ptr @on_invoke() personality ptr @__gxx_personality_v0 {\n  %r = call ptr @buz()\n  %1 = invoke nonnull ptr @simple_func(ptr %r)\n          to label %proceed unwind label %pad\n\nproceed:                                          ; preds = %0\n  ret ptr %r\n\npad:                                              ; preds = %0\n  %2 = landingpad { ptr, i32 }\n          cleanup\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "callee9",
+          "test_body": "declare void @foo()\n\ndeclare ptr @buz()\n\ndefine ptr @callee9() {\n  %r = call ptr @buz()\n  call void @foo() #0\n  ret ptr %r\n}\n\nattributes #0 = { nounwind }\n"
+        },
+        {
+          "test_name": "caller6",
+          "test_body": "declare void @callee(ptr)\n\ndefine void @caller6(ptr %arg) {\n  call void @callee(ptr dereferenceable(8) %arg)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "caller7",
+          "test_body": "declare nonnull ptr @callee7()\n\ndefine ptr @caller7() {\n  %r = call ptr @callee7()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "simple_func",
+          "test_body": "define ptr @simple_func(ptr %ptr) {\n  ret ptr %ptr\n}\n"
+        },
+        {
+          "test_name": "callee8",
+          "test_body": "declare ptr @buz()\n\ndefine nonnull ptr @callee8() {\n  %r = call ptr @buz()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "caller8",
+          "test_body": "declare nonnull ptr @callee8()\n\ndefine ptr @caller8() {\n  %r = call nonnull ptr @callee8()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "callee7",
+          "test_body": "declare ptr @buz()\n\ndefine nonnull ptr @callee7() {\n  %r = call ptr @buz() #0\n  ret ptr %r\n}\n\nattributes #0 = { nounwind willreturn }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Inline/ret_attr_align_and_noundef.ll",
+      "commands": [
+        "opt -S -passes=inline %s",
+        "opt -S -passes='module-inline' %s"
+      ],
+      "tests": [
+        {
+          "test_name": "caller11_todo",
+          "test_body": "declare ptr @callee11()\n\ndefine ptr @caller11_todo() {\n  %r = call nonnull ptr @callee11()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "caller9_fail_creates_ub",
+          "test_body": "; Function Attrs: nounwind willreturn\ndeclare void @use.ptr(ptr) #0\n\ndeclare ptr @callee9()\n\ndefine ptr @caller9_fail_creates_ub() {\n  %r = call nonnull ptr @callee9()\n  call void @use.ptr(ptr %r)\n  ret ptr %r\n}\n\nattributes #0 = { nounwind willreturn }\n"
+        },
+        {
+          "test_name": "caller10_okay_will_be_ub_todo",
+          "test_body": "declare ptr @callee10()\n\ndefine noundef ptr @caller10_okay_will_be_ub_todo() {\n  %r = call nonnull ptr @callee10()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "callee9",
+          "test_body": "declare ptr @foo()\n\ndefine ptr @callee9() {\n  %r = call noundef ptr @foo()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "caller8_okay_use_after_poison_anyways",
+          "test_body": "; Function Attrs: nounwind willreturn\ndeclare void @use.ptr(ptr) #0\n\ndeclare ptr @callee8()\n\ndefine ptr @caller8_okay_use_after_poison_anyways() {\n  %r = call nonnull ptr @callee8()\n  call void @use.ptr(ptr %r)\n  ret ptr %r\n}\n\nattributes #0 = { nounwind willreturn }\n"
+        },
+        {
+          "test_name": "caller9_okay_is_ub_anyways",
+          "test_body": "; Function Attrs: nounwind willreturn\ndeclare void @use.ptr(ptr) #0\n\ndeclare ptr @callee9()\n\ndefine ptr @caller9_okay_is_ub_anyways() {\n  %r = call noundef nonnull ptr @callee9()\n  call void @use.ptr(ptr %r)\n  ret ptr %r\n}\n\nattributes #0 = { nounwind willreturn }\n"
+        },
+        {
+          "test_name": "caller10_okay_will_be_ub",
+          "test_body": "declare ptr @callee10()\n\ndefine ptr @caller10_okay_will_be_ub() {\n  %r = call noundef nonnull ptr @callee10()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "caller12_todo",
+          "test_body": "declare ptr @callee12()\n\ndefine ptr @caller12_todo() {\n  %r = call nonnull ptr @callee12()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "caller10_fail_maybe_poison",
+          "test_body": "declare ptr @callee10()\n\ndefine ptr @caller10_fail_maybe_poison() {\n  %r = call nonnull ptr @callee10()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "callee8",
+          "test_body": "declare ptr @foo()\n\ndefine ptr @callee8() {\n  %r = call ptr @foo()\n  ret ptr %r\n}\n"
+        },
+        {
+          "test_name": "caller_bad_ret_prop",
+          "test_body": "define ptr @caller_bad_ret_prop(ptr %p1, ptr %p2, i64 %x, ptr %other) {\n  %1 = call noundef ptr %p1(i64 %x, ptr %p2)\n  %2 = call nonnull ptr @callee_bad_ret_prop(ptr %1, ptr %other)\n  ret ptr %2\n}\n\ndeclare ptr @callee_bad_ret_prop(ptr, ptr)\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/Inline/ret_attr_update.ll",
+      "commands": [
+        "opt < %s -inline-threshold=0 -passes=always-inline -S",
+        "opt < %s -passes=always-inline -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test7",
+          "test_body": "; Function Attrs: alwaysinline\ndeclare hidden ptr @callee7(ptr, i1) #0\n\ndefine void @test7(ptr %ptr, i64 %x, i1 %cond) {\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %x\n  %t = call nonnull ptr @callee7(ptr %gep, i1 %cond)\n  call void @snort(ptr %t)\n  ret void\n}\n\ndeclare void @snort(ptr)\n\nattributes #0 = { alwaysinline }\n"
+        },
+        {
+          "test_name": "caller2",
+          "test_body": "; Function Attrs: alwaysinline\ndeclare hidden ptr @callee_with_throwable(ptr) #0\n\n; Function Attrs: alwaysinline\ndeclare hidden ptr @callee_with_explicit_control_flow(ptr) #0\n\ndefine ptr @caller2(ptr %ptr, i64 %x, i1 %cond) {\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %x\n  %p = call nonnull ptr @callee_with_throwable(ptr %gep)\n  %q = call nonnull ptr @callee_with_explicit_control_flow(ptr %gep)\n  br i1 %cond, label %pret, label %qret\n\npret:                                             ; preds = %0\n  ret ptr %p\n\nqret:                                             ; preds = %0\n  ret ptr %q\n}\n\nattributes #0 = { alwaysinline }\n"
+        },
+        {
+          "test_name": "caller",
+          "test_body": "; Function Attrs: alwaysinline\ndeclare ptr @callee(ptr) #0\n\ndefine ptr @caller(ptr %ptr, i64 %x) {\n  %gep = getelementptr inbounds i8, ptr %ptr, i64 %x\n  %p = call nonnull ptr @callee(ptr %gep)\n  ret ptr %p\n}\n\nattributes #0 = { alwaysinline }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/assume.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine --enable-knowledge-retention -S"
+      ],
+      "tests": [
+        {
+          "test_name": "nonnull_on_invoke",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndeclare ptr @get_ptr()\n\ndeclare i32 @__gxx_personality_v0(...)\n\ndefine void @nonnull_on_invoke() personality ptr @__gxx_personality_v0 {\n  %ptr = invoke ptr @get_ptr()\n          to label %proceed unwind label %pad\n\nproceed:                                          ; preds = %0\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr) ]\n  ret void\n\npad:                                              ; preds = %0\n  %1 = landingpad { ptr, i32 }\n          cleanup\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "nonnull5",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndeclare void @escape(ptr)\n\ndefine i1 @nonnull5(ptr %a) {\n  %load = load ptr, ptr %a, align 8\n  tail call void @escape(ptr %load)\n  %integral = ptrtoint ptr %load to i64\n  %cmp = icmp slt i64 %integral, 0\n  tail call void @llvm.assume(i1 %cmp)\n  %rval = icmp eq ptr %load, null\n  ret i1 %rval\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "redundant_nonnull1",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @redundant_nonnull1(ptr nonnull %ptr) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "nonnull_on_call",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndeclare ptr @get_ptr()\n\ndefine void @nonnull_on_call() {\n  %ptr = call ptr @get_ptr()\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/AArch64/hoist-runtime-checks.ll",
+      "commands": [
+        "opt -passes=\"default<O3>\" -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "sum_prefix_with_sum",
+          "test_body": "target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\"\ntarget triple = \"arm64-apple-macosx11.0.0\"\n\n%\"class.std::__1::span\" = type { ptr, i64 }\n\ndefine dso_local noundef i32 @sum_prefix_with_sum(ptr %s.coerce0, i64 %s.coerce1, i64 noundef %n) {\nentry:\n  %s = alloca %\"class.std::__1::span\", align 8\n  %n.addr = alloca i64, align 8\n  %ret = alloca i32, align 4\n  %i = alloca i64, align 8\n  %0 = getelementptr inbounds { ptr, i64 }, ptr %s, i32 0, i32 0\n  store ptr %s.coerce0, ptr %0, align 8\n  %1 = getelementptr inbounds { ptr, i64 }, ptr %s, i32 0, i32 1\n  store i64 %s.coerce1, ptr %1, align 8\n  store i64 %n, ptr %n.addr, align 8\n  call void @llvm.lifetime.start.p0(ptr %ret)\n  store i32 0, ptr %ret, align 4\n  call void @llvm.lifetime.start.p0(ptr %i)\n  store i64 0, ptr %i, align 8\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.inc, %entry\n  %2 = load i64, ptr %i, align 8\n  %3 = load i64, ptr %n.addr, align 8\n  %cmp = icmp ult i64 %2, %3\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond\n  call void @llvm.lifetime.end.p0(ptr %i)\n  br label %for.end\n\nfor.body:                                         ; preds = %for.cond\n  %4 = load i64, ptr %i, align 8\n  %call = call noundef nonnull align 4 dereferenceable(4) ptr @span_checked_access(ptr noundef nonnull align 8 dereferenceable(16) %s, i64 noundef %4)\n  %5 = load i32, ptr %call, align 4\n  %6 = load i32, ptr %ret, align 4\n  %add = add nsw i32 %6, %5\n  store i32 %add, ptr %ret, align 4\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %7 = load i64, ptr %i, align 8\n  %inc = add i64 %7, 1\n  store i64 %inc, ptr %i, align 8\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.cond.cleanup\n  %8 = load i32, ptr %ret, align 4\n  call void @llvm.lifetime.end.p0(ptr %ret)\n  ret i32 %8\n}\n\ndeclare hidden noundef nonnull align 4 dereferenceable(4) ptr @span_checked_access(ptr noundef nonnull align 8 dereferenceable(16), i64 noundef)\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr captures(none)) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr captures(none)) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/X86/hoist-load-of-baseptr.ll",
+      "commands": [
+        "opt -passes=\"default<O1>\" -S < %s",
+        "opt -passes=\"default<O2>\" -S < %s",
+        "opt -passes=\"default<O3>\" -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "_Z7computeRSt6vectorIiSaIiEEy",
+          "test_body": "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\ndefine dso_local void @_Z7computeRSt6vectorIiSaIiEEy(ptr noundef nonnull align 8 dereferenceable(24) %data, i64 noundef %numElems) {\nentry:\n  %data.addr = alloca ptr, align 8\n  %numElems.addr = alloca i64, align 8\n  %i = alloca i64, align 8\n  %cleanup.dest.slot = alloca i32, align 4\n  %j = alloca i64, align 8\n  store ptr %data, ptr %data.addr, align 8, !tbaa !0\n  store i64 %numElems, ptr %numElems.addr, align 8, !tbaa !4\n  call void @llvm.lifetime.start.p0(ptr %i)\n  store i64 0, ptr %i, align 8, !tbaa !4\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.inc6, %entry\n  %0 = load i64, ptr %i, align 8, !tbaa !4\n  %cmp = icmp ult i64 %0, 100\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond\n  store i32 2, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %i)\n  br label %for.end8\n\nfor.body:                                         ; preds = %for.cond\n  call void @llvm.lifetime.start.p0(ptr %j)\n  store i64 0, ptr %j, align 8, !tbaa !4\n  br label %for.cond1\n\nfor.cond1:                                        ; preds = %for.inc, %for.body\n  %1 = load i64, ptr %j, align 8, !tbaa !4\n  %2 = load i64, ptr %numElems.addr, align 8, !tbaa !4\n  %cmp2 = icmp ult i64 %1, %2\n  br i1 %cmp2, label %for.body4, label %for.cond.cleanup3\n\nfor.cond.cleanup3:                                ; preds = %for.cond1\n  store i32 5, ptr %cleanup.dest.slot, align 4\n  call void @llvm.lifetime.end.p0(ptr %j)\n  br label %for.end\n\nfor.body4:                                        ; preds = %for.cond1\n  %3 = load ptr, ptr %data.addr, align 8, !tbaa !0\n  %4 = load i64, ptr %j, align 8, !tbaa !4\n  %call = call noundef nonnull align 4 dereferenceable(4) ptr @_ZNSt6vectorIiSaIiEEixEm(ptr noundef nonnull align 8 dereferenceable(24) %3, i64 noundef %4)\n  %5 = load i32, ptr %call, align 4, !tbaa !6\n  %inc = add nsw i32 %5, 1\n  store i32 %inc, ptr %call, align 4, !tbaa !6\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.body4\n  %6 = load i64, ptr %j, align 8, !tbaa !4\n  %inc5 = add i64 %6, 1\n  store i64 %inc5, ptr %j, align 8, !tbaa !4\n  br label %for.cond1, !llvm.loop !8\n\nfor.end:                                          ; preds = %for.cond.cleanup3\n  br label %for.inc6\n\nfor.inc6:                                         ; preds = %for.end\n  %7 = load i64, ptr %i, align 8, !tbaa !4\n  %inc7 = add i64 %7, 1\n  store i64 %inc7, ptr %i, align 8, !tbaa !4\n  br label %for.cond, !llvm.loop !10\n\nfor.end8:                                         ; preds = %for.cond.cleanup\n  ret void\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr captures(none)) #0\n\ndeclare dso_local noundef nonnull align 4 dereferenceable(4) ptr @_ZNSt6vectorIiSaIiEEixEm(ptr noundef nonnull align 8 dereferenceable(24), i64 noundef) align 2\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr captures(none)) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"any pointer\", !2, i64 0}\n!2 = !{!\"omnipotent char\", !3, i64 0}\n!3 = !{!\"Simple C++ TBAA\"}\n!4 = !{!5, !5, i64 0}\n!5 = !{!\"long long\", !2, i64 0}\n!6 = !{!7, !7, i64 0}\n!7 = !{!\"int\", !2, i64 0}\n!8 = distinct !{!8, !9}\n!9 = !{!\"llvm.loop.mustprogress\"}\n!10 = distinct !{!10, !9}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/loop-access-checks.ll",
+      "commands": [
+        "opt -passes='default<O2>' -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "loop_with_signed_induction",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr captures(none)) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr captures(none)) #0\n\ndeclare hidden noundef i64 @alloc(ptr noundef nonnull align 8 dereferenceable(24))\n\ndeclare hidden noundef nonnull align 8 dereferenceable(8) ptr @operator_acc(ptr noundef nonnull align 8 dereferenceable(24), i64 noundef)\n\ndefine void @loop_with_signed_induction(ptr noundef nonnull align 8 dereferenceable(24) %vec) {\nentry:\n  %vec.addr = alloca ptr, align 8\n  %count = alloca i64, align 8\n  %i = alloca i64, align 8\n  store ptr %vec, ptr %vec.addr, align 8\n  call void @llvm.lifetime.start.p0(ptr %count)\n  %0 = load ptr, ptr %vec.addr, align 8\n  %call = call noundef i64 @alloc(ptr noundef nonnull align 8 dereferenceable(24) %0)\n  store i64 %call, ptr %count, align 8\n  call void @llvm.lifetime.start.p0(ptr %i)\n  store i64 0, ptr %i, align 8\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.inc, %entry\n  %1 = load i64, ptr %i, align 8\n  %2 = load i64, ptr %count, align 8\n  %cmp = icmp slt i64 %1, %2\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond\n  call void @llvm.lifetime.end.p0(ptr %i)\n  br label %for.end\n\nfor.body:                                         ; preds = %for.cond\n  %3 = load ptr, ptr %vec.addr, align 8\n  %4 = load i64, ptr %i, align 8\n  %call1 = call noundef nonnull align 8 dereferenceable(8) ptr @operator_acc(ptr noundef nonnull align 8 dereferenceable(24) %3, i64 noundef %4)\n  %5 = load double, ptr %call1, align 8, !tbaa !0\n  %add = fadd double %5, 1.000000e+00\n  store double %add, ptr %call1, align 8, !tbaa !0\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %6 = load i64, ptr %i, align 8\n  %inc = add nsw i64 %6, 1\n  store i64 %inc, ptr %i, align 8\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.cond.cleanup\n  call void @llvm.lifetime.end.p0(ptr %count)\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n\n!0 = !{!1, !1, i64 0}\n!1 = !{!\"double\", !2, i64 0}\n!2 = !{!\"omnipotent char\", !3, i64 0}\n!3 = !{!\"Simple C++ TBAA\"}\n"
+        },
+        {
+          "test_name": "foo",
+          "test_body": "; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.start.p0(ptr captures(none)) #0\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: readwrite)\ndeclare void @llvm.lifetime.end.p0(ptr captures(none)) #0\n\ndefine void @foo(ptr noalias noundef nonnull align 8 dereferenceable(24) %vec) {\nentry:\n  %vec.addr = alloca ptr, align 8\n  %count = alloca i64, align 8\n  %i = alloca i64, align 8\n  store ptr %vec, ptr %vec.addr, align 8\n  call void @llvm.lifetime.start.p0(ptr %count)\n  %0 = load ptr, ptr %vec.addr, align 8\n  %call = call noundef i64 @alloc(ptr noundef nonnull align 8 dereferenceable(24) %0)\n  store i64 %call, ptr %count, align 8\n  call void @llvm.lifetime.start.p0(ptr %i)\n  store i64 0, ptr %i, align 8\n  br label %for.cond\n\nfor.cond:                                         ; preds = %for.inc, %entry\n  %1 = load i64, ptr %i, align 8\n  %2 = load i64, ptr %count, align 8\n  %cmp = icmp ne i64 %1, %2\n  br i1 %cmp, label %for.body, label %for.cond.cleanup\n\nfor.cond.cleanup:                                 ; preds = %for.cond\n  call void @llvm.lifetime.end.p0(ptr %i)\n  br label %for.end\n\nfor.body:                                         ; preds = %for.cond\n  %3 = load ptr, ptr %vec.addr, align 8\n  %4 = load i64, ptr %i, align 8\n  %call1 = call noundef nonnull align 8 dereferenceable(8) ptr @operator_acc(ptr noundef nonnull align 8 dereferenceable(24) %3, i64 noundef %4)\n  %5 = load double, ptr %call1, align 8\n  %add = fadd double %5, 1.000000e+00\n  store double %add, ptr %call1, align 8\n  br label %for.inc\n\nfor.inc:                                          ; preds = %for.body\n  %6 = load i64, ptr %i, align 8\n  %inc = add i64 %6, 1\n  store i64 %inc, ptr %i, align 8\n  br label %for.cond\n\nfor.end:                                          ; preds = %for.cond.cleanup\n  call void @llvm.lifetime.end.p0(ptr %count)\n  ret void\n}\n\ndeclare hidden noundef i64 @alloc(ptr noundef nonnull align 8 dereferenceable(24))\n\ndeclare hidden noundef nonnull align 8 dereferenceable(8) ptr @operator_acc(ptr noundef nonnull align 8 dereferenceable(24), i64 noundef)\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(argmem: readwrite) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 135676 tests passed\n* 3394 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 196547 tests passed\n* 5338 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "philnik777",
+      "body": "I'm not entirely sure this is a good idea, but I thought I'd let others have a look and decide whether this is worth pursuing."
+    },
+    {
+      "author": "philnik777",
+      "body": "@nikic any thoughts on this?"
+    }
+  ],
+  "knowledge_cutoff": "2026-03-06T19:04:03Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h": [
+      [
+        47,
+        52
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        3725,
+        3731
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp": [
+      [
+        304,
+        309
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/InlineFunction.cpp": [
+      [
+        2837,
+        2843
+      ]
+    ],
+    "llvm/test/Transforms/Inline/cgscc-update.ll": [
+      [
+        1,
+        4
+      ]
+    ],
+    "llvm/test/Transforms/Inline/nonnull.ll": [
+      [
+        131,
+        137
+      ],
+      [
+        140,
+        146
+      ],
+      [
+        159,
+        164
+      ],
+      [
+        168,
+        174
+      ],
+      [
+        179,
+        187
+      ]
+    ],
+    "llvm/test/Transforms/Inline/ret_attr_align_and_noundef.ll": [
+      [
+        188,
+        193
+      ],
+      [
+        208,
+        213
+      ],
+      [
+        219,
+        224
+      ],
+      [
+        242,
+        247
+      ],
+      [
+        252,
+        257
+      ],
+      [
+        262,
+        267
+      ],
+      [
+        306,
+        311
+      ],
+      [
+        333,
+        338
+      ],
+      [
+        471,
+        476
+      ]
+    ],
+    "llvm/test/Transforms/Inline/ret_attr_update.ll": [
+      [
+        17,
+        22
+      ],
+      [
+        54,
+        59
+      ],
+      [
+        63,
+        68
+      ],
+      [
+        187,
+        192
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/assume.ll": [
+      [
+        532,
+        537
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/AArch64/hoist-runtime-checks.ll": [
+      [
+        128,
+        140
+      ],
+      [
+        148,
+        178
+      ],
+      [
+        228,
+        234
+      ],
+      [
+        293,
+        299
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/X86/hoist-load-of-baseptr.ll": [
+      [
+        18,
+        24
+      ],
+      [
+        28,
+        49
+      ],
+      [
+        57,
+        71
+      ],
+      [
+        76,
+        97
+      ],
+      [
+        105,
+        119
+      ],
+      [
+        122,
+        137
+      ],
+      [
+        238,
+        270
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/loop-access-checks.ll": [
+      [
+        133,
+        139
+      ],
+      [
+        143,
+        159
+      ],
+      [
+        272,
+        278
+      ],
+      [
+        282,
+        298
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst"
+    ],
+    "llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp": [
+      "llvm::salvageKnowledge",
+      "llvm::simplifyRetainedKnowledge"
+    ],
+    "llvm/lib/Transforms/Utils/InlineFunction.cpp": [
+      "llvm::InlineFunctionImpl"
+    ],
+    "llvm/test/Transforms/Inline/nonnull.ll": [
+      "caller9"
+    ],
+    "llvm/test/Transforms/Inline/ret_attr_align_and_noundef.ll": [
+      "caller15_okay_intersect_ranges"
+    ]
+  }
+}

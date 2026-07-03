@@ -1,0 +1,134 @@
+{
+  "pr_id": 199002,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/199002",
+  "state": "open",
+  "title": "[ValueTracking] Conservative NoSync check prevents vectorization",
+  "author": "kshitijvp",
+  "base_commit": "8b1c7ea6f6e91a9977177dd214aca0523f58064e",
+  "fix_commit": "8fd490349d1ec31285069843ce3cd1caa2596ca2",
+  "patch": "diff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex b2f664a9c9c0d..79ff896779ce2 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -639,7 +639,7 @@ inline bool isValidAssumeForContext(const Instruction *I,\n }\n \n /// Returns true, if no instruction between \\p Assume and \\p CtxI may free\n-/// memory and the function is marked as NoSync. The latter ensures the current\n+/// or synchronize memory. The latter ensures the current\n /// function cannot arrange for another thread to free on its behalf.\n LLVM_ABI bool willNotFreeBetween(const Instruction *Assume,\n                                  const Instruction *CtxI);\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 3be0db5ad9c7e..c685956288139 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -708,18 +708,21 @@ bool llvm::willNotFreeBetween(const Instruction *Assume,\n     for (const auto &[Idx, I] : enumerate(Range)) {\n       if (Idx > MaxInstrsToCheckForFree)\n         return false;\n-      if (const auto *CB = dyn_cast<CallBase>(&I))\n-        if (!CB->hasFnAttr(Attribute::NoFree))\n+\n+      if (I.maySynchronize())\n+        return false;\n+\n+      auto *CB = dyn_cast<CallBase>(&I);\n+      if (CB) {\n+        // Non call site cases covered by the two checks above\n+        if (!CB->hasFnAttr(Attribute::NoSync) ||\n+            !CB->hasFnAttr(Attribute::NoFree))\n           return false;\n+      }\n     }\n     return true;\n   };\n \n-  // Make sure the current function cannot arrange for another thread to free on\n-  // its behalf.\n-  if (!CtxI->getFunction()->hasNoSync())\n-    return false;\n-\n   // Handle cross-block case: CtxI in a successor of Assume's block.\n   const BasicBlock *CtxBB = CtxI->getParent();\n   const BasicBlock *AssumeBB = Assume->getParent();\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "Conservative nosync check in ValueTracking.cpp returns false causing potentially\r\nfaulting load preventing vectorization. Instead check if any instructions between\r\nAssume Instruction and Ctx Instruction are synchronizing.\r\nFixes #180180 ",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/LoopVectorize/dereferenceable-info-from-assumption-constant-size.ll",
+      "commands": [
+        "opt -p loop-vectorize -force-vector-width=2 -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "volatileVectorizingTest",
+          "test_body": "define i64 @volatileVectorizingTest(ptr noundef nonnull readonly align 8 captures(none) dereferenceable(24) %v, i32 noundef %n) {\nentry:\n  %l.v = load ptr, ptr %v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  %pi.l.v = ptrtoint ptr %l.v to i64\n  %gep.v = getelementptr inbounds nuw i8, ptr %v, i64 8\n  %l.gep.v = load ptr, ptr %gep.v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %pi.l.gep.v = ptrtoint ptr %l.gep.v to i64\n  %sub = sub i64 %pi.l.gep.v, %pi.l.v\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %l.v, i64 %sub) ]\n  %volatile = load volatile ptr, ptr %v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %c.1 = icmp eq ptr %l.v, %l.gep.v\n  br i1 %c.1, label %exit, label %loop.preheader\n\nloop.preheader:                                   ; preds = %entry\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %loop.preheader\n  %merge = phi ptr [ %gep.merge, %loop.latch ], [ %l.v, %loop.preheader ]\n  %val = load i32, ptr %merge, align 4\n  %c.2 = icmp slt i32 %val, %n\n  br i1 %c.2, label %loop.early.exit, label %loop.latch\n\nloop.early.exit:                                  ; preds = %loop.header\n  %iv = phi ptr [ %merge, %loop.header ]\n  %pi.iv = ptrtoint ptr %iv to i64\n  br label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %gep.merge = getelementptr inbounds nuw i8, ptr %merge, i64 4\n  %c.3 = icmp eq ptr %gep.merge, %l.gep.v\n  br i1 %c.3, label %loop.comp, label %loop.header\n\nloop.comp:                                        ; preds = %loop.latch\n  br label %exit\n\nexit:                                             ; preds = %loop.comp, %loop.early.exit, %entry\n  %mer = phi i64 [ %pi.l.gep.v, %entry ], [ %pi.iv, %loop.early.exit ], [ %pi.l.gep.v, %loop.comp ]\n  ret i64 %mer\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "VectorizingWithoutNoSyncAttributeTest",
+          "test_body": "define i64 @VectorizingWithoutNoSyncAttributeTest(ptr noundef nonnull readonly align 8 captures(none) dereferenceable(24) %v, i32 noundef %n) {\nentry:\n  %l.v = load ptr, ptr %v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  %pi.l.v = ptrtoint ptr %l.v to i64\n  %gep.v = getelementptr inbounds nuw i8, ptr %v, i64 8\n  %l.gep.v = load ptr, ptr %gep.v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %pi.l.gep.v = ptrtoint ptr %l.gep.v to i64\n  %sub = sub i64 %pi.l.gep.v, %pi.l.v\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %l.v, i64 %sub) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %c.1 = icmp eq ptr %l.v, %l.gep.v\n  br i1 %c.1, label %exit, label %loop.preheader\n\nloop.preheader:                                   ; preds = %entry\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %loop.preheader\n  %merge = phi ptr [ %gep.merge, %loop.latch ], [ %l.v, %loop.preheader ]\n  %val = load i32, ptr %merge, align 4\n  %c.2 = icmp slt i32 %val, %n\n  br i1 %c.2, label %loop.early.exit, label %loop.latch\n\nloop.early.exit:                                  ; preds = %loop.header\n  %iv = phi ptr [ %merge, %loop.header ]\n  %pi.iv = ptrtoint ptr %iv to i64\n  br label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %gep.merge = getelementptr inbounds nuw i8, ptr %merge, i64 4\n  %c.3 = icmp eq ptr %gep.merge, %l.gep.v\n  br i1 %c.3, label %loop.comp, label %loop.header\n\nloop.comp:                                        ; preds = %loop.latch\n  br label %exit\n\nexit:                                             ; preds = %loop.comp, %loop.early.exit, %entry\n  %mer = phi i64 [ %pi.l.gep.v, %entry ], [ %pi.iv, %loop.early.exit ], [ %pi.l.gep.v, %loop.comp ]\n  ret i64 %mer\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "atomicNotVectorizingTest",
+          "test_body": "define i64 @atomicNotVectorizingTest(ptr noundef nonnull readonly align 8 captures(none) dereferenceable(24) %v, i32 noundef %n) {\nentry:\n  %l.v = load ptr, ptr %v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  %pi.l.v = ptrtoint ptr %l.v to i64\n  %gep.v = getelementptr inbounds nuw i8, ptr %v, i64 8\n  %l.gep.v = load ptr, ptr %gep.v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %pi.l.gep.v = ptrtoint ptr %l.gep.v to i64\n  %sub = sub i64 %pi.l.gep.v, %pi.l.v\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %l.v, i64 %sub) ]\n  %atomic = load atomic ptr, ptr %v seq_cst, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %c.1 = icmp eq ptr %l.v, %l.gep.v\n  br i1 %c.1, label %exit, label %loop.preheader\n\nloop.preheader:                                   ; preds = %entry\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %loop.preheader\n  %merge = phi ptr [ %gep.merge, %loop.latch ], [ %l.v, %loop.preheader ]\n  %val = load i32, ptr %merge, align 4\n  %c.2 = icmp slt i32 %val, %n\n  br i1 %c.2, label %loop.early.exit, label %loop.latch\n\nloop.early.exit:                                  ; preds = %loop.header\n  %iv = phi ptr [ %merge, %loop.header ]\n  %pi.iv = ptrtoint ptr %iv to i64\n  br label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %gep.merge = getelementptr inbounds nuw i8, ptr %merge, i64 4\n  %c.3 = icmp eq ptr %gep.merge, %l.gep.v\n  br i1 %c.3, label %loop.comp, label %loop.header\n\nloop.comp:                                        ; preds = %loop.latch\n  br label %exit\n\nexit:                                             ; preds = %loop.comp, %loop.early.exit, %entry\n  %mer = phi i64 [ %pi.l.gep.v, %entry ], [ %pi.iv, %loop.early.exit ], [ %pi.l.gep.v, %loop.comp ]\n  ret i64 %mer\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "fenceNotVectorizingTest",
+          "test_body": "define i64 @fenceNotVectorizingTest(ptr noundef nonnull readonly align 8 captures(none) dereferenceable(24) %v, i32 noundef %n) {\nentry:\n  %l.v = load ptr, ptr %v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  %pi.l.v = ptrtoint ptr %l.v to i64\n  %gep.v = getelementptr inbounds nuw i8, ptr %v, i64 8\n  %l.gep.v = load ptr, ptr %gep.v, align 8\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %pi.l.gep.v = ptrtoint ptr %l.gep.v to i64\n  %sub = sub i64 %pi.l.gep.v, %pi.l.v\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %l.v, i64 %sub) ]\n  fence seq_cst\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.v, i64 4) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %l.gep.v, i64 4) ]\n  %c.1 = icmp eq ptr %l.v, %l.gep.v\n  br i1 %c.1, label %exit, label %loop.preheader\n\nloop.preheader:                                   ; preds = %entry\n  br label %loop.header\n\nloop.header:                                      ; preds = %loop.latch, %loop.preheader\n  %merge = phi ptr [ %gep.merge, %loop.latch ], [ %l.v, %loop.preheader ]\n  %val = load i32, ptr %merge, align 4\n  %c.2 = icmp slt i32 %val, %n\n  br i1 %c.2, label %loop.early.exit, label %loop.latch\n\nloop.early.exit:                                  ; preds = %loop.header\n  %iv = phi ptr [ %merge, %loop.header ]\n  %pi.iv = ptrtoint ptr %iv to i64\n  br label %exit\n\nloop.latch:                                       ; preds = %loop.header\n  %gep.merge = getelementptr inbounds nuw i8, ptr %merge, i64 4\n  %c.3 = icmp eq ptr %gep.merge, %l.gep.v\n  br i1 %c.3, label %loop.comp, label %loop.header\n\nloop.comp:                                        ; preds = %loop.latch\n  br label %exit\n\nexit:                                             ; preds = %loop.comp, %loop.early.exit, %entry\n  %mer = phi i64 [ %pi.l.gep.v, %entry ], [ %pi.iv, %loop.early.exit ], [ %pi.l.gep.v, %loop.comp ]\n  ret i64 %mer\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SimplifyCFG/speculate-derefable-load.ll",
+      "commands": [
+        "opt -S -passes=simplifycfg < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "assume_deref_align2",
+          "test_body": "define i64 @assume_deref_align2(i1 %c1, i32 %x, ptr %p) {\nentry:\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %p, i64 8), \"align\"(ptr %p, i64 8) ]\n  br i1 %c1, label %if1, label %exit\n\nif1:                                              ; preds = %entry\n  %c2 = icmp ugt i32 %x, 10\n  br i1 %c2, label %if2, label %exit\n\nif2:                                              ; preds = %if1\n  %v = load i64, ptr %p, align 8\n  br label %exit\n\nexit:                                             ; preds = %if2, %if1, %entry\n  %res = phi i64 [ %v, %if2 ], [ 1, %if1 ], [ 0, %entry ]\n  ret i64 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        },
+        {
+          "test_name": "align_deref_align",
+          "test_body": "define i64 @align_deref_align(i1 %c, ptr %p) {\nentry:\n  call void @llvm.assume(i1 true) [ \"dereferenceable\"(ptr %p, i64 8), \"align\"(ptr %p, i64 8) ]\n  br i1 %c, label %if, label %exit\n\nif:                                               ; preds = %entry\n  %v = load i64, ptr %p, align 8\n  br label %exit\n\nexit:                                             ; preds = %if, %entry\n  %res = phi i64 [ %v, %if ], [ 0, %entry ]\n  ret i64 %res\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n@llvm/pr-subscribers-llvm-transforms\n\n@llvm/pr-subscribers-llvm-analysis\n\nAuthor: Kshitij Paranjape (kshitijvp)\n\n<details>\n<summary>Changes</summary>\n\nConservative nosync check in ValueTracking.cpp returns false causing potentially faulting load preventing vectorization. Instead check if any instructions between Assume Instruction and Ctx Instruction are synchronizing.\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/199002.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/include/llvm/Analysis/ValueTracking.h (+1-1) \n- (modified) llvm/lib/Analysis/ValueTracking.cpp (+17-5) \n\n\n``````````diff\ndiff --git a/llvm/include/llvm/Analysis/ValueTracking.h b/llvm/include/llvm/Analysis/ValueTracking.h\nindex b2f664a9c9c0d..79ff896779ce2 100644\n--- a/llvm/include/llvm/Analysis/ValueTracking.h\n+++ b/llvm/include/llvm/Analysis/ValueTracking.h\n@@ -639,7 +639,7 @@ inline bool isValidAssumeForContext(const Instruction *I,\n }\n \n /// Returns true, if no instruction between \\p Assume and \\p CtxI may free\n-/// memory and the function is marked as NoSync. The latter ensures the current\n+/// or synchronize memory. The latter ensures the current\n /// function cannot arrange for another thread to free on its behalf.\n LLVM_ABI bool willNotFreeBetween(const Instruction *Assume,\n                                  const Instruction *CtxI);\ndiff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 3be0db5ad9c7e..b59bed0cc7f23 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -703,14 +703,26 @@ bool llvm::isValidAssumeForContext(const Instruction *Inv,\n \n bool llvm::willNotFreeBetween(const Instruction *Assume,\n                               const Instruction *CtxI) {\n-  // Helper to check if there are any calls in the range that may free memory.\n+  // Helper to make sure the current function cannot arrange for\n+  // another thread to free on its behalf and to check if there\n+  // are any calls in the range that may free memory.\n   auto hasNoFreeCalls = [](auto Range) {\n     for (const auto &[Idx, I] : enumerate(Range)) {\n       if (Idx > MaxInstrsToCheckForFree)\n         return false;\n-      if (const auto *CB = dyn_cast<CallBase>(&I))\n-        if (!CB->hasFnAttr(Attribute::NoFree))\n-          return false;\n+      if (I.isVolatile())\n+        return false;\n+\n+      if (I.maySynchronize())\n+        return false;\n+\n+      auto *CB = dyn_cast<CallBase>(&I);\n+      if (CB) {\n+        // Non call site cases covered by the two checks above\n+        if (!CB->hasFnAttr(Attribute::NoSync) ||\n+            !CB->hasFnAttr(Attribute::NoFree))\n+            return false;\n+      }\n     }\n     return true;\n   };\n@@ -739,7 +751,7 @@ bool llvm::willNotFreeBetween(const Instruction *Assume,\n   }\n \n   // Check if there are any calls between Assume and CtxIter that may free\n-  // memory.\n+  // memory or synchronize.\n   return hasNoFreeCalls(make_range(Assume->getIterator(), CtxIter));\n }\n \n\n``````````\n\n</details>\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "kshitijvp",
+      "body": "I will add the cleaned IR Tests soon.\nSorry for the delay."
+    },
+    {
+      "author": "kshitijvp",
+      "body": "> Is there a reason to re-posting this as a new PR again instead of just updating the existing one? It is very hard to keep track of the comments\n\nThere was some problem with the previous PR and Nikic wasn't able to add reviews so had to open a new one."
+    },
+    {
+      "author": "kshitijvp",
+      "body": "Since Nikic pointed out, instead of isOrderedAtomic I have used I.maySynchronize(), and have also used the same name since synchronization is just another way of freeing."
+    },
+    {
+      "author": "kshitijvp",
+      "body": "I have added the cleaned IR Tests.\r\nSorry for the inconvenience caused."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 135011 tests passed\n* 3322 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 195702 tests passed\n* 5258 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-05-21T11:09:41Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Analysis/ValueTracking.h": [
+      [
+        639,
+        645
+      ]
+    ],
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        708,
+        725
+      ]
+    ],
+    "llvm/test/Transforms/LoopVectorize/dereferenceable-info-from-assumption-constant-size.ll": [
+      [
+        1307,
+        1336
+      ],
+      [
+        1456,
+        1459
+      ]
+    ],
+    "llvm/test/Transforms/SimplifyCFG/speculate-derefable-load.ll": [
+      [
+        4,
+        17
+      ],
+      [
+        52,
+        68
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "llvm::willNotFreeBetween"
+    ]
+  }
+}

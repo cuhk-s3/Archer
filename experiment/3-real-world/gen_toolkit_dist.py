@@ -6,6 +6,7 @@ from typing import Any
 
 
 def parse_args() -> argparse.Namespace:
+  default_record_dir = Path(__file__).resolve().parent / "record"
   parser = argparse.ArgumentParser(
     description=(
       "Summarize selected tool calls and draw three horizontal bars: "
@@ -15,25 +16,25 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--results-dir",
     type=Path,
-    default=Path(__file__).resolve().parents[2] / "record",
+    default=default_record_dir,
     help="Path to results directory containing stats JSON files.",
   )
   parser.add_argument(
     "--output-png",
     type=Path,
-    default=Path(__file__).resolve().parents[2] / "record" / "toolkit_dist.png",
+    default=default_record_dir / "toolkit_dist.png",
     help="Output path of the bar chart PNG.",
   )
   parser.add_argument(
     "--output-json",
     type=Path,
-    default=Path(__file__).resolve().parents[2] / "record" / "toolkit_dist.json",
+    default=default_record_dir / "toolkit_dist.json",
     help="Output path of aggregated statistics JSON.",
   )
   parser.add_argument(
     "--output-pdf",
     type=Path,
-    default=Path(__file__).resolve().parents[2] / "record" / "toolkit_dist.pdf",
+    default=default_record_dir / "toolkit_dist.pdf",
     help="Output path of the bar chart PDF.",
   )
   return parser.parse_args()
@@ -311,16 +312,16 @@ def main() -> None:
 
   plt.rcParams.update(
     {
-      "font.size": 12,
-      "axes.titlesize": 12,
-      "axes.labelsize": 12,
+      "font.size": 18,
+      "axes.titlesize": 18,
+      "axes.labelsize": 18,
     }
   )
 
-  fig, ax = plt.subplots(figsize=(7.2, 3.6))
-  label_fontsize = 12
-  axis_fontsize = 12
-  tick_fontsize = 12
+  fig, ax = plt.subplots(figsize=(8.4, 4.2))
+  label_fontsize = 18
+  axis_fontsize = 18
+  tick_fontsize = 18
   base_face = "#E2EFFF"
   base_edge = "#1D73DD"
   hatch_by_label = {
@@ -331,6 +332,9 @@ def main() -> None:
     "verify": "//",
     "workflow": "",
   }
+  context_label = "context"
+  verification_label = "validation"
+  workflow_label = "management"
 
   # Context: stacked horizontal bar.
   left = 0
@@ -339,7 +343,7 @@ def main() -> None:
   for key in ["search", "langref"]:
     val = context_parts[key]
     ax.barh(
-      "context",
+      context_label,
       val,
       left=left,
       color=base_face,
@@ -353,7 +357,7 @@ def main() -> None:
     if val > 0 and key == "search":
       ax.text(
         left + val / 2,
-        "context",
+        context_label,
         "search",
         ha="center",
         va="center",
@@ -381,7 +385,7 @@ def main() -> None:
   for key in ["trans", "difftest", "verify"]:
     val = verification_parts[key]
     ax.barh(
-      "verification",
+      verification_label,
       val,
       left=left,
       color=base_face,
@@ -395,7 +399,7 @@ def main() -> None:
     if val > 0:
       ax.text(
         left + val / 2,
-        "verification",
+        verification_label,
         f"{key}",
         ha="center",
         va="center",
@@ -406,7 +410,7 @@ def main() -> None:
   # Workflow: single horizontal bar (aggregated from three tools).
   workflow_total = group_totals["workflow"]
   ax.barh(
-    "workflow",
+    workflow_label,
     workflow_total,
     color=base_face,
     edgecolor=base_edge,
@@ -419,7 +423,7 @@ def main() -> None:
   if workflow_total > 0:
     ax.text(
       workflow_total / 2,
-      "workflow",
+      workflow_label,
       "workflow",
       ha="center",
       va="center",

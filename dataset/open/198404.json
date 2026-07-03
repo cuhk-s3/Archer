@@ -1,0 +1,100 @@
+{
+  "pr_id": 198404,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/198404",
+  "state": "open",
+  "title": "[InstCombine] Drop the correct assume when working on assume bundles",
+  "author": "philnik777",
+  "base_commit": "9721f891b38277c183075d483627e55c519cf739",
+  "fix_commit": "0e3185b5319dd7159bd440713c3f3b7d0e387834",
+  "patch": "diff --git a/llvm/include/llvm/IR/InstrTypes.h b/llvm/include/llvm/IR/InstrTypes.h\nindex 61dc5ebef1b1d..7f2f0c12a7e77 100644\n--- a/llvm/include/llvm/IR/InstrTypes.h\n+++ b/llvm/include/llvm/IR/InstrTypes.h\n@@ -1187,6 +1187,10 @@ class CallBase : public Instruction {\n   removeOperandBundle(CallBase *CB, uint32_t ID,\n                       InsertPosition InsertPt = nullptr);\n \n+  LLVM_ABI static CallBase *\n+  removeOperandBundleAt(CallBase *CB, size_t Offset,\n+                        InsertPosition InsertPtr = nullptr);\n+\n   /// Return the convergence control token for this call, if it exists.\n   Value *getConvergenceControlToken() const {\n     if (auto Bundle = getOperandBundle(llvm::LLVMContext::OB_convergencectrl)) {\ndiff --git a/llvm/lib/IR/Instructions.cpp b/llvm/lib/IR/Instructions.cpp\nindex 93ec59846d360..c9d9d9d8a989e 100644\n--- a/llvm/lib/IR/Instructions.cpp\n+++ b/llvm/lib/IR/Instructions.cpp\n@@ -609,6 +609,22 @@ CallBase *CallBase::removeOperandBundle(CallBase *CB, uint32_t ID,\n   return CreateNew ? Create(CB, Bundles, InsertPt) : CB;\n }\n \n+CallBase *CallBase::removeOperandBundleAt(CallBase *CB, size_t Offset,\n+                                          InsertPosition InsertPt) {\n+  auto OpBundleCount = CB->getNumOperandBundles();\n+  assert(Offset < OpBundleCount &&\n+         \"Trying to remove non-existant operand bundle\");\n+  SmallVector<OperandBundleDef, 1> Bundles;\n+  Bundles.reserve(OpBundleCount - 1);\n+  size_t I = 0;\n+  for (; I != Offset; ++I)\n+    Bundles.emplace_back(CB->getOperandBundleAt(I));\n+  ++I;\n+  for (; I != OpBundleCount; ++I)\n+    Bundles.emplace_back(CB->getOperandBundleAt(I));\n+  return Create(CB, Bundles, InsertPt);\n+}\n+\n bool CallBase::hasReadingOperandBundles() const {\n   // Implementation note: this is a conservative implementation of operand\n   // bundle semantics, where *any* non-assume operand bundle (other than\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 2a8bf3ffecd6f..7da8eebcad1fe 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3652,7 +3652,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n \n         // Remove align 1 bundles; they don't add any useful information.\n         if (RK.ArgValue == 1)\n-          return CallBase::removeOperandBundle(II, OBU.getTagID());\n+          return CallBase::removeOperandBundleAt(II, Idx);\n \n         // Don't try to remove align assumptions for pointers derived from\n         // arguments. We might lose information if the function gets inline and\n@@ -3666,7 +3666,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n         if ((1ULL << computeKnownBits(RK.WasOn, II).countMinTrailingZeros()) <\n             RK.ArgValue)\n           continue;\n-        return CallBase::removeOperandBundle(II, OBU.getTagID());\n+        return CallBase::removeOperandBundleAt(II, Idx);\n       }\n \n       if (OBU.getTagName() == \"nonnull\" && OBU.Inputs.size() == 1) {\n@@ -3677,7 +3677,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n \n         // Drop assume if we can prove nonnull without it\n         if (isKnownNonZero(RK.WasOn, getSimplifyQuery().getWithInstruction(II)))\n-          return CallBase::removeOperandBundle(II, OBU.getTagID());\n+          return CallBase::removeOperandBundleAt(II, Idx);\n \n         // Fold the assume into metadata if it's valid at the load\n         if (auto *LI = dyn_cast<LoadInst>(RK.WasOn);\n@@ -3686,7 +3686,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n           MDNode *MD = MDNode::get(II->getContext(), {});\n           LI->setMetadata(LLVMContext::MD_nonnull, MD);\n           LI->setMetadata(LLVMContext::MD_noundef, MD);\n-          return CallBase::removeOperandBundle(II, OBU.getTagID());\n+          return CallBase::removeOperandBundleAt(II, Idx);\n         }\n \n         // TODO: apply nonnull return attributes to calls and invokes\n",
+  "components": [
+    "IR",
+    "InstCombine"
+  ],
+  "description": "Currently, all assumes of the same kind in an assume bundle are dropped, even though only a single one is actually checked to be redundant and should be dropped. This introduces a new `removeOperandFromBundleAt`, which instead drops a bundle at a specific position. This should also be faster, since copying the bundles can now be done into an already correctly allocated vector.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/assume.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine --enable-knowledge-retention -S"
+      ],
+      "tests": [
+        {
+          "test_name": "partially_redundant",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @partially_redundant(ptr %ptr, ptr %ptr2, ptr %ptr3) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr), \"nonnull\"(ptr %ptr2) ]\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr), \"nonnull\"(ptr %ptr3) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "redundant_nonnull3",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @redundant_nonnull3(ptr %ptr) {\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr) ]\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "assumption_conflicts_with_known_bits",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine i32 @assumption_conflicts_with_known_bits(i32 %a, i32 %b) {\n  %and1 = and i32 %b, 3\n  %B1 = lshr i32 %and1, %and1\n  %B3 = shl nuw nsw i32 %and1, %B1\n  %cmp = icmp eq i32 %B3, 1\n  tail call void @llvm.assume(i1 %cmp)\n  %cmp2 = icmp eq i32 %B1, %B3\n  tail call void @llvm.assume(i1 %cmp2)\n  ret i32 %and1\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:ir",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n@llvm/pr-subscribers-llvm-transforms\n\n@llvm/pr-subscribers-llvm-ir\n\nAuthor: Nikolas Klauser (philnik777)\n\n<details>\n<summary>Changes</summary>\n\nCurrently, all assumes of the same kind in an assume bundle are dropped, even though only a single one is actually checked to be redundant and should be dropped. This introduces a new `removeOperandFromBundleAt`, which instead drops a bundle at a specific position. This should also be faster, since copying the bundles can now be done into an already correctly allocated vector.\n\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/198404.diff\n\n\n4 Files Affected:\n\n- (modified) llvm/include/llvm/IR/InstrTypes.h (+4) \n- (modified) llvm/lib/IR/Instructions.cpp (+16) \n- (modified) llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp (+4-4) \n- (modified) llvm/test/Transforms/InstCombine/assume.ll (+11) \n\n\n``````````diff\ndiff --git a/llvm/include/llvm/IR/InstrTypes.h b/llvm/include/llvm/IR/InstrTypes.h\nindex 61dc5ebef1b1d..7f2f0c12a7e77 100644\n--- a/llvm/include/llvm/IR/InstrTypes.h\n+++ b/llvm/include/llvm/IR/InstrTypes.h\n@@ -1187,6 +1187,10 @@ class CallBase : public Instruction {\n   removeOperandBundle(CallBase *CB, uint32_t ID,\n                       InsertPosition InsertPt = nullptr);\n \n+  LLVM_ABI static CallBase *\n+  removeOperandBundleAt(CallBase *CB, size_t Offset,\n+                        InsertPosition InsertPtr = nullptr);\n+\n   /// Return the convergence control token for this call, if it exists.\n   Value *getConvergenceControlToken() const {\n     if (auto Bundle = getOperandBundle(llvm::LLVMContext::OB_convergencectrl)) {\ndiff --git a/llvm/lib/IR/Instructions.cpp b/llvm/lib/IR/Instructions.cpp\nindex 93ec59846d360..c9d9d9d8a989e 100644\n--- a/llvm/lib/IR/Instructions.cpp\n+++ b/llvm/lib/IR/Instructions.cpp\n@@ -609,6 +609,22 @@ CallBase *CallBase::removeOperandBundle(CallBase *CB, uint32_t ID,\n   return CreateNew ? Create(CB, Bundles, InsertPt) : CB;\n }\n \n+CallBase *CallBase::removeOperandBundleAt(CallBase *CB, size_t Offset,\n+                                          InsertPosition InsertPt) {\n+  auto OpBundleCount = CB->getNumOperandBundles();\n+  assert(Offset < OpBundleCount &&\n+         \"Trying to remove non-existant operand bundle\");\n+  SmallVector<OperandBundleDef, 1> Bundles;\n+  Bundles.reserve(OpBundleCount - 1);\n+  size_t I = 0;\n+  for (; I != Offset; ++I)\n+    Bundles.emplace_back(CB->getOperandBundleAt(I));\n+  ++I;\n+  for (; I != OpBundleCount; ++I)\n+    Bundles.emplace_back(CB->getOperandBundleAt(I));\n+  return Create(CB, Bundles, InsertPt);\n+}\n+\n bool CallBase::hasReadingOperandBundles() const {\n   // Implementation note: this is a conservative implementation of operand\n   // bundle semantics, where *any* non-assume operand bundle (other than\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 2a8bf3ffecd6f..7da8eebcad1fe 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3652,7 +3652,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n \n         // Remove align 1 bundles; they don't add any useful information.\n         if (RK.ArgValue == 1)\n-          return CallBase::removeOperandBundle(II, OBU.getTagID());\n+          return CallBase::removeOperandBundleAt(II, Idx);\n \n         // Don't try to remove align assumptions for pointers derived from\n         // arguments. We might lose information if the function gets inline and\n@@ -3666,7 +3666,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n         if ((1ULL << computeKnownBits(RK.WasOn, II).countMinTrailingZeros()) <\n             RK.ArgValue)\n           continue;\n-        return CallBase::removeOperandBundle(II, OBU.getTagID());\n+        return CallBase::removeOperandBundleAt(II, Idx);\n       }\n \n       if (OBU.getTagName() == \"nonnull\" && OBU.Inputs.size() == 1) {\n@@ -3677,7 +3677,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n \n         // Drop assume if we can prove nonnull without it\n         if (isKnownNonZero(RK.WasOn, getSimplifyQuery().getWithInstruction(II)))\n-          return CallBase::removeOperandBundle(II, OBU.getTagID());\n+          return CallBase::removeOperandBundleAt(II, Idx);\n \n         // Fold the assume into metadata if it's valid at the load\n         if (auto *LI = dyn_cast<LoadInst>(RK.WasOn);\n@@ -3686,7 +3686,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n           MDNode *MD = MDNode::get(II->getContext(), {});\n           LI->setMetadata(LLVMContext::MD_nonnull, MD);\n           LI->setMetadata(LLVMContext::MD_noundef, MD);\n-          return CallBase::removeOperandBundle(II, OBU.getTagID());\n+          return CallBase::removeOperandBundleAt(II, Idx);\n         }\n \n         // TODO: apply nonnull return attributes to calls and invokes\ndiff --git a/llvm/test/Transforms/InstCombine/assume.ll b/llvm/test/Transforms/InstCombine/assume.ll\nindex c39f606382650..18571498df5a3 100644\n--- a/llvm/test/Transforms/InstCombine/assume.ll\n+++ b/llvm/test/Transforms/InstCombine/assume.ll\n@@ -490,6 +490,17 @@ define void @redundant_nonnull3(ptr %ptr) {\n   ret void\n }\n \n+define void @partially_redundant(ptr %ptr, ptr %ptr2, ptr %ptr3) {\n+; CHECK-LABEL: @partially_redundant(\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"nonnull\"(ptr [[PTR2:%.*]]) ]\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"nonnull\"(ptr [[PTR:%.*]]), \"nonnull\"(ptr [[PTR3:%.*]]) ]\n+; CHECK-NEXT:    ret void\n+;\n+  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr), \"nonnull\"(ptr %ptr2) ]\n+  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %ptr), \"nonnull\"(ptr %ptr3) ]\n+  ret void\n+}\n+\n ; PR35846 - https://bugs.llvm.org/show_bug.cgi?id=35846\n \n define i32 @assumption_conflicts_with_known_bits(i32 %a, i32 %b) {\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-18T21:21:04Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/IR/InstrTypes.h": [
+      [
+        1187,
+        1192
+      ]
+    ],
+    "llvm/lib/IR/Instructions.cpp": [
+      [
+        609,
+        614
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        3652,
+        3658
+      ],
+      [
+        3666,
+        3672
+      ],
+      [
+        3677,
+        3683
+      ],
+      [
+        3686,
+        3692
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/assume.ll": [
+      [
+        490,
+        495
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/include/llvm/IR/InstrTypes.h": [
+      "getConvergenceControlToken"
+    ],
+    "llvm/lib/IR/Instructions.cpp": [
+      "CallBase::hasReadingOperandBundles",
+      "CallBase::removeOperandBundle"
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst"
+    ]
+  }
+}

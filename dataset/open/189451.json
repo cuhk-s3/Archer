@@ -1,0 +1,135 @@
+{
+  "pr_id": 189451,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/189451",
+  "state": "open",
+  "title": "[SLP] Support ordered fadd reduction via reduction intrinsics",
+  "author": "alexey-bataev",
+  "base_commit": "6c979bbcfae4fa21c907f3d7d099cf8ac6543202",
+  "fix_commit": "e785becfc263c7d6de731853b838f0364d6d9446",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\nindex f1a6eb2d7e8af..e405a8e2f9dd3 100644\n--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n+++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp\n@@ -27923,6 +27923,11 @@ class HorizontalReduction {\n   }\n \n public:\n+  /// \\returns true if \\p V has an opcode that could form an ordered reduction.\n+  static bool isSupportedOrderedReductionOp(Instruction *I) {\n+    return I->getOpcode() == Instruction::FAdd;\n+  }\n+\n   static RecurKind getRdxKind(Value *V) {\n     auto *I = dyn_cast<Instruction>(V);\n     if (!I)\n@@ -28169,6 +28174,93 @@ class HorizontalReduction {\n     return RK != ReductionOrdering::None;\n   }\n \n+  /// Analyze whether \\p Root forms a linearized ordered reduction chain.\n+  /// If \\p MatchLHS is true, analyzes LHS-associated (left-linearized) chains\n+  /// where the chain recurses on the LHS and the RHS at each level is a leaf:\n+  ///   ((((v0 op v1) op v2) op v3) op v4)\n+  /// If \\p MatchLHS is false, analyzes RHS-associated (right-linearized) chains\n+  /// where the chain recurses on the RHS and the LHS at each level is a leaf:\n+  ///   (v0 op (v1 op (v2 op (v3 op v4))))\n+  /// Leaf values are stored in ReducedVals.back() in accumulation order\n+  /// (innermost pair first, outermost last), e.g. [v0,v1,v2,v3,v4] for\n+  /// LHS-associated and [v4,v3,v2,v1,v0] for RHS-associated chains.\n+  /// \\returns true if the chain is a valid ordered reduction.\n+  bool matchOrderedReduction(BoUpSLP &R, Instruction *Root, bool MatchLHS) {\n+    ReducedVals.clear();\n+    ReducedValsToOps.clear();\n+    ReductionOps.clear();\n+    RdxKind = getRdxKind(Root);\n+    // Currently, only ordered fadd reductions are supported.\n+    if (RdxKind != RecurKind::FAdd)\n+      return false;\n+    if (isVectorizable(RdxKind, Root) != ReductionOrdering::Ordered)\n+      return false;\n+\n+    // Ordered reductions only support simple binary ops, not min/max\n+    // select(cmp) patterns or poison-safe bool logic ops.\n+    if (isCmpSelMinMax(Root) || isBoolLogicOp(Root))\n+      return false;\n+\n+    Type *Ty = Root->getType();\n+    if (!isValidElementType(Ty) || Ty->isPointerTy())\n+      return false;\n+\n+    // This is an ordered (linearized) reduction regardless of whether the\n+    // individual operations are associative.\n+    RK = ReductionOrdering::Ordered;\n+    ReductionRoot = Root;\n+    unsigned FirstOpIdx = getFirstOperandIndex(Root);\n+    unsigned ChainOpIdx = MatchLHS ? FirstOpIdx : FirstOpIdx + 1;\n+    unsigned LeafOpIdx = MatchLHS ? FirstOpIdx + 1 : FirstOpIdx;\n+    initReductionOps(Root);\n+    ReducedVals.emplace_back();\n+    SmallPtrSet<Instruction *, 16> Visited;\n+    Instruction *TreeN = Root;\n+    unsigned Depth = 0;\n+    bool ChainComplete = false;\n+    constexpr unsigned MaxReducedVals = 1024;\n+    while (TreeN) {\n+      if (Depth++ > RecursionMaxDepth)\n+        break;\n+      if (ReducedVals.back().size() >= MaxReducedVals)\n+        break;\n+      if (!Visited.insert(TreeN).second)\n+        break;\n+      if (getRdxKind(TreeN) != RdxKind)\n+        break;\n+      addReductionOps(TreeN);\n+      Value *LeafVal = getRdxOperand(TreeN, LeafOpIdx);\n+      Value *ChainVal = getRdxOperand(TreeN, ChainOpIdx);\n+      ReducedValsToOps[LeafVal].push_back(TreeN);\n+      ReducedValsToOps[ChainVal].push_back(TreeN);\n+      ReducedVals.back().push_back(LeafVal);\n+      auto *ChainInst = dyn_cast<Instruction>(ChainVal);\n+      if (!ChainInst || getRdxKind(ChainInst) != RdxKind ||\n+          !hasRequiredNumberOfUses(/*IsCmpSelMinMax=*/false, ChainInst)) {\n+        ReducedVals.back().push_back(ChainVal);\n+        ChainComplete = true;\n+        break;\n+      }\n+      TreeN = ChainInst;\n+    }\n+    // Leaves are collected outer-to-inner (top-down).  Reverse to get the\n+    // accumulation order (innermost first) needed by ordered reduction\n+    // intrinsics.  This is correct for both LHS- and RHS-associated chains\n+    // because fadd is commutative \u2014 each step only relies on a+b == b+a,\n+    // never on associativity.\n+    if (!ChainComplete || ReducedVals.back().size() < ReductionLimit) {\n+      for (ReductionOpsType &RdxOps : ReductionOps)\n+        for (Value *RdxOp : RdxOps)\n+          R.analyzedReductionRoot(cast<Instruction>(RdxOp));\n+      ReducedVals.pop_back();\n+      ReducedValsToOps.clear();\n+      ReductionOps.clear();\n+      return false;\n+    }\n+    std::reverse(ReducedVals.back().begin(), ReducedVals.back().end());\n+    return true;\n+  }\n+\n   /// Try to find a reduction tree.\n   bool matchAssociativeReduction(BoUpSLP &R, Instruction *Root,\n                                  ScalarEvolution &SE, DominatorTree &DT,\n@@ -29185,6 +29277,239 @@ class HorizontalReduction {\n     return VectorizedTree;\n   }\n \n+  /// Attempt to vectorize an ordered (linearized) reduction chain.\n+  /// Reduced values from matchOrderedReduction() are in accumulation order.\n+  /// Vectorized subsets are immediately reduced via ordered reduction\n+  /// intrinsics; non-vectorized values are folded linearly.\n+  Value *tryToReduceOrdered(BoUpSLP &V, const DataLayout &DL,\n+                            TargetTransformInfo *TTI,\n+                            const TargetLibraryInfo &TLI, AssumptionCache *AC,\n+                            DominatorTree &DT) {\n+    constexpr unsigned RegMaxNumber = 4;\n+    constexpr unsigned RedValsMaxNumber = 128;\n+\n+    assert(RK == ReductionOrdering::Ordered && \"Expected ordered reduction\");\n+    assert(ReducedVals.size() == 1 &&\n+           \"Expected single group from matchOrderedReduction\");\n+\n+    IRBuilder<TargetFolder> Builder(ReductionRoot->getContext(),\n+                                    TargetFolder(DL));\n+    Instruction *RdxRootInst = cast<Instruction>(ReductionRoot);\n+    Builder.SetInsertPoint(RdxRootInst);\n+\n+    SmallVector<Value *> Candidates(ReducedVals.back());\n+\n+    // Intersect the fast-math-flags from all reduction operations.\n+    FastMathFlags RdxFMF;\n+    RdxFMF.set();\n+    for (Value *RdxVal : Candidates)\n+      for (Instruction *Op : ReducedValsToOps.at(RdxVal))\n+        if (auto *FPMO = dyn_cast<FPMathOperator>(Op))\n+          RdxFMF &= FPMO->getFastMathFlags();\n+\n+    unsigned MaxVecRegSize = V.getMaxVecRegSize();\n+    unsigned EltSize = V.getVectorElementSize(Candidates[0]);\n+    const unsigned MaxElts =\n+        std::clamp<unsigned>(llvm::bit_floor(MaxVecRegSize / EltSize),\n+                             RedValsMaxNumber, RegMaxNumber * RedValsMaxNumber);\n+\n+    unsigned ReduxWidth = 0;\n+    auto GetVectorFactor = [&, &TTI = *TTI](unsigned ReduxWidth) {\n+      Type *ScalarTy = Candidates.front()->getType();\n+      ReduxWidth =\n+          getFloorFullVectorNumberOfElements(TTI, ScalarTy, ReduxWidth);\n+      VectorType *Tp = getWidenedType(ScalarTy, ReduxWidth);\n+      unsigned NumParts = ::getNumberOfParts(TTI, Tp, ScalarTy);\n+      unsigned NumRegs =\n+          TTI.getNumberOfRegisters(TTI.getRegisterClassForType(true, Tp));\n+      while (NumParts > NumRegs) {\n+        assert(ReduxWidth > 0 && \"ReduxWidth is unexpectedly 0.\");\n+        ReduxWidth = bit_floor(ReduxWidth - 1);\n+        VectorType *Tp = getWidenedType(ScalarTy, ReduxWidth);\n+        NumParts = ::getNumberOfParts(TTI, Tp, ScalarTy);\n+        NumRegs =\n+            TTI.getNumberOfRegisters(TTI.getRegisterClassForType(true, Tp));\n+      }\n+      if (NumParts > NumRegs / 2)\n+        ReduxWidth = bit_floor(ReduxWidth);\n+      return ReduxWidth;\n+    };\n+    auto ShrinkReduxWidth = [&]() {\n+      --ReduxWidth;\n+      if (ReduxWidth > 1)\n+        ReduxWidth = GetVectorFactor(ReduxWidth);\n+    };\n+\n+    // Try to build, cost-check, and vectorize a window [Start, Start+Width).\n+    unsigned SuccessStart = 0, SuccessWidth = 0;\n+    Value *SuccessRoot = nullptr;\n+    SmallMapVector<Value *, unsigned, 16> EmptySameValuesCounter;\n+    auto TryWindow = [&](unsigned Start, unsigned Width) -> bool {\n+      ArrayRef<Value *> VL = ArrayRef(Candidates).slice(Start, Width);\n+      if (V.areAnalyzedReductionVals(VL))\n+        return false;\n+      if (any_of(VL, [&V](Value *RedVal) {\n+            auto *RedValI = dyn_cast<Instruction>(RedVal);\n+            return RedValI && V.isDeleted(RedValI);\n+          }))\n+        return false;\n+\n+      SmallDenseSet<Value *> IgnoreList;\n+      for (Value *RdxVal : VL)\n+        for (Instruction *Op : ReducedValsToOps.at(RdxVal))\n+          IgnoreList.insert(Op);\n+\n+      V.buildTree(VL, IgnoreList);\n+      if (V.isTreeTinyAndNotFullyVectorizable(false)) {\n+        V.analyzedReductionVals(VL);\n+        return false;\n+      }\n+      V.reorderTopToBottom();\n+      V.reorderBottomToTop();\n+\n+      BoUpSLP::ExtraValueToDebugLocsMap LocalExternallyUsedValues;\n+      LocalExternallyUsedValues.insert(ReductionRoot);\n+      for (unsigned Cnt : seq<unsigned>(Candidates.size())) {\n+        if (Cnt >= Start && Cnt < Start + Width)\n+          continue;\n+        if (isa<Instruction>(Candidates[Cnt]))\n+          LocalExternallyUsedValues.insert(Candidates[Cnt]);\n+      }\n+\n+      V.transformNodes();\n+      V.computeMinimumValueSizes();\n+      InstructionCost TreeCost = V.calculateTreeCostAndTrimNonProfitable(VL);\n+      V.buildExternalUses(LocalExternallyUsedValues);\n+\n+      InstructionCost ReductionCost =\n+          getReductionCost(TTI, VL, EmptySameValuesCounter,\n+                           /*IsCmpSelMinMax=*/false, RdxFMF, V, DT, DL, TLI);\n+      InstructionCost Cost =\n+          V.getTreeCost(TreeCost, VL, ReductionCost, RdxRootInst);\n+      LLVM_DEBUG(dbgs() << \"SLP: Found cost = \" << Cost\n+                        << \" for ordered reduction\\n\");\n+      if (Cost > -SLPCostThreshold ||\n+          (Cost == -SLPCostThreshold && V.getTreeSize() > 1)) {\n+        if (Cost.isValid())\n+          V.getORE()->emit([&]() {\n+            return OptimizationRemarkMissed(SV_NAME, \"HorSLPNotBeneficial\",\n+                                            ReducedValsToOps.at(VL[0]).front())\n+                   << \"Vectorizing ordered reduction is possible \"\n+                   << \"but not beneficial with cost \" << ore::NV(\"Cost\", Cost)\n+                   << \" and threshold \"\n+                   << ore::NV(\"Threshold\", -SLPCostThreshold);\n+          });\n+        V.analyzedReductionVals(VL);\n+        return false;\n+      }\n+\n+      LLVM_DEBUG(dbgs() << \"SLP: Vectorizing ordered reduction at cost:\" << Cost\n+                        << \". (HorRdx)\\n\");\n+      V.getORE()->emit([&]() {\n+        return OptimizationRemark(SV_NAME, \"VectorizedHorizontalReduction\",\n+                                  ReducedValsToOps.at(VL[0]).front())\n+               << \"Vectorized ordered reduction with cost \"\n+               << ore::NV(\"Cost\", Cost) << \" and with tree size \"\n+               << ore::NV(\"TreeSize\", V.getTreeSize());\n+      });\n+\n+      Builder.setFastMathFlags(RdxFMF);\n+      SuccessRoot = V.vectorizeTree(LocalExternallyUsedValues, RdxRootInst);\n+      assert(SuccessRoot && \"Expected vectorized tree\");\n+      SuccessStart = Start;\n+      SuccessWidth = Width;\n+      return true;\n+    };\n+\n+    // Phase 1: front-anchored \u2014 try [0, W), shrinking W.\n+    // Phase 2: back-anchored  \u2014 try [N-W, N), shrinking W.\n+    // We try one side fully before the other to limit compile time.\n+    unsigned N = Candidates.size();\n+    for (bool FromFront : {true, false}) {\n+      ReduxWidth = N;\n+      if (!VectorizeNonPowerOf2 || !has_single_bit(ReduxWidth + 1))\n+        ReduxWidth = GetVectorFactor(ReduxWidth);\n+      ReduxWidth = std::min(ReduxWidth, MaxElts);\n+\n+      while (ReduxWidth >= ReductionLimit) {\n+        unsigned Start = FromFront ? 0 : N - ReduxWidth;\n+        if (!FromFront && Start == 0) {\n+          ShrinkReduxWidth();\n+          continue;\n+        }\n+        if (TryWindow(Start, ReduxWidth))\n+          break;\n+        ShrinkReduxWidth();\n+      }\n+      if (SuccessRoot)\n+        break;\n+    }\n+\n+    if (!SuccessRoot) {\n+      for (ReductionOpsType &RdxOps : ReductionOps)\n+        for (Value *RdxOp : RdxOps)\n+          V.analyzedReductionRoot(cast<Instruction>(RdxOp));\n+      return nullptr;\n+    }\n+\n+    // Fold leading scalars [0, SuccessStart) into an accumulator.\n+    Type *DestTy = ReductionRoot->getType();\n+    Value *VectorizedTree = nullptr;\n+    for (Value *RdxVal : ArrayRef(Candidates).take_front(SuccessStart)) {\n+      Builder.SetCurrentDebugLocation(\n+          ReducedValsToOps.at(RdxVal).front()->getDebugLoc());\n+      if (!VectorizedTree)\n+        VectorizedTree = RdxVal;\n+      else\n+        VectorizedTree = createOp(Builder, RdxKind, VectorizedTree, RdxVal,\n+                                  \"op.rdx\", ReductionOps);\n+    }\n+\n+    // Emit ordered reduction for the vectorized window.\n+    Builder.SetCurrentDebugLocation(\n+        cast<Instruction>(ReductionRoot)->getDebugLoc());\n+    if (VectorizedTree)\n+      VectorizedTree =\n+          emitReduction(SuccessRoot, Builder, TTI, DestTy, VectorizedTree);\n+    else\n+      VectorizedTree = emitReduction(SuccessRoot, Builder, TTI, DestTy);\n+\n+    // Fold trailing scalars [SuccessStart+SuccessWidth, N).\n+    for (Value *RdxVal :\n+         ArrayRef(Candidates).drop_front(SuccessStart + SuccessWidth)) {\n+      Builder.SetCurrentDebugLocation(\n+          ReducedValsToOps.at(RdxVal).front()->getDebugLoc());\n+      VectorizedTree = createOp(Builder, RdxKind, VectorizedTree, RdxVal,\n+                                \"op.rdx\", ReductionOps);\n+    }\n+\n+    ReductionRoot->replaceAllUsesWith(VectorizedTree);\n+\n+#ifndef NDEBUG\n+    SmallPtrSet<Value *, 4> IgnoreSet;\n+    for (ArrayRef<Value *> RdxOps : ReductionOps)\n+      IgnoreSet.insert_range(RdxOps);\n+#endif\n+    for (ArrayRef<Value *> RdxOps : ReductionOps) {\n+      for (Value *Ignore : RdxOps) {\n+        if (!Ignore)\n+          continue;\n+#ifndef NDEBUG\n+        for (auto *U : Ignore->users()) {\n+          assert(IgnoreSet.count(U) &&\n+                 \"All users must be either in the reduction ops list.\");\n+        }\n+#endif\n+        if (!Ignore->use_empty()) {\n+          Value *P = PoisonValue::get(Ignore->getType());\n+          Ignore->replaceAllUsesWith(P);\n+        }\n+      }\n+      V.removeInstructionsAndOperands(RdxOps, {});\n+    }\n+    return VectorizedTree;\n+  }\n+\n private:\n   /// Creates the reduction from the given \\p Vec vector value with the given\n   /// scale \\p Scale and signedness \\p IsSigned.\n@@ -29624,14 +29949,17 @@ class HorizontalReduction {\n   }\n \n   /// Emit a horizontal reduction of the vectorized value.\n+  /// If \\p Start is non-null, emit an ordered reduction intrinsic that\n+  /// sequentially accumulates into \\p Start (only valid for FAdd/FMulAdd).\n   Value *emitReduction(Value *VectorizedValue, IRBuilderBase &Builder,\n-                       const TargetTransformInfo *TTI, Type *DestTy) {\n+                       const TargetTransformInfo *TTI, Type *DestTy,\n+                       Value *Start = nullptr) {\n     assert(VectorizedValue && \"Need to have a vectorized tree node\");\n     assert(RdxKind != RecurKind::FMulAdd &&\n            \"A call to the llvm.fmuladd intrinsic is not handled yet\");\n \n     auto *FTy = cast<FixedVectorType>(VectorizedValue->getType());\n-    if (FTy->getScalarType() == Builder.getInt1Ty() &&\n+    if (!Start && FTy->getScalarType() == Builder.getInt1Ty() &&\n         RdxKind == RecurKind::Add &&\n         DestTy->getScalarType() != FTy->getScalarType()) {\n       // Convert vector_reduce_add(ZExt(<n x i1>)) to\n@@ -29642,6 +29970,8 @@ class HorizontalReduction {\n       return Builder.CreateUnaryIntrinsic(Intrinsic::ctpop, V);\n     }\n     ++NumVectorInstructions;\n+    if (Start)\n+      return createOrderedReduction(Builder, RdxKind, VectorizedValue, Start);\n     return createSimpleReduction(Builder, VectorizedValue, RdxKind);\n   }\n \n@@ -30063,9 +30393,26 @@ bool SLPVectorizerPass::vectorizeHorReduction(\n     if (!isReductionCandidate(Inst))\n       return nullptr;\n     HorizontalReduction HorRdx;\n-    if (!HorRdx.matchAssociativeReduction(R, Inst, *SE, *DT, *DL, *TTI, *TLI))\n-      return nullptr;\n-    return HorRdx.tryToReduce(R, *DL, TTI, *TLI, AC, *DT);\n+    Value *Res = nullptr;\n+    if (HorRdx.matchAssociativeReduction(R, Inst, *SE, *DT, *DL, *TTI, *TLI))\n+      if (Value *Red = HorRdx.tryToReduce(R, *DL, TTI, *TLI, AC, *DT)) {\n+        if (Red != Inst)\n+          return Red;\n+        Res = Red;\n+      }\n+    if (HorizontalReduction::isSupportedOrderedReductionOp(Inst)) {\n+      if (HorRdx.matchOrderedReduction(R, Inst, /*MatchLHS=*/true))\n+        if (Value *Red =\n+                HorRdx.tryToReduceOrdered(R, *DL, TTI, *TLI, AC, *DT)) {\n+          if (Red != Inst)\n+            return Red;\n+          Res = Red;\n+        }\n+      if (HorRdx.matchOrderedReduction(R, Inst, /*MatchLHS=*/false))\n+        if (Value *Red = HorRdx.tryToReduceOrdered(R, *DL, TTI, *TLI, AC, *DT))\n+          return Red;\n+    }\n+    return Res;\n   };\n   auto TryAppendToPostponedInsts = [&](Instruction *FutureSeed) {\n     if (TryOperandsAsNewSeeds && FutureSeed == Root) {\n",
+  "components": [
+    "SLPVectorizer"
+  ],
+  "description": "Add matchOrderedReduction() to recognize linearized ordered fadd chains\n(both LHS- and RHS-associated) and tryToReduceOrdered() to vectorize\nthem using ordered reduction intrinsics (llvm.vector.reduce.fadd).\n\nPreviously, the SLP vectorizer could only vectorize ordered reductions\nby keeping the original scalar chain and emitting extractelement\ninstructions. The new path replaces the scalar chain with a vector\nordered reduction intrinsic (where profitable), which allows the backend to lower it\nmore efficiently.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/phi.ll",
+      "commands": [
+        "opt < %s -passes=slp-vectorizer,dce -slp-threshold=-100 -S -mtriple=i386-apple-macosx10.8.0 -mcpu=corei7-avx"
+      ],
+      "tests": [
+        {
+          "test_name": "foo3",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n8:16:32-S128\"\ntarget triple = \"i386-apple-macosx10.9.0\"\n\ndefine float @foo3(ptr readonly captures(none) %A) {\nentry:\n  %0 = load float, ptr %A, align 4\n  %arrayidx1 = getelementptr inbounds float, ptr %A, i64 1\n  %1 = load float, ptr %arrayidx1, align 4\n  %arrayidx2 = getelementptr inbounds float, ptr %A, i64 2\n  %2 = load float, ptr %arrayidx2, align 4\n  %arrayidx3 = getelementptr inbounds float, ptr %A, i64 3\n  %3 = load float, ptr %arrayidx3, align 4\n  %arrayidx4 = getelementptr inbounds float, ptr %A, i64 4\n  %4 = load float, ptr %arrayidx4, align 4\n  br label %for.body\n\nfor.body:                                         ; preds = %for.body, %entry\n  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]\n  %P.056 = phi float [ %4, %entry ], [ %add26, %for.body ]\n  %Y.055 = phi float [ %3, %entry ], [ %add21, %for.body ]\n  %B.054 = phi float [ %2, %entry ], [ %add16, %for.body ]\n  %G.053 = phi float [ %1, %entry ], [ %add11, %for.body ]\n  %R.052 = phi float [ %0, %entry ], [ %add6, %for.body ]\n  %5 = phi float [ %1, %entry ], [ %11, %for.body ]\n  %6 = phi float [ %0, %entry ], [ %9, %for.body ]\n  %mul = fmul float %6, 7.000000e+00\n  %add6 = fadd float %R.052, %mul\n  %mul10 = fmul float %5, 8.000000e+00\n  %add11 = fadd float %G.053, %mul10\n  %7 = add nsw i64 %indvars.iv, 2\n  %arrayidx14 = getelementptr inbounds float, ptr %A, i64 %7\n  %8 = load float, ptr %arrayidx14, align 4\n  %mul15 = fmul float %8, 9.000000e+00\n  %add16 = fadd float %B.054, %mul15\n  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 3\n  %arrayidx19 = getelementptr inbounds float, ptr %A, i64 %indvars.iv.next\n  %9 = load float, ptr %arrayidx19, align 4\n  %mul20 = fmul float %9, 1.000000e+01\n  %add21 = fadd float %Y.055, %mul20\n  %10 = add nsw i64 %indvars.iv, 4\n  %arrayidx24 = getelementptr inbounds float, ptr %A, i64 %10\n  %11 = load float, ptr %arrayidx24, align 4\n  %mul25 = fmul float %11, 1.100000e+01\n  %add26 = fadd float %P.056, %mul25\n  %12 = trunc i64 %indvars.iv.next to i32\n  %cmp = icmp slt i32 %12, 121\n  br i1 %cmp, label %for.body, label %for.end\n\nfor.end:                                          ; preds = %for.body\n  %add28 = fadd float %add6, %add11\n  %add29 = fadd float %add28, %add16\n  %add30 = fadd float %add29, %add21\n  %add31 = fadd float %add30, %add26\n  ret float %add31\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/SLPVectorizer/X86/scatter-vectorize-reorder-non-empty.ll",
+      "commands": [
+        "opt -passes=slp-vectorizer -S < %s -mtriple=x86_64-unknown-linux-gnu -mcpu=skylake -slp-threshold=-10"
+      ],
+      "tests": [
+        {
+          "test_name": "test01",
+          "test_body": "define double @test01() {\n  %1 = load i32, ptr null, align 8\n  %2 = load i32, ptr getelementptr inbounds (i32, ptr null, i32 1), align 4\n  %3 = getelementptr double, ptr null, i32 %2\n  %4 = load double, ptr %3, align 8\n  %5 = getelementptr double, ptr null, i32 %1\n  %6 = load double, ptr %5, align 8\n  %7 = fadd double %6, %6\n  %8 = fadd double %4, %7\n  %9 = fadd double 0.000000e+00, 0.000000e+00\n  %10 = fadd double %6, %9\n  %11 = fadd double %10, %8\n  ret double %11\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:SLPVectorizer",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    },
+    {
+      "author": "alexey-bataev",
+      "body": "Ping!"
+    }
+  ],
+  "knowledge_cutoff": "2026-03-30T18:48:40Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      [
+        27923,
+        27928
+      ],
+      [
+        28169,
+        28174
+      ],
+      [
+        29185,
+        29190
+      ],
+      [
+        29624,
+        29637
+      ],
+      [
+        29642,
+        29647
+      ],
+      [
+        30063,
+        30071
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/phi.ll": [
+      [
+        168,
+        180
+      ]
+    ],
+    "llvm/test/Transforms/SLPVectorizer/X86/scatter-vectorize-reorder-non-empty.ll": [
+      [
+        7,
+        21
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp": [
+      "SLPVectorizerPass::vectorizeHorReduction",
+      "createSingleOp",
+      "emitReduction",
+      "getRdxKind",
+      "matchAssociativeReduction",
+      "matchReductionForOperands",
+      "tryToReduce"
+    ]
+  }
+}

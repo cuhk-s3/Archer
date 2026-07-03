@@ -1,0 +1,124 @@
+{
+  "pr_id": 201315,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/201315",
+  "state": "open",
+  "title": "[InstCombine] Prevent folding shuffle-select with binary operation when FMF is more restrictive than input",
+  "author": "fuad1502",
+  "base_commit": "94c0e6fb2536cb2c0dbd205fadd4a8e929388b1a",
+  "fix_commit": "56c9e19830de943668b36546d17bc2dd29e81d49",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\nindex 3a7fbbcb468da..e85a50919efee 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n@@ -2283,16 +2283,26 @@ static Instruction *foldSelectShuffleWith1Binop(ShuffleVectorInst &Shuf,\n \n   Value *X = Op0IsBinop ? Op1 : Op0;\n \n-  // Prevent folding in the case the non-binop operand might have NaN values.\n-  // If X can have NaN elements then we have that the floating point math\n-  // operation in the transformed code may not preserve the exact NaN\n-  // bit-pattern -- e.g. `fadd sNaN, 0.0 -> qNaN`.\n-  // This makes the transformation incorrect since the original program would\n-  // have preserved the exact NaN bit-pattern.\n-  // Avoid the folding if X can have NaN elements.\n-  if (Shuf.getType()->getElementType()->isFloatingPointTy() &&\n-      !isKnownNeverNaN(X, SQ))\n-    return nullptr;\n+  if (Shuf.getType()->getElementType()->isFloatingPointTy()) {\n+    // Prevent folding in the case the non-binop operand might have NaN values.\n+    // If X can have NaN elements then we have that the floating point math\n+    // operation in the transformed code may not preserve the exact NaN\n+    // bit-pattern -- e.g. `fadd sNaN, 0.0 -> qNaN`.\n+    // This makes the transformation incorrect since the original program would\n+    // have preserved the exact NaN bit-pattern.\n+    // Avoid the folding if X can have NaN elements.\n+    if (!isKnownNeverNaN(X, SQ))\n+      return nullptr;\n+\n+    // Prevent folding when input can be infinity but noinf fast math flags is\n+    // set. If X can have Inf elements and fast math flag noinf is set, the\n+    // transformation may generate poison where the original program would\n+    // preserve the Inf value.\n+    auto Fmf = BO->getFastMathFlags();\n+    if (Fmf.noInfs() && !isKnownNeverInfinity(X, SQ)) {\n+      return nullptr;\n+    }\n+  }\n \n   // Shuffle identity constants into the lanes that return the original value.\n   // Example: shuf (mul X, {-1,-2,-3,-4}), X, {0,5,6,3} --> mul X, {-1,1,1,-4}\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Solves https://github.com/llvm/llvm-project/issues/74326\r\n\r\nWhen binary operation has `ninf` FMF, but the input does not have `nofpclass(inf)`, we should not perform the transformation. Because the transformation may produce poison value when the input has an `Inf` element, whereas the original code will simply pass through the `Inf` element.\r\n\r\nAlive proof: https://alive2.llvm.org/ce/z/CMs7vx",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/shuffle_select-inseltpoison.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fmul_fmf_less_restrictive",
+          "test_body": "define <4 x float> @fmul_fmf_less_restrictive(<4 x float> nofpclass(nan) %v) {\n  %b = fmul <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fmul_fmf_more_restrictive",
+          "test_body": "define <4 x float> @fmul_fmf_more_restrictive(<4 x float> nofpclass(nan) %v) {\n  %b = fmul nnan ninf <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fmul_fmf_as_restrictive",
+          "test_body": "define <4 x float> @fmul_fmf_as_restrictive(<4 x float> nofpclass(nan inf) %v) {\n  %b = fmul nnan ninf <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fsub",
+          "test_body": "define <4 x double> @fsub(<4 x double> %v) {\n  %b = fsub <4 x double> <double 4.100000e+01, double 4.200000e+01, double 4.300000e+01, double 4.400000e+01>, %v\n  %s = shufflevector <4 x double> %v, <4 x double> %b, <4 x i32> <i32 poison, i32 1, i32 6, i32 7>\n  ret <4 x double> %s\n}\n"
+        },
+        {
+          "test_name": "fmul",
+          "test_body": "define <4 x float> @fmul(<4 x float> nofpclass(nan) %v) {\n  %b = fmul nnan <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fdiv_constant_op0",
+          "test_body": "define <4 x double> @fdiv_constant_op0(<4 x double> %v) {\n  %b = fdiv fast <4 x double> <double 4.100000e+01, double 4.200000e+01, double 4.300000e+01, double 4.400000e+01>, %v\n  %s = shufflevector <4 x double> %v, <4 x double> %b, <4 x i32> <i32 poison, i32 1, i32 6, i32 7>\n  ret <4 x double> %s\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/shuffle_select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "fmul_fmf_less_restrictive",
+          "test_body": "define <4 x float> @fmul_fmf_less_restrictive(<4 x float> nofpclass(nan) %v) {\n  %b = fmul <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fmul_fmf_more_restrictive",
+          "test_body": "define <4 x float> @fmul_fmf_more_restrictive(<4 x float> nofpclass(nan) %v) {\n  %b = fmul nnan ninf <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fmul_fmf_as_restrictive",
+          "test_body": "define <4 x float> @fmul_fmf_as_restrictive(<4 x float> nofpclass(nan inf) %v) {\n  %b = fmul nnan ninf <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fsub",
+          "test_body": "define <4 x double> @fsub(<4 x double> %v) {\n  %b = fsub <4 x double> <double 4.100000e+01, double 4.200000e+01, double 4.300000e+01, double 4.400000e+01>, %v\n  %s = shufflevector <4 x double> %v, <4 x double> %b, <4 x i32> <i32 poison, i32 1, i32 6, i32 7>\n  ret <4 x double> %s\n}\n"
+        },
+        {
+          "test_name": "fmul",
+          "test_body": "define <4 x float> @fmul(<4 x float> nofpclass(nan) %v) {\n  %b = fmul nnan <4 x float> %v, <float 4.100000e+01, float 4.200000e+01, float 4.300000e+01, float 4.400000e+01>\n  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n  ret <4 x float> %s\n}\n"
+        },
+        {
+          "test_name": "fdiv_constant_op0",
+          "test_body": "define <4 x double> @fdiv_constant_op0(<4 x double> %v) {\n  %b = fdiv fast <4 x double> <double 4.100000e+01, double 4.200000e+01, double 4.300000e+01, double 4.400000e+01>, %v\n  %s = shufflevector <4 x double> %v, <4 x double> %b, <4 x i32> <i32 poison, i32 1, i32 6, i32 7>\n  ret <4 x double> %s\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Fuad Ismail (fuad1502)\n\n<details>\n<summary>Changes</summary>\n\nSolves https://github.com/llvm/llvm-project/issues/74326\r\n\r\nWhen binary operation has `ninf` FMF, but the input does not have `nofpclass(inf)`, we should not perform the transformation. Because the transformation may produce poison value when the input has an `Inf` element, whereas the original code will simply pass through the `Inf` element.\r\n\r\nAlive proof: https://alive2.llvm.org/ce/\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/201315.diff\n\n\n3 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp (+20-10) \n- (modified) llvm/test/Transforms/InstCombine/shuffle_select-inseltpoison.ll (+37) \n- (modified) llvm/test/Transforms/InstCombine/shuffle_select.ll (+37) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\nindex 3a7fbbcb468da..e85a50919efee 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp\n@@ -2283,16 +2283,26 @@ static Instruction *foldSelectShuffleWith1Binop(ShuffleVectorInst &Shuf,\n \n   Value *X = Op0IsBinop ? Op1 : Op0;\n \n-  // Prevent folding in the case the non-binop operand might have NaN values.\n-  // If X can have NaN elements then we have that the floating point math\n-  // operation in the transformed code may not preserve the exact NaN\n-  // bit-pattern -- e.g. `fadd sNaN, 0.0 -> qNaN`.\n-  // This makes the transformation incorrect since the original program would\n-  // have preserved the exact NaN bit-pattern.\n-  // Avoid the folding if X can have NaN elements.\n-  if (Shuf.getType()->getElementType()->isFloatingPointTy() &&\n-      !isKnownNeverNaN(X, SQ))\n-    return nullptr;\n+  if (Shuf.getType()->getElementType()->isFloatingPointTy()) {\n+    // Prevent folding in the case the non-binop operand might have NaN values.\n+    // If X can have NaN elements then we have that the floating point math\n+    // operation in the transformed code may not preserve the exact NaN\n+    // bit-pattern -- e.g. `fadd sNaN, 0.0 -> qNaN`.\n+    // This makes the transformation incorrect since the original program would\n+    // have preserved the exact NaN bit-pattern.\n+    // Avoid the folding if X can have NaN elements.\n+    if (!isKnownNeverNaN(X, SQ))\n+      return nullptr;\n+\n+    // Prevent folding when input can be infinity but noinf fast math flags is\n+    // set. If X can have Inf elements and fast math flag noinf is set, the\n+    // transformation may generate poison where the original program would\n+    // preserve the Inf value.\n+    auto Fmf = BO->getFastMathFlags();\n+    if (Fmf.noInfs() && !isKnownNeverInfinity(X, SQ)) {\n+      return nullptr;\n+    }\n+  }\n \n   // Shuffle identity constants into the lanes that return the original value.\n   // Example: shuf (mul X, {-1,-2,-3,-4}), X, {0,5,6,3} --> mul X, {-1,1,1,-4}\ndiff --git a/llvm/test/Transforms/InstCombine/shuffle_select-inseltpoison.ll b/llvm/test/Transforms/InstCombine/shuffle_select-inseltpoison.ll\nindex 3ed7fc2589d7a..62aacec027b14 100644\n--- a/llvm/test/Transforms/InstCombine/shuffle_select-inseltpoison.ll\n+++ b/llvm/test/Transforms/InstCombine/shuffle_select-inseltpoison.ll\n@@ -372,6 +372,31 @@ define <4 x double> @fsub(<4 x double> %v) {\n \n define <4 x float> @fmul(<4 x float> nofpclass(nan) %v) {\n ; CHECK-LABEL: @fmul(\n+; CHECK-NEXT:    [[S:%.*]] = fmul nnan <4 x float> [[V:%.*]], <float 4.100000e+01, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>\n+; CHECK-NEXT:    ret <4 x float> [[S]]\n+;\n+  %b = fmul nnan <4 x float> %v, <float 41.0, float 42.0, float 43.0, float 44.0>\n+  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+  ret <4 x float> %s\n+}\n+\n+; Negative test: FMF more restrictive than input FP class\n+\n+define <4 x float> @fmul_fmf_more_restrictive(<4 x float> nofpclass(nan) %v) {\n+; CHECK-LABEL: @fmul_fmf_more_restrictive(\n+; CHECK-NEXT:    [[B:%.*]] = fmul nnan ninf <4 x float> [[V:%.*]], <float 4.100000e+01, float poison, float poison, float poison>\n+; CHECK-NEXT:    [[S:%.*]] = shufflevector <4 x float> [[B]], <4 x float> [[V]], <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+; CHECK-NEXT:    ret <4 x float> [[S]]\n+;\n+  %b = fmul nnan ninf <4 x float> %v, <float 41.0, float 42.0, float 43.0, float 44.0>\n+  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+  ret <4 x float> %s\n+}\n+\n+; Try FMF (nnan ninf) as restrictive input FP class\n+\n+define <4 x float> @fmul_fmf_as_restrictive(<4 x float> nofpclass(nan inf) %v) {\n+; CHECK-LABEL: @fmul_fmf_as_restrictive(\n ; CHECK-NEXT:    [[S:%.*]] = fmul nnan ninf <4 x float> [[V:%.*]], <float 4.100000e+01, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>\n ; CHECK-NEXT:    ret <4 x float> [[S]]\n ;\n@@ -380,6 +405,18 @@ define <4 x float> @fmul(<4 x float> nofpclass(nan) %v) {\n   ret <4 x float> %s\n }\n \n+; Try FMF less restrictive than input FP class\n+\n+define <4 x float> @fmul_fmf_less_restrictive(<4 x float> nofpclass(nan) %v) {\n+; CHECK-LABEL: @fmul_fmf_less_restrictive(\n+; CHECK-NEXT:    [[S:%.*]] = fmul nnan <4 x float> [[V:%.*]], <float 4.100000e+01, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>\n+; CHECK-NEXT:    ret <4 x float> [[S]]\n+;\n+  %b = fmul <4 x float> %v, <float 41.0, float 42.0, float 43.0, float 44.0>\n+  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+  ret <4 x float> %s\n+}\n+\n define <4 x double> @fdiv_constant_op0(<4 x double> %v) {\n ; CHECK-LABEL: @fdiv_constant_op0(\n ; CHECK-NEXT:    [[B:%.*]] = fdiv fast <4 x double> <double poison, double poison, double 4.300000e+01, double 4.400000e+01>, [[V:%.*]]\ndiff --git a/llvm/test/Transforms/InstCombine/shuffle_select.ll b/llvm/test/Transforms/InstCombine/shuffle_select.ll\nindex 21765f74dad78..a4d314066a536 100644\n--- a/llvm/test/Transforms/InstCombine/shuffle_select.ll\n+++ b/llvm/test/Transforms/InstCombine/shuffle_select.ll\n@@ -372,6 +372,31 @@ define <4 x double> @fsub(<4 x double> %v) {\n \n define <4 x float> @fmul(<4 x float> nofpclass(nan) %v) {\n ; CHECK-LABEL: @fmul(\n+; CHECK-NEXT:    [[S:%.*]] = fmul nnan <4 x float> [[V:%.*]], <float 4.100000e+01, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>\n+; CHECK-NEXT:    ret <4 x float> [[S]]\n+;\n+  %b = fmul nnan <4 x float> %v, <float 41.0, float 42.0, float 43.0, float 44.0>\n+  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+  ret <4 x float> %s\n+}\n+\n+; Negative test: FMF more restrictive than input FP class\n+\n+define <4 x float> @fmul_fmf_more_restrictive(<4 x float> nofpclass(nan) %v) {\n+; CHECK-LABEL: @fmul_fmf_more_restrictive(\n+; CHECK-NEXT:    [[B:%.*]] = fmul nnan ninf <4 x float> [[V:%.*]], <float 4.100000e+01, float poison, float poison, float poison>\n+; CHECK-NEXT:    [[S:%.*]] = shufflevector <4 x float> [[B]], <4 x float> [[V]], <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+; CHECK-NEXT:    ret <4 x float> [[S]]\n+;\n+  %b = fmul nnan ninf <4 x float> %v, <float 41.0, float 42.0, float 43.0, float 44.0>\n+  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+  ret <4 x float> %s\n+}\n+\n+; Try FMF (nnan ninf) as restrictive input FP class\n+\n+define <4 x float> @fmul_fmf_as_restrictive(<4 x float> nofpclass(nan inf) %v) {\n+; CHECK-LABEL: @fmul_fmf_as_restrictive(\n ; CHECK-NEXT:    [[S:%.*]] = fmul nnan ninf <4 x float> [[V:%.*]], <float 4.100000e+01, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>\n ; CHECK-NEXT:    ret <4 x float> [[S]]\n ;\n@@ -380,6 +405,18 @@ define <4 x float> @fmul(<4 x float> nofpclass(nan) %v) {\n   ret <4 x float> %s\n }\n \n+; Try FMF less restrictive than input FP class\n+\n+define <4 x float> @fmul_fmf_less_restrictive(<4 x float> nofpclass(nan) %v) {\n+; CHECK-LABEL: @fmul_fmf_less_restrictive(\n+; CHECK-NEXT:    [[S:%.*]] = fmul nnan <4 x float> [[V:%.*]], <float 4.100000e+01, float 1.000000e+00, float 1.000000e+00, float 1.000000e+00>\n+; CHECK-NEXT:    ret <4 x float> [[S]]\n+;\n+  %b = fmul <4 x float> %v, <float 41.0, float 42.0, float 43.0, float 44.0>\n+  %s = shufflevector <4 x float> %b, <4 x float> %v, <4 x i32> <i32 0, i32 5, i32 6, i32 7>\n+  ret <4 x float> %s\n+}\n+\n define <4 x double> @fdiv_constant_op0(<4 x double> %v) {\n ; CHECK-LABEL: @fdiv_constant_op0(\n ; CHECK-NEXT:    [[B:%.*]] = fdiv fast <4 x double> <double poison, double poison, double 4.300000e+01, double 4.400000e+01>, [[V:%.*]]\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-06-03T10:58:50Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp": [
+      [
+        2283,
+        2298
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/shuffle_select-inseltpoison.ll": [
+      [
+        372,
+        377
+      ],
+      [
+        380,
+        385
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/shuffle_select.ll": [
+      [
+        372,
+        377
+      ],
+      [
+        380,
+        385
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineVectorOps.cpp": [
+      "foldSelectShuffleWith1Binop"
+    ]
+  }
+}

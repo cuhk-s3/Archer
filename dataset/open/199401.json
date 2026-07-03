@@ -1,0 +1,70 @@
+{
+  "pr_id": 199401,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/199401",
+  "state": "open",
+  "title": "[InstCombine] Fix vector_reduce_mul(sext <n x i1>).",
+  "author": "jlebar",
+  "base_commit": "dd1649b020081263b3d2a08e3b254d7b4280222f",
+  "fix_commit": "393eadae0ee0caeeffdb87e9174e3803fabb8961",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 360326f47594d..b567d5a0b665b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -4111,14 +4111,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n   }\n   case Intrinsic::vector_reduce_mul: {\n     if (IID == Intrinsic::vector_reduce_mul) {\n-      // Multiplicative reduction over the vector with (potentially-extended)\n-      // i1 element type is actually a (potentially zero-extended)\n-      // logical `and` reduction over the original non-extended value:\n-      //   vector_reduce_mul(?ext(<n x i1>))\n-      //     -->\n-      //   zext(vector_reduce_and(<n x i1>))\n       Value *Arg = II->getArgOperand(0);\n-      Value *Vect;\n \n       if (Value *NewOp =\n               simplifyReductionOperand(Arg, /*CanReorderLanes=*/true)) {\n@@ -4126,13 +4119,37 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n         return II;\n       }\n \n-      if (match(Arg, m_ZExtOrSExtOrSelf(m_Value(Vect)))) {\n-        if (auto *VTy = dyn_cast<VectorType>(Vect->getType()))\n-          if (VTy->getElementType() == Builder.getInt1Ty()) {\n-            Value *Res = Builder.CreateAndReduce(Vect);\n-            Res = Builder.CreateZExt(Res, II->getType());\n-            return replaceInstUsesWith(CI, Res);\n-          }\n+      auto IsI1Vec = [&](Value *V) {\n+        auto *VTy = dyn_cast<VectorType>(V->getType());\n+        return VTy && VTy->getElementType() == Builder.getInt1Ty();\n+      };\n+\n+      // vector_reduce_mul(zext(<n x i1>)) --> zext(vector_reduce_and(<n x i1>))\n+      Value *Vect;\n+      if (match(Arg, m_ZExt(m_Value(Vect))) && IsI1Vec(Vect)) {\n+        Value *Res = Builder.CreateAndReduce(Vect);\n+        return replaceInstUsesWith(CI, Builder.CreateZExt(Res, II->getType()));\n+      }\n+\n+      // vector_reduce_mul(sext(<n x i1>)) -->\n+      //   sext(vector_reduce_and(<n x i1>)) if n is odd\n+      //   zext(vector_reduce_and(<n x i1>)) if n is even.\n+      // This is because if the vector is all `true`, we are multiplying n -1s.\n+      // Therefore the answer is -1 if n is odd, or 1 if n is even.\n+      if (match(Arg, m_SExt(m_Value(Vect)))) {\n+        if (auto *VTy = dyn_cast<FixedVectorType>(Vect->getType());\n+            VTy && VTy->getElementType() == Builder.getInt1Ty()) {\n+          Value *Res = Builder.CreateAndReduce(Vect);\n+          Res = (VTy->getNumElements() & 1)\n+                    ? Builder.CreateSExt(Res, II->getType())\n+                    : Builder.CreateZExt(Res, II->getType());\n+          return replaceInstUsesWith(CI, Res);\n+        }\n+      }\n+\n+      // vector_reduce_mul(<n x i1>) --> vector_reduce_and(<n x i1>)\n+      if (IsI1Vec(Arg)) {\n+        return replaceInstUsesWith(CI, Builder.CreateAndReduce(Arg));\n       }\n     }\n     [[fallthrough]];\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "Before this patch, instcombine folded\r\n\r\n    vector_reduce_mul(sext (<n x i1> val))\r\n\r\nto\r\n\r\n    zext(vector_reduce_and(<n x i1> val)).\r\n\r\nBut this is incorrect when n is odd: The result of the reduction is -1,\r\nnot 1.\r\n\r\nThis bug was found by a large run of Opus 4.7 looking for bugs in LLVM.\r\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/reduction-mul-sext-zext-i1.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "reduce_mul_zext_odd_lanes",
+          "test_body": "define i8 @reduce_mul_zext_odd_lanes(<3 x i1> %x) {\n  %zext = zext <3 x i1> %x to <3 x i8>\n  %res = call i8 @llvm.vector.reduce.mul.v3i8(<3 x i8> %zext)\n  ret i8 %res\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.mul.v3i8(<3 x i8>) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "reduce_mul_sext_odd_lanes",
+          "test_body": "define i8 @reduce_mul_sext_odd_lanes(<3 x i1> %x) {\n  %sext = sext <3 x i1> %x to <3 x i8>\n  %res = call i8 @llvm.vector.reduce.mul.v3i8(<3 x i8> %sext)\n  ret i8 %res\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.vector.reduce.mul.v3i8(<3 x i8>) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "reduce_mul_zext_external_use",
+          "test_body": "@glob1 = external global i64, align 8\n\ndefine i64 @reduce_mul_zext_external_use(<8 x i1> %x) {\n  %zext = zext <8 x i1> %x to <8 x i64>\n  %res = call i64 @llvm.vector.reduce.mul.v8i64(<8 x i64> %zext)\n  %ext = extractelement <8 x i64> %zext, i32 0\n  store i64 %ext, ptr @glob1, align 8\n  ret i64 %res\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i64 @llvm.vector.reduce.mul.v8i64(<8 x i64>) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Justin Lebar (jlebar)\n\n<details>\n<summary>Changes</summary>\n\nBefore this patch, instcombine folded\n\n  vector_reduce_mul(sext (&lt;n x i1&gt; val))\n\nto\n\n  zext(vector_reduce_and(&lt;n x i1&gt; val)).\n\nBut this is incorrect when n is odd: The result of the reduction is -1,\nnot 1.\n\nThis bug was found by a large run of Opus 4.7 looking for bugs in LLVM.\n\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/199401.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp (+31-14) \n- (modified) llvm/test/Transforms/InstCombine/reduction-mul-sext-zext-i1.ll (+25) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 360326f47594d..b567d5a0b665b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -4111,14 +4111,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n   }\n   case Intrinsic::vector_reduce_mul: {\n     if (IID == Intrinsic::vector_reduce_mul) {\n-      // Multiplicative reduction over the vector with (potentially-extended)\n-      // i1 element type is actually a (potentially zero-extended)\n-      // logical `and` reduction over the original non-extended value:\n-      //   vector_reduce_mul(?ext(<n x i1>))\n-      //     -->\n-      //   zext(vector_reduce_and(<n x i1>))\n       Value *Arg = II->getArgOperand(0);\n-      Value *Vect;\n \n       if (Value *NewOp =\n               simplifyReductionOperand(Arg, /*CanReorderLanes=*/true)) {\n@@ -4126,13 +4119,37 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n         return II;\n       }\n \n-      if (match(Arg, m_ZExtOrSExtOrSelf(m_Value(Vect)))) {\n-        if (auto *VTy = dyn_cast<VectorType>(Vect->getType()))\n-          if (VTy->getElementType() == Builder.getInt1Ty()) {\n-            Value *Res = Builder.CreateAndReduce(Vect);\n-            Res = Builder.CreateZExt(Res, II->getType());\n-            return replaceInstUsesWith(CI, Res);\n-          }\n+      auto IsI1Vec = [&](Value *V) {\n+        auto *VTy = dyn_cast<VectorType>(V->getType());\n+        return VTy && VTy->getElementType() == Builder.getInt1Ty();\n+      };\n+\n+      // vector_reduce_mul(zext(<n x i1>)) --> zext(vector_reduce_and(<n x i1>))\n+      Value *Vect;\n+      if (match(Arg, m_ZExt(m_Value(Vect))) && IsI1Vec(Vect)) {\n+        Value *Res = Builder.CreateAndReduce(Vect);\n+        return replaceInstUsesWith(CI, Builder.CreateZExt(Res, II->getType()));\n+      }\n+\n+      // vector_reduce_mul(sext(<n x i1>)) -->\n+      //   sext(vector_reduce_and(<n x i1>)) if n is odd\n+      //   zext(vector_reduce_and(<n x i1>)) if n is even.\n+      // This is because if the vector is all `true`, we are multiplying n -1s.\n+      // Therefore the answer is -1 if n is odd, or 1 if n is even.\n+      if (match(Arg, m_SExt(m_Value(Vect)))) {\n+        if (auto *VTy = dyn_cast<FixedVectorType>(Vect->getType());\n+            VTy && VTy->getElementType() == Builder.getInt1Ty()) {\n+          Value *Res = Builder.CreateAndReduce(Vect);\n+          Res = (VTy->getNumElements() & 1)\n+                    ? Builder.CreateSExt(Res, II->getType())\n+                    : Builder.CreateZExt(Res, II->getType());\n+          return replaceInstUsesWith(CI, Res);\n+        }\n+      }\n+\n+      // vector_reduce_mul(<n x i1>) --> vector_reduce_and(<n x i1>)\n+      if (IsI1Vec(Arg)) {\n+        return replaceInstUsesWith(CI, Builder.CreateAndReduce(Arg));\n       }\n     }\n     [[fallthrough]];\ndiff --git a/llvm/test/Transforms/InstCombine/reduction-mul-sext-zext-i1.ll b/llvm/test/Transforms/InstCombine/reduction-mul-sext-zext-i1.ll\nindex f70820801602c..c867e076d9b4a 100644\n--- a/llvm/test/Transforms/InstCombine/reduction-mul-sext-zext-i1.ll\n+++ b/llvm/test/Transforms/InstCombine/reduction-mul-sext-zext-i1.ll\n@@ -95,8 +95,33 @@ define i64 @reduce_mul_zext_external_use(<8 x i1> %x) {\n   ret i64 %res\n }\n \n+define i8 @reduce_mul_sext_odd_lanes(<3 x i1> %x) {\n+; CHECK-LABEL: @reduce_mul_sext_odd_lanes(\n+; CHECK-NEXT:    [[TMP1:%.*]] = bitcast <3 x i1> [[X:%.*]] to i3\n+; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i3 [[TMP1]], -1\n+; CHECK-NEXT:    [[RES:%.*]] = sext i1 [[TMP2]] to i8\n+; CHECK-NEXT:    ret i8 [[RES]]\n+;\n+  %sext = sext <3 x i1> %x to <3 x i8>\n+  %res = call i8 @llvm.vector.reduce.mul.v3i8(<3 x i8> %sext)\n+  ret i8 %res\n+}\n+\n+define i8 @reduce_mul_zext_odd_lanes(<3 x i1> %x) {\n+; CHECK-LABEL: @reduce_mul_zext_odd_lanes(\n+; CHECK-NEXT:    [[TMP1:%.*]] = bitcast <3 x i1> [[X:%.*]] to i3\n+; CHECK-NEXT:    [[TMP2:%.*]] = icmp eq i3 [[TMP1]], -1\n+; CHECK-NEXT:    [[RES:%.*]] = zext i1 [[TMP2]] to i8\n+; CHECK-NEXT:    ret i8 [[RES]]\n+;\n+  %zext = zext <3 x i1> %x to <3 x i8>\n+  %res = call i8 @llvm.vector.reduce.mul.v3i8(<3 x i8> %zext)\n+  ret i8 %res\n+}\n+\n declare i1 @llvm.vector.reduce.mul.v8i32(<8 x i1> %a)\n declare i32 @llvm.vector.reduce.mul.v4i32(<4 x i32> %a)\n declare i64 @llvm.vector.reduce.mul.v8i64(<8 x i64> %a)\n declare i16 @llvm.vector.reduce.mul.v16i16(<16 x i16> %a)\n declare i8 @llvm.vector.reduce.mul.v128i8(<128 x i8> %a)\n+declare i8 @llvm.vector.reduce.mul.v3i8(<3 x i8> %a)\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-24T06:32:52Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        4111,
+        4124
+      ],
+      [
+        4126,
+        4138
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/reduction-mul-sext-zext-i1.ll": [
+      [
+        95,
+        102
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst"
+    ]
+  }
+}

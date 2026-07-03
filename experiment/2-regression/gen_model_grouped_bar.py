@@ -28,6 +28,10 @@ def normalize_group_name(column: str) -> str:
     return "CodeRabbit"
   if lower.startswith("greptile"):
     return "Greptile"
+  if lower.startswith("codex"):
+    return "Codex"
+  if lower.startswith("copilot"):
+    return "Copilot"
   return column.strip()
 
 
@@ -70,22 +74,44 @@ def compute_success_rates(
 
 
 def plot_grouped_chart(
-  stats: list[tuple[str, str, float, int, int]], out_png: Path, out_pdf: Path
+  stats: list[tuple[str, str, float, int, int]],
+  out_png: Path,
+  out_pdf: Path,
+  *,
+  figsize: tuple[float, float] = (5.2, 3.5),
+  bar_width: float = 0.25,
+  bar_step: float = 0.25,
+  default_group_gap: float = 0.24,
+  group_gaps: dict[str, float] | None = None,
+  show_legend: bool = True,
+  group_label_rotation: float = 23,
+  group_label_fontsize: float = 9,
+  group_label_y: float = -0.06,
 ) -> None:
   grouped: OrderedDict[str, list[tuple[str, float, int, int]]] = OrderedDict()
   for group, variant, rate, found, total in stats:
     grouped.setdefault(group, []).append((variant, rate, found, total))
 
-  # Keep source order but swap Direct/MSWE display positions.
-  if "Direct" in grouped and "MSWE" in grouped:
-    ordered_groups = list(grouped.keys())
+  ordered_groups = list(grouped.keys())
+
+  # Put Codex/Copilot immediately before CodeRabbit in the commercial-tools block.
+  commercial_front = [name for name in ["Codex", "Copilot"] if name in grouped]
+  if commercial_front and "CodeRabbit" in grouped:
+    ordered_groups = [name for name in ordered_groups if name not in commercial_front]
+    coderabbit_idx = ordered_groups.index("CodeRabbit")
+    ordered_groups[coderabbit_idx:coderabbit_idx] = commercial_front
+
+  # Keep MSWE before Direct when both are shown.
+  if "Direct" in ordered_groups and "MSWE" in ordered_groups:
     direct_idx = ordered_groups.index("Direct")
     mswe_idx = ordered_groups.index("MSWE")
-    ordered_groups[direct_idx], ordered_groups[mswe_idx] = (
-      ordered_groups[mswe_idx],
-      ordered_groups[direct_idx],
-    )
-    grouped = OrderedDict((name, grouped[name]) for name in ordered_groups)
+    if direct_idx < mswe_idx:
+      ordered_groups[direct_idx], ordered_groups[mswe_idx] = (
+        ordered_groups[mswe_idx],
+        ordered_groups[direct_idx],
+      )
+
+  grouped = OrderedDict((name, grouped[name]) for name in ordered_groups)
 
   variant_colors = {
     "base": ("#1D73DD", "#E2EFFF"),
@@ -100,20 +126,20 @@ def plot_grouped_chart(
     "rag": "..",
   }
 
-  bar_width = 0.25
-  bar_step = 0.25
-
   custom_group_gaps = {
     "Gemini-3.1-Pro": 0.25,
     "DeepSeek-V3.2": 0.2,
     "Qwen3.5-Plus": 0.2,
+    "Codex": 0.25,
+    "Copilot": 0.25,
     "CodeRabbit": 0.25,
     "Greptile": 0.25,
     "Optimuzz": 0.25,
     "Direct": 0.2,
     "MSWE": 0.2,
   }
-  default_group_gap = 0.24
+  if group_gaps:
+    custom_group_gaps.update(group_gaps)
 
   x_positions = []
   labels = []
@@ -139,7 +165,7 @@ def plot_grouped_chart(
     group_centers.append((group, (start + end) / 2.0))
     cursor += custom_group_gaps.get(group, default_group_gap)
 
-  fig, ax = plt.subplots(figsize=(5.2, 3.5))
+  fig, ax = plt.subplots(figsize=figsize)
 
   bars = ax.bar(
     x_positions,
@@ -170,14 +196,14 @@ def plot_grouped_chart(
   for group, center in group_centers:
     ax.text(
       center,
-      -0.06,
+      group_label_y,
       group,
-      ha="right",
+      ha="center" if group_label_rotation == 0 else "right",
       va="top",
-      rotation=23,
+      rotation=group_label_rotation,
       rotation_mode="anchor",
       transform=ax.get_xaxis_transform(),
-      fontsize=9,
+      fontsize=group_label_fontsize,
     )
 
   legend_elems = [
@@ -206,14 +232,15 @@ def plot_grouped_chart(
       label="rag",
     ),
   ]
-  ax.legend(
-    handles=legend_elems,
-    loc="upper right",
-    frameon=False,
-    borderaxespad=0.4,
-    labelspacing=0.4,
-    handletextpad=0.6,
-  )
+  if show_legend:
+    ax.legend(
+      handles=legend_elems,
+      loc="upper right",
+      frameon=False,
+      borderaxespad=0.4,
+      labelspacing=0.4,
+      handletextpad=0.6,
+    )
 
   fig.tight_layout()
   fig.subplots_adjust(bottom=0.33, top=0.88, left=0.09, right=0.98)
@@ -222,6 +249,81 @@ def plot_grouped_chart(
   fig.savefig(out_png, dpi=300, bbox_inches="tight")
   fig.savefig(out_pdf, bbox_inches="tight")
   plt.close(fig)
+
+
+def filter_stats(
+  stats: list[tuple[str, str, float, int, int]],
+  groups: list[str],
+) -> list[tuple[str, str, float, int, int]]:
+  group_order = {group: idx for idx, group in enumerate(groups)}
+  selected = [item for item in stats if item[0] in group_order]
+  return sorted(selected, key=lambda item: group_order[item[0]])
+
+
+def with_aegis_reference(
+  stats: list[tuple[str, str, float, int, int]],
+) -> list[tuple[str, str, float, int, int]]:
+  aegis = [
+    ("Archer", variant, rate, found, total)
+    for group, variant, rate, found, total in stats
+    if group == "Gemini-3.1-Pro" and variant == "base"
+  ]
+  comparison_groups = [
+    "Codex",
+    "Copilot",
+    "CodeRabbit",
+    "Greptile",
+    "Optimuzz",
+    "MSWE",
+    "Direct",
+  ]
+  return aegis + filter_stats(stats, comparison_groups)
+
+
+def plot_split_charts(
+  stats: list[tuple[str, str, float, int, int]], figures_dir: Path
+) -> None:
+  model_stats = filter_stats(stats, ["Gemini-3.1-Pro", "DeepSeek-V3.2", "Qwen3.5-Plus"])
+  comparison_stats = with_aegis_reference(stats)
+
+  plot_grouped_chart(
+    model_stats,
+    figures_dir / "regression_model_backbones_bar.png",
+    figures_dir / "regression_model_backbones_bar.pdf",
+    figsize=(3.35, 2.9),
+    bar_width=0.16,
+    bar_step=0.18,
+    default_group_gap=0.12,
+    group_gaps={
+      "Gemini-3.1-Pro": 0.12,
+      "DeepSeek-V3.2": 0.10,
+      "Qwen3.5-Plus": 0.10,
+    },
+    group_label_rotation=0,
+    group_label_fontsize=8.2,
+    group_label_y=-0.08,
+  )
+  plot_grouped_chart(
+    comparison_stats,
+    figures_dir / "regression_tool_baselines_bar.png",
+    figures_dir / "regression_tool_baselines_bar.pdf",
+    figsize=(3.25, 2.7),
+    bar_width=0.12,
+    bar_step=0.14,
+    default_group_gap=0.01,
+    group_gaps={
+      "Archer": 0.02,
+      "Codex": 0.01,
+      "Copilot": 0.01,
+      "CodeRabbit": 0.01,
+      "Greptile": 0.01,
+      "Optimuzz": 0.01,
+      "MSWE": 0.01,
+      "Direct": 0.01,
+    },
+    show_legend=False,
+    group_label_fontsize=8.0,
+  )
 
 
 def print_summary(stats: list[tuple[str, str, float, int, int]]) -> None:
@@ -235,9 +337,14 @@ if __name__ == "__main__":
   csv_path = base / "results.csv"
   out_png = base / "figures" / "regression_model_grouped_bar.png"
   out_pdf = base / "figures" / "regression_model_grouped_bar.pdf"
+  figures_dir = base / "figures"
 
   stats, _total = compute_success_rates(csv_path)
   print_summary(stats)
   plot_grouped_chart(stats, out_png, out_pdf)
+  plot_split_charts(stats, figures_dir)
   print(f"\nSaved: {out_png}")
   print(f"Saved: {out_pdf}")
+  for split_name in ["regression_model_backbones_bar", "regression_tool_baselines_bar"]:
+    print(f"Saved: {figures_dir / f'{split_name}.png'}")
+    print(f"Saved: {figures_dir / f'{split_name}.pdf'}")

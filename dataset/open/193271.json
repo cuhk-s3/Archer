@@ -1,0 +1,198 @@
+{
+  "pr_id": 193271,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/193271",
+  "state": "open",
+  "title": "[VectorCombine] Pass flags during IR creation",
+  "author": "jackhong12",
+  "base_commit": "4f2d572349c442439f6bc7b0f4fdaab9806dab3c",
+  "fix_commit": "8d9691131c72be15dd337b162f05540feabbc130",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 29eced7ee9de1..e901bcd92da1f 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -156,6 +156,12 @@ class VectorCombine {\n   bool shrinkType(Instruction &I);\n   bool shrinkLoadForShuffles(Instruction &I);\n   bool shrinkPhiOfShuffles(Instruction &I);\n+  Value *createBinaryOp(Instruction::BinaryOps Opcode, Value *Op0, Value *Op1,\n+                        BinaryOperator *OldI);\n+  Value *createUnaryOp(Instruction::UnaryOps Opcode, Value *Operand,\n+                       UnaryOperator *OldI);\n+  Value *createCmp(CmpInst::Predicate Pred, Value *LHS, Value *RHS,\n+                   CmpInst *OldI);\n \n   void replaceValue(Instruction &Old, Value &New, bool Erase = true) {\n     LLVM_DEBUG(dbgs() << \"VC: Replacing: \" << Old << '\\n');\n@@ -1282,6 +1288,80 @@ bool VectorCombine::scalarizeVPIntrinsic(Instruction &I) {\n   return true;\n }\n \n+Value *VectorCombine::createUnaryOp(Instruction::UnaryOps Opcode,\n+                                    Value *Operand, UnaryOperator *OldI) {\n+  switch (Opcode) {\n+  case Instruction::FNeg:\n+    return Builder.CreateFNegFMF(Operand, OldI,\n+                                 OldI->getName() + \".scalar.fneg\");\n+  case Instruction::UnaryOpsEnd:\n+    llvm_unreachable(\"Invalid unary opcode\");\n+  }\n+  llvm_unreachable(\"Invalid unary opcode\");\n+}\n+\n+Value *VectorCombine::createBinaryOp(Instruction::BinaryOps Opcode, Value *LHS,\n+                                     Value *RHS, BinaryOperator *OldI) {\n+  Twine Prefix = OldI->getName() + \".scalar.\";\n+  switch (Opcode) {\n+  case Instruction::Add:\n+    return Builder.CreateAdd(LHS, RHS, Prefix + \"add\",\n+                             OldI->hasNoUnsignedWrap(),\n+                             OldI->hasNoSignedWrap());\n+  case Instruction::Sub:\n+    return Builder.CreateSub(LHS, RHS, Prefix + \"sub\",\n+                             OldI->hasNoUnsignedWrap(),\n+                             OldI->hasNoSignedWrap());\n+  case Instruction::Mul:\n+    return Builder.CreateMul(LHS, RHS, Prefix + \"mul\",\n+                             OldI->hasNoUnsignedWrap(),\n+                             OldI->hasNoSignedWrap());\n+  case Instruction::UDiv:\n+    return Builder.CreateUDiv(LHS, RHS, Prefix + \"udiv\", OldI->isExact());\n+  case Instruction::SDiv:\n+    return Builder.CreateSDiv(LHS, RHS, Prefix + \"sdiv\", OldI->isExact());\n+  case Instruction::URem:\n+    return Builder.CreateURem(LHS, RHS, Prefix + \"urem\");\n+  case Instruction::SRem:\n+    return Builder.CreateSRem(LHS, RHS, Prefix + \"srem\");\n+  case Instruction::Shl:\n+    return Builder.CreateShl(LHS, RHS, Prefix + \"shl\",\n+                             OldI->hasNoUnsignedWrap(),\n+                             OldI->hasNoSignedWrap());\n+  case Instruction::LShr:\n+    return Builder.CreateLShr(LHS, RHS, Prefix + \"lshr\", OldI->isExact());\n+  case Instruction::AShr:\n+    return Builder.CreateAShr(LHS, RHS, Prefix + \"ashr\", OldI->isExact());\n+  case Instruction::And:\n+    return Builder.CreateAnd(LHS, RHS, Prefix + \"and\");\n+  case Instruction::Or:\n+    return Builder.CreateOr(LHS, RHS, Prefix + \"or\");\n+  case Instruction::Xor:\n+    return Builder.CreateXor(LHS, RHS, Prefix + \"xor\");\n+  case Instruction::FAdd:\n+    return Builder.CreateFAddFMF(LHS, RHS, OldI, Prefix + \"fadd\");\n+  case Instruction::FSub:\n+    return Builder.CreateFSubFMF(LHS, RHS, OldI, Prefix + \"fsub\");\n+  case Instruction::FMul:\n+    return Builder.CreateFMulFMF(LHS, RHS, OldI, Prefix + \"fmul\");\n+  case Instruction::FDiv:\n+    return Builder.CreateFDivFMF(LHS, RHS, OldI, Prefix + \"fdiv\");\n+  case Instruction::FRem:\n+    return Builder.CreateFRemFMF(LHS, RHS, OldI, Prefix + \"frem\");\n+  case Instruction::BinaryOpsEnd:\n+    llvm_unreachable(\"Invalid binary opcode\");\n+  }\n+  llvm_unreachable(\"Invalid binary opcode\");\n+}\n+\n+Value *VectorCombine::createCmp(CmpInst::Predicate Pred, Value *LHS, Value *RHS,\n+                                CmpInst *OldI) {\n+  if (FCmpInst *FC = dyn_cast<FCmpInst>(OldI))\n+    return Builder.CreateFCmpFMF(Pred, LHS, RHS, FC);\n+\n+  return Builder.CreateCmp(Pred, LHS, RHS);\n+}\n+\n /// Match a vector op/compare/intrinsic with at least one\n /// inserted scalar operand and convert to scalar op/cmp/intrinsic followed\n /// by insertelement.\n@@ -1435,19 +1515,14 @@ bool VectorCombine::scalarizeOpOrCmp(Instruction &I) {\n \n   Value *Scalar;\n   if (CI)\n-    Scalar = Builder.CreateCmp(CI->getPredicate(), ScalarOps[0], ScalarOps[1]);\n-  else if (UO || BO)\n-    Scalar = Builder.CreateNAryOp(Opcode, ScalarOps);\n+    Scalar = createCmp(CI->getPredicate(), ScalarOps[0], ScalarOps[1], CI);\n+  else if (UO)\n+    Scalar = createUnaryOp(UO->getOpcode(), ScalarOps[0], UO);\n+  else if (BO)\n+    Scalar = createBinaryOp(BO->getOpcode(), ScalarOps[0], ScalarOps[1], BO);\n   else\n     Scalar = Builder.CreateIntrinsic(ScalarTy, II->getIntrinsicID(), ScalarOps);\n \n-  Scalar->setName(I.getName() + \".scalar\");\n-\n-  // All IR flags are safe to back-propagate. There is no potential for extra\n-  // poison to be created by the scalar instruction.\n-  if (auto *ScalarInst = dyn_cast<Instruction>(Scalar))\n-    ScalarInst->copyIRFlags(&I);\n-\n   Value *Insert = Builder.CreateInsertElement(NewVecC, Scalar, *Index);\n   replaceValue(I, *Insert);\n   return true;\n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "Since commit 777d6b5, VectorCombine has been using InstSimplifyFolder to simplify vector instructions during IR construction. When creating a new instruction, InstSimplifyFolder may fold the operation and return an existing operand instead of emitting a new instruction.\r\n\r\nIn such cases, copying IR flags to the returned value is incorrect and may unintentionally propagate flags to pre\u2011existing instructions, polluting the original IR. To avoid this, flags should be passed at IR creation rather than being setted after construction.  Fix #192607.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/VectorCombine/binop-scalarize.ll",
+      "commands": [
+        "opt < %s -S -p vector-combine"
+      ],
+      "tests": [
+        {
+          "test_name": "test_sub",
+          "test_body": "define <2 x i32> @test_sub(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 1, i64 0\n  %vecSub = sub nuw nsw <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecSub\n}\n"
+        },
+        {
+          "test_name": "test_srem",
+          "test_body": "define <2 x i32> @test_srem(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecSrem = srem <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecSrem\n}\n"
+        },
+        {
+          "test_name": "test_frem",
+          "test_body": "define <2 x float> @test_frem(float %arg) {\n  %vec0 = insertelement <2 x float> zeroinitializer, float %arg, i64 0\n  %vec1 = insertelement <2 x float> zeroinitializer, float 3.000000e+00, i64 0\n  %vecFRem = frem fast <2 x float> %vec0, %vec1\n  ret <2 x float> %vecFRem\n}\n"
+        },
+        {
+          "test_name": "test_shl",
+          "test_body": "define <2 x i32> @test_shl(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecShl = shl nuw nsw <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecShl\n}\n"
+        },
+        {
+          "test_name": "test_mul",
+          "test_body": "define <2 x i32> @test_mul(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecMul = mul nuw nsw <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecMul\n}\n"
+        },
+        {
+          "test_name": "pr193271",
+          "test_body": "define i32 @pr193271(i32 %arg) {\n  %ret = add i32 %arg, 1\n  %insert = insertelement <2 x i32> zeroinitializer, i32 %ret, i64 0\n  %vecAdd = add nuw <2 x i32> %insert, zeroinitializer\n  ret i32 %ret\n}\n"
+        },
+        {
+          "test_name": "test_or",
+          "test_body": "define <2 x i32> @test_or(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecOr = or disjoint <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecOr\n}\n"
+        },
+        {
+          "test_name": "test_urem",
+          "test_body": "define <2 x i32> @test_urem(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecUrem = urem <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecUrem\n}\n"
+        },
+        {
+          "test_name": "test_add",
+          "test_body": "define <2 x i32> @test_add(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 1, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vecAdd = add nuw nsw <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecAdd\n}\n"
+        },
+        {
+          "test_name": "test_and",
+          "test_body": "define <2 x i32> @test_and(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecAnd = and <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecAnd\n}\n"
+        },
+        {
+          "test_name": "test_fsub",
+          "test_body": "define <2 x float> @test_fsub(float %arg) {\n  %vec0 = insertelement <2 x float> zeroinitializer, float %arg, i64 0\n  %vec1 = insertelement <2 x float> zeroinitializer, float 3.000000e+00, i64 0\n  %vecFSub = fsub fast <2 x float> %vec0, %vec1\n  ret <2 x float> %vecFSub\n}\n"
+        },
+        {
+          "test_name": "test_udiv",
+          "test_body": "define <2 x i32> @test_udiv(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecUdiv = udiv <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecUdiv\n}\n"
+        },
+        {
+          "test_name": "test_fadd",
+          "test_body": "define <2 x float> @test_fadd(float %arg) {\n  %vec0 = insertelement <2 x float> zeroinitializer, float %arg, i64 0\n  %vec1 = insertelement <2 x float> zeroinitializer, float 3.000000e+00, i64 0\n  %vecFAdd = fadd fast <2 x float> %vec0, %vec1\n  ret <2 x float> %vecFAdd\n}\n"
+        },
+        {
+          "test_name": "test_lshr",
+          "test_body": "define <2 x i32> @test_lshr(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecLshr = lshr exact <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecLshr\n}\n"
+        },
+        {
+          "test_name": "test_fmul",
+          "test_body": "define <2 x float> @test_fmul(float %arg) {\n  %vec0 = insertelement <2 x float> zeroinitializer, float %arg, i64 0\n  %vec1 = insertelement <2 x float> zeroinitializer, float 3.000000e+00, i64 0\n  %vecFMul = fmul fast <2 x float> %vec0, %vec1\n  ret <2 x float> %vecFMul\n}\n"
+        },
+        {
+          "test_name": "test_fdiv",
+          "test_body": "define <2 x float> @test_fdiv(float %arg) {\n  %vec0 = insertelement <2 x float> zeroinitializer, float %arg, i64 0\n  %vec1 = insertelement <2 x float> zeroinitializer, float 3.000000e+00, i64 0\n  %vecFDiv = fdiv fast <2 x float> %vec0, %vec1\n  ret <2 x float> %vecFDiv\n}\n"
+        },
+        {
+          "test_name": "test_sdiv",
+          "test_body": "define <2 x i32> @test_sdiv(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecSdiv = sdiv <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecSdiv\n}\n"
+        },
+        {
+          "test_name": "test_ashr",
+          "test_body": "define <2 x i32> @test_ashr(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecAshr = ashr exact <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecAshr\n}\n"
+        },
+        {
+          "test_name": "test_xor",
+          "test_body": "define <2 x i32> @test_xor(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecXor = xor <2 x i32> %vec0, %vec1\n  ret <2 x i32> %vecXor\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/cmp-scalarize.ll",
+      "commands": [
+        "opt < %s -S -p vector-combine"
+      ],
+      "tests": [
+        {
+          "test_name": "test_icmp_slt",
+          "test_body": "define <2 x i1> @test_icmp_slt(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecCmp = icmp slt <2 x i32> %vec0, %vec1\n  ret <2 x i1> %vecCmp\n}\n"
+        },
+        {
+          "test_name": "test_icmp_eq",
+          "test_body": "define <2 x i1> @test_icmp_eq(i32 %arg) {\n  %vec0 = insertelement <2 x i32> zeroinitializer, i32 %arg, i64 0\n  %vec1 = insertelement <2 x i32> zeroinitializer, i32 3, i64 0\n  %vecCmp = icmp eq <2 x i32> %vec0, %vec1\n  ret <2 x i1> %vecCmp\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_ult",
+          "test_body": "define <2 x i1> @test_fcmp_ult(float %arg) {\n  %vec0 = insertelement <2 x float> zeroinitializer, float %arg, i64 0\n  %vec1 = insertelement <2 x float> zeroinitializer, float 3.000000e+00, i64 0\n  %vecCmp = fcmp fast ult <2 x float> %vec0, %vec1\n  ret <2 x i1> %vecCmp\n}\n"
+        },
+        {
+          "test_name": "test_fcmp_oeq",
+          "test_body": "define <2 x i1> @test_fcmp_oeq(float %arg) {\n  %vec0 = insertelement <2 x float> zeroinitializer, float %arg, i64 0\n  %vec1 = insertelement <2 x float> zeroinitializer, float 3.000000e+00, i64 0\n  %vecCmp = fcmp oeq <2 x float> %vec0, %vec1\n  ret <2 x i1> %vecCmp\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/unary-op-scalarize.ll",
+      "commands": [
+        "opt < %s -S -p vector-combine"
+      ],
+      "tests": [
+        {
+          "test_name": "fneg_scalable",
+          "test_body": "define <vscale x 4 x float> @fneg_scalable(float %x) {\n  %x.insert = insertelement <vscale x 4 x float> poison, float %x, i32 0\n  %v = fneg <vscale x 4 x float> %x.insert\n  ret <vscale x 4 x float> %v\n}\n"
+        },
+        {
+          "test_name": "fneg_scalable_fast",
+          "test_body": "define <vscale x 4 x float> @fneg_scalable_fast(float %x) {\n  %x.insert = insertelement <vscale x 4 x float> poison, float %x, i32 0\n  %v = fneg fast <vscale x 4 x float> %x.insert\n  ret <vscale x 4 x float> %v\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 194185 tests passed\n* 5115 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 133814 tests passed\n* 3136 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    }
+  ],
+  "knowledge_cutoff": "2026-04-21T17:15:16Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        156,
+        161
+      ],
+      [
+        1282,
+        1287
+      ],
+      [
+        1435,
+        1453
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/binop-scalarize.ll": [
+      [
+        39,
+        41
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/unary-op-scalarize.ll": [
+      [
+        24,
+        26
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::scalarizeOpOrCmp",
+      "VectorCombine::scalarizeVPIntrinsic",
+      "replaceValue"
+    ],
+    "llvm/test/Transforms/VectorCombine/unary-op-scalarize.ll": [
+      "fneg_scalable"
+    ]
+  }
+}

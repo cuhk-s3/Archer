@@ -1,0 +1,91 @@
+{
+  "pr_id": 198178,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/198178",
+  "state": "open",
+  "title": "[InstCombine] Convert logical and/or with trunc nuw to i1 into bitwise ops",
+  "author": "andjo403",
+  "base_commit": "2f79d41e3e2ebf1fa2695fd69fcc110c01113689",
+  "fix_commit": "c11b572749b743c8af997bfa1d5452179fd90599",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex a064aa1016399..4a47a2a06809b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -3653,7 +3653,7 @@ static Instruction *foldNestedSelects(SelectInst &OuterSelVal,\n /// already poison. For example, if ValAssumedPoison is `icmp samesign X, 10`\n /// and V is `icmp ne X, 5`, impliesPoisonOrCond returns true.\n static bool impliesPoisonOrCond(const Value *ValAssumedPoison, const Value *V,\n-                                bool Expected) {\n+                                bool Expected, const SimplifyQuery &SQ) {\n   if (impliesPoison(ValAssumedPoison, V))\n     return true;\n \n@@ -3678,6 +3678,16 @@ static bool impliesPoisonOrCond(const Value *ValAssumedPoison, const Value *V,\n                       *RHSC2);\n     }\n   }\n+  Value *A;\n+  if (match(ValAssumedPoison, m_NUWTrunc(m_Value(A))) &&\n+      isGuaranteedNotToBePoison(A)) {\n+    assert(ValAssumedPoison->getType()->isIntOrIntVectorTy(1));\n+    unsigned BitWidth = A->getType()->getScalarSizeInBits();\n+    return ConstantRange(APInt::getZero(BitWidth), APInt(BitWidth, 2))\n+        .contains(computeConstantRangeIncludingKnownBits(\n+            A, false,\n+            SQ.getWithInstruction(cast<Instruction>(ValAssumedPoison))));\n+  }\n \n   return false;\n }\n@@ -3703,13 +3713,13 @@ Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   // checks whether folding it does not convert a well-defined value into\n   // poison.\n   if (match(TrueVal, m_One())) {\n-    if (impliesPoisonOrCond(FalseVal, CondVal, /*Expected=*/false)) {\n+    if (impliesPoisonOrCond(FalseVal, CondVal, /*Expected=*/false, SQ)) {\n       // Change: A = select B, true, C --> A = or B, C\n       return BinaryOperator::CreateOr(CondVal, FalseVal);\n     }\n \n     if (match(CondVal, m_OneUse(m_Select(m_Value(A), m_One(), m_Value(B)))) &&\n-        impliesPoisonOrCond(FalseVal, B, /*Expected=*/false)) {\n+        impliesPoisonOrCond(FalseVal, B, /*Expected=*/false, SQ)) {\n       // (A || B) || C --> A || (B | C)\n       Value *LOr = Builder.CreateLogicalOr(A, Builder.CreateOr(B, FalseVal));\n       if (auto *I = dyn_cast<Instruction>(LOr)) {\n@@ -3749,13 +3759,13 @@ Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   }\n \n   if (match(FalseVal, m_Zero())) {\n-    if (impliesPoisonOrCond(TrueVal, CondVal, /*Expected=*/true)) {\n+    if (impliesPoisonOrCond(TrueVal, CondVal, /*Expected=*/true, SQ)) {\n       // Change: A = select B, C, false --> A = and B, C\n       return BinaryOperator::CreateAnd(CondVal, TrueVal);\n     }\n \n     if (match(CondVal, m_OneUse(m_Select(m_Value(A), m_Value(B), m_Zero()))) &&\n-        impliesPoisonOrCond(TrueVal, B, /*Expected=*/true)) {\n+        impliesPoisonOrCond(TrueVal, B, /*Expected=*/true, SQ)) {\n       // (A && B) && C --> A && (B & C)\n       Value *LAnd = Builder.CreateLogicalAnd(A, Builder.CreateAnd(B, TrueVal));\n       if (auto *I = dyn_cast<Instruction>(LAnd)) {\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "if it is know that `trunc nuw to i1 ` can not be poison logical and/or can be folded to bitwise ops.\r\n\r\nregression seen in https://github.com/dtcxzyw/llvm-opt-benchmark/pull/3528#discussion_r2874045398 from https://github.com/llvm/llvm-project/pull/184182\r\n\r\nproof https://alive2.llvm.org/ce/z/xQ2Sj-",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/logical-select.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_logical_and_icmp_samesign_vec_with_poison_tv",
+          "test_body": "define <2 x i1> @test_logical_and_icmp_samesign_vec_with_poison_tv(<2 x i8> %x) {\n  %cmp1 = icmp ne <2 x i8> %x, splat (i8 9)\n  %cmp2 = icmp samesign ult <2 x i8> %x, <i8 11, i8 poison>\n  %and = select <2 x i1> %cmp1, <2 x i1> %cmp2, <2 x i1> zeroinitializer\n  ret <2 x i1> %and\n}\n"
+        },
+        {
+          "test_name": "test_logical_and_trunc_nuw_vec",
+          "test_body": "define <2 x i1> @test_logical_and_trunc_nuw_vec(<2 x i1> %c, <2 x i8> noundef range(i8 0, 2) %x) {\n  %trunc = trunc nuw <2 x i8> %x to <2 x i1>\n  %and = select <2 x i1> %c, <2 x i1> %trunc, <2 x i1> zeroinitializer\n  ret <2 x i1> %and\n}\n"
+        },
+        {
+          "test_name": "neg_test_logical_and_trunc_nuw_no_noundef",
+          "test_body": "define i1 @neg_test_logical_and_trunc_nuw_no_noundef(i1 %c, i8 range(i8 0, 2) %x) {\n  %trunc = trunc nuw i8 %x to i1\n  %and = select i1 %c, i1 %trunc, i1 false\n  ret i1 %and\n}\n"
+        },
+        {
+          "test_name": "test_logical_or_trunc_nuw",
+          "test_body": "define i1 @test_logical_or_trunc_nuw(i1 %c, i8 noundef range(i8 0, 2) %x) {\n  %trunc = trunc nuw i8 %x to i1\n  %or = select i1 %c, i1 true, i1 %trunc\n  ret i1 %or\n}\n"
+        },
+        {
+          "test_name": "neg_test_logical_and_trunc_nuw_no_range",
+          "test_body": "define i1 @neg_test_logical_and_trunc_nuw_no_range(i1 %c, i8 noundef %x) {\n  %trunc = trunc nuw i8 %x to i1\n  %and = select i1 %c, i1 %trunc, i1 false\n  ret i1 %and\n}\n"
+        },
+        {
+          "test_name": "test_logical_and_trunc_nuw",
+          "test_body": "define i1 @test_logical_and_trunc_nuw(i1 %c, i8 noundef range(i8 0, 2) %x) {\n  %trunc = trunc nuw i8 %x to i1\n  %and = select i1 %c, i1 %trunc, i1 false\n  ret i1 %and\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Andreas Jonson (andjo403)\n\n<details>\n<summary>Changes</summary>\n\nif it is know that `trunc nuw to i1 ` can not be poison logical and/or can be folded to bitwise ops.\r\n\r\nregression seen in https://github.com/dtcxzyw/llvm-opt-benchmark/pull/3528#discussion_r2874045398 from https://github.com/llvm/llvm-project/pull/184182\r\n\r\nproof https://alive2.llvm.org/ce/z/xQ2Sj-\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/198178.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp (+15-5) \n- (modified) llvm/test/Transforms/InstCombine/logical-select.ll (+55) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex a064aa1016399..4a47a2a06809b 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -3653,7 +3653,7 @@ static Instruction *foldNestedSelects(SelectInst &OuterSelVal,\n /// already poison. For example, if ValAssumedPoison is `icmp samesign X, 10`\n /// and V is `icmp ne X, 5`, impliesPoisonOrCond returns true.\n static bool impliesPoisonOrCond(const Value *ValAssumedPoison, const Value *V,\n-                                bool Expected) {\n+                                bool Expected, const SimplifyQuery &SQ) {\n   if (impliesPoison(ValAssumedPoison, V))\n     return true;\n \n@@ -3678,6 +3678,16 @@ static bool impliesPoisonOrCond(const Value *ValAssumedPoison, const Value *V,\n                       *RHSC2);\n     }\n   }\n+  Value *A;\n+  if (match(ValAssumedPoison, m_NUWTrunc(m_Value(A))) &&\n+      isGuaranteedNotToBePoison(A)) {\n+    assert(ValAssumedPoison->getType()->isIntOrIntVectorTy(1));\n+    unsigned BitWidth = A->getType()->getScalarSizeInBits();\n+    return ConstantRange(APInt::getZero(BitWidth), APInt(BitWidth, 2))\n+        .contains(computeConstantRangeIncludingKnownBits(\n+            A, false,\n+            SQ.getWithInstruction(cast<Instruction>(ValAssumedPoison))));\n+  }\n \n   return false;\n }\n@@ -3703,13 +3713,13 @@ Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   // checks whether folding it does not convert a well-defined value into\n   // poison.\n   if (match(TrueVal, m_One())) {\n-    if (impliesPoisonOrCond(FalseVal, CondVal, /*Expected=*/false)) {\n+    if (impliesPoisonOrCond(FalseVal, CondVal, /*Expected=*/false, SQ)) {\n       // Change: A = select B, true, C --> A = or B, C\n       return BinaryOperator::CreateOr(CondVal, FalseVal);\n     }\n \n     if (match(CondVal, m_OneUse(m_Select(m_Value(A), m_One(), m_Value(B)))) &&\n-        impliesPoisonOrCond(FalseVal, B, /*Expected=*/false)) {\n+        impliesPoisonOrCond(FalseVal, B, /*Expected=*/false, SQ)) {\n       // (A || B) || C --> A || (B | C)\n       Value *LOr = Builder.CreateLogicalOr(A, Builder.CreateOr(B, FalseVal));\n       if (auto *I = dyn_cast<Instruction>(LOr)) {\n@@ -3749,13 +3759,13 @@ Instruction *InstCombinerImpl::foldSelectOfBools(SelectInst &SI) {\n   }\n \n   if (match(FalseVal, m_Zero())) {\n-    if (impliesPoisonOrCond(TrueVal, CondVal, /*Expected=*/true)) {\n+    if (impliesPoisonOrCond(TrueVal, CondVal, /*Expected=*/true, SQ)) {\n       // Change: A = select B, C, false --> A = and B, C\n       return BinaryOperator::CreateAnd(CondVal, TrueVal);\n     }\n \n     if (match(CondVal, m_OneUse(m_Select(m_Value(A), m_Value(B), m_Zero()))) &&\n-        impliesPoisonOrCond(TrueVal, B, /*Expected=*/true)) {\n+        impliesPoisonOrCond(TrueVal, B, /*Expected=*/true, SQ)) {\n       // (A && B) && C --> A && (B & C)\n       Value *LAnd = Builder.CreateLogicalAnd(A, Builder.CreateAnd(B, TrueVal));\n       if (auto *I = dyn_cast<Instruction>(LAnd)) {\ndiff --git a/llvm/test/Transforms/InstCombine/logical-select.ll b/llvm/test/Transforms/InstCombine/logical-select.ll\nindex e6de063969a6a..85e8c98455c91 100644\n--- a/llvm/test/Transforms/InstCombine/logical-select.ll\n+++ b/llvm/test/Transforms/InstCombine/logical-select.ll\n@@ -1637,3 +1637,58 @@ define <2 x i1> @test_logical_and_icmp_samesign_vec_with_poison_tv(<2 x i8> %x)\n   %and = select <2 x i1> %cmp1, <2 x i1> %cmp2, <2 x i1> zeroinitializer\n   ret <2 x i1> %and\n }\n+\n+define i1 @test_logical_and_trunc_nuw(i1 %c, i8 noundef range(i8 0,2) %x) {\n+; CHECK-LABEL: @test_logical_and_trunc_nuw(\n+; CHECK-NEXT:    [[TRUNC:%.*]] = trunc nuw i8 [[X:%.*]] to i1\n+; CHECK-NEXT:    [[AND:%.*]] = and i1 [[C:%.*]], [[TRUNC]]\n+; CHECK-NEXT:    ret i1 [[AND]]\n+;\n+  %trunc = trunc nuw i8 %x to i1\n+  %and = select i1 %c, i1 %trunc, i1 false\n+  ret i1 %and\n+}\n+\n+define i1 @test_logical_or_trunc_nuw(i1 %c, i8 noundef range(i8 0,2) %x) {\n+; CHECK-LABEL: @test_logical_or_trunc_nuw(\n+; CHECK-NEXT:    [[TRUNC:%.*]] = trunc nuw i8 [[X:%.*]] to i1\n+; CHECK-NEXT:    [[OR:%.*]] = or i1 [[C:%.*]], [[TRUNC]]\n+; CHECK-NEXT:    ret i1 [[OR]]\n+;\n+  %trunc = trunc nuw i8 %x to i1\n+  %or = select i1 %c, i1 true, i1 %trunc\n+  ret i1 %or\n+}\n+\n+define <2 x i1> @test_logical_and_trunc_nuw_vec(<2 x i1> %c, <2 x i8> noundef range(i8 0,2) %x) {\n+; CHECK-LABEL: @test_logical_and_trunc_nuw_vec(\n+; CHECK-NEXT:    [[TRUNC:%.*]] = trunc nuw <2 x i8> [[X:%.*]] to <2 x i1>\n+; CHECK-NEXT:    [[AND:%.*]] = and <2 x i1> [[C:%.*]], [[TRUNC]]\n+; CHECK-NEXT:    ret <2 x i1> [[AND]]\n+;\n+  %trunc = trunc nuw <2 x i8> %x to <2 x i1>\n+  %and = select <2 x i1> %c, <2 x i1> %trunc, <2 x i1> zeroinitializer\n+  ret <2 x i1> %and\n+}\n+\n+define i1 @neg_test_logical_and_trunc_nuw_no_range(i1 %c, i8 noundef %x) {\n+; CHECK-LABEL: @neg_test_logical_and_trunc_nuw_no_range(\n+; CHECK-NEXT:    [[TRUNC:%.*]] = trunc nuw i8 [[X:%.*]] to i1\n+; CHECK-NEXT:    [[AND:%.*]] = select i1 [[C:%.*]], i1 [[TRUNC]], i1 false\n+; CHECK-NEXT:    ret i1 [[AND]]\n+;\n+  %trunc = trunc nuw i8 %x to i1\n+  %and = select i1 %c, i1 %trunc, i1 false\n+  ret i1 %and\n+}\n+\n+define i1 @neg_test_logical_and_trunc_nuw_no_noundef(i1 %c, i8 range(i8 0,2) %x) {\n+; CHECK-LABEL: @neg_test_logical_and_trunc_nuw_no_noundef(\n+; CHECK-NEXT:    [[TRUNC:%.*]] = trunc nuw i8 [[X:%.*]] to i1\n+; CHECK-NEXT:    [[AND:%.*]] = select i1 [[C:%.*]], i1 [[TRUNC]], i1 false\n+; CHECK-NEXT:    ret i1 [[AND]]\n+;\n+  %trunc = trunc nuw i8 %x to i1\n+  %and = select i1 %c, i1 %trunc, i1 false\n+  ret i1 %and\n+}\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-17T13:34:18Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        3653,
+        3659
+      ],
+      [
+        3678,
+        3683
+      ],
+      [
+        3703,
+        3715
+      ],
+      [
+        3749,
+        3761
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/logical-select.ll": [
+      [
+        1637,
+        1639
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::foldSelectOfBools",
+      "impliesPoisonOrCond"
+    ]
+  }
+}

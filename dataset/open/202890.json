@@ -1,0 +1,122 @@
+{
+  "pr_id": 202890,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/202890",
+  "state": "open",
+  "title": "[InstCombine] Remove knowledge retention folding",
+  "author": "philnik777",
+  "base_commit": "93e03fc2666e10b4e32091bc27d35709f49c9443",
+  "fix_commit": "a8a6120a1469386776f47da09b23d709aa117245",
+  "patch": "diff --git a/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h b/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\nindex 1c0c318c8b0f2..501807ae57999 100644\n--- a/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\n+++ b/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\n@@ -58,15 +58,6 @@ struct AssumeSimplifyPass : public OptionalPassInfoMixin<AssumeSimplifyPass> {\n struct AssumeBuilderPass : public OptionalPassInfoMixin<AssumeBuilderPass> {\n   LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);\n };\n-\n-/// canonicalize the RetainedKnowledge RK. it is assumed that RK is part of\n-/// Assume. This will return an empty RetainedKnowledge if the knowledge is\n-/// useless.\n-LLVM_ABI RetainedKnowledge simplifyRetainedKnowledge(AssumeInst *Assume,\n-                                                     RetainedKnowledge RK,\n-                                                     AssumptionCache *AC,\n-                                                     DominatorTree *DT);\n-\n } // namespace llvm\n \n #endif\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 19d896227e69a..48a2c6a033c0f 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3799,41 +3799,6 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n       }\n     }\n \n-    /// Canonicalize Knowledge in operand bundles.\n-    if (EnableKnowledgeRetention && II->hasOperandBundles()) {\n-      for (unsigned Idx = 0; Idx < II->getNumOperandBundles(); Idx++) {\n-        auto &BOI = II->bundle_op_info_begin()[Idx];\n-        RetainedKnowledge RK =\n-          llvm::getKnowledgeFromBundle(cast<AssumeInst>(*II), BOI);\n-        if (BOI.End - BOI.Begin > 2)\n-          continue; // Prevent reducing knowledge in an align with offset since\n-                    // extracting a RetainedKnowledge from them looses offset\n-                    // information\n-        RetainedKnowledge CanonRK =\n-          llvm::simplifyRetainedKnowledge(cast<AssumeInst>(II), RK,\n-                                          &getAssumptionCache(),\n-                                          &getDominatorTree());\n-        if (CanonRK == RK)\n-          continue;\n-        if (!CanonRK) {\n-          if (BOI.End - BOI.Begin > 0) {\n-            Worklist.pushValue(II->op_begin()[BOI.Begin]);\n-            Value::dropDroppableUse(II->op_begin()[BOI.Begin]);\n-          }\n-          continue;\n-        }\n-        assert(RK.AttrKind == CanonRK.AttrKind);\n-        if (BOI.End - BOI.Begin > 0)\n-          II->op_begin()[BOI.Begin].set(CanonRK.WasOn);\n-        if (BOI.End - BOI.Begin > 1)\n-          II->op_begin()[BOI.Begin + 1].set(ConstantInt::get(\n-              Type::getInt64Ty(II->getContext()), CanonRK.ArgValue));\n-        if (RK.WasOn)\n-          Worklist.pushValue(RK.WasOn);\n-        return II;\n-      }\n-    }\n-\n     // If there is a dominating assume with the same condition as this one,\n     // then this one is redundant, and should be removed.\n     KnownBits Known(1);\ndiff --git a/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp b/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\nindex 722d04c9ae957..a1176762f6768 100644\n--- a/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\n+++ b/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\n@@ -304,21 +304,6 @@ bool llvm::salvageKnowledge(Instruction *I, AssumptionCache *AC,\n   return Changed;\n }\n \n-RetainedKnowledge llvm::simplifyRetainedKnowledge(AssumeInst *Assume,\n-                                                  RetainedKnowledge RK,\n-                                                  AssumptionCache *AC,\n-                                                  DominatorTree *DT) {\n-  AssumeBuilderState Builder(Assume->getModule(), Assume, AC, DT);\n-  RK = canonicalizedKnowledge(RK, Assume->getDataLayout());\n-\n-  if (!Builder.isKnowledgeWorthPreserving(RK))\n-    return RetainedKnowledge::none();\n-\n-  if (Builder.tryToPreserveWithoutAddingAssume(RK))\n-    return RetainedKnowledge::none();\n-  return RK;\n-}\n-\n namespace {\n \n struct AssumeSimplify {\n",
+  "components": [
+    "AssumeBundleBuilder",
+    "InstCombine"
+  ],
+  "description": "The knowledge retention API for simplifying assumes isn't that useful anymore, since most simplifications done by it are now done unconditionally directly in InstCombine. It's also known to miscompoile multiple patterns.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/assume.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "align_with_variable_offset",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @align_with_variable_offset(ptr %ptr, i64 %offset) {\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 16) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 8, i64 %offset) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "align_with_constant_offset_8",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @align_with_constant_offset_8(ptr %ptr) {\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 16) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 8, i64 8) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "nonnull_gep_inbounds_bundle_null_is_valid",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\n; Function Attrs: null_pointer_is_valid\ndefine void @nonnull_gep_inbounds_bundle_null_is_valid(ptr %p, i64 %i) #1 {\n  %p2 = getelementptr inbounds i8, ptr %p, i64 %i\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %p2) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\nattributes #1 = { null_pointer_is_valid }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "align_with_constant_offset_4",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @align_with_constant_offset_4(ptr %ptr) {\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 16) ]\n  %ptr2 = getelementptr i8, ptr %ptr, i64 4\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr2, i64 8, i64 4) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "nonnull_gep_inbounds_bundle",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @nonnull_gep_inbounds_bundle(ptr %p, i64 %i) {\n  %p2 = getelementptr inbounds i8, ptr %p, i64 %i\n  call void @llvm.assume(i1 true) [ \"nonnull\"(ptr %p2) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "canonicalize_assume",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @canonicalize_assume(ptr %0) {\n  %2 = getelementptr inbounds i32, ptr %0, i64 2\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %2, i64 16) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        },
+        {
+          "test_name": "align_with_constant_offset_0",
+          "test_body": "target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #0\n\ndefine void @align_with_constant_offset_0(ptr %ptr) {\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 16) ]\n  call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 8, i64 0) ]\n  ret void\n}\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n\n!llvm.dbg.cu = !{}\n!llvm.module.flags = !{!0, !1, !2, !3}\n\n!0 = !{i32 2, !\"Dwarf Version\", i32 4}\n!1 = !{i32 2, !\"Debug Info Version\", i32 3}\n!2 = !{i32 1, !\"wchar_size\", i32 4}\n!3 = !{i32 8, !\"PIC Level\", i32 2}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Nikolas Klauser (philnik777)\n\n<details>\n<summary>Changes</summary>\n\nThe knowledge retention API for simplifying assumes isn't that useful anymore, since most simplifications done by it are now done unconditionally directly in InstCombine. It's also known to miscompoile multiple patterns.\n\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/202890.diff\n\n\n4 Files Affected:\n\n- (modified) llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h (-9) \n- (modified) llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp (-35) \n- (modified) llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp (-15) \n- (modified) llvm/test/Transforms/InstCombine/assume.ll (+21-43) \n\n\n``````````diff\ndiff --git a/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h b/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\nindex 1c0c318c8b0f2..501807ae57999 100644\n--- a/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\n+++ b/llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h\n@@ -58,15 +58,6 @@ struct AssumeSimplifyPass : public OptionalPassInfoMixin<AssumeSimplifyPass> {\n struct AssumeBuilderPass : public OptionalPassInfoMixin<AssumeBuilderPass> {\n   LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);\n };\n-\n-/// canonicalize the RetainedKnowledge RK. it is assumed that RK is part of\n-/// Assume. This will return an empty RetainedKnowledge if the knowledge is\n-/// useless.\n-LLVM_ABI RetainedKnowledge simplifyRetainedKnowledge(AssumeInst *Assume,\n-                                                     RetainedKnowledge RK,\n-                                                     AssumptionCache *AC,\n-                                                     DominatorTree *DT);\n-\n } // namespace llvm\n \n #endif\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\nindex 19d896227e69a..48a2c6a033c0f 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp\n@@ -3799,41 +3799,6 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {\n       }\n     }\n \n-    /// Canonicalize Knowledge in operand bundles.\n-    if (EnableKnowledgeRetention && II->hasOperandBundles()) {\n-      for (unsigned Idx = 0; Idx < II->getNumOperandBundles(); Idx++) {\n-        auto &BOI = II->bundle_op_info_begin()[Idx];\n-        RetainedKnowledge RK =\n-          llvm::getKnowledgeFromBundle(cast<AssumeInst>(*II), BOI);\n-        if (BOI.End - BOI.Begin > 2)\n-          continue; // Prevent reducing knowledge in an align with offset since\n-                    // extracting a RetainedKnowledge from them looses offset\n-                    // information\n-        RetainedKnowledge CanonRK =\n-          llvm::simplifyRetainedKnowledge(cast<AssumeInst>(II), RK,\n-                                          &getAssumptionCache(),\n-                                          &getDominatorTree());\n-        if (CanonRK == RK)\n-          continue;\n-        if (!CanonRK) {\n-          if (BOI.End - BOI.Begin > 0) {\n-            Worklist.pushValue(II->op_begin()[BOI.Begin]);\n-            Value::dropDroppableUse(II->op_begin()[BOI.Begin]);\n-          }\n-          continue;\n-        }\n-        assert(RK.AttrKind == CanonRK.AttrKind);\n-        if (BOI.End - BOI.Begin > 0)\n-          II->op_begin()[BOI.Begin].set(CanonRK.WasOn);\n-        if (BOI.End - BOI.Begin > 1)\n-          II->op_begin()[BOI.Begin + 1].set(ConstantInt::get(\n-              Type::getInt64Ty(II->getContext()), CanonRK.ArgValue));\n-        if (RK.WasOn)\n-          Worklist.pushValue(RK.WasOn);\n-        return II;\n-      }\n-    }\n-\n     // If there is a dominating assume with the same condition as this one,\n     // then this one is redundant, and should be removed.\n     KnownBits Known(1);\ndiff --git a/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp b/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\nindex 722d04c9ae957..a1176762f6768 100644\n--- a/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\n+++ b/llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp\n@@ -304,21 +304,6 @@ bool llvm::salvageKnowledge(Instruction *I, AssumptionCache *AC,\n   return Changed;\n }\n \n-RetainedKnowledge llvm::simplifyRetainedKnowledge(AssumeInst *Assume,\n-                                                  RetainedKnowledge RK,\n-                                                  AssumptionCache *AC,\n-                                                  DominatorTree *DT) {\n-  AssumeBuilderState Builder(Assume->getModule(), Assume, AC, DT);\n-  RK = canonicalizedKnowledge(RK, Assume->getDataLayout());\n-\n-  if (!Builder.isKnowledgeWorthPreserving(RK))\n-    return RetainedKnowledge::none();\n-\n-  if (Builder.tryToPreserveWithoutAddingAssume(RK))\n-    return RetainedKnowledge::none();\n-  return RK;\n-}\n-\n namespace {\n \n struct AssumeSimplify {\ndiff --git a/llvm/test/Transforms/InstCombine/assume.ll b/llvm/test/Transforms/InstCombine/assume.ll\nindex f191dfb4f0d93..bf073b8d7ce70 100644\n--- a/llvm/test/Transforms/InstCombine/assume.ll\n+++ b/llvm/test/Transforms/InstCombine/assume.ll\n@@ -1,7 +1,5 @@\n ; NOTE: Assertions have been autogenerated by utils/update_test_checks.py\n-; RUN: opt < %s -passes=instcombine -S | FileCheck --check-prefixes=CHECK,DEFAULT %s\n-; RUN: opt < %s -passes=instcombine --enable-knowledge-retention -S | FileCheck --check-prefixes=CHECK,BUNDLES %s\n-\n+; RUN: opt < %s -passes=instcombine -S | FileCheck %s\n \n target datalayout = \"e-m:e-i64:64-f80:128-n8:16:32:64-S128\"\n target triple = \"x86_64-unknown-linux-gnu\"\n@@ -122,14 +120,10 @@ entry:\n }\n \n define void @align_with_constant_offset_0(ptr %ptr) {\n-; DEFAULT-LABEL: @align_with_constant_offset_0(\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16) ]\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR]], i64 8, i64 0) ]\n-; DEFAULT-NEXT:    ret void\n-;\n-; BUNDLES-LABEL: @align_with_constant_offset_0(\n-; BUNDLES-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16, i64 0) ]\n-; BUNDLES-NEXT:    ret void\n+; CHECK-LABEL: @align_with_constant_offset_0(\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16) ]\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR]], i64 8, i64 0) ]\n+; CHECK-NEXT:    ret void\n ;\n   call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 16) ]\n   call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 8, i64 0) ]\n@@ -163,14 +157,10 @@ define void @align_with_constant_offset_4(ptr %ptr) {\n }\n \n define void @align_with_constant_offset_8(ptr %ptr) {\n-; DEFAULT-LABEL: @align_with_constant_offset_8(\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16) ]\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR]], i64 8, i64 8) ]\n-; DEFAULT-NEXT:    ret void\n-;\n-; BUNDLES-LABEL: @align_with_constant_offset_8(\n-; BUNDLES-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16, i64 8) ]\n-; BUNDLES-NEXT:    ret void\n+; CHECK-LABEL: @align_with_constant_offset_8(\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16) ]\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR]], i64 8, i64 8) ]\n+; CHECK-NEXT:    ret void\n ;\n   call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 16) ]\n   call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 8, i64 8) ]\n@@ -178,14 +168,10 @@ define void @align_with_constant_offset_8(ptr %ptr) {\n }\n \n define void @align_with_variable_offset(ptr %ptr, i64 %offset) {\n-; DEFAULT-LABEL: @align_with_variable_offset(\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16) ]\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR]], i64 8, i64 [[OFFSET:%.*]]) ]\n-; DEFAULT-NEXT:    ret void\n-;\n-; BUNDLES-LABEL: @align_with_variable_offset(\n-; BUNDLES-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16, i64 [[OFFSET:%.*]]) ]\n-; BUNDLES-NEXT:    ret void\n+; CHECK-LABEL: @align_with_variable_offset(\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR:%.*]], i64 16) ]\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[PTR]], i64 8, i64 [[OFFSET:%.*]]) ]\n+; CHECK-NEXT:    ret void\n ;\n   call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 16) ]\n   call void @llvm.assume(i1 true) [ \"align\"(ptr %ptr, i64 8, i64 %offset) ]\n@@ -770,14 +756,10 @@ define void @nonnull_gep_inbounds_bundle(ptr %p, i64 %i) {\n }\n \n define void @nonnull_gep_inbounds_bundle_null_is_valid(ptr %p, i64 %i) null_pointer_is_valid {\n-; DEFAULT-LABEL: @nonnull_gep_inbounds_bundle_null_is_valid(\n-; DEFAULT-NEXT:    [[P2:%.*]] = getelementptr inbounds i8, ptr [[P:%.*]], i64 [[I:%.*]]\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"nonnull\"(ptr [[P2]]) ]\n-; DEFAULT-NEXT:    ret void\n-;\n-; BUNDLES-LABEL: @nonnull_gep_inbounds_bundle_null_is_valid(\n-; BUNDLES-NEXT:    call void @llvm.assume(i1 true) [ \"nonnull\"(ptr [[P:%.*]]) ]\n-; BUNDLES-NEXT:    ret void\n+; CHECK-LABEL: @nonnull_gep_inbounds_bundle_null_is_valid(\n+; CHECK-NEXT:    [[P2:%.*]] = getelementptr inbounds i8, ptr [[P:%.*]], i64 [[I:%.*]]\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"nonnull\"(ptr [[P2]]) ]\n+; CHECK-NEXT:    ret void\n ;\n   %p2 = getelementptr inbounds i8, ptr %p, i64 %i\n   call void @llvm.assume(i1 true) [\"nonnull\"(ptr %p2)]\n@@ -1020,14 +1002,10 @@ exit:\n }\n \n define void @canonicalize_assume(ptr %0) {\n-; DEFAULT-LABEL: @canonicalize_assume(\n-; DEFAULT-NEXT:    [[TMP2:%.*]] = getelementptr inbounds nuw i8, ptr [[TMP0:%.*]], i64 8\n-; DEFAULT-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[TMP2]], i64 16) ]\n-; DEFAULT-NEXT:    ret void\n-;\n-; BUNDLES-LABEL: @canonicalize_assume(\n-; BUNDLES-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[TMP0:%.*]], i64 8) ]\n-; BUNDLES-NEXT:    ret void\n+; CHECK-LABEL: @canonicalize_assume(\n+; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr inbounds nuw i8, ptr [[TMP0:%.*]], i64 8\n+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ \"align\"(ptr [[TMP2]], i64 16) ]\n+; CHECK-NEXT:    ret void\n ;\n   %2 = getelementptr inbounds i32, ptr %0, i64 2\n   call void @llvm.assume(i1 true) [ \"align\"(ptr %2, i64 16) ]\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-06-10T08:30:09Z",
+  "patch_location_lineno": {
+    "llvm/include/llvm/Transforms/Utils/AssumeBundleBuilder.h": [
+      [
+        58,
+        72
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      [
+        3799,
+        3839
+      ]
+    ],
+    "llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp": [
+      [
+        304,
+        324
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/assume.ll": [
+      [
+        1,
+        7
+      ],
+      [
+        122,
+        135
+      ],
+      [
+        163,
+        176
+      ],
+      [
+        178,
+        191
+      ],
+      [
+        770,
+        783
+      ],
+      [
+        1020,
+        1033
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp": [
+      "InstCombinerImpl::visitCallInst"
+    ],
+    "llvm/lib/Transforms/Utils/AssumeBundleBuilder.cpp": [
+      "llvm::salvageKnowledge",
+      "llvm::simplifyRetainedKnowledge"
+    ],
+    "llvm/test/Transforms/InstCombine/assume.ll": [
+      "redundant_align"
+    ]
+  }
+}

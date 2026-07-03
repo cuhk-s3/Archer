@@ -1,0 +1,188 @@
+{
+  "pr_id": 187898,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/187898",
+  "state": "open",
+  "title": "Missed optimization when `b - a` is known nonnegative inside `select` instruction",
+  "author": "user1342234",
+  "base_commit": "924a4ada31c8a0bf464e3db2e636315f0157a7c3",
+  "fix_commit": "a0eedf15a14cc9bfa163a696e229d23d5fd2f632",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\nindex 1de03254e8182..48cb22e5657f3 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp\n@@ -657,6 +657,42 @@ Instruction *InstCombinerImpl::foldSelectIntoOp(SelectInst &SI, Value *TrueVal,\n   return nullptr;\n }\n \n+static Value *canoncalizeSelectICmpMinMax(const ICmpInst *Cmp, Value *TVal,\n+                                          Value *FVal,\n+                                          InstCombiner::BuilderTy &Builder,\n+                                          const SimplifyQuery &SQ) {\n+  Value *CmpLHS = Cmp->getOperand(0);\n+  Value *CmpRHS = Cmp->getOperand(1);\n+  ICmpInst::Predicate Pred = Cmp->getPredicate();\n+  if (match(FVal, m_Zero())) {\n+    std::swap(TVal, FVal);\n+    Pred = ICmpInst::getInversePredicate(Pred);\n+  }\n+  if (!match(TVal, m_Zero())) {\n+    return nullptr;\n+  }\n+\n+  if (Pred == CmpInst::ICMP_SGT || Pred == CmpInst::ICMP_SGE) {\n+    std::swap(CmpLHS, CmpRHS);\n+    Pred = ICmpInst::getSwappedPredicate(Pred);\n+  }\n+\n+  // Handles:\n+  // (X <= Y) ? 0 : (X - Y)\n+  // (X <= Y) ? (Y - X) : 0\n+  // (X >= Y) ? 0 : (Y - X)\n+  // (X >= Y) ? (X - Y) : 0\n+  if ((Pred == CmpInst::ICMP_SLT || Pred == CmpInst::ICMP_SLE) &&\n+      match(FVal, m_NSWSub(m_Specific(CmpLHS), m_Specific(CmpRHS))) &&\n+      isGuaranteedNotToBeUndef(CmpLHS, SQ.AC, SQ.CxtI, SQ.DT)) {\n+    Value *SMin =\n+        Builder.CreateBinaryIntrinsic(Intrinsic::smin, CmpRHS, CmpLHS);\n+    return Builder.CreateNSWSub(CmpLHS, SMin);\n+  }\n+\n+  return nullptr;\n+}\n+\n /// Try to fold a select to a min/max intrinsic. Many cases are already handled\n /// by matchDecomposedSelectPattern but here we handle the cases where more\n /// extensive modification of the IR is required.\n@@ -664,10 +700,13 @@ static Value *foldSelectICmpMinMax(const ICmpInst *Cmp, Value *TVal,\n                                    Value *FVal,\n                                    InstCombiner::BuilderTy &Builder,\n                                    const SimplifyQuery &SQ) {\n-  const Value *CmpLHS = Cmp->getOperand(0);\n-  const Value *CmpRHS = Cmp->getOperand(1);\n+  Value *CmpLHS = Cmp->getOperand(0);\n+  Value *CmpRHS = Cmp->getOperand(1);\n   ICmpInst::Predicate Pred = Cmp->getPredicate();\n \n+  if (Value *V = canoncalizeSelectICmpMinMax(Cmp, Tval, FVal, Builder, SQ))\n+    return V;\n+\n   // (X > Y) ? X : (Y - 1) ==> MIN(X, Y - 1)\n   // (X < Y) ? X : (Y + 1) ==> MAX(X, Y + 1)\n   // This transformation is valid when overflow corresponding to the sign of\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "This is part of #146131 and #182597\r\n\r\n`func3` and `func4` are [equivalent](https://alive2.llvm.org/ce/z/NNMTDa) but `func3` produces a `sext` instead of `zext` when `b - a` is known non-negative.\r\n\r\n[Proof of correctness](https://alive2.llvm.org/ce/z/ZthC9m)\r\n\r\n```c++\r\n#include <stdint.h>\r\n\r\nuint64_t func3(int32_t a, int32_t b) {\r\n    return (b < a ? 0 : (int32_t)(b - a));\r\n}\r\n\r\nuint64_t func4(int32_t a, int32_t b) {\r\n    return (b < a ? 0 : (uint32_t)(b - a));\r\n}\r\n```\r\nIn x86-64, it would make shorter code by zero-extending instead of sign-extending b - a.\r\n\r\n\r\nMy PR fixes this by handling all patterns below:\r\n`(X < Y) ? 0 : (X - Y)`\r\n`(X > Y) ? 0 : (Y - X)`\r\n`(X < Y) ? (Y - X) : 0`\r\n`(X > Y) ? (X - Y) : 0`",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/or.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S",
+        "opt < %s -passes=instcombine -S -use-constant-int-for-fixed-length-splat"
+      ],
+      "tests": [
+        {
+          "test_name": "or_select_smax_neg_to_abs",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i8 @or_select_smax_neg_to_abs(i8 %a) {\n  %sgt0 = icmp sgt i8 %a, 0\n  %neg = sub nsw i8 0, %a\n  %sel = select i1 %sgt0, i8 0, i8 %neg\n  ret i8 %sel\n}\n"
+        },
+        {
+          "test_name": "or_positive_minus_non_positive_to_abs",
+          "test_body": "target datalayout = \"e-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:32:64-v64:64:64-v128:128:128-a0:0:64-f80:128:128-n32:64\"\n\ndefine i8 @or_positive_minus_non_positive_to_abs(i8 %a) {\n  %b = icmp sgt i8 %a, 0\n  %mask = sext i1 %b to i8\n  %neg = sub i8 0, %a\n  %mask_inv = xor i8 %mask, -1\n  %c = and i8 %neg, %mask_inv\n  %d = and i8 %a, %mask\n  %or = or i8 %c, %d\n  ret i8 %or\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/select-min-max.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "umin_umax",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i8 @llvm.umin.i8(i8, i8) #0\n\ndefine i8 @umin_umax(i8 %x) {\n  %m = call i8 @llvm.umin.i8(i8 %x, i8 127)\n  %c = icmp ugt i8 %x, 126\n  %s = select i1 %c, i8 %m, i8 126\n  ret i8 %s\n}\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "not_smax",
+          "test_body": "define i8 @not_smax(i8 %i41, i8 %i43) {\n  %i44 = icmp slt i8 %i41, %i43\n  %i46 = sub nsw i8 %i41, %i43\n  %spec.select = select i1 %i44, i8 0, i8 %i46\n  ret i8 %spec.select\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/sext-nonneg-sub.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "select_nonnegative_slt",
+          "test_body": "define i64 @select_nonnegative_slt(i32 noundef %x, i32 %y) {\n  %cmp = icmp slt i32 %x, %y\n  %sub = sub nsw i32 %x, %y\n  %cond = select i1 %cmp, i32 0, i32 %sub\n  %conv = sext i32 %cond to i64\n  ret i64 %conv\n}\n"
+        },
+        {
+          "test_name": "slt_wrong_sub_order",
+          "test_body": "define i64 @slt_wrong_sub_order(i32 noundef %x, i32 %y) {\n  %cmp = icmp slt i32 %x, %y\n  %sub = sub nsw i32 %x, %y\n  %sel = select i1 %cmp, i32 %sub, i32 0\n  %ext = sext i32 %sel to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "select_nonnegative_slt_vec",
+          "test_body": "define <4 x i64> @select_nonnegative_slt_vec(<4 x i32> noundef %x, <4 x i32> %y) {\n  %cmp = icmp slt <4 x i32> %x, %y\n  %sub = sub nsw <4 x i32> %x, %y\n  %cond = select <4 x i1> %cmp, <4 x i32> zeroinitializer, <4 x i32> %sub\n  %conv = sext <4 x i32> %cond to <4 x i64>\n  ret <4 x i64> %conv\n}\n"
+        },
+        {
+          "test_name": "select_nonnegative_slt_scalable",
+          "test_body": "define <vscale x 4 x i64> @select_nonnegative_slt_scalable(<vscale x 4 x i32> noundef %x, <vscale x 4 x i32> %y) {\n  %cmp = icmp slt <vscale x 4 x i32> %x, %y\n  %sub = sub nsw <vscale x 4 x i32> %x, %y\n  %cond = select <vscale x 4 x i1> %cmp, <vscale x 4 x i32> zeroinitializer, <vscale x 4 x i32> %sub\n  %conv = sext <vscale x 4 x i32> %cond to <vscale x 4 x i64>\n  ret <vscale x 4 x i64> %conv\n}\n"
+        },
+        {
+          "test_name": "sgt_commuted",
+          "test_body": "define i64 @sgt_commuted(i32 noundef %x, i32 %y) {\n  %cmp = icmp slt i32 %y, %x\n  %sub = sub nsw i32 %x, %y\n  %sel = select i1 %cmp, i32 %sub, i32 0\n  %ext = sext i32 %sel to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "slt_commuted",
+          "test_body": "define i64 @slt_commuted(i32 %x, i32 noundef %y) {\n  %cmp = icmp sgt i32 %y, %x\n  %sub = sub nsw i32 %y, %x\n  %sel = select i1 %cmp, i32 %sub, i32 0\n  %ext = sext i32 %sel to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "neg_unguarded_sub",
+          "test_body": "define i64 @neg_unguarded_sub(i32 %a, i32 %b) {\n  %sub = sub nsw i32 %b, %a\n  %ext = sext i32 %sub to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "sgt_negative_fval",
+          "test_body": "define i64 @sgt_negative_fval(i32 noundef %x, i32 %y) {\n  %cmp = icmp slt i32 %y, %x\n  %sub = sub nsw i32 %x, %y\n  %sel = select i1 %cmp, i32 %sub, i32 -1\n  %ext = sext i32 %sel to i64\n  ret i64 %ext\n}\n"
+        },
+        {
+          "test_name": "slt_negative_tval",
+          "test_body": "define i64 @slt_negative_tval(i32 %x, i32 noundef %y) {\n  %cmp = icmp slt i32 %x, %y\n  %sub = sub nsw i32 %y, %x\n  %sel = select i1 %cmp, i32 -1, i32 %sub\n  %ext = sext i32 %sel to i64\n  ret i64 %ext\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 134066 tests passed\n* 3185 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "user1342234",
+      "body": "Fixed tests relating to types other than Integers and Pointers being passed to `IsKnownNonNegative`.  Last three failing test cases are:\r\n1. `Transforms/InstCombine/select-min-max.ll` - Test case `@not_smax` matches my optimization and folds.\r\n2. `Transforms/InstCombine/or.ll` - Test case `@or_select_smax_neg_to_abs`\r\nmatches my optimization and folds. Also, there is a [TODO](https://github.com/llvm/llvm-project/blob/3258d361cbc5d57e5e507004706eb36acf120066/llvm/test/Transforms/InstCombine/or.ll#L2131) listed on the case to fold it to smax/smin. \r\n3. `Transforms\\PhaseOrdering\\min-max-abs-cse.ll` - Test case `@smax_nsw` matches my optimization and folds.\r\n\r\nIs it ok for me to update these tests? \r\n"
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 194580 tests passed\n* 5169 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "aengelke",
+      "body": "> Is it ok for me to update these tests?\r\n\r\nSure."
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "https://alive2.llvm.org/ce/z/NNMTDa only proves `func3` and `func4` are equivalent. Please provide generalized alive2 proof for the transformation implemented in this patch (See also https://llvm.org/docs/InstCombineContributorGuide.html#proofs).\r\n"
+    },
+    {
+      "author": "user1342234",
+      "body": "> https://alive2.llvm.org/ce/z/NNMTDa only proves `func3` and `func4` are equivalent. Please provide generalized alive2 proof for the transformation implemented in this patch (See also https://llvm.org/docs/InstCombineContributorGuide.html#proofs).\r\n\r\nThank you for the advice. It seems my generalization was [incorrect ](https://alive2.llvm.org/ce/z/VJwfTk) so I will push the required fixes."
+    },
+    {
+      "author": "user1342234",
+      "body": "- Edited PR description to add Proof of correctness\r\n"
+    },
+    {
+      "author": "user1342234",
+      "body": "There were a lot of changes, so I'm summarizing where we're at right now with some questions:\r\n\r\n- Proof of correctness is done but there is a potential issue. If `noundef` is removed from the functions or removed in alive2 options then our target becomes more poisonous than the source. I believe this is an issue. I'm not entirely sure though.\r\n\r\n- Generalization to all non-negative constants failed, commit was reverted. \r\n\r\n- There was a bug in `Builder.CreateNSWSub(CmpRHS, SMin)` corrected to `Builder.CreateNSWSub(CmpLHS, SMin)`. This necessitated a couple changes in our tests.\r\n\r\n- Added vector tests"
+    },
+    {
+      "author": "user1342234",
+      "body": "@dtcxzyw "
+    },
+    {
+      "author": "nikic",
+      "body": "> Proof of correctness is done but there is a potential issue. If `noundef` is removed from the functions or removed in alive2 options then our target becomes more poisonous than the source. I believe this is an issue. I'm not entirely sure though.\r\n\r\nThe problem here is that introducing multiple uses of a value is usually incorrect in the presence of undef, because both uses can be picked independently. You can add an isGuaranteedNotToBeUndef() check on the relevant operand."
+    },
+    {
+      "author": "user1342234",
+      "body": "> The problem here is that introducing multiple uses of a value is usually incorrect in the presence of undef, because both uses can be picked independently. You can add an isGuaranteedNotToBeUndef() check on the relevant operand.\r\n\r\nThank you it makes sense now. I will add an undef guard for each case."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "user1342234",
+      "body": "@dtcxzyw ping"
+    }
+  ],
+  "knowledge_cutoff": "2026-03-22T02:27:43Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      [
+        657,
+        662
+      ],
+      [
+        664,
+        673
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/or.ll": [
+      [
+        2131,
+        2140
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/select-min-max.ll": [
+      [
+        252,
+        259
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/sext-nonneg-sub.ll": [
+      [
+        61,
+        63
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineSelect.cpp": [
+      "InstCombinerImpl::foldSelectIntoOp",
+      "foldSelectICmpMinMax"
+    ]
+  }
+}

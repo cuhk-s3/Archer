@@ -1,0 +1,102 @@
+{
+  "pr_id": 201353,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/201353",
+  "state": "open",
+  "title": "[Loads] Use willNotFreeBetween() for dereferenceable-at-point",
+  "author": "nikic",
+  "base_commit": "906968b379d2d591299b677868e4364e0ea1b5a0",
+  "fix_commit": "e8505217b822db9834528582b0807cc3bd8fc5d0",
+  "patch": "diff --git a/llvm/lib/Analysis/Loads.cpp b/llvm/lib/Analysis/Loads.cpp\nindex 797d18325c336..1aed126079829 100644\n--- a/llvm/lib/Analysis/Loads.cpp\n+++ b/llvm/lib/Analysis/Loads.cpp\n@@ -130,12 +130,34 @@ static bool isDereferenceableAndAlignedPointer(\n   auto IsKnownDeref = [&]() {\n     bool CheckForNonNull, CheckForFreed;\n     if (!Size.ule(V->getPointerDereferenceableBytes(DL, CheckForNonNull,\n-                                                    CheckForFreed)) ||\n-        CheckForFreed)\n+                                                    CheckForFreed)))\n       return false;\n     if (CheckForNonNull &&\n         !isKnownNonZero(V, SimplifyQuery(DL, DT, AC, CtxI)))\n       return false;\n+\n+    auto *I = dyn_cast<Instruction>(V);\n+    if (CheckForFreed) {\n+      const Instruction *DefI;\n+      if (I) {\n+        // We don't want to consider frees by the instruction producing the\n+        // pointer, so skip it if we can.\n+        if (auto *II = dyn_cast<InvokeInst>(V)) {\n+          DefI = &II->getNormalDest()->front();\n+        } else if (!I->isTerminator()) {\n+          DefI = I->getNextNode();\n+        } else {\n+          DefI = I;\n+        }\n+      } else {\n+        // For arguments, check frees from the start of the entry block.\n+        DefI = &cast<Argument>(V)->getParent()->getEntryBlock().front();\n+      }\n+\n+      if (!willNotFreeBetween(DefI, CtxI))\n+        return false;\n+    }\n+\n     // When using something like !dereferenceable on a load, the\n     // dereferenceability may only be valid on a specific control-flow path.\n     // If the instruction doesn't dominate the context instruction, we're\n@@ -144,7 +166,6 @@ static bool isDereferenceableAndAlignedPointer(\n     // in which case we don't know if the dereferenceability info still holds.\n     // We don't bother handling allocas here, as they aren't speculatable\n     // anyway.\n-    auto *I = dyn_cast<Instruction>(V);\n     if (I && !isa<AllocaInst>(I))\n       return CtxI && isValidAssumeForContext(I, CtxI, DT);\n     return true;\n",
+  "components": [
+    "Loads"
+  ],
+  "description": "If dereferenceable-at-point semantics are enabled, use willNotFreeBetween() to check whether frees are known to not occur between the definition point of the value and the context instruction.\r\n\r\nWe already use this logic for dereferenceable assumptions, this enables it for other dereferenceability fact (under deref-at-point).",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/ValueTracking/memory-dereferenceable.ll",
+      "commands": [
+        "opt -passes='print<mem-derefs>' -S < %s -disable-output  -use-dereferenceable-at-point-semantics=false 2>&1",
+        "opt -passes='print<mem-derefs>' -S < %s -disable-output  -use-dereferenceable-at-point-semantics 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "dereferenceable_ret_not_freed_between",
+          "test_body": "target datalayout = \"e-i32:32:64\"\n\ndeclare ptr @foo()\n\ndefine void @dereferenceable_ret_not_freed_between() {\n  %a = call dereferenceable(16) ptr @foo()\n  call void @mayfree() #0\n  %v = load i32, ptr %a, align 4\n  ret void\n}\n\ndeclare void @mayfree()\n\nattributes #0 = { nofree }\n"
+        },
+        {
+          "test_name": "dereferenceable_ret_freed_between",
+          "test_body": "target datalayout = \"e-i32:32:64\"\n\ndeclare ptr @foo()\n\ndefine void @dereferenceable_ret_freed_between() {\n  %a = call dereferenceable(16) ptr @foo()\n  call void @mayfree()\n  %v = load i32, ptr %a, align 4\n  ret void\n}\n\ndeclare void @mayfree()\n"
+        },
+        {
+          "test_name": "dereferenceable_ret_not_freed_between_invoke",
+          "test_body": "target datalayout = \"e-i32:32:64\"\n\ndeclare ptr @foo()\n\ndefine void @dereferenceable_ret_not_freed_between_invoke() personality ptr null {\n  %a = invoke dereferenceable(16) ptr @foo()\n          to label %cont unwind label %lpad\n\ncont:                                             ; preds = %0\n  call void @mayfree() #0\n  %v = load i32, ptr %a, align 4\n  ret void\n\nlpad:                                             ; preds = %0\n  %l = landingpad { ptr, i32 }\n          cleanup\n  resume { ptr, i32 } %l\n}\n\ndeclare void @mayfree()\n\nattributes #0 = { nofree }\n"
+        },
+        {
+          "test_name": "dereferenceable_arg_freed_between2",
+          "test_body": "target datalayout = \"e-i32:32:64\"\n\ndefine void @dereferenceable_arg_freed_between2(ptr dereferenceable(16) %a, ptr %p) {\n  %1 = load atomic i32, ptr %p acquire, align 4\n  %v = load i32, ptr %a, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "dereferenceable_arg_not_freed_between",
+          "test_body": "target datalayout = \"e-i32:32:64\"\n\ndefine void @dereferenceable_arg_not_freed_between(ptr dereferenceable(16) %a) {\n  call void @mayfree() #0\n  %v = load i32, ptr %a, align 4\n  ret void\n}\n\ndeclare void @mayfree()\n\nattributes #0 = { nofree }\n"
+        },
+        {
+          "test_name": "dereferenceable_arg_freed_between",
+          "test_body": "target datalayout = \"e-i32:32:64\"\n\ndefine void @dereferenceable_arg_freed_between(ptr dereferenceable(16) %a) {\n  call void @mayfree()\n  %v = load i32, ptr %a, align 4\n  ret void\n}\n\ndeclare void @mayfree()\n"
+        },
+        {
+          "test_name": "dereferenceable_ret_freed_between2",
+          "test_body": "target datalayout = \"e-i32:32:64\"\n\ndeclare ptr @foo()\n\ndefine void @dereferenceable_ret_freed_between2(ptr %p) {\n  %a = call dereferenceable(16) ptr @foo()\n  %1 = load atomic i32, ptr %p acquire, align 4\n  %v = load i32, ptr %a, align 4\n  ret void\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-analysis\n\nAuthor: Nikita Popov (nikic)\n\n<details>\n<summary>Changes</summary>\n\nIf dereferenceable-at-point semantics are enabled, use willNotFreeBetween() to check whether frees are known to not occur between the definition point of the value and the context instruction.\r\n\r\nWe already use this logic for dereferenceable assumptions, this enables it for other dereferenceability fact (under deref-at-point).\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/201353.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Analysis/Loads.cpp (+24-3) \n- (modified) llvm/test/Analysis/ValueTracking/memory-dereferenceable.ll (+75) \n\n\n``````````diff\ndiff --git a/llvm/lib/Analysis/Loads.cpp b/llvm/lib/Analysis/Loads.cpp\nindex 797d18325c336..1aed126079829 100644\n--- a/llvm/lib/Analysis/Loads.cpp\n+++ b/llvm/lib/Analysis/Loads.cpp\n@@ -130,12 +130,34 @@ static bool isDereferenceableAndAlignedPointer(\n   auto IsKnownDeref = [&]() {\n     bool CheckForNonNull, CheckForFreed;\n     if (!Size.ule(V->getPointerDereferenceableBytes(DL, CheckForNonNull,\n-                                                    CheckForFreed)) ||\n-        CheckForFreed)\n+                                                    CheckForFreed)))\n       return false;\n     if (CheckForNonNull &&\n         !isKnownNonZero(V, SimplifyQuery(DL, DT, AC, CtxI)))\n       return false;\n+\n+    auto *I = dyn_cast<Instruction>(V);\n+    if (CheckForFreed) {\n+      const Instruction *DefI;\n+      if (I) {\n+        // We don't want to consider frees by the instruction producing the\n+        // pointer, so skip it if we can.\n+        if (auto *II = dyn_cast<InvokeInst>(V)) {\n+          DefI = &II->getNormalDest()->front();\n+        } else if (!I->isTerminator()) {\n+          DefI = I->getNextNode();\n+        } else {\n+          DefI = I;\n+        }\n+      } else {\n+        // For arguments, check frees from the start of the entry block.\n+        DefI = &cast<Argument>(V)->getParent()->getEntryBlock().front();\n+      }\n+\n+      if (!willNotFreeBetween(DefI, CtxI))\n+        return false;\n+    }\n+\n     // When using something like !dereferenceable on a load, the\n     // dereferenceability may only be valid on a specific control-flow path.\n     // If the instruction doesn't dominate the context instruction, we're\n@@ -144,7 +166,6 @@ static bool isDereferenceableAndAlignedPointer(\n     // in which case we don't know if the dereferenceability info still holds.\n     // We don't bother handling allocas here, as they aren't speculatable\n     // anyway.\n-    auto *I = dyn_cast<Instruction>(V);\n     if (I && !isa<AllocaInst>(I))\n       return CtxI && isValidAssumeForContext(I, CtxI, DT);\n     return true;\ndiff --git a/llvm/test/Analysis/ValueTracking/memory-dereferenceable.ll b/llvm/test/Analysis/ValueTracking/memory-dereferenceable.ll\nindex a03a76373f803..f7e69b0c1f04f 100644\n--- a/llvm/test/Analysis/ValueTracking/memory-dereferenceable.ll\n+++ b/llvm/test/Analysis/ValueTracking/memory-dereferenceable.ll\n@@ -67,6 +67,7 @@ entry:\n ; GLOBAL: %d4_load{{.*}}(unaligned)\n ; POINT-NOT: %d4_load{{.*}}(unaligned)\n     %d4_load = load ptr, ptr @globali32ptr, !dereferenceable !0\n+    call void @mayfree()\n     %load7 = load i32, ptr %d4_load\n \n     ; Load from an offset not covered by the dereferenceable portion\n@@ -83,6 +84,7 @@ entry:\n ; GLOBAL: %d_or_null_non_null_load{{.*}}(unaligned)\n ; POINT-NOT: %d_or_null_non_null_load{{.*}}(unaligned)\n     %d_or_null_non_null_load = load ptr, ptr @globali32ptr, !nonnull !2, !dereferenceable_or_null !0\n+    call void @mayfree()\n     %load10 = load i32, ptr %d_or_null_non_null_load\n \n     ; Loads from aligned arguments\n@@ -119,6 +121,7 @@ entry:\n     %no_deref_return = call ptr @foo()\n     %deref_return = call dereferenceable(32) ptr @foo()\n     %deref_and_aligned_return = call dereferenceable(32) align 16 ptr @foo()\n+    call void @mayfree()\n     %load23 = load i32, ptr %no_deref_return\n     %load24 = load i32, ptr %deref_return, align 16\n     %load25 = load i32, ptr %deref_and_aligned_return, align 16\n@@ -130,8 +133,10 @@ entry:\n ; POINT-NOT: %d4_aligned_load{{.*}}(aligned)\n     %d4_unaligned_load = load ptr, ptr @globali32ptr, !dereferenceable !0\n     %d4_aligned_load = load ptr, ptr @globali32ptr, !dereferenceable !0, !align !{i64 16}\n+    call void @mayfree()\n     %load26 = load i32, ptr %d4_unaligned_load, align 16\n     %load27 = load i32, ptr %d4_aligned_load, align 16\n+\n     ret void\n }\n \n@@ -311,6 +316,76 @@ if.end:\n   ret void\n }\n \n+; CHECK-LABEL: 'dereferenceable_arg_freed_between'\n+; GLOBAL: %a\n+; POINT-NOT: %a\n+define void @dereferenceable_arg_freed_between(ptr dereferenceable(16) %a) {\n+  call void @mayfree()\n+  %v = load i32, ptr %a\n+  ret void\n+}\n+\n+; CHECK-LABEL: 'dereferenceable_arg_freed_between2'\n+; GLOBAL: %a\n+; POINT-NOT: %a\n+define void @dereferenceable_arg_freed_between2(ptr dereferenceable(16) %a, ptr %p) {\n+  load atomic i32, ptr %p acquire, align 4\n+  %v = load i32, ptr %a\n+  ret void\n+}\n+\n+; CHECK-LABEL: 'dereferenceable_arg_not_freed_between'\n+; CHECK: %a\n+define void @dereferenceable_arg_not_freed_between(ptr dereferenceable(16) %a) {\n+  call void @mayfree() nofree\n+  %v = load i32, ptr %a\n+  ret void\n+}\n+\n+; CHECK-LABEL: 'dereferenceable_ret_freed_between'\n+; GLOBAL: %a\n+; POINT-NOT: %a\n+define void @dereferenceable_ret_freed_between() {\n+  %a = call dereferenceable(16) ptr @foo()\n+  call void @mayfree()\n+  %v = load i32, ptr %a\n+  ret void\n+}\n+\n+; CHECK-LABEL: 'dereferenceable_ret_freed_between2'\n+; GLOBAL: %a\n+; POINT-NOT: %a\n+define void @dereferenceable_ret_freed_between2(ptr %p) {\n+  %a = call dereferenceable(16) ptr @foo()\n+  load atomic i32, ptr %p acquire, align 4\n+  %v = load i32, ptr %a\n+  ret void\n+}\n+\n+; CHECK-LABEL: 'dereferenceable_ret_not_freed_between'\n+; CHECK: %a\n+define void @dereferenceable_ret_not_freed_between() {\n+  %a = call dereferenceable(16) ptr @foo()\n+  call void @mayfree() nofree\n+  %v = load i32, ptr %a\n+  ret void\n+}\n+\n+; CHECK-LABEL: 'dereferenceable_ret_not_freed_between_invoke'\n+; CHECK: %a\n+define void @dereferenceable_ret_not_freed_between_invoke() personality ptr null {\n+  %a = invoke dereferenceable(16) ptr @foo() to label %cont unwind label %lpad\n+\n+cont:\n+  call void @mayfree() nofree\n+  %v = load i32, ptr %a\n+  ret void\n+\n+lpad:\n+  %l = landingpad { ptr, i32 } cleanup\n+  resume { ptr, i32} %l\n+}\n+\n declare token @llvm.experimental.gc.statepoint.p0(i64, i32, ptr, i32, i32, ...)\n declare ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token, i32, i32)\n \n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-06-03T13:11:15Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/Loads.cpp": [
+      [
+        130,
+        141
+      ],
+      [
+        144,
+        150
+      ]
+    ],
+    "llvm/test/Analysis/ValueTracking/memory-dereferenceable.ll": [
+      [
+        67,
+        72
+      ],
+      [
+        83,
+        88
+      ],
+      [
+        119,
+        124
+      ],
+      [
+        130,
+        137
+      ],
+      [
+        311,
+        316
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/Loads.cpp": [
+      "isDereferenceableAndAlignedPointer"
+    ]
+  }
+}

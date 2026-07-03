@@ -1,0 +1,136 @@
+{
+  "pr_id": 186315,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/186315",
+  "state": "open",
+  "title": "[ValueTracking] Fix computeKnownFPClass handling of nsz",
+  "author": "cardigan1008",
+  "base_commit": "9116344c02bf0b9ec037451d12935d7539c48679",
+  "fix_commit": "1587a810f68921a01ebd790b7192ed8ed55bde33",
+  "patch": "diff --git a/llvm/lib/Analysis/ValueTracking.cpp b/llvm/lib/Analysis/ValueTracking.cpp\nindex 9bd6fd0dcc733..8c755c034870e 100644\n--- a/llvm/lib/Analysis/ValueTracking.cpp\n+++ b/llvm/lib/Analysis/ValueTracking.cpp\n@@ -5118,9 +5118,14 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n   if (Depth == MaxAnalysisRecursionDepth)\n     return;\n \n+  // True only for ops where NSZ may relax the result zero sign.\n+  bool AllowNSZResultRelaxation = false;\n   const unsigned Opc = Op->getOpcode();\n   switch (Opc) {\n   case Instruction::FNeg: {\n+    // fneg(fabs(...)) always produces -0 for zero inputs.\n+    AllowNSZResultRelaxation =\n+        !match(Op->getOperand(0), m_Intrinsic<Intrinsic::fabs>(m_Value()));\n     computeKnownFPClass(Op->getOperand(0), DemandedElts, InterestedClasses,\n                         Known, Q, Depth + 1);\n     Known.fneg();\n@@ -5620,6 +5625,7 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n   }\n   case Instruction::FAdd:\n   case Instruction::FSub: {\n+    AllowNSZResultRelaxation = true;\n     KnownFPClass KnownLHS, KnownRHS;\n     bool WantNegative =\n         Op->getOpcode() == Instruction::FAdd &&\n@@ -5676,6 +5682,7 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n     break;\n   }\n   case Instruction::FMul: {\n+    AllowNSZResultRelaxation = true;\n     const Function *F = cast<Instruction>(Op)->getFunction();\n     DenormalMode Mode =\n         F ? F->getDenormalMode(\n@@ -5724,6 +5731,7 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n   }\n   case Instruction::FDiv:\n   case Instruction::FRem: {\n+    AllowNSZResultRelaxation = true;\n     const bool WantNan = (InterestedClasses & fcNan) != fcNone;\n \n     if (Op->getOpcode() == Instruction::FRem)\n@@ -6122,6 +6130,30 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,\n   default:\n     break;\n   }\n+\n+  // With no-signed-zeros semantics, +0 and -0 are interchangeable.\n+  // If only one sign of logical zero is possible in the result, the other\n+  // sign must also be considered possible. Apply this selectively because\n+  // some ops preserve or explicitly determine the zero sign.\n+  if (const auto *FPOp = dyn_cast_or_null<FPMathOperator>(Op)) {\n+    if (FPOp->hasNoSignedZeros() && AllowNSZResultRelaxation) {\n+      const auto *I = dyn_cast<Instruction>(Op);\n+      const Function *F = I ? I->getFunction() : nullptr;\n+      const fltSemantics &FltSem =\n+          Op->getType()->getScalarType()->getFltSemantics();\n+      DenormalMode Mode =\n+          F ? F->getDenormalMode(FltSem) : DenormalMode::getDynamic();\n+      bool NeverPosZero = Known.isKnownNeverLogicalPosZero(Mode);\n+      bool NeverNegZero = Known.isKnownNeverLogicalNegZero(Mode);\n+      if (NeverPosZero != NeverNegZero) {\n+        if (NeverPosZero)\n+          Known.KnownFPClasses |= fcPosZero;\n+        if (NeverNegZero)\n+          Known.KnownFPClasses |= fcNegZero;\n+        Known.SignBit = std::nullopt;\n+      }\n+    }\n+  }\n }\n \n KnownFPClass llvm::computeKnownFPClass(const Value *V,\n",
+  "components": [
+    "ValueTracking"
+  ],
+  "description": "Fixes #151303 \r\nFixes #185920 \r\n\r\nThis patch fixes incorrect `nofpclass` inference in ValueTracking for floating-point operations with `nsz`.\r\n\r\nWith `nsz`, +0.0 and -0.0 are interchangeable for the current operation. Update `computeKnownFPClass` to expand a known single zero sign to include both `pzero` and `nzero` under `nsz`, so later `nofpclass` inference does not preserve signed-zero-specific facts.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/Attributor/nofpclass.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat=false -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s",
+        "opt -aa-pipeline=basic-aa -passes=attributor-cgscc -attributor-manifest-internal -attributor-annotate-decl-cs -use-constant-fp-for-scalable-splat -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "fadd_double_known_negative_zero_nsz_daz",
+          "test_body": "; Function Attrs: denormal_fpenv(preservesign)\ndefine float @fadd_double_known_negative_zero_nsz_daz(float noundef nofpclass(ninf pzero sub nnorm) %arg) #0 {\n  %add = fadd nsz float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { denormal_fpenv(preservesign) }\n"
+        },
+        {
+          "test_name": "fsub_self",
+          "test_body": "define float @fsub_self(float noundef %arg) {\n  %sub = fsub float %arg, %arg\n  ret float %sub\n}\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_nonsub_dynamic",
+          "test_body": "; Function Attrs: denormal_fpenv(ieee|dynamic)\ndefine float @fadd_double_known_negative_nonsub_dynamic(float noundef nofpclass(pinf zero sub pnorm) %arg) #0 {\n  %add = fadd float %arg, %arg\n  ret float %add\n}\n\nattributes #0 = { denormal_fpenv(ieee|dynamic) }\n"
+        },
+        {
+          "test_name": "fadd_double_known_negative_zero_nsz",
+          "test_body": "define float @fadd_double_known_negative_zero_nsz(float noundef nofpclass(ninf pzero sub nnorm) %arg) {\n  %add = fadd nsz float %arg, %arg\n  ret float %add\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/InstCombine/fabs.ll",
+      "commands": [
+        "opt -mtriple=x86_64-unknown-linux-gnu < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test_fabs_used_is_fpclass_pzero",
+          "test_body": "define i1 @test_fabs_used_is_fpclass_pzero(float %x) {\n  %cmp = fcmp oge float %x, 0.000000e+00\n  %neg = fneg float %x\n  %sel = select i1 %cmp, float %x, float %neg\n  %is_fpclass = call i1 @llvm.is.fpclass.f32(float %sel, i32 64)\n  ret i1 %is_fpclass\n}\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare i1 @llvm.is.fpclass.f32(float, i32 immarg) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "fabs_fneg_nsz_assume_neg",
+          "test_body": "; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\ndefine float @fabs_fneg_nsz_assume_neg(float %a) {\n  %i32 = bitcast float %a to i32\n  %cmp = icmp slt i32 %i32, 0\n  call void @llvm.assume(i1 %cmp)\n  %b = fneg nsz float %a\n  %c = call float @llvm.fabs.f32(float %b)\n  ret float %c\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write)\ndeclare void @llvm.assume(i1 noundef) #1\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\nattributes #1 = { nocallback nofree nosync nounwind willreturn memory(inaccessiblemem: write) }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "floating-point",
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "arsenm",
+      "body": "Title is misleading? This is fixing a correctness problem, not making the analysis result better?"
+    },
+    {
+      "author": "cardigan1008",
+      "body": "> Title is misleading? This is fixing a correctness problem, not making the analysis result better?\r\n\r\nUpdated the title and description. "
+    },
+    {
+      "author": "cardigan1008",
+      "body": "> Hm... shouldn't we handle nsz generically somehow? If nsz is set, then for all inputs we need to treat treat a pzero known FP class as also including nzero and vice versa.\r\n\r\nThanks for the suggestion. I've updated the fix to widen the zero with nsz set. "
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 194068 tests passed\n* 5111 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 133771 tests passed\n* 3128 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "cardigan1008",
+      "body": "Ping. "
+    },
+    {
+      "author": "cardigan1008",
+      "body": "gentle ping :)"
+    }
+  ],
+  "knowledge_cutoff": "2026-03-13T05:00:49Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      [
+        5118,
+        5126
+      ],
+      [
+        5620,
+        5625
+      ],
+      [
+        5676,
+        5681
+      ],
+      [
+        5724,
+        5729
+      ],
+      [
+        6122,
+        6127
+      ]
+    ],
+    "llvm/test/Transforms/Attributor/nofpclass.ll": [
+      [
+        3370,
+        3375
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fabs.ll": [
+      [
+        1826,
+        1828
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/ValueTracking.cpp": [
+      "llvm::computeKnownFPClass"
+    ]
+  }
+}

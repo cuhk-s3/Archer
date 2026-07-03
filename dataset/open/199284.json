@@ -1,0 +1,107 @@
+{
+  "pr_id": 199284,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/199284",
+  "state": "open",
+  "title": "[SimplifyLibCalls] Don't set nnan on synthesized frem in optimizeFMod",
+  "author": "jlebar",
+  "base_commit": "cc926938e05be54018d1bfd72144d07ad7599a8a",
+  "fix_commit": "509980385605c7e0c1f4a770a2f907328d854d22",
+  "patch": "diff --git a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\nindex b60f0c7021d51..9584e0e1c825f 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n@@ -2853,11 +2853,10 @@ Value *LibCallSimplifier::optimizeSqrt(CallInst *CI, IRBuilderBase &B) {\n \n Value *LibCallSimplifier::optimizeFMod(CallInst *CI, IRBuilderBase &B) {\n \n-  // fmod(x,y) can set errno if y == 0 or x == +/-inf, and returns Nan in those\n-  // case. If we know those do not happen, then we can convert the fmod into\n-  // frem.\n-  bool IsNoNan = CI->hasNoNaNs();\n-  if (!IsNoNan) {\n+  // fmod(x,y) sets errno if y == 0 or x == +/-inf. frem does not set errno,\n+  // so the fold is valid only when we can prove fmod wouldn't either.\n+  bool IsNoErrno = CI->hasNoNaNs();\n+  if (!IsNoErrno) {\n     SimplifyQuery SQ(DL, TLI, DT, AC, CI, true, true, DC);\n     KnownFPClass Known0 = computeKnownFPClass(CI->getOperand(0), fcInf, SQ);\n     if (Known0.isKnownNeverInfinity()) {\n@@ -2866,16 +2865,12 @@ Value *LibCallSimplifier::optimizeFMod(CallInst *CI, IRBuilderBase &B) {\n       Function *F = CI->getParent()->getParent();\n       const fltSemantics &FltSem =\n           CI->getType()->getScalarType()->getFltSemantics();\n-      IsNoNan = Known1.isKnownNeverLogicalZero(F->getDenormalMode(FltSem));\n+      IsNoErrno = Known1.isKnownNeverLogicalZero(F->getDenormalMode(FltSem));\n     }\n   }\n \n-  if (IsNoNan) {\n-    Value *FRem = B.CreateFRemFMF(CI->getOperand(0), CI->getOperand(1), CI);\n-    if (auto *FRemI = dyn_cast<Instruction>(FRem))\n-      FRemI->setHasNoNaNs(true);\n-    return FRem;\n-  }\n+  if (IsNoErrno)\n+    return B.CreateFRemFMF(CI->getOperand(0), CI->getOperand(1), CI);\n   return nullptr;\n }\n \n",
+  "components": [
+    "SimplifyLibCalls"
+  ],
+  "description": "LibCallSimplifier can fold a libcall to fmod to an frem instruction if\nthe fmod call doesn't set errno.\n\nfmod(x, y) sets errno if x == +/-Inf or y == 0.  The old code assumed\nthat this was also a sufficient condition to prove that the result is\nnot NaN, and so unconditionally set the nnan fmf on the new frem\ninstruction.  That's not sound; e.g. fmod(x, NaN) == frem(x, NaN) ==\nNaN.\n\nWe don't actually have to worry about propagating the `nnan` flag;\nB.CreateFRemFMF does it for us automagically.\n\nThis bug was found by a large run of Opus 4.7 looking for bugs in LLVM.\n",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/fmod.ll",
+      "commands": [
+        "opt -S -passes=instcombine < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test_noinf_nozero",
+          "test_body": "define float @test_noinf_nozero(float nofpclass(inf) %f, float nofpclass(zero) %g) {\nentry:\n  %call = tail call float @fmodf(float %f, float %g)\n  ret float %call\n}\n\ndeclare float @fmodf(float, float)\n"
+        },
+        {
+          "test_name": "test_nan_input_noerrno",
+          "test_body": "define float @test_nan_input_noerrno(float nofpclass(zero) %g, i1 %c) {\nentry:\n  %f = select i1 %c, float +qnan, float 1.000000e+00\n  %call = tail call float @fmodf(float %f, float %g)\n  ret float %call\n}\n\ndeclare float @fmodf(float, float)\n"
+        },
+        {
+          "test_name": "test_inf_const",
+          "test_body": "define float @test_inf_const(float %f) {\nentry:\n  %abs = tail call float @llvm.fabs.f32(float %f)\n  %isinf = fcmp oeq float %abs, +inf\n  br i1 %isinf, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @fmodf(float %f, float 2.000000e+00)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}\n\ndeclare float @fmodf(float, float)\n\n; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)\ndeclare float @llvm.fabs.f32(float) #0\n\nattributes #0 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }\n"
+        },
+        {
+          "test_name": "test_double",
+          "test_body": "define double @test_double(double nofpclass(inf) %f, double nofpclass(zero) %g) {\nentry:\n  %call = tail call double @fmod(double %f, double %g)\n  ret double %call\n}\n\ndeclare double @fmod(double, double)\n"
+        },
+        {
+          "test_name": "test_const_zero",
+          "test_body": "define float @test_const_zero(float %f) {\nentry:\n  %iszero = fcmp oeq float %f, 0.000000e+00\n  br i1 %iszero, label %return, label %if.end\n\nif.end:                                           ; preds = %entry\n  %call = tail call float @fmodf(float 2.000000e+00, float %f)\n  ret float %call\n\nreturn:                                           ; preds = %entry\n  ret float 0.000000e+00\n}\n\ndeclare float @fmodf(float, float)\n"
+        },
+        {
+          "test_name": "test_fp128",
+          "test_body": "define fp128 @test_fp128(fp128 nofpclass(inf) %f, fp128 nofpclass(zero) %g) {\nentry:\n  %call = tail call fp128 @fmodl(fp128 %f, fp128 %g)\n  ret fp128 %call\n}\n\ndeclare fp128 @fmodl(fp128, fp128)\n"
+        },
+        {
+          "test_name": "test_nnan",
+          "test_body": "define float @test_nnan(float %f, float %g) {\nentry:\n  %call = tail call nnan float @fmodf(float %f, float %g)\n  ret float %call\n}\n\ndeclare float @fmodf(float, float)\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Justin Lebar (jlebar)\n\n<details>\n<summary>Changes</summary>\n\nLibCallSimplifier can fold a libcall to fmod to an frem instruction if\nthe fmod call doesn't set errno.\n\nfmod(x, y) sets errno if x == +/-Inf or y == 0.  The old code assumed\nthat this was also a sufficient condition to prove that the result is\nnot NaN, and so unconditionally set the nnan fmf on the new frem\ninstruction.  That's not sound; e.g. fmod(x, NaN) == frem(x, NaN) ==\nNaN.\n\nWe don't actually have to worry about propagating the `nnan` flag;\nB.CreateFRemFMF does it for us automagically.\n\nThis bug was found by a large run of Opus 4.7 looking for bugs in LLVM.\n\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/199284.diff\n\n\n2 Files Affected:\n\n- (modified) llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp (+7-12) \n- (modified) llvm/test/Transforms/InstCombine/fmod.ll (+19-5) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\nindex b60f0c7021d51..9584e0e1c825f 100644\n--- a/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n+++ b/llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp\n@@ -2853,11 +2853,10 @@ Value *LibCallSimplifier::optimizeSqrt(CallInst *CI, IRBuilderBase &B) {\n \n Value *LibCallSimplifier::optimizeFMod(CallInst *CI, IRBuilderBase &B) {\n \n-  // fmod(x,y) can set errno if y == 0 or x == +/-inf, and returns Nan in those\n-  // case. If we know those do not happen, then we can convert the fmod into\n-  // frem.\n-  bool IsNoNan = CI->hasNoNaNs();\n-  if (!IsNoNan) {\n+  // fmod(x,y) sets errno if y == 0 or x == +/-inf. frem does not set errno,\n+  // so the fold is valid only when we can prove fmod wouldn't either.\n+  bool IsNoErrno = CI->hasNoNaNs();\n+  if (!IsNoErrno) {\n     SimplifyQuery SQ(DL, TLI, DT, AC, CI, true, true, DC);\n     KnownFPClass Known0 = computeKnownFPClass(CI->getOperand(0), fcInf, SQ);\n     if (Known0.isKnownNeverInfinity()) {\n@@ -2866,16 +2865,12 @@ Value *LibCallSimplifier::optimizeFMod(CallInst *CI, IRBuilderBase &B) {\n       Function *F = CI->getParent()->getParent();\n       const fltSemantics &FltSem =\n           CI->getType()->getScalarType()->getFltSemantics();\n-      IsNoNan = Known1.isKnownNeverLogicalZero(F->getDenormalMode(FltSem));\n+      IsNoErrno = Known1.isKnownNeverLogicalZero(F->getDenormalMode(FltSem));\n     }\n   }\n \n-  if (IsNoNan) {\n-    Value *FRem = B.CreateFRemFMF(CI->getOperand(0), CI->getOperand(1), CI);\n-    if (auto *FRemI = dyn_cast<Instruction>(FRem))\n-      FRemI->setHasNoNaNs(true);\n-    return FRem;\n-  }\n+  if (IsNoErrno)\n+    return B.CreateFRemFMF(CI->getOperand(0), CI->getOperand(1), CI);\n   return nullptr;\n }\n \ndiff --git a/llvm/test/Transforms/InstCombine/fmod.ll b/llvm/test/Transforms/InstCombine/fmod.ll\nindex 804812abadbbb..a1ef7d6b2c61a 100644\n--- a/llvm/test/Transforms/InstCombine/fmod.ll\n+++ b/llvm/test/Transforms/InstCombine/fmod.ll\n@@ -9,7 +9,7 @@ define float @test_inf_const(float %f) {\n ; CHECK-NEXT:    [[ISINF:%.*]] = fcmp oeq float [[ABS]], +inf\n ; CHECK-NEXT:    br i1 [[ISINF]], label [[RETURN:%.*]], label [[IF_END:%.*]]\n ; CHECK:       if.end:\n-; CHECK-NEXT:    [[CALL:%.*]] = frem nnan float [[F]], 2.000000e+00\n+; CHECK-NEXT:    [[CALL:%.*]] = frem float [[F]], 2.000000e+00\n ; CHECK-NEXT:    ret float [[CALL]]\n ; CHECK:       return:\n ; CHECK-NEXT:    ret float 0.000000e+00\n@@ -34,7 +34,7 @@ define float @test_const_zero(float %f) {\n ; CHECK-NEXT:    [[ISZERO:%.*]] = fcmp oeq float [[F]], 0.000000e+00\n ; CHECK-NEXT:    br i1 [[ISZERO]], label [[RETURN:%.*]], label [[IF_END:%.*]]\n ; CHECK:       if.end:\n-; CHECK-NEXT:    [[CALL:%.*]] = frem nnan float 2.000000e+00, [[F]]\n+; CHECK-NEXT:    [[CALL:%.*]] = frem float 2.000000e+00, [[F]]\n ; CHECK-NEXT:    ret float [[CALL]]\n ; CHECK:       return:\n ; CHECK-NEXT:    ret float 0.000000e+00\n@@ -67,7 +67,7 @@ define float @test_noinf_nozero(float nofpclass(inf) %f, float nofpclass(zero) %\n ; CHECK-LABEL: define float @test_noinf_nozero(\n ; CHECK-SAME: float nofpclass(inf) [[F:%.*]], float nofpclass(zero) [[G:%.*]]) {\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[CALL:%.*]] = frem nnan float [[F]], [[G]]\n+; CHECK-NEXT:    [[CALL:%.*]] = frem float [[F]], [[G]]\n ; CHECK-NEXT:    ret float [[CALL]]\n ;\n entry:\n@@ -79,7 +79,7 @@ define double @test_double(double nofpclass(inf) %f, double nofpclass(zero) %g)\n ; CHECK-LABEL: define double @test_double(\n ; CHECK-SAME: double nofpclass(inf) [[F:%.*]], double nofpclass(zero) [[G:%.*]]) {\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[CALL:%.*]] = frem nnan double [[F]], [[G]]\n+; CHECK-NEXT:    [[CALL:%.*]] = frem double [[F]], [[G]]\n ; CHECK-NEXT:    ret double [[CALL]]\n ;\n entry:\n@@ -91,7 +91,7 @@ define fp128 @test_fp128(fp128 nofpclass(inf) %f, fp128 nofpclass(zero) %g) {\n ; CHECK-LABEL: define fp128 @test_fp128(\n ; CHECK-SAME: fp128 nofpclass(inf) [[F:%.*]], fp128 nofpclass(zero) [[G:%.*]]) {\n ; CHECK-NEXT:  entry:\n-; CHECK-NEXT:    [[CALL:%.*]] = frem nnan fp128 [[F]], [[G]]\n+; CHECK-NEXT:    [[CALL:%.*]] = frem fp128 [[F]], [[G]]\n ; CHECK-NEXT:    ret fp128 [[CALL]]\n ;\n entry:\n@@ -123,6 +123,20 @@ entry:\n   ret float %call\n }\n \n+define float @test_nan_input_noerrno(float nofpclass(zero) %g, i1 %c) {\n+; CHECK-LABEL: define float @test_nan_input_noerrno(\n+; CHECK-SAME: float nofpclass(zero) [[G:%.*]], i1 [[C:%.*]]) {\n+; CHECK-NEXT:  entry:\n+; CHECK-NEXT:    [[F:%.*]] = select i1 [[C]], float 0x7FF8000000000000, float 1.000000e+00\n+; CHECK-NEXT:    [[CALL:%.*]] = frem float [[F]], [[G]]\n+; CHECK-NEXT:    ret float [[CALL]]\n+;\n+entry:\n+  %f = select i1 %c, float 0x7FF8000000000000, float 1.0\n+  %call = tail call float @fmodf(float %f, float %g)\n+  ret float %call\n+}\n+\n define float @test_nnan(float %f, float %g) {\n ; CHECK-LABEL: define float @test_nnan(\n ; CHECK-SAME: float [[F:%.*]], float [[G:%.*]]) {\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-22T20:55:19Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+      [
+        2853,
+        2863
+      ],
+      [
+        2866,
+        2881
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/fmod.ll": [
+      [
+        9,
+        15
+      ],
+      [
+        34,
+        40
+      ],
+      [
+        67,
+        73
+      ],
+      [
+        79,
+        85
+      ],
+      [
+        91,
+        97
+      ],
+      [
+        123,
+        128
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Utils/SimplifyLibCalls.cpp": [
+      "LibCallSimplifier::optimizeFMod",
+      "LibCallSimplifier::optimizeTrigInversionPairs"
+    ]
+  }
+}

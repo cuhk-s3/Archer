@@ -1,0 +1,80 @@
+{
+  "pr_id": 197090,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/197090",
+  "state": "open",
+  "title": "[InstCombine] Use KnownBits in `foldBoxMultiply`",
+  "author": "el-ev",
+  "base_commit": "b4f7c93e7d1325f1c1f00b47c10d2923e8259369",
+  "fix_commit": "82800fa010fc5c245c7aee007cd2b890f1cb4b8a",
+  "patch": "diff --git a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\nindex 462256c78a48b..db3faeb8ffadb 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n@@ -1509,7 +1509,7 @@ static Instruction *factorizeMathWithShlOps(BinaryOperator &I,\n \n /// Reduce a sequence of masked half-width multiplies to a single multiply.\n /// ((XLow * YHigh) + (YLow * XHigh)) << HalfBits) + (XLow * YLow) --> X * Y\n-static Instruction *foldBoxMultiply(BinaryOperator &I) {\n+Instruction *InstCombinerImpl::foldBoxMultiply(BinaryOperator &I) {\n   unsigned BitWidth = I.getType()->getScalarSizeInBits();\n   // Skip the odd bitwidth types.\n   if ((BitWidth & 0x1))\n@@ -1527,22 +1527,32 @@ static Instruction *foldBoxMultiply(BinaryOperator &I) {\n                          m_OneUse(m_Mul(m_Value(YLo), m_Value(XLo))))))\n     return nullptr;\n \n-  // XLo = X & HalfMask\n-  // YLo = Y & HalfMask\n-  // TODO: Refactor with SimplifyDemandedBits or KnownBits known leading zeros\n-  // to enhance robustness\n+  // XLo = X & HalfMask or X if upper bits are known zero\n+  // YLo = Y & HalfMask or Y if upper bits are known zero\n   Value *X, *Y;\n-  if (!match(XLo, m_And(m_Value(X), m_SpecificInt(HalfMask))) ||\n-      !match(YLo, m_And(m_Value(Y), m_SpecificInt(HalfMask))))\n-    return nullptr;\n+  APInt HighMask = APInt::getHighBitsSet(BitWidth, HalfBits);\n+  if (!match(XLo, m_And(m_Value(X), m_SpecificInt(HalfMask)))) {\n+    if (!MaskedValueIsZero(XLo, HighMask, &I))\n+      return nullptr;\n+    X = XLo;\n+  }\n+\n+  if (!match(YLo, m_And(m_Value(Y), m_SpecificInt(HalfMask)))) {\n+    if (!MaskedValueIsZero(YLo, HighMask, &I))\n+      return nullptr;\n+    Y = YLo;\n+  }\n \n   // CrossSum = (X' * (Y >> Halfbits)) + (Y' * (X >> HalfBits))\n   // X' can be either X or XLo in the pattern (and the same for Y')\n-  if (match(CrossSum,\n-            m_c_Add(m_c_Mul(m_LShr(m_Specific(Y), m_SpecificInt(HalfBits)),\n-                            m_CombineOr(m_Specific(X), m_Specific(XLo))),\n-                    m_c_Mul(m_LShr(m_Specific(X), m_SpecificInt(HalfBits)),\n-                            m_CombineOr(m_Specific(Y), m_Specific(YLo))))))\n+  auto XHiPat = m_LShr(m_Specific(X), m_SpecificInt(HalfBits));\n+  auto YHiPat = m_LShr(m_Specific(Y), m_SpecificInt(HalfBits));\n+  auto XPat = m_CombineOr(m_Specific(X), m_Specific(XLo));\n+  auto YPat = m_CombineOr(m_Specific(Y), m_Specific(YLo));\n+\n+  if (match(CrossSum, m_c_Add(m_c_Mul(YHiPat, XPat), m_c_Mul(XHiPat, YPat))) ||\n+      (X == XLo && match(CrossSum, m_c_Mul(YHiPat, XPat))) ||\n+      (Y == YLo && match(CrossSum, m_c_Mul(XHiPat, YPat))))\n     return BinaryOperator::CreateMul(X, Y);\n \n   return nullptr;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 0abdd415b767b..6d1324e8f1904 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -565,6 +565,8 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   ///     -> (zext (udiv (add nuw X, Y-1), Y))\n   Instruction *foldDivCeil(BinaryOperator &I);\n \n+  Instruction *foldBoxMultiply(BinaryOperator &I);\n+\n   /// This tries to simplify binary operations by factorizing out common terms\n   /// (e. g. \"(A*B)+(A*C)\" -> \"A*(B+C)\").\n   Value *tryFactorizationFolds(BinaryOperator &I);\n",
+  "components": [
+    "InstCombine"
+  ],
+  "description": "There is a TODO for this.\r\n\r\nWhen the low-half operands (`XLo`/`YLo`) of the multiply pattern have upper bits known to be zero, this is effectively equivalent to applying an `and` mask.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/InstCombine/mul_fold.ll",
+      "commands": [
+        "opt < %s -passes=instcombine -S"
+      ],
+      "tests": [
+        {
+          "test_name": "mul32_low_knownbits_both_zext",
+          "test_body": "define i32 @mul32_low_knownbits_both_zext(i16 %a, i16 %b) {\n  %in0 = zext i16 %a to i32\n  %in1 = zext i16 %b to i32\n  %In0Hi = lshr i32 %in0, 16\n  %In1Hi = lshr i32 %in1, 16\n  %m10 = mul i32 %In1Hi, %in0\n  %m01 = mul i32 %in1, %In0Hi\n  %m00 = mul i32 %in1, %in0\n  %addc = add i32 %m10, %m01\n  %shl = shl i32 %addc, 16\n  %retLo = add i32 %shl, %m00\n  ret i32 %retLo\n}\n"
+        },
+        {
+          "test_name": "mul9_low",
+          "test_body": "define i9 @mul9_low(i9 %in0, i9 %in1) {\n  %In0Lo = and i9 %in0, 15\n  %In0Hi = lshr i9 %in0, 4\n  %In1Lo = and i9 %in1, 15\n  %In1Hi = lshr i9 %in1, 4\n  %m10 = mul i9 %In1Hi, %In0Lo\n  %m01 = mul i9 %In1Lo, %In0Hi\n  %m00 = mul i9 %In1Lo, %In0Lo\n  %addc = add i9 %m10, %m01\n  %shl = shl i9 %addc, 4\n  %retLo = add i9 %shl, %m00\n  ret i9 %retLo\n}\n"
+        },
+        {
+          "test_name": "mul130_low_one_extra_user",
+          "test_body": "declare i130 @use130(i130)\n\ndefine i130 @mul130_low_one_extra_user(i130 %in0, i130 %in1) {\n  %In0Lo = and i130 %in0, 36893488147419103231\n  %In0Hi = lshr i130 %in0, 65\n  %In1Lo = and i130 %in1, 36893488147419103231\n  %In1Hi = lshr i130 %in1, 65\n  %m10 = mul i130 %In1Hi, %In0Lo\n  call void @use130(i130 %m10)\n  %m01 = mul i130 %In1Lo, %In0Hi\n  %m00 = mul i130 %In1Lo, %In0Lo\n  %addc = add i130 %m10, %m01\n  %shl = shl i130 %addc, 65\n  %retLo = add i130 %shl, %m00\n  ret i130 %retLo\n}\n"
+        },
+        {
+          "test_name": "mul32_low_knownbits_one_zext",
+          "test_body": "define i32 @mul32_low_knownbits_one_zext(i16 %a, i32 %in1) {\n  %in0 = zext i16 %a to i32\n  %In0Hi = lshr i32 %in0, 16\n  %In1Lo = and i32 %in1, 65535\n  %In1Hi = lshr i32 %in1, 16\n  %m10 = mul i32 %In1Hi, %in0\n  %m01 = mul i32 %In1Lo, %In0Hi\n  %m00 = mul i32 %In1Lo, %in0\n  %addc = add i32 %m10, %m01\n  %shl = shl i32 %addc, 16\n  %retLo = add i32 %shl, %m00\n  ret i32 %retLo\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:instcombine",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n\n@llvm/pr-subscribers-llvm-transforms\n\nAuthor: Iris Shi (el-ev)\n\n<details>\n<summary>Changes</summary>\n\nThere is a TODO for this.\r\n\r\nWhen the low-half operands (`XLo`/`YLo`) of the multiply pattern have upper bits known to be zero, this is effectively equivalent to applying an `and` mask.\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/197090.diff\n\n\n3 Files Affected:\n\n- (modified) llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp (+23-13) \n- (modified) llvm/lib/Transforms/InstCombine/InstCombineInternal.h (+2) \n- (modified) llvm/test/Transforms/InstCombine/mul_fold.ll (+41) \n\n\n``````````diff\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\nindex 462256c78a48b..db3faeb8ffadb 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp\n@@ -1509,7 +1509,7 @@ static Instruction *factorizeMathWithShlOps(BinaryOperator &I,\n \n /// Reduce a sequence of masked half-width multiplies to a single multiply.\n /// ((XLow * YHigh) + (YLow * XHigh)) << HalfBits) + (XLow * YLow) --> X * Y\n-static Instruction *foldBoxMultiply(BinaryOperator &I) {\n+Instruction *InstCombinerImpl::foldBoxMultiply(BinaryOperator &I) {\n   unsigned BitWidth = I.getType()->getScalarSizeInBits();\n   // Skip the odd bitwidth types.\n   if ((BitWidth & 0x1))\n@@ -1527,22 +1527,32 @@ static Instruction *foldBoxMultiply(BinaryOperator &I) {\n                          m_OneUse(m_Mul(m_Value(YLo), m_Value(XLo))))))\n     return nullptr;\n \n-  // XLo = X & HalfMask\n-  // YLo = Y & HalfMask\n-  // TODO: Refactor with SimplifyDemandedBits or KnownBits known leading zeros\n-  // to enhance robustness\n+  // XLo = X & HalfMask or X if upper bits are known zero\n+  // YLo = Y & HalfMask or Y if upper bits are known zero\n   Value *X, *Y;\n-  if (!match(XLo, m_And(m_Value(X), m_SpecificInt(HalfMask))) ||\n-      !match(YLo, m_And(m_Value(Y), m_SpecificInt(HalfMask))))\n-    return nullptr;\n+  APInt HighMask = APInt::getHighBitsSet(BitWidth, HalfBits);\n+  if (!match(XLo, m_And(m_Value(X), m_SpecificInt(HalfMask)))) {\n+    if (!MaskedValueIsZero(XLo, HighMask, &I))\n+      return nullptr;\n+    X = XLo;\n+  }\n+\n+  if (!match(YLo, m_And(m_Value(Y), m_SpecificInt(HalfMask)))) {\n+    if (!MaskedValueIsZero(YLo, HighMask, &I))\n+      return nullptr;\n+    Y = YLo;\n+  }\n \n   // CrossSum = (X' * (Y >> Halfbits)) + (Y' * (X >> HalfBits))\n   // X' can be either X or XLo in the pattern (and the same for Y')\n-  if (match(CrossSum,\n-            m_c_Add(m_c_Mul(m_LShr(m_Specific(Y), m_SpecificInt(HalfBits)),\n-                            m_CombineOr(m_Specific(X), m_Specific(XLo))),\n-                    m_c_Mul(m_LShr(m_Specific(X), m_SpecificInt(HalfBits)),\n-                            m_CombineOr(m_Specific(Y), m_Specific(YLo))))))\n+  auto XHiPat = m_LShr(m_Specific(X), m_SpecificInt(HalfBits));\n+  auto YHiPat = m_LShr(m_Specific(Y), m_SpecificInt(HalfBits));\n+  auto XPat = m_CombineOr(m_Specific(X), m_Specific(XLo));\n+  auto YPat = m_CombineOr(m_Specific(Y), m_Specific(YLo));\n+\n+  if (match(CrossSum, m_c_Add(m_c_Mul(YHiPat, XPat), m_c_Mul(XHiPat, YPat))) ||\n+      (X == XLo && match(CrossSum, m_c_Mul(YHiPat, XPat))) ||\n+      (Y == YLo && match(CrossSum, m_c_Mul(XHiPat, YPat))))\n     return BinaryOperator::CreateMul(X, Y);\n \n   return nullptr;\ndiff --git a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\nindex 0abdd415b767b..6d1324e8f1904 100644\n--- a/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n+++ b/llvm/lib/Transforms/InstCombine/InstCombineInternal.h\n@@ -565,6 +565,8 @@ class LLVM_LIBRARY_VISIBILITY InstCombinerImpl final\n   ///     -> (zext (udiv (add nuw X, Y-1), Y))\n   Instruction *foldDivCeil(BinaryOperator &I);\n \n+  Instruction *foldBoxMultiply(BinaryOperator &I);\n+\n   /// This tries to simplify binary operations by factorizing out common terms\n   /// (e. g. \"(A*B)+(A*C)\" -> \"A*(B+C)\").\n   Value *tryFactorizationFolds(BinaryOperator &I);\ndiff --git a/llvm/test/Transforms/InstCombine/mul_fold.ll b/llvm/test/Transforms/InstCombine/mul_fold.ll\nindex ced30b6efa204..f260f1b72bea3 100644\n--- a/llvm/test/Transforms/InstCombine/mul_fold.ll\n+++ b/llvm/test/Transforms/InstCombine/mul_fold.ll\n@@ -605,6 +605,47 @@ define i130 @mul130_low_one_extra_user(i130 %in0, i130 %in1) {\n   ret i130 %retLo\n }\n \n+; Both operands have known-zero upper bits\n+define i32 @mul32_low_knownbits_both_zext(i16 %a, i16 %b) {\n+; CHECK-LABEL: @mul32_low_knownbits_both_zext(\n+; CHECK-NEXT:    [[IN0:%.*]] = zext i16 [[A:%.*]] to i32\n+; CHECK-NEXT:    [[IN1:%.*]] = zext i16 [[B:%.*]] to i32\n+; CHECK-NEXT:    [[RETLO:%.*]] = mul nuw i32 [[IN1]], [[IN0]]\n+; CHECK-NEXT:    ret i32 [[RETLO]]\n+;\n+  %in0 = zext i16 %a to i32\n+  %in1 = zext i16 %b to i32\n+  %In0Hi = lshr i32 %in0, 16\n+  %In1Hi = lshr i32 %in1, 16\n+  %m10 = mul i32 %In1Hi, %in0\n+  %m01 = mul i32 %in1, %In0Hi\n+  %m00 = mul i32 %in1, %in0\n+  %addc = add i32 %m10, %m01\n+  %shl = shl i32 %addc, 16\n+  %retLo = add i32 %shl, %m00\n+  ret i32 %retLo\n+}\n+\n+; One operand with known-zero upper bits, the other with `and`\n+define i32 @mul32_low_knownbits_one_zext(i16 %a, i32 %in1) {\n+; CHECK-LABEL: @mul32_low_knownbits_one_zext(\n+; CHECK-NEXT:    [[IN0:%.*]] = zext i16 [[A:%.*]] to i32\n+; CHECK-NEXT:    [[RETLO:%.*]] = mul i32 [[IN1:%.*]], [[IN0]]\n+; CHECK-NEXT:    ret i32 [[RETLO]]\n+;\n+  %in0 = zext i16 %a to i32\n+  %In0Hi = lshr i32 %in0, 16\n+  %In1Lo = and i32 %in1, 65535\n+  %In1Hi = lshr i32 %in1, 16\n+  %m10 = mul i32 %In1Hi, %in0\n+  %m01 = mul i32 %In1Lo, %In0Hi\n+  %m00 = mul i32 %In1Lo, %in0\n+  %addc = add i32 %m10, %m01\n+  %shl = shl i32 %addc, 16\n+  %retLo = add i32 %shl, %m00\n+  ret i32 %retLo\n+}\n+\n ; Negative case: Skip odd bitwidth type\n define i9 @mul9_low(i9 %in0, i9 %in1) {\n ; CHECK-LABEL: @mul9_low(\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-12T03:35:42Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp": [
+      [
+        1509,
+        1515
+      ],
+      [
+        1527,
+        1548
+      ]
+    ],
+    "llvm/lib/Transforms/InstCombine/InstCombineInternal.h": [
+      [
+        565,
+        570
+      ]
+    ],
+    "llvm/test/Transforms/InstCombine/mul_fold.ll": [
+      [
+        605,
+        610
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/InstCombine/InstCombineAddSub.cpp": [
+      "foldBoxMultiply"
+    ]
+  }
+}

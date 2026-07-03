@@ -1,0 +1,297 @@
+{
+  "pr_id": 187870,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/187870",
+  "state": "open",
+  "title": "[VectorCombine] Handle widening/narrowing bitcasts in foldShuffleToIdentity",
+  "author": "AbdallahRashed",
+  "base_commit": "def34823cd0adc539f2eeb6c0791a4f795c8cc85",
+  "fix_commit": "738a742b370d34b1aa53046a07ed58c386293b58",
+  "patch": "diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\nindex 5ba344ea9a808..386617dc11358 100644\n--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n+++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp\n@@ -3527,7 +3527,7 @@ generateNewInstTree(ArrayRef<InstLane> Item, Use *From, FixedVectorType *Ty,\n     return FrontV;\n   }\n   if (SplatLeafs.contains(std::make_pair(FrontV, From))) {\n-    SmallVector<int, 16> Mask(Ty->getNumElements(), FrontLane);\n+    SmallVector<int, 16> Mask(Item.size(), FrontLane);\n     return Builder.CreateShuffleVector(FrontV, Mask);\n   }\n   if (ConcatLeafs.contains(std::make_pair(FrontV, From))) {\n@@ -3551,6 +3551,53 @@ generateNewInstTree(ArrayRef<InstLane> Item, Use *From, FixedVectorType *Ty,\n   }\n \n   auto *I = cast<Instruction>(FrontV);\n+\n+  // Handle vector bitcasts that change element count. We cannot use\n+  // generateInstLaneVectorFromOperand for these because the lane indices\n+  // don't map 1:1 through the bitcast.\n+  if (auto *BitCast = dyn_cast<BitCastInst>(I)) {\n+    auto *BCDstTy = dyn_cast<FixedVectorType>(BitCast->getDestTy());\n+    auto *BCSrcTy = dyn_cast<FixedVectorType>(BitCast->getSrcTy());\n+    if (BCDstTy && BCSrcTy &&\n+        BCDstTy->getNumElements() != BCSrcTy->getNumElements()) {\n+      unsigned DstElts = BCDstTy->getNumElements();\n+      unsigned SrcElts = BCSrcTy->getNumElements();\n+      SmallVector<InstLane> NewItem;\n+      if (DstElts > SrcElts) {\n+        // Widening: compress operand Item.\n+        unsigned R = DstElts / SrcElts;\n+        if (Item.size() % R != 0)\n+          return nullptr;\n+        for (unsigned Idx = 0, E = Item.size(); Idx < E; Idx += R) {\n+          auto [V, Lane] = Item[Idx];\n+          if (!V)\n+            NewItem.push_back({nullptr, PoisonMaskElem});\n+          else {\n+            NewItem.push_back(lookThroughShuffles(\n+                cast<Instruction>(V)->getOperand(0), Lane / R));\n+          }\n+        }\n+      } else {\n+        // Narrowing: expand operand Item.\n+        unsigned R = SrcElts / DstElts;\n+        for (auto [V, Lane] : Item) {\n+          if (!V) {\n+            for (unsigned J = 0; J < R; ++J)\n+              NewItem.push_back({nullptr, PoisonMaskElem});\n+          } else {\n+            Value *Op = cast<Instruction>(V)->getOperand(0);\n+            for (unsigned J = 0; J < R; ++J)\n+              NewItem.push_back(lookThroughShuffles(Op, Lane * R + J));\n+          }\n+        }\n+      }\n+      Value *Op = generateNewInstTree(NewItem, &BitCast->getOperandUse(0), Ty,\n+                                      IdentityLeafs, SplatLeafs, ConcatLeafs,\n+                                      Builder, TTI);\n+      return Builder.CreateBitCast(\n+          Op, FixedVectorType::get(BCDstTy->getScalarType(), Item.size()));\n+    }\n+  }\n   auto *II = dyn_cast<IntrinsicInst>(I);\n   unsigned NumOps = I->getNumOperands() - (II ? 1 : 0);\n   SmallVector<Value *> Ops(NumOps);\n@@ -3571,7 +3618,7 @@ generateNewInstTree(ArrayRef<InstLane> Item, Use *From, FixedVectorType *Ty,\n       ValueList.push_back(Lane.first);\n \n   Type *DstTy =\n-      FixedVectorType::get(I->getType()->getScalarType(), Ty->getNumElements());\n+      FixedVectorType::get(I->getType()->getScalarType(), Item.size());\n   if (auto *BI = dyn_cast<BinaryOperator>(I)) {\n     auto *Value = Builder.CreateBinOp((Instruction::BinaryOps)BI->getOpcode(),\n                                       Ops[0], Ops[1]);\n@@ -3621,6 +3668,7 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {\n   Worklist.push_back(std::make_pair(Start, &*I.use_begin()));\n   DenseSet<std::pair<Value *, Use *>> IdentityLeafs, SplatLeafs, ConcatLeafs;\n   unsigned NumVisited = 0;\n+  bool TraversedElCountChangingBitcast = false;\n \n   while (!Worklist.empty()) {\n     if (++NumVisited > MaxInstrsToScan)\n@@ -3644,7 +3692,7 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {\n     // Look for an identity value.\n     if (FrontLane == 0 &&\n         cast<FixedVectorType>(FrontV->getType())->getNumElements() ==\n-            Ty->getNumElements() &&\n+            Item.size() &&\n         all_of(drop_begin(enumerate(Item)), [IsEquiv, Item](const auto &E) {\n           Value *FrontV = Item.front().first;\n           return !E.value().first || (IsEquiv(E.value().first, FrontV) &&\n@@ -3725,14 +3773,76 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {\n                               &cast<Instruction>(FrontV)->getOperandUse(0));\n         continue;\n       } else if (auto *BitCast = dyn_cast<BitCastInst>(FrontV)) {\n-        // TODO: Handle vector widening/narrowing bitcasts.\n-        auto *DstTy = dyn_cast<FixedVectorType>(BitCast->getDestTy());\n-        auto *SrcTy = dyn_cast<FixedVectorType>(BitCast->getSrcTy());\n-        if (DstTy && SrcTy &&\n-            SrcTy->getNumElements() == DstTy->getNumElements()) {\n-          Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 0),\n-                                &BitCast->getOperandUse(0));\n-          continue;\n+        auto *BCDstTy = dyn_cast<FixedVectorType>(BitCast->getDestTy());\n+        auto *BCSrcTy = dyn_cast<FixedVectorType>(BitCast->getSrcTy());\n+        if (BCDstTy && BCSrcTy) {\n+          unsigned DstElts = BCDstTy->getNumElements();\n+          unsigned SrcElts = BCSrcTy->getNumElements();\n+          if (DstElts == SrcElts) {\n+            // Same element count - simple pass-through.\n+            Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 0),\n+                                  &BitCast->getOperandUse(0));\n+            continue;\n+          }\n+          if (DstElts > SrcElts && DstElts % SrcElts == 0 &&\n+              Item.size() % (DstElts / SrcElts) == 0) {\n+            // Widening bitcast (e.g. <2 x i32> -> <4 x i16>). Compress\n+            // consecutive groups of R destination lanes into one source\n+            // lane.\n+            unsigned R = DstElts / SrcElts;\n+            SmallVector<InstLane> NItem;\n+            bool Valid = true;\n+            for (unsigned Idx = 0, E = Item.size(); Idx < E; Idx += R) {\n+              auto [V0, L0] = Item[Idx];\n+              if (!V0) {\n+                if (any_of(ArrayRef(Item).slice(Idx + 1, R - 1),\n+                           [](InstLane IL) { return IL.first != nullptr; })) {\n+                  Valid = false;\n+                  break;\n+                }\n+                NItem.push_back({nullptr, PoisonMaskElem});\n+                continue;\n+              }\n+              if (L0 % R != 0) {\n+                Valid = false;\n+                break;\n+              }\n+              for (unsigned J = 1; J < R; ++J) {\n+                auto [VJ, LJ] = Item[Idx + J];\n+                if (!VJ || VJ != V0 || LJ != L0 + (int)J) {\n+                  Valid = false;\n+                  break;\n+                }\n+              }\n+              if (!Valid)\n+                break;\n+              NItem.push_back(lookThroughShuffles(\n+                  cast<Instruction>(V0)->getOperand(0), L0 / R));\n+            }\n+            if (Valid) {\n+              TraversedElCountChangingBitcast = true;\n+              Worklist.emplace_back(NItem, &BitCast->getOperandUse(0));\n+              continue;\n+            }\n+          } else if (SrcElts > DstElts && SrcElts % DstElts == 0) {\n+            // Narrowing bitcast (e.g. <4 x i16> -> <2 x i32>). Expand\n+            // each destination lane into R source lanes.\n+            unsigned R = SrcElts / DstElts;\n+            SmallVector<InstLane> NItem;\n+            for (auto [V, Lane] : Item) {\n+              if (!V) {\n+                for (unsigned J = 0; J < R; ++J)\n+                  NItem.push_back({nullptr, PoisonMaskElem});\n+                continue;\n+              }\n+              Value *Op = cast<Instruction>(V)->getOperand(0);\n+              for (unsigned J = 0; J < R; ++J)\n+                NItem.push_back(lookThroughShuffles(Op, Lane * R + J));\n+            }\n+            TraversedElCountChangingBitcast = true;\n+            Worklist.emplace_back(NItem, &BitCast->getOperandUse(0));\n+            continue;\n+          }\n         }\n       } else if (auto *Sel = dyn_cast<SelectInst>(FrontV)) {\n         Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 0),\n@@ -3775,6 +3885,12 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {\n   if (NumVisited <= 1)\n     return false;\n \n+  // If the only non-leaf node traversed was a single bitcast that changes\n+  // element count, the fold would just commute the bitcast and shuffle.\n+  // foldBitcastShuffle does the reverse transform, causing an infinite loop.\n+  if (NumVisited == 2 && TraversedElCountChangingBitcast)\n+    return false;\n+\n   LLVM_DEBUG(dbgs() << \"Found a superfluous identity shuffle: \" << I << \"\\n\");\n \n   // If we got this far, we know the shuffles are superfluous and can be\n",
+  "components": [
+    "VectorCombine"
+  ],
+  "description": "\r\n\r\nTrack lane indices through vector bitcasts that change element count in foldShuffleToIdentity. Widening bitcasts (e.g. <2 x i32> -> <4 x i16>) compress R consecutive destination lanes into one source lane, while narrowing bitcasts (e.g. <4 x i16> -> <2 x i32>) expand each destination lane into R source lanes.\r\n\r\nAlso fix identity check, splat mask, and destination type construction to use Item.size() instead of Ty->getNumElements(), since the Item vector changes size when passing through element-count-changing bitcasts.\r\n\r\nFixes #96884.",
+  "tests": [
+    {
+      "file": "llvm/test/Transforms/PhaseOrdering/X86/pr67803.ll",
+      "commands": [
+        "opt < %s -O3 -S -mtriple=x86_64-- -mcpu=x86-64-v2",
+        "opt < %s -O3 -S -mtriple=x86_64-- -mcpu=x86-64-v3",
+        "opt < %s -O3 -S -mtriple=x86_64-- -mcpu=x86-64-v4"
+      ],
+      "tests": [
+        {
+          "test_name": "PR67803",
+          "test_body": "define <4 x i64> @PR67803(<4 x i64> %x, <4 x i64> %y, <4 x i64> %a, <4 x i64> %b) {\nentry:\n  %0 = bitcast <4 x i64> %x to <8 x i32>\n  %extract = shufflevector <8 x i32> %0, <8 x i32> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %1 = bitcast <4 x i32> %extract to <2 x i64>\n  %2 = bitcast <4 x i64> %y to <8 x i32>\n  %extract1 = shufflevector <8 x i32> %2, <8 x i32> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %3 = bitcast <4 x i32> %extract1 to <2 x i64>\n  %cmp.i21 = icmp sgt <4 x i32> %extract, %extract1\n  %sext.i22 = sext <4 x i1> %cmp.i21 to <4 x i32>\n  %4 = bitcast <4 x i32> %sext.i22 to <2 x i64>\n  %extract2 = shufflevector <8 x i32> %0, <8 x i32> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %5 = bitcast <4 x i32> %extract2 to <2 x i64>\n  %extract3 = shufflevector <8 x i32> %2, <8 x i32> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %6 = bitcast <4 x i32> %extract3 to <2 x i64>\n  %cmp.i = icmp sgt <4 x i32> %extract2, %extract3\n  %sext.i = sext <4 x i1> %cmp.i to <4 x i32>\n  %7 = bitcast <4 x i32> %sext.i to <2 x i64>\n  %shuffle.i = shufflevector <2 x i64> %4, <2 x i64> %7, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %8 = bitcast <4 x i64> %a to <8 x i32>\n  %extract6 = shufflevector <8 x i32> %8, <8 x i32> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %9 = bitcast <4 x i32> %extract6 to <2 x i64>\n  %10 = bitcast <4 x i64> %b to <8 x i32>\n  %extract7 = shufflevector <8 x i32> %10, <8 x i32> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %11 = bitcast <4 x i32> %extract7 to <2 x i64>\n  %12 = bitcast <4 x i64> %shuffle.i to <8 x i32>\n  %extract8 = shufflevector <8 x i32> %12, <8 x i32> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %13 = bitcast <4 x i32> %extract8 to <2 x i64>\n  %14 = bitcast <2 x i64> %9 to <16 x i8>\n  %15 = bitcast <2 x i64> %11 to <16 x i8>\n  %16 = bitcast <2 x i64> %13 to <16 x i8>\n  %17 = call <16 x i8> @llvm.x86.sse41.pblendvb(<16 x i8> %14, <16 x i8> %15, <16 x i8> %16)\n  %18 = bitcast <16 x i8> %17 to <2 x i64>\n  %extract10 = shufflevector <8 x i32> %8, <8 x i32> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %19 = bitcast <4 x i32> %extract10 to <2 x i64>\n  %extract11 = shufflevector <8 x i32> %10, <8 x i32> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %20 = bitcast <4 x i32> %extract11 to <2 x i64>\n  %extract12 = shufflevector <8 x i32> %12, <8 x i32> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %21 = bitcast <4 x i32> %extract12 to <2 x i64>\n  %22 = bitcast <2 x i64> %19 to <16 x i8>\n  %23 = bitcast <2 x i64> %20 to <16 x i8>\n  %24 = bitcast <2 x i64> %21 to <16 x i8>\n  %25 = call <16 x i8> @llvm.x86.sse41.pblendvb(<16 x i8> %22, <16 x i8> %23, <16 x i8> %24)\n  %26 = bitcast <16 x i8> %25 to <2 x i64>\n  %shuffle.i23 = shufflevector <2 x i64> %18, <2 x i64> %26, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x i64> %shuffle.i23\n}\n\n; Function Attrs: nocallback nofree nosync nounwind willreturn memory(none)\ndeclare <16 x i8> @llvm.x86.sse41.pblendvb(<16 x i8>, <16 x i8>, <16 x i8>) #0\n\nattributes #0 = { nocallback nofree nosync nounwind willreturn memory(none) }\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/AArch64/combine-shuffle-ext.ll",
+      "commands": [
+        "opt -p vector-combine -mtriple=arm64-apple-macosx -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "mask_extracts_second_vector",
+          "test_body": "define <4 x i32> @mask_extracts_second_vector(ptr %di, <8 x i16> %other) {\nentry:\n  %l = load i32, ptr %di, align 4\n  %vec.ins = insertelement <2 x i32> <i32 poison, i32 0>, i32 %l, i64 0\n  %vec.bc = bitcast <2 x i32> %vec.ins to <8 x i8>\n  %ext.1 = sext <8 x i8> %vec.bc to <8 x i16>\n  %vec.shuffle = shufflevector <8 x i16> %ext.1, <8 x i16> %other, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %ext.2 = sext <4 x i16> %vec.shuffle to <4 x i32>\n  ret <4 x i32> %ext.2\n}\n"
+        },
+        {
+          "test_name": "mask_extracts_second_vector_sext",
+          "test_body": "define <4 x i32> @mask_extracts_second_vector_sext(ptr %di, <8 x i16> %other) {\nentry:\n  %l = load i32, ptr %di, align 4\n  %vec.ins = insertelement <2 x i32> <i32 poison, i32 0>, i32 %l, i64 0\n  %vec.bc = bitcast <2 x i32> %vec.ins to <8 x i8>\n  %ext.1 = zext <8 x i8> %vec.bc to <8 x i16>\n  %vec.shuffle = shufflevector <8 x i16> %ext.1, <8 x i16> %other, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %ext.2 = zext nneg <4 x i16> %vec.shuffle to <4 x i32>\n  ret <4 x i32> %ext.2\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/AArch64/shuffletoidentity.ll",
+      "commands": [
+        "opt -passes=vector-combine -S %s"
+      ],
+      "tests": [
+        {
+          "test_name": "bitcast_narrowwiden_sub",
+          "test_body": "target triple = \"aarch64\"\n\ndefine <8 x i16> @bitcast_narrowwiden_sub(<8 x i16> %a) {\n  %lo = shufflevector <8 x i16> %a, <8 x i16> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %hi = shufflevector <8 x i16> %a, <8 x i16> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %bc_lo = bitcast <4 x i16> %lo to <2 x i32>\n  %bc_hi = bitcast <4 x i16> %hi to <2 x i32>\n  %neg_lo = sub <2 x i32> zeroinitializer, %bc_lo\n  %neg_hi = sub <2 x i32> zeroinitializer, %bc_hi\n  %bc_lo2 = bitcast <2 x i32> %neg_lo to <4 x i16>\n  %bc_hi2 = bitcast <2 x i32> %neg_hi to <4 x i16>\n  %result = shufflevector <4 x i16> %bc_lo2, <4 x i16> %bc_hi2, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x i16> %result\n}\n"
+        },
+        {
+          "test_name": "concat_splats",
+          "test_body": "target triple = \"aarch64\"\n\ndefine <48 x i8> @concat_splats(<64 x i8> %wide.vec, <64 x i8> %wide.vec117) {\n  %strided.vec = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 0, i32 4, i32 8, i32 12, i32 16, i32 20, i32 24, i32 28, i32 32, i32 36, i32 40, i32 44, i32 48, i32 52, i32 56, i32 60>\n  %strided.vec114 = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 1, i32 5, i32 9, i32 13, i32 17, i32 21, i32 25, i32 29, i32 33, i32 37, i32 41, i32 45, i32 49, i32 53, i32 57, i32 61>\n  %strided.vec115 = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 2, i32 6, i32 10, i32 14, i32 18, i32 22, i32 26, i32 30, i32 34, i32 38, i32 42, i32 46, i32 50, i32 54, i32 58, i32 62>\n  %strided.vec116 = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 3, i32 7, i32 11, i32 15, i32 19, i32 23, i32 27, i32 31, i32 35, i32 39, i32 43, i32 47, i32 51, i32 55, i32 59, i32 63>\n  %1 = zext <16 x i8> %strided.vec to <16 x i32>\n  %2 = mul nuw nsw <16 x i32> %1, splat (i32 3)\n  %3 = zext <16 x i8> %strided.vec114 to <16 x i32>\n  %4 = add nuw nsw <16 x i32> %3, splat (i32 2)\n  %5 = add nuw nsw <16 x i32> %4, %2\n  %6 = lshr <16 x i32> %5, splat (i32 2)\n  %7 = zext <16 x i8> %strided.vec115 to <16 x i32>\n  %8 = add nuw nsw <16 x i32> %3, splat (i32 1)\n  %9 = add nuw nsw <16 x i32> %8, %7\n  %10 = lshr <16 x i32> %9, splat (i32 1)\n  %11 = zext <16 x i8> %strided.vec116 to <16 x i32>\n  %12 = mul nuw nsw <16 x i32> %11, splat (i32 3)\n  %13 = add nuw nsw <16 x i32> %7, splat (i32 2)\n  %14 = add nuw nsw <16 x i32> %13, %12\n  %15 = lshr <16 x i32> %14, splat (i32 2)\n  %strided.vec118 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 0, i32 4, i32 8, i32 12, i32 16, i32 20, i32 24, i32 28, i32 32, i32 36, i32 40, i32 44, i32 48, i32 52, i32 56, i32 60>\n  %strided.vec119 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 1, i32 5, i32 9, i32 13, i32 17, i32 21, i32 25, i32 29, i32 33, i32 37, i32 41, i32 45, i32 49, i32 53, i32 57, i32 61>\n  %strided.vec120 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 2, i32 6, i32 10, i32 14, i32 18, i32 22, i32 26, i32 30, i32 34, i32 38, i32 42, i32 46, i32 50, i32 54, i32 58, i32 62>\n  %strided.vec121 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 3, i32 7, i32 11, i32 15, i32 19, i32 23, i32 27, i32 31, i32 35, i32 39, i32 43, i32 47, i32 51, i32 55, i32 59, i32 63>\n  %16 = zext <16 x i8> %strided.vec118 to <16 x i32>\n  %17 = mul nuw nsw <16 x i32> %16, splat (i32 3)\n  %18 = zext <16 x i8> %strided.vec119 to <16 x i32>\n  %19 = add nuw nsw <16 x i32> %18, splat (i32 2)\n  %20 = add nuw nsw <16 x i32> %19, %17\n  %21 = lshr <16 x i32> %20, splat (i32 2)\n  %22 = zext <16 x i8> %strided.vec120 to <16 x i32>\n  %23 = add nuw nsw <16 x i32> %18, splat (i32 1)\n  %24 = add nuw nsw <16 x i32> %23, %22\n  %25 = lshr <16 x i32> %24, splat (i32 1)\n  %26 = zext <16 x i8> %strided.vec121 to <16 x i32>\n  %27 = mul nuw nsw <16 x i32> %26, splat (i32 3)\n  %28 = add nuw nsw <16 x i32> %22, splat (i32 2)\n  %29 = add nuw nsw <16 x i32> %28, %27\n  %30 = lshr <16 x i32> %29, splat (i32 2)\n  %31 = mul nuw nsw <16 x i32> %6, splat (i32 3)\n  %32 = add nuw nsw <16 x i32> %31, splat (i32 2)\n  %33 = add nuw nsw <16 x i32> %32, %21\n  %34 = lshr <16 x i32> %33, splat (i32 2)\n  %35 = trunc nuw <16 x i32> %34 to <16 x i8>\n  %36 = mul nuw nsw <16 x i32> %10, splat (i32 3)\n  %37 = add nuw nsw <16 x i32> %36, splat (i32 2)\n  %38 = add nuw nsw <16 x i32> %37, %25\n  %39 = lshr <16 x i32> %38, splat (i32 2)\n  %40 = trunc nuw <16 x i32> %39 to <16 x i8>\n  %41 = mul nuw nsw <16 x i32> %15, splat (i32 3)\n  %42 = add nuw nsw <16 x i32> %41, splat (i32 2)\n  %43 = add nuw nsw <16 x i32> %42, %30\n  %44 = lshr <16 x i32> %43, splat (i32 2)\n  %45 = trunc nuw <16 x i32> %44 to <16 x i8>\n  %46 = shufflevector <16 x i8> %35, <16 x i8> %40, <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31>\n  %47 = shufflevector <16 x i8> %45, <16 x i8> poison, <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison>\n  %interleaved.vec = shufflevector <32 x i8> %46, <32 x i8> %47, <48 x i32> <i32 0, i32 16, i32 32, i32 1, i32 17, i32 33, i32 2, i32 18, i32 34, i32 3, i32 19, i32 35, i32 4, i32 20, i32 36, i32 5, i32 21, i32 37, i32 6, i32 22, i32 38, i32 7, i32 23, i32 39, i32 8, i32 24, i32 40, i32 9, i32 25, i32 41, i32 10, i32 26, i32 42, i32 11, i32 27, i32 43, i32 12, i32 28, i32 44, i32 13, i32 29, i32 45, i32 14, i32 30, i32 46, i32 15, i32 31, i32 47>\n  ret <48 x i8> %interleaved.vec\n}\n"
+        },
+        {
+          "test_name": "bitcast_narrow4_widen4_add",
+          "test_body": "target triple = \"aarch64\"\n\ndefine <16 x i8> @bitcast_narrow4_widen4_add(<16 x i8> %a, <16 x i8> %b) {\n  %a_lo = shufflevector <16 x i8> %a, <16 x i8> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  %a_hi = shufflevector <16 x i8> %a, <16 x i8> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>\n  %b_lo = shufflevector <16 x i8> %b, <16 x i8> poison, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  %b_hi = shufflevector <16 x i8> %b, <16 x i8> poison, <8 x i32> <i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>\n  %bc_a_lo = bitcast <8 x i8> %a_lo to <2 x i32>\n  %bc_a_hi = bitcast <8 x i8> %a_hi to <2 x i32>\n  %bc_b_lo = bitcast <8 x i8> %b_lo to <2 x i32>\n  %bc_b_hi = bitcast <8 x i8> %b_hi to <2 x i32>\n  %add_lo = add <2 x i32> %bc_a_lo, %bc_b_lo\n  %add_hi = add <2 x i32> %bc_a_hi, %bc_b_hi\n  %bc_lo = bitcast <2 x i32> %add_lo to <8 x i8>\n  %bc_hi = bitcast <2 x i32> %add_hi to <8 x i8>\n  %result = shufflevector <8 x i8> %bc_lo, <8 x i8> %bc_hi, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>\n  ret <16 x i8> %result\n}\n"
+        },
+        {
+          "test_name": "bitcast_narrowwiden_add",
+          "test_body": "target triple = \"aarch64\"\n\ndefine <8 x i16> @bitcast_narrowwiden_add(<8 x i16> %a, <8 x i16> %b) {\n  %a_lo = shufflevector <8 x i16> %a, <8 x i16> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %a_hi = shufflevector <8 x i16> %a, <8 x i16> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %b_lo = shufflevector <8 x i16> %b, <8 x i16> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  %b_hi = shufflevector <8 x i16> %b, <8 x i16> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %bc_a_lo = bitcast <4 x i16> %a_lo to <2 x i32>\n  %bc_a_hi = bitcast <4 x i16> %a_hi to <2 x i32>\n  %bc_b_lo = bitcast <4 x i16> %b_lo to <2 x i32>\n  %bc_b_hi = bitcast <4 x i16> %b_hi to <2 x i32>\n  %add_lo = add <2 x i32> %bc_a_lo, %bc_b_lo\n  %add_hi = add <2 x i32> %bc_a_hi, %bc_b_hi\n  %bc_lo = bitcast <2 x i32> %add_lo to <4 x i16>\n  %bc_hi = bitcast <2 x i32> %add_hi to <4 x i16>\n  %result = shufflevector <4 x i16> %bc_lo, <4 x i16> %bc_hi, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x i16> %result\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/shuffle-inseltpoison.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=SSE2",
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=AVX2"
+      ],
+      "tests": [
+        {
+          "test_name": "bitcast_shuf_uses",
+          "test_body": "declare void @use(<4 x i32>)\n\ndefine <16 x i8> @bitcast_shuf_uses(<4 x i32> %v) {\n  %shuf = shufflevector <4 x i32> %v, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  call void @use(<4 x i32> %shuf)\n  %r = bitcast <4 x i32> %shuf to <16 x i8>\n  ret <16 x i8> %r\n}\n"
+        },
+        {
+          "test_name": "PR35454_2",
+          "test_body": "define <2 x i64> @PR35454_2(<2 x i64> %v) {\n  %bc = bitcast <2 x i64> %v to <4 x i32>\n  %permil = shufflevector <4 x i32> %bc, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc1 = bitcast <4 x i32> %permil to <8 x i16>\n  %add = shl <8 x i16> %bc1, splat (i16 1)\n  %bc2 = bitcast <8 x i16> %add to <4 x i32>\n  %permil1 = shufflevector <4 x i32> %bc2, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc3 = bitcast <4 x i32> %permil1 to <2 x i64>\n  ret <2 x i64> %bc3\n}\n"
+        },
+        {
+          "test_name": "PR35454_1",
+          "test_body": "define <2 x i64> @PR35454_1(<2 x i64> %v) {\n  %bc = bitcast <2 x i64> %v to <4 x i32>\n  %permil = shufflevector <4 x i32> %bc, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc1 = bitcast <4 x i32> %permil to <16 x i8>\n  %add = shl <16 x i8> %bc1, splat (i8 1)\n  %bc2 = bitcast <16 x i8> %add to <4 x i32>\n  %permil1 = shufflevector <4 x i32> %bc2, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc3 = bitcast <4 x i32> %permil1 to <2 x i64>\n  ret <2 x i64> %bc3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/shuffle.ll",
+      "commands": [
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=SSE2",
+        "opt < %s -passes=vector-combine -S -mtriple=x86_64-- -mattr=AVX2"
+      ],
+      "tests": [
+        {
+          "test_name": "PR35454_2",
+          "test_body": "define <2 x i64> @PR35454_2(<2 x i64> %v) {\n  %bc = bitcast <2 x i64> %v to <4 x i32>\n  %permil = shufflevector <4 x i32> %bc, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc1 = bitcast <4 x i32> %permil to <8 x i16>\n  %add = shl <8 x i16> %bc1, splat (i16 1)\n  %bc2 = bitcast <8 x i16> %add to <4 x i32>\n  %permil1 = shufflevector <4 x i32> %bc2, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc3 = bitcast <4 x i32> %permil1 to <2 x i64>\n  ret <2 x i64> %bc3\n}\n"
+        },
+        {
+          "test_name": "PR35454_1",
+          "test_body": "define <2 x i64> @PR35454_1(<2 x i64> %v) {\n  %bc = bitcast <2 x i64> %v to <4 x i32>\n  %permil = shufflevector <4 x i32> %bc, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc1 = bitcast <4 x i32> %permil to <16 x i8>\n  %add = shl <16 x i8> %bc1, splat (i8 1)\n  %bc2 = bitcast <16 x i8> %add to <4 x i32>\n  %permil1 = shufflevector <4 x i32> %bc2, <4 x i32> poison, <4 x i32> <i32 3, i32 2, i32 1, i32 0>\n  %bc3 = bitcast <4 x i32> %permil1 to <2 x i64>\n  ret <2 x i64> %bc3\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/VectorCombine/X86/shuffletoidentity-bitcast.ll",
+      "commands": [
+        "opt -passes=vector-combine -S %s -mtriple=x86_64-- -mattr=+sse2",
+        "opt -passes=vector-combine -S %s -mtriple=x86_64-- -mattr=+avx2"
+      ],
+      "tests": [
+        {
+          "test_name": "bitcast_i64_to_i8_add",
+          "test_body": "define <2 x i64> @bitcast_i64_to_i8_add(<2 x i64> %a, <2 x i64> %b) {\n  %a_lo = shufflevector <2 x i64> %a, <2 x i64> poison, <1 x i32> zeroinitializer\n  %a_hi = shufflevector <2 x i64> %a, <2 x i64> poison, <1 x i32> <i32 1>\n  %b_lo = shufflevector <2 x i64> %b, <2 x i64> poison, <1 x i32> zeroinitializer\n  %b_hi = shufflevector <2 x i64> %b, <2 x i64> poison, <1 x i32> <i32 1>\n  %bc_a_lo = bitcast <1 x i64> %a_lo to <8 x i8>\n  %bc_a_hi = bitcast <1 x i64> %a_hi to <8 x i8>\n  %bc_b_lo = bitcast <1 x i64> %b_lo to <8 x i8>\n  %bc_b_hi = bitcast <1 x i64> %b_hi to <8 x i8>\n  %add_lo = add <8 x i8> %bc_a_lo, %bc_b_lo\n  %add_hi = add <8 x i8> %bc_a_hi, %bc_b_hi\n  %bc_lo = bitcast <8 x i8> %add_lo to <1 x i64>\n  %bc_hi = bitcast <8 x i8> %add_hi to <1 x i64>\n  %result = shufflevector <1 x i64> %bc_lo, <1 x i64> %bc_hi, <2 x i32> <i32 0, i32 1>\n  ret <2 x i64> %result\n}\n"
+        },
+        {
+          "test_name": "avx_bitcast_select",
+          "test_body": "define <4 x i64> @avx_bitcast_select(<4 x i64> %a, <4 x i64> %b) {\n  %a_lo = shufflevector <4 x i64> %a, <4 x i64> poison, <2 x i32> <i32 0, i32 1>\n  %a_hi = shufflevector <4 x i64> %a, <4 x i64> poison, <2 x i32> <i32 2, i32 3>\n  %b_lo = shufflevector <4 x i64> %b, <4 x i64> poison, <2 x i32> <i32 0, i32 1>\n  %b_hi = shufflevector <4 x i64> %b, <4 x i64> poison, <2 x i32> <i32 2, i32 3>\n  %bc_a_lo = bitcast <2 x i64> %a_lo to <4 x i32>\n  %bc_a_hi = bitcast <2 x i64> %a_hi to <4 x i32>\n  %bc_b_lo = bitcast <2 x i64> %b_lo to <4 x i32>\n  %bc_b_hi = bitcast <2 x i64> %b_hi to <4 x i32>\n  %cmp_lo = icmp sgt <4 x i32> %bc_a_lo, %bc_b_lo\n  %cmp_hi = icmp sgt <4 x i32> %bc_a_hi, %bc_b_hi\n  %sel_lo = select <4 x i1> %cmp_lo, <4 x i32> %bc_a_lo, <4 x i32> %bc_b_lo\n  %sel_hi = select <4 x i1> %cmp_hi, <4 x i32> %bc_a_hi, <4 x i32> %bc_b_hi\n  %bc_lo = bitcast <4 x i32> %sel_lo to <2 x i64>\n  %bc_hi = bitcast <4 x i32> %sel_hi to <2 x i64>\n  %result = shufflevector <2 x i64> %bc_lo, <2 x i64> %bc_hi, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x i64> %result\n}\n"
+        },
+        {
+          "test_name": "bitcast_widening_non_divisible",
+          "test_body": "define <3 x i32> @bitcast_widening_non_divisible(<2 x i64> %x) {\n  %bc = bitcast <2 x i64> %x to <4 x i32>\n  %r = shufflevector <4 x i32> %bc, <4 x i32> poison, <3 x i32> <i32 0, i32 1, i32 2>\n  ret <3 x i32> %r\n}\n"
+        },
+        {
+          "test_name": "bitcast_widen_misaligned",
+          "test_body": "define <8 x i16> @bitcast_widen_misaligned(<8 x i16> %a) {\n  %lo = shufflevector <8 x i16> %a, <8 x i16> poison, <4 x i32> <i32 1, i32 2, i32 3, i32 4>\n  %hi = shufflevector <8 x i16> %a, <8 x i16> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>\n  %bc_lo = bitcast <4 x i16> %lo to <2 x i32>\n  %bc_hi = bitcast <4 x i16> %hi to <2 x i32>\n  %add_lo = add <2 x i32> %bc_lo, %bc_lo\n  %add_hi = add <2 x i32> %bc_hi, %bc_hi\n  %res_lo = bitcast <2 x i32> %add_lo to <4 x i16>\n  %res_hi = bitcast <2 x i32> %add_hi to <4 x i16>\n  %result = shufflevector <4 x i16> %res_lo, <4 x i16> %res_hi, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>\n  ret <8 x i16> %result\n}\n"
+        },
+        {
+          "test_name": "bitcast_i32_to_i64_add",
+          "test_body": "define <4 x i32> @bitcast_i32_to_i64_add(<4 x i32> %a, <4 x i32> %b) {\n  %a_lo = shufflevector <4 x i32> %a, <4 x i32> poison, <2 x i32> <i32 0, i32 1>\n  %a_hi = shufflevector <4 x i32> %a, <4 x i32> poison, <2 x i32> <i32 2, i32 3>\n  %b_lo = shufflevector <4 x i32> %b, <4 x i32> poison, <2 x i32> <i32 0, i32 1>\n  %b_hi = shufflevector <4 x i32> %b, <4 x i32> poison, <2 x i32> <i32 2, i32 3>\n  %bc_a_lo = bitcast <2 x i32> %a_lo to <1 x i64>\n  %bc_a_hi = bitcast <2 x i32> %a_hi to <1 x i64>\n  %bc_b_lo = bitcast <2 x i32> %b_lo to <1 x i64>\n  %bc_b_hi = bitcast <2 x i32> %b_hi to <1 x i64>\n  %add_lo = add <1 x i64> %bc_a_lo, %bc_b_lo\n  %add_hi = add <1 x i64> %bc_a_hi, %bc_b_hi\n  %bc_lo = bitcast <1 x i64> %add_lo to <2 x i32>\n  %bc_hi = bitcast <1 x i64> %add_hi to <2 x i32>\n  %result = shufflevector <2 x i32> %bc_lo, <2 x i32> %bc_hi, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x i32> %result\n}\n"
+        },
+        {
+          "test_name": "bitcast_i64_to_i16_shl",
+          "test_body": "define <2 x i64> @bitcast_i64_to_i16_shl(<2 x i64> %a) {\n  %a_lo = shufflevector <2 x i64> %a, <2 x i64> poison, <1 x i32> zeroinitializer\n  %a_hi = shufflevector <2 x i64> %a, <2 x i64> poison, <1 x i32> <i32 1>\n  %bc_lo = bitcast <1 x i64> %a_lo to <4 x i16>\n  %bc_hi = bitcast <1 x i64> %a_hi to <4 x i16>\n  %shl_lo = shl <4 x i16> %bc_lo, splat (i16 3)\n  %shl_hi = shl <4 x i16> %bc_hi, splat (i16 3)\n  %res_lo = bitcast <4 x i16> %shl_lo to <1 x i64>\n  %res_hi = bitcast <4 x i16> %shl_hi to <1 x i64>\n  %result = shufflevector <1 x i64> %res_lo, <1 x i64> %res_hi, <2 x i32> <i32 0, i32 1>\n  ret <2 x i64> %result\n}\n"
+        },
+        {
+          "test_name": "bitcast_i64_to_i32_xor",
+          "test_body": "define <2 x i64> @bitcast_i64_to_i32_xor(<2 x i64> %a, <2 x i64> %b) {\n  %a_lo = shufflevector <2 x i64> %a, <2 x i64> poison, <1 x i32> zeroinitializer\n  %a_hi = shufflevector <2 x i64> %a, <2 x i64> poison, <1 x i32> <i32 1>\n  %b_lo = shufflevector <2 x i64> %b, <2 x i64> poison, <1 x i32> zeroinitializer\n  %b_hi = shufflevector <2 x i64> %b, <2 x i64> poison, <1 x i32> <i32 1>\n  %bc_a_lo = bitcast <1 x i64> %a_lo to <2 x i32>\n  %bc_a_hi = bitcast <1 x i64> %a_hi to <2 x i32>\n  %bc_b_lo = bitcast <1 x i64> %b_lo to <2 x i32>\n  %bc_b_hi = bitcast <1 x i64> %b_hi to <2 x i32>\n  %xor_lo = xor <2 x i32> %bc_a_lo, %bc_b_lo\n  %xor_hi = xor <2 x i32> %bc_a_hi, %bc_b_hi\n  %bc_lo = bitcast <2 x i32> %xor_lo to <1 x i64>\n  %bc_hi = bitcast <2 x i32> %xor_hi to <1 x i64>\n  %result = shufflevector <1 x i64> %bc_lo, <1 x i64> %bc_hi, <2 x i32> <i32 0, i32 1>\n  ret <2 x i64> %result\n}\n"
+        },
+        {
+          "test_name": "avx_bitcast_i64_to_i32_and",
+          "test_body": "define <4 x i64> @avx_bitcast_i64_to_i32_and(<4 x i64> %a, <4 x i64> %b) {\n  %a_lo = shufflevector <4 x i64> %a, <4 x i64> poison, <2 x i32> <i32 0, i32 1>\n  %a_hi = shufflevector <4 x i64> %a, <4 x i64> poison, <2 x i32> <i32 2, i32 3>\n  %b_lo = shufflevector <4 x i64> %b, <4 x i64> poison, <2 x i32> <i32 0, i32 1>\n  %b_hi = shufflevector <4 x i64> %b, <4 x i64> poison, <2 x i32> <i32 2, i32 3>\n  %bc_a_lo = bitcast <2 x i64> %a_lo to <4 x i32>\n  %bc_a_hi = bitcast <2 x i64> %a_hi to <4 x i32>\n  %bc_b_lo = bitcast <2 x i64> %b_lo to <4 x i32>\n  %bc_b_hi = bitcast <2 x i64> %b_hi to <4 x i32>\n  %and_lo = and <4 x i32> %bc_a_lo, %bc_b_lo\n  %and_hi = and <4 x i32> %bc_a_hi, %bc_b_hi\n  %bc_lo = bitcast <4 x i32> %and_lo to <2 x i64>\n  %bc_hi = bitcast <4 x i32> %and_hi to <2 x i64>\n  %result = shufflevector <2 x i64> %bc_lo, <2 x i64> %bc_hi, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n  ret <4 x i64> %result\n}\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "vectorizers",
+    "llvm:transforms",
+    "llvm:vectorcombine"
+  ],
+  "comments": [
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--LLVM CODE FORMAT COMMENT: {clang-format}-->\n\n:white_check_mark: With the latest revision this PR passed the C/C++ code formatter."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Linux-->\n# :penguin: Linux x64 Test Results\n\n* 194628 tests passed\n* 5165 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "github-actions[bot]",
+      "body": "<!--PREMERGE ADVISOR COMMENT: Windows-->\n# :window: Windows x64 Test Results\n\n* 134122 tests passed\n* 3189 tests skipped\n\n:white_check_mark: The build succeeded and all tests passed."
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "> Please regenerate the outstanding CI failing tests\r\n\r\ndone"
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "Hello @RKSimon  can you please review my PR. Thank you"
+    },
+    {
+      "author": "RKSimon",
+      "body": "@AbdallahRashed I think this will need refactoring once #188989 lands"
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "Hello @RKSimon  I see https://github.com/llvm/llvm-project/pull/188989 has been merged, Do I need to work on this one now? is it ready? is there any other dependency? still needed ? Thank you "
+    },
+    {
+      "author": "RKSimon",
+      "body": "> Hello @RKSimon I see #188989 has been merged, Do I need to work on this one now? is it ready? is there any other dependency? still needed ? Thank you\r\n\r\nYes, you should be good to work on this now - starting with fixing the merge conflict"
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "> Fix merge failure\r\n\r\nsorry little bit busy, will do it tomorrow hopefully or day after tomorrow maximum, Thank you "
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "> > Hello @RKSimon I see #188989 has been merged, Do I need to work on this one now? is it ready? is there any other dependency? still needed ? Thank you\r\n> \r\n> Yes, you should be good to work on this now - starting with fixing the merge conflict\r\n\r\ndone  please review "
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "Hello @arsenm  @RKSimon  can you please let me know if something is needed? "
+    },
+    {
+      "author": "dtcxzyw",
+      "body": "The following correctness issue was found by [llvm-hackme](https://github.com/dtcxzyw/llvm-hackme).\n\n<!-- llvm-hackme-state: no_issue_found_for_current_patch -->\n<!-- llvm-hackme-baseline: fa2b19ff0de2edb3166331d8ffa1f9ad5ea4eafe -->\n<!-- llvm-hackme-head-sha: 75d83ca6258504528375e0553f41af60afb387fa -->\n<!-- llvm-hackme-patch-sha256: d74a1ce8cc6fb464daed215f1cd3a9ac3496e9d8bcce489d2e881c93ff314d18 -->\n\nThis comment is generated by an automated correctness checking service designed to help identify critical correctness bugs (opt crashes or Alive2 miscompilations) and improve PR review efficiency under limited reviewer bandwidth.\n\n## Status: Previously reported issue no longer reproduces\n\nThe correctness bug previously reported by [llvm-hackme](https://github.com/dtcxzyw/llvm-hackme) no longer reproduces with the current PR update, and fuzzing did not identify any new correctness bugs (opt crashes or Alive2 miscompilations).\n\n**Baseline Revision**: `fa2b19ff0de2edb3166331d8ffa1f9ad5ea4eafe`\n**PR Head SHA**: `75d83ca6258504528375e0553f41af60afb387fa`\n**Patch SHA256**: `d74a1ce8cc6fb464daed215f1cd3a9ac3496e9d8bcce489d2e881c93ff314d18`\n"
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "> The following correctness issue was found by [llvm-hackme](https://github.com/dtcxzyw/llvm-hackme).\r\n> \r\n> This comment is generated by an automated correctness checking service designed to help identify critical correctness bugs (opt crashes or Alive2 miscompilations) and improve PR review efficiency under limited reviewer bandwidth.\r\n> \r\n> ## Status: Previously reported issue no longer reproduces\r\n> The correctness bug previously reported by [llvm-hackme](https://github.com/dtcxzyw/llvm-hackme) no longer reproduces with the current PR update, and fuzzing did not identify any new correctness bugs (opt crashes or Alive2 miscompilations).\r\n> \r\n> **Baseline Revision**: `fa2b19ff0de2edb3166331d8ffa1f9ad5ea4eafe` **PR Head SHA**: `75d83ca6258504528375e0553f41af60afb387fa` **Patch SHA256**: `d74a1ce8cc6fb464daed215f1cd3a9ac3496e9d8bcce489d2e881c93ff314d18`\r\n\r\nThank you,fixed"
+    },
+    {
+      "author": "AbdallahRashed",
+      "body": "@RKSimon  please check thank you "
+    }
+  ],
+  "knowledge_cutoff": "2026-03-21T16:25:17Z",
+  "patch_location_lineno": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      [
+        3527,
+        3533
+      ],
+      [
+        3551,
+        3556
+      ],
+      [
+        3571,
+        3577
+      ],
+      [
+        3621,
+        3626
+      ],
+      [
+        3644,
+        3650
+      ],
+      [
+        3725,
+        3738
+      ],
+      [
+        3775,
+        3780
+      ]
+    ],
+    "llvm/test/Transforms/PhaseOrdering/X86/pr67803.ll": [
+      [
+        1,
+        35
+      ],
+      [
+        77,
+        79
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/AArch64/combine-shuffle-ext.ll": [
+      [
+        399,
+        407
+      ],
+      [
+        553,
+        561
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/AArch64/shuffletoidentity.ll": [
+      [
+        1356,
+        1358
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/X86/shuffle-inseltpoison.ll": [
+      [
+        124,
+        144
+      ],
+      [
+        154,
+        174
+      ]
+    ],
+    "llvm/test/Transforms/VectorCombine/X86/shuffle.ll": [
+      [
+        183,
+        204
+      ],
+      [
+        215,
+        236
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Transforms/Vectorize/VectorCombine.cpp": [
+      "VectorCombine::foldShuffleToIdentity",
+      "generateNewInstTree"
+    ]
+  }
+}

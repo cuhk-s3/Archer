@@ -1,0 +1,233 @@
+{
+  "pr_id": 196890,
+  "pr_url": "https://github.com/llvm/llvm-project/pull/196890",
+  "state": "open",
+  "title": "Revert \"[AA] No synchronization effects for never-escaping identified local\"",
+  "author": "nikic",
+  "base_commit": "23b7a131c27a37da8ce465c82e599b75c10dfba6",
+  "fix_commit": "8503d7a1bcefab26cda9b556ea7114e4caa12676",
+  "patch": "diff --git a/llvm/lib/Analysis/AliasAnalysis.cpp b/llvm/lib/Analysis/AliasAnalysis.cpp\nindex ffb2dc0f4e041..1449a54d1de2b 100644\n--- a/llvm/lib/Analysis/AliasAnalysis.cpp\n+++ b/llvm/lib/Analysis/AliasAnalysis.cpp\n@@ -458,34 +458,12 @@ raw_ostream &llvm::operator<<(raw_ostream &OS, AliasResult AR) {\n // Helper method implementation\n //===----------------------------------------------------------------------===//\n \n-/// Get ModRefInfo for a synchronizing operation, such as a fence or stronger\n-/// than monotonic atomic load/store.\n-static ModRefInfo getSyncEffects(AAResults *AA, const MemoryLocation &Loc,\n-                                 AAQueryInfo &AAQI) {\n-  if (!Loc.Ptr)\n-    return ModRefInfo::ModRef;\n-\n-  // If the location is *never* captured, it cannot be affected by\n-  // synchronizing operations. However, we cannot ignore locations that are\n-  // only captured after the operation, as the synchronization may still have\n-  // an effect if the object is only captured *later*. As such, set I to null\n-  // and ReturnCaptures to true here.\n-  const Value *Obj = getUnderlyingObject(Loc.Ptr);\n-  if (capturesNothing(AAQI.CA->getCapturesBefore(\n-          Obj, /*I=*/nullptr, /*OrAt=*/true, /*ReturnCaptures=*/true)))\n-    return ModRefInfo::NoModRef;\n-\n-  // If Loc is a constant memory location, the synchronization operation\n-  // definitely could not modify it.\n-  return AA->getModRefInfoMask(Loc);\n-}\n-\n ModRefInfo AAResults::getModRefInfo(const LoadInst *L,\n                                     const MemoryLocation &Loc,\n                                     AAQueryInfo &AAQI) {\n   // Be conservative in the face of atomic.\n   if (isStrongerThan(L->getOrdering(), AtomicOrdering::Unordered))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   // If the load address doesn't alias the given address, it doesn't read\n   // or write the specified memory.\n@@ -503,7 +481,7 @@ ModRefInfo AAResults::getModRefInfo(const StoreInst *S,\n                                     AAQueryInfo &AAQI) {\n   // Be conservative in the face of atomic.\n   if (isStrongerThan(S->getOrdering(), AtomicOrdering::Unordered))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   if (Loc.Ptr) {\n     AliasResult AR = alias(MemoryLocation::get(S), Loc, AAQI, S);\n@@ -537,9 +515,14 @@ ModRefInfo AAResults::getModRefInfo(const FenceInst *F,\n         return ModRefInfo::NoModRef;\n     }\n \n-    return Result & getSyncEffects(this, Loc, AAQI);\n-  }\n+    // Apply the ModRef mask. This ensures that if Loc is a constant memory\n+    // location, we take into account the fact that the fence definitely could\n+    // not modify the memory location.\n+    if (!isNoModRef(Result))\n+      Result &= getModRefInfoMask(Loc);\n \n+    return Result;\n+  }\n   return ModRefInfo::ModRef;\n }\n \n@@ -593,7 +576,7 @@ ModRefInfo AAResults::getModRefInfo(const AtomicCmpXchgInst *CX,\n                                     AAQueryInfo &AAQI) {\n   // Acquire/Release cmpxchg has properties that matter for arbitrary addresses.\n   if (isStrongerThanMonotonic(CX->getSuccessOrdering()))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   if (Loc.Ptr) {\n     AliasResult AR = alias(MemoryLocation::get(CX), Loc, AAQI, CX);\n@@ -611,7 +594,7 @@ ModRefInfo AAResults::getModRefInfo(const AtomicRMWInst *RMW,\n                                     AAQueryInfo &AAQI) {\n   // Acquire/Release atomicrmw has properties that matter for arbitrary addresses.\n   if (isStrongerThanMonotonic(RMW->getOrdering()))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   if (Loc.Ptr) {\n     AliasResult AR = alias(MemoryLocation::get(RMW), Loc, AAQI, RMW);\n",
+  "components": [
+    "AliasAnalysis"
+  ],
+  "description": "Reverts llvm/llvm-project#193939\r\n\r\nCaused buildbot failure.",
+  "tests": [
+    {
+      "file": "llvm/test/Analysis/BasicAA/atomics.ll",
+      "commands": [
+        "opt -passes=aa-eval -print-all-alias-modref-info -disable-output 2>&1 %s"
+      ],
+      "tests": [
+        {
+          "test_name": "noalias_no_escape",
+          "test_body": "define void @noalias_no_escape(ptr noalias %a, ptr %x) {\n  store i32 0, ptr %a, align 4\n  fence release\n  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n  %3 = load atomic i32, ptr %x acquire, align 4\n  store atomic i32 0, ptr %x release, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "alloca_escape_after",
+          "test_body": "declare void @escape(ptr)\n\ndefine void @alloca_escape_after(ptr %x) {\n  %a = alloca i32, align 4\n  store i32 0, ptr %a, align 4\n  fence release\n  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n  %3 = load atomic i32, ptr %x acquire, align 4\n  store atomic i32 0, ptr %x release, align 4\n  call void @escape(ptr %a)\n  ret void\n}\n"
+        },
+        {
+          "test_name": "malloc_no_escape",
+          "test_body": "declare noalias ptr @malloc(i64)\n\ndefine void @malloc_no_escape(ptr %x) {\n  %a = call ptr @malloc(i64 4)\n  store i32 0, ptr %a, align 4\n  fence release\n  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n  %3 = load atomic i32, ptr %x acquire, align 4\n  store atomic i32 0, ptr %x release, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "noalias_escape_after",
+          "test_body": "define void @noalias_escape_after(ptr noalias %a, ptr %x) {\n  store i32 0, ptr %a, align 4\n  fence release\n  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n  %3 = load atomic i32, ptr %x acquire, align 4\n  store atomic i32 0, ptr %x release, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "alloca_no_escape",
+          "test_body": "define void @alloca_no_escape(ptr %x) {\n  %a = alloca i32, align 4\n  store i32 0, ptr %a, align 4\n  %1 = atomicrmw add ptr %x, i32 1 monotonic, align 4\n  %2 = cmpxchg ptr %x, i32 0, i32 1 monotonic monotonic, align 4\n  %3 = load atomic i32, ptr %x monotonic, align 4\n  store atomic i32 0, ptr %x monotonic, align 4\n  fence release\n  %4 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n  %5 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n  %6 = load atomic i32, ptr %x acquire, align 4\n  store atomic i32 0, ptr %x release, align 4\n  fence seq_cst\n  %7 = atomicrmw add ptr %x, i32 1 seq_cst, align 4\n  %8 = cmpxchg ptr %x, i32 0, i32 1 seq_cst seq_cst, align 4\n  %9 = load atomic i32, ptr %x seq_cst, align 4\n  store atomic i32 0, ptr %x seq_cst, align 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Analysis/MemorySSA/atomic-clobber.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes='print<memoryssa>,verify<memoryssa>' -disable-output < %s 2>&1"
+      ],
+      "tests": [
+        {
+          "test_name": "seq_cst_clobber",
+          "test_body": "define void @seq_cst_clobber(ptr noalias %a, ptr noalias %b) {\n  %1 = load atomic i32, ptr %a monotonic, align 4\n  %2 = load atomic i32, ptr %a seq_cst, align 4\n  %3 = load atomic i32, ptr %a monotonic, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "check_aa_is_sane",
+          "test_body": "define void @check_aa_is_sane(ptr noalias %a, ptr noalias %b) {\n  %1 = cmpxchg ptr %a, i32 0, i32 1 acquire acquire, align 4\n  %2 = load i32, ptr %b, align 4\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/DeadStoreElimination/fence.ll",
+      "commands": [
+        "opt -S -passes=dse < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test3",
+          "test_body": "define void @test3(ptr byval(i32) %addr.i) {\n  store i32 5, ptr %addr.i, align 4\n  fence release\n  ret void\n}\n"
+        },
+        {
+          "test_name": "fence_seq_cst",
+          "test_body": "define void @fence_seq_cst() {\n  %P1 = alloca i32, align 4\n  store i32 0, ptr %P1, align 4\n  fence seq_cst\n  store i32 4, ptr %P1, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test2",
+          "test_body": "define void @test2(ptr %addr.i) {\n  store i32 5, ptr %addr.i, align 4\n  fence acquire\n  store i32 5, ptr %addr.i, align 4\n  ret void\n}\n"
+        },
+        {
+          "test_name": "test_nocapture",
+          "test_body": "declare void @foo(ptr captures(none))\n\ndeclare noalias ptr @malloc(i32)\n\ndefine void @test_nocapture() {\n  %m = call ptr @malloc(i32 24)\n  call void @foo(ptr %m)\n  store i8 4, ptr %m, align 1\n  fence release\n  ret void\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/fence.ll",
+      "commands": [
+        "opt -S -passes=gvn < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "test3",
+          "test_body": "define i32 @test3(ptr noalias %addr.i, ptr noalias %otheraddr) {\n  fence acquire\n  %a = load i32, ptr %addr.i, align 4\n  fence acquire\n  %a2 = load i32, ptr %addr.i, align 4\n  %res = sub i32 %a, %a2\n  ret i32 %res\n}\n"
+        },
+        {
+          "test_name": "test2",
+          "test_body": "define i32 @test2(ptr %addr.i) {\n  %a = load i32, ptr %addr.i, align 4\n  fence release\n  %a2 = load i32, ptr %addr.i, align 4\n  %res = sub i32 %a, %a2\n  ret i32 %res\n}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/GVN/simplify-icf-cache-invalidation.ll",
+      "commands": [
+        "opt -passes=gvn -S < %s"
+      ],
+      "tests": [
+        {
+          "test_name": "eggs",
+          "test_body": "%struct.wombat = type { ptr }\n%struct.baz = type { i8, ptr }\n\n@global = external hidden unnamed_addr constant ptr\n\ndeclare ptr @f()\n\ndefine hidden void @eggs(ptr %arg, i1 %arg2, ptr %arg3, i32 %arg4, ptr %arg5) unnamed_addr align 2 {\nbb:\n  %tmp = alloca %struct.wombat, align 8\n  store ptr @global, ptr %arg, align 8, !invariant.group !0\n  br i1 %arg2, label %bb4, label %bb2\n\nbb2:                                              ; preds = %bb\n  %tmp3 = atomicrmw sub ptr %arg3, i32 %arg4 acq_rel, align 4\n  br label %bb4\n\nbb4:                                              ; preds = %bb2, %bb\n  %tmp5 = load ptr, ptr %arg5, align 8\n  %tmp6 = getelementptr inbounds %struct.baz, ptr %tmp5, i64 0, i32 1\n  br i1 %arg2, label %bb9, label %bb7\n\nbb7:                                              ; preds = %bb4\n  %tmp8 = tail call ptr @f()\n  br label %bb9\n\nbb9:                                              ; preds = %bb7, %bb4\n  %tmp10 = load ptr, ptr %arg5, align 8\n  %tmp13 = load ptr, ptr %arg, align 8, !invariant.group !0\n  %tmp15 = load ptr, ptr %tmp13, align 8\n  tail call void %tmp15(ptr %arg, i1 %arg2)\n  %tmp17 = load ptr, ptr %tmp, align 8\n  %tmp18 = icmp eq ptr %tmp17, null\n  ret void\n}\n\n!0 = !{}\n"
+        }
+      ]
+    },
+    {
+      "file": "llvm/test/Transforms/LICM/atomics.ll",
+      "commands": [
+        "opt -aa-pipeline=basic-aa -passes='require<opt-remark-emit>,loop-mssa(licm)' < %s -S"
+      ],
+      "tests": [
+        {
+          "test_name": "test8",
+          "test_body": "define i32 @test8(ptr noalias captures(none) %x, ptr captures(none) %y) {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  %vala = load atomic i32, ptr %y monotonic, align 4\n  store atomic i32 %vala, ptr %x unordered, align 4\n  fence release\n  %exitcond = icmp ne i32 %vala, 0\n  br i1 %exitcond, label %end, label %loop\n\nend:                                              ; preds = %loop\n  ret i32 %vala\n}\n"
+        },
+        {
+          "test_name": "test7b",
+          "test_body": "; Function Attrs: nounwind ssp uwtable\ndefine i32 @test7b(ptr noalias captures(none) %x, ptr captures(none) %y, ptr noalias captures(none) %z) #0 {\nentry:\n  br label %loop\n\nloop:                                             ; preds = %loop, %entry\n  store i32 5, ptr %x, align 4\n  %vala = load atomic i32, ptr %y monotonic, align 4\n  store atomic i32 %vala, ptr %z unordered, align 4\n  %exitcond = icmp ne i32 %vala, 0\n  br i1 %exitcond, label %end, label %loop\n\nend:                                              ; preds = %loop\n  ret i32 %vala\n}\n\nattributes #0 = { nounwind ssp uwtable }\n"
+        }
+      ]
+    }
+  ],
+  "labels": [
+    "llvm:analysis",
+    "llvm:transforms"
+  ],
+  "comments": [
+    {
+      "author": "llvmorg-github-actions[bot]",
+      "body": "\n<!--LLVM PR SUMMARY COMMENT-->\n@llvm/pr-subscribers-llvm-transforms\n\n@llvm/pr-subscribers-llvm-analysis\n\nAuthor: Nikita Popov (nikic)\n\n<details>\n<summary>Changes</summary>\n\nReverts llvm/llvm-project#<!-- -->193939\r\n\r\nCaused buildbot failure.\n\n---\nFull diff: https://github.com/llvm/llvm-project/pull/196890.diff\n\n\n7 Files Affected:\n\n- (modified) llvm/lib/Analysis/AliasAnalysis.cpp (+11-28) \n- (modified) llvm/test/Analysis/BasicAA/atomics.ll (+22-24) \n- (modified) llvm/test/Analysis/MemorySSA/atomic-clobber.ll (+1-1) \n- (modified) llvm/test/Transforms/DeadStoreElimination/fence.ll (+8) \n- (modified) llvm/test/Transforms/GVN/fence.ll (+2-2) \n- (modified) llvm/test/Transforms/GVN/simplify-icf-cache-invalidation.ll (+2) \n- (modified) llvm/test/Transforms/LICM/atomics.ll (+3-3) \n\n\n``````````diff\ndiff --git a/llvm/lib/Analysis/AliasAnalysis.cpp b/llvm/lib/Analysis/AliasAnalysis.cpp\nindex ffb2dc0f4e041..1449a54d1de2b 100644\n--- a/llvm/lib/Analysis/AliasAnalysis.cpp\n+++ b/llvm/lib/Analysis/AliasAnalysis.cpp\n@@ -458,34 +458,12 @@ raw_ostream &llvm::operator<<(raw_ostream &OS, AliasResult AR) {\n // Helper method implementation\n //===----------------------------------------------------------------------===//\n \n-/// Get ModRefInfo for a synchronizing operation, such as a fence or stronger\n-/// than monotonic atomic load/store.\n-static ModRefInfo getSyncEffects(AAResults *AA, const MemoryLocation &Loc,\n-                                 AAQueryInfo &AAQI) {\n-  if (!Loc.Ptr)\n-    return ModRefInfo::ModRef;\n-\n-  // If the location is *never* captured, it cannot be affected by\n-  // synchronizing operations. However, we cannot ignore locations that are\n-  // only captured after the operation, as the synchronization may still have\n-  // an effect if the object is only captured *later*. As such, set I to null\n-  // and ReturnCaptures to true here.\n-  const Value *Obj = getUnderlyingObject(Loc.Ptr);\n-  if (capturesNothing(AAQI.CA->getCapturesBefore(\n-          Obj, /*I=*/nullptr, /*OrAt=*/true, /*ReturnCaptures=*/true)))\n-    return ModRefInfo::NoModRef;\n-\n-  // If Loc is a constant memory location, the synchronization operation\n-  // definitely could not modify it.\n-  return AA->getModRefInfoMask(Loc);\n-}\n-\n ModRefInfo AAResults::getModRefInfo(const LoadInst *L,\n                                     const MemoryLocation &Loc,\n                                     AAQueryInfo &AAQI) {\n   // Be conservative in the face of atomic.\n   if (isStrongerThan(L->getOrdering(), AtomicOrdering::Unordered))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   // If the load address doesn't alias the given address, it doesn't read\n   // or write the specified memory.\n@@ -503,7 +481,7 @@ ModRefInfo AAResults::getModRefInfo(const StoreInst *S,\n                                     AAQueryInfo &AAQI) {\n   // Be conservative in the face of atomic.\n   if (isStrongerThan(S->getOrdering(), AtomicOrdering::Unordered))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   if (Loc.Ptr) {\n     AliasResult AR = alias(MemoryLocation::get(S), Loc, AAQI, S);\n@@ -537,9 +515,14 @@ ModRefInfo AAResults::getModRefInfo(const FenceInst *F,\n         return ModRefInfo::NoModRef;\n     }\n \n-    return Result & getSyncEffects(this, Loc, AAQI);\n-  }\n+    // Apply the ModRef mask. This ensures that if Loc is a constant memory\n+    // location, we take into account the fact that the fence definitely could\n+    // not modify the memory location.\n+    if (!isNoModRef(Result))\n+      Result &= getModRefInfoMask(Loc);\n \n+    return Result;\n+  }\n   return ModRefInfo::ModRef;\n }\n \n@@ -593,7 +576,7 @@ ModRefInfo AAResults::getModRefInfo(const AtomicCmpXchgInst *CX,\n                                     AAQueryInfo &AAQI) {\n   // Acquire/Release cmpxchg has properties that matter for arbitrary addresses.\n   if (isStrongerThanMonotonic(CX->getSuccessOrdering()))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   if (Loc.Ptr) {\n     AliasResult AR = alias(MemoryLocation::get(CX), Loc, AAQI, CX);\n@@ -611,7 +594,7 @@ ModRefInfo AAResults::getModRefInfo(const AtomicRMWInst *RMW,\n                                     AAQueryInfo &AAQI) {\n   // Acquire/Release atomicrmw has properties that matter for arbitrary addresses.\n   if (isStrongerThanMonotonic(RMW->getOrdering()))\n-    return getSyncEffects(this, Loc, AAQI);\n+    return ModRefInfo::ModRef;\n \n   if (Loc.Ptr) {\n     AliasResult AR = alias(MemoryLocation::get(RMW), Loc, AAQI, RMW);\ndiff --git a/llvm/test/Analysis/BasicAA/atomics.ll b/llvm/test/Analysis/BasicAA/atomics.ll\nindex 1101466fe7055..db0417c758e92 100644\n--- a/llvm/test/Analysis/BasicAA/atomics.ll\n+++ b/llvm/test/Analysis/BasicAA/atomics.ll\n@@ -8,29 +8,29 @@ declare noalias ptr @malloc(i64)\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %1 = atomicrmw add ptr %x, i32 1 monotonic, align 4\n ; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 monotonic monotonic, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 monotonic monotonic, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %3 = load atomic i32, ptr %x monotonic, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %3 = load atomic i32, ptr %x monotonic, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %3 = load atomic i32, ptr %x monotonic, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x monotonic, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x monotonic, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  store atomic i32 0, ptr %x monotonic, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  fence release\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  fence release\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  fence release\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %4 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %4 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %4 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %5 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %5 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %5 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %6 = load atomic i32, ptr %x acquire, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %6 = load atomic i32, ptr %x acquire, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %6 = load atomic i32, ptr %x acquire, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x release, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x release, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  store atomic i32 0, ptr %x release, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  fence seq_cst\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  fence seq_cst\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  fence seq_cst\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %7 = atomicrmw add ptr %x, i32 1 seq_cst, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %7 = atomicrmw add ptr %x, i32 1 seq_cst, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %7 = atomicrmw add ptr %x, i32 1 seq_cst, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %8 = cmpxchg ptr %x, i32 0, i32 1 seq_cst seq_cst, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %8 = cmpxchg ptr %x, i32 0, i32 1 seq_cst seq_cst, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %8 = cmpxchg ptr %x, i32 0, i32 1 seq_cst seq_cst, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %9 = load atomic i32, ptr %x seq_cst, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %9 = load atomic i32, ptr %x seq_cst, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %9 = load atomic i32, ptr %x seq_cst, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x seq_cst, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x seq_cst, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  store atomic i32 0, ptr %x seq_cst, align 4\n define void @alloca_no_escape(ptr %x) {\n   %a = alloca i32\n@@ -83,15 +83,15 @@ define void @alloca_escape_after(ptr %x) {\n }\n \n ; CHECK-LABEL: Function: noalias_no_escape:\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  fence release\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  fence release\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  fence release\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %3 = load atomic i32, ptr %x acquire, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %3 = load atomic i32, ptr %x acquire, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %3 = load atomic i32, ptr %x acquire, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x release, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x release, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  store atomic i32 0, ptr %x release, align 4\n define void @noalias_no_escape(ptr noalias %a, ptr %x) {\n   store i32 0, ptr %a\n@@ -125,23 +125,21 @@ define void @noalias_escape_after(ptr noalias %a, ptr %x) {\n   load atomic i32, ptr %x acquire, align 4\n   store atomic i32 0, ptr %x release, align 4\n \n-  call void @escape(ptr %a)\n-\n   ret void\n }\n \n ; CHECK-LABEL: Function: malloc_no_escape:\n ; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %a = call ptr @malloc(i64 4)\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %a = call ptr @malloc(i64 4)\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  fence release\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  fence release\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  fence release\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %1 = atomicrmw add ptr %x, i32 1 acq_rel, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %2 = cmpxchg ptr %x, i32 0, i32 1 acq_rel monotonic, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  %3 = load atomic i32, ptr %x acquire, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  %3 = load atomic i32, ptr %x acquire, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  %3 = load atomic i32, ptr %x acquire, align 4\n-; CHECK:  NoModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x release, align 4\n+; CHECK:  Both ModRef:  Ptr: i32* %a\t<->  store atomic i32 0, ptr %x release, align 4\n ; CHECK:  Both ModRef:  Ptr: i32* %x\t<->  store atomic i32 0, ptr %x release, align 4\n define void @malloc_no_escape(ptr %x) {\n   %a = call ptr @malloc(i64 4)\ndiff --git a/llvm/test/Analysis/MemorySSA/atomic-clobber.ll b/llvm/test/Analysis/MemorySSA/atomic-clobber.ll\nindex 86708ecbc58fd..326ec8b15283d 100644\n--- a/llvm/test/Analysis/MemorySSA/atomic-clobber.ll\n+++ b/llvm/test/Analysis/MemorySSA/atomic-clobber.ll\n@@ -106,7 +106,7 @@ define void @seq_cst_clobber(ptr noalias %a, ptr noalias %b) {\n ; If AA gets more aggressive, we can find another way.\n ;\n ; CHECK-LABEL: define void @check_aa_is_sane\n-define void @check_aa_is_sane(ptr noalias %a, ptr %b) {\n+define void @check_aa_is_sane(ptr noalias %a, ptr noalias %b) {\n ; CHECK: 1 = MemoryDef(liveOnEntry)\n ; CHECK-NEXT: cmpxchg ptr %a, i32 0, i32 1 acquire acquire\n   cmpxchg ptr %a, i32 0, i32 1 acquire acquire\ndiff --git a/llvm/test/Transforms/DeadStoreElimination/fence.ll b/llvm/test/Transforms/DeadStoreElimination/fence.ll\nindex 3c02d715eb94d..b619b0035ce03 100644\n--- a/llvm/test/Transforms/DeadStoreElimination/fence.ll\n+++ b/llvm/test/Transforms/DeadStoreElimination/fence.ll\n@@ -54,6 +54,7 @@ define void @test2(ptr %addr.i) {\n   ret void\n }\n \n+; TODO:\n ; We DSE stack alloc'ed and byval locations, in the presence of fences.\n ; Fence does not make an otherwise thread local store visible.\n ; Right now the DSE in presence of fence is only done in end blocks (with no successors),\n@@ -62,6 +63,7 @@ define void @test2(ptr %addr.i) {\n define void @test3(ptr byval(i32) %addr.i) {\n ; CHECK-LABEL: define void @test3(\n ; CHECK-SAME: ptr byval(i32) [[ADDR_I:%.*]]) {\n+; CHECK-NEXT:    store i32 5, ptr [[ADDR_I]], align 4\n ; CHECK-NEXT:    fence release\n ; CHECK-NEXT:    ret void\n ;\n@@ -74,11 +76,13 @@ declare void @foo(ptr nocapture %p)\n \n declare noalias ptr @malloc(i32)\n \n+; TODO:\n ; DSE of stores in locations allocated through library calls.\n define void @test_nocapture() {\n ; CHECK-LABEL: define void @test_nocapture() {\n ; CHECK-NEXT:    [[M:%.*]] = call ptr @malloc(i32 24)\n ; CHECK-NEXT:    call void @foo(ptr [[M]])\n+; CHECK-NEXT:    store i8 4, ptr [[M]], align 1\n ; CHECK-NEXT:    fence release\n ; CHECK-NEXT:    ret void\n ;\n@@ -89,10 +93,14 @@ define void @test_nocapture() {\n   ret void\n }\n \n+\n+; TODO:\n ; This is a full fence, but it does not make a thread local store visible.\n ; We can DSE the store in presence of the fence.\n define void @fence_seq_cst() {\n ; CHECK-LABEL: define void @fence_seq_cst() {\n+; CHECK-NEXT:    [[P1:%.*]] = alloca i32, align 4\n+; CHECK-NEXT:    store i32 0, ptr [[P1]], align 4\n ; CHECK-NEXT:    fence seq_cst\n ; CHECK-NEXT:    ret void\n ;\ndiff --git a/llvm/test/Transforms/GVN/fence.ll b/llvm/test/Transforms/GVN/fence.ll\nindex 16c6b5143703d..f2b1538843681 100644\n--- a/llvm/test/Transforms/GVN/fence.ll\n+++ b/llvm/test/Transforms/GVN/fence.ll\n@@ -37,9 +37,9 @@ define i32 @test2(ptr %addr.i) {\n ; ordering property (though it is that too), but a liveness\n ; property.  We expect to eventually see the value of store by\n ; another thread when spinning on that location.\n-define i32 @test3(ptr %addr.i) {\n+define i32 @test3(ptr noalias %addr.i, ptr noalias %otheraddr) {\n ; CHECK-LABEL: define i32 @test3\n-; CHECK-SAME: (ptr [[ADDR_I:%.*]]) {\n+; CHECK-SAME: (ptr noalias [[ADDR_I:%.*]], ptr noalias [[OTHERADDR:%.*]]) {\n ; CHECK-NEXT:    fence acquire\n ; CHECK-NEXT:    [[A:%.*]] = load i32, ptr [[ADDR_I]], align 4\n ; CHECK-NEXT:    fence acquire\ndiff --git a/llvm/test/Transforms/GVN/simplify-icf-cache-invalidation.ll b/llvm/test/Transforms/GVN/simplify-icf-cache-invalidation.ll\nindex fc85048ebdacf..f4a4155e94f80 100644\n--- a/llvm/test/Transforms/GVN/simplify-icf-cache-invalidation.ll\n+++ b/llvm/test/Transforms/GVN/simplify-icf-cache-invalidation.ll\n@@ -28,6 +28,8 @@ define hidden void @eggs(ptr %arg, i1 %arg2, ptr %arg3, i32 %arg4, ptr %arg5) un\n ; CHECK-NEXT:    br label %[[BB9]]\n ; CHECK:       [[BB9]]:\n ; CHECK-NEXT:    tail call void @quux(ptr [[ARG]], i1 [[ARG2]])\n+; CHECK-NEXT:    [[TMP17:%.*]] = load ptr, ptr [[TMP]], align 8\n+; CHECK-NEXT:    [[TMP18:%.*]] = icmp eq ptr [[TMP17]], null\n ; CHECK-NEXT:    ret void\n ;\n bb:\ndiff --git a/llvm/test/Transforms/LICM/atomics.ll b/llvm/test/Transforms/LICM/atomics.ll\nindex 1d29b038c9a53..2b3435ba2e7ef 100644\n--- a/llvm/test/Transforms/LICM/atomics.ll\n+++ b/llvm/test/Transforms/LICM/atomics.ll\n@@ -239,7 +239,6 @@ define i32 @test7b(ptr nocapture noalias %x, ptr nocapture %y, ptr noalias nocap\n ; CHECK-LABEL: define i32 @test7b(\n ; CHECK-SAME: ptr noalias captures(none) [[X:%.*]], ptr captures(none) [[Y:%.*]], ptr noalias captures(none) [[Z:%.*]]) #[[ATTR0]] {\n ; CHECK-NEXT:  [[ENTRY:.*:]]\n-; CHECK-NEXT:    store i32 5, ptr [[X]], align 4\n ; CHECK-NEXT:    br label %[[LOOP:.*]]\n ; CHECK:       [[LOOP]]:\n ; CHECK-NEXT:    [[VALA:%.*]] = load atomic i32, ptr [[Y]] monotonic, align 4\n@@ -248,6 +247,7 @@ define i32 @test7b(ptr nocapture noalias %x, ptr nocapture %y, ptr noalias nocap\n ; CHECK:       [[END]]:\n ; CHECK-NEXT:    [[VALA_LCSSA1:%.*]] = phi i32 [ [[VALA]], %[[LOOP]] ]\n ; CHECK-NEXT:    [[VALA_LCSSA:%.*]] = phi i32 [ [[VALA]], %[[LOOP]] ]\n+; CHECK-NEXT:    store i32 5, ptr [[X]], align 4\n ; CHECK-NEXT:    store atomic i32 [[VALA_LCSSA1]], ptr [[Z]] unordered, align 4\n ; CHECK-NEXT:    ret i32 [[VALA_LCSSA]]\n ;\n@@ -266,9 +266,9 @@ end:\n }\n \n \n-define i32 @test8(ptr nocapture %x, ptr nocapture noalias %y) {\n+define i32 @test8(ptr nocapture noalias %x, ptr nocapture %y) {\n ; CHECK-LABEL: define i32 @test8(\n-; CHECK-SAME: ptr captures(none) [[X:%.*]], ptr noalias captures(none) [[Y:%.*]]) {\n+; CHECK-SAME: ptr noalias captures(none) [[X:%.*]], ptr captures(none) [[Y:%.*]]) {\n ; CHECK-NEXT:  [[ENTRY:.*:]]\n ; CHECK-NEXT:    br label %[[LOOP:.*]]\n ; CHECK:       [[LOOP]]:\n\n``````````\n\n</details>\n"
+    }
+  ],
+  "knowledge_cutoff": "2026-05-11T07:07:17Z",
+  "patch_location_lineno": {
+    "llvm/lib/Analysis/AliasAnalysis.cpp": [
+      [
+        458,
+        491
+      ],
+      [
+        503,
+        509
+      ],
+      [
+        537,
+        545
+      ],
+      [
+        593,
+        599
+      ],
+      [
+        611,
+        617
+      ]
+    ],
+    "llvm/test/Analysis/BasicAA/atomics.ll": [
+      [
+        8,
+        36
+      ],
+      [
+        83,
+        97
+      ],
+      [
+        125,
+        147
+      ]
+    ],
+    "llvm/test/Analysis/MemorySSA/atomic-clobber.ll": [
+      [
+        106,
+        112
+      ]
+    ],
+    "llvm/test/Transforms/DeadStoreElimination/fence.ll": [
+      [
+        54,
+        59
+      ],
+      [
+        62,
+        67
+      ],
+      [
+        74,
+        84
+      ],
+      [
+        89,
+        98
+      ]
+    ],
+    "llvm/test/Transforms/GVN/fence.ll": [
+      [
+        37,
+        45
+      ]
+    ],
+    "llvm/test/Transforms/GVN/simplify-icf-cache-invalidation.ll": [
+      [
+        28,
+        33
+      ]
+    ],
+    "llvm/test/Transforms/LICM/atomics.ll": [
+      [
+        239,
+        245
+      ],
+      [
+        248,
+        253
+      ],
+      [
+        266,
+        274
+      ]
+    ]
+  },
+  "patch_location_funcname": {
+    "llvm/lib/Analysis/AliasAnalysis.cpp": [
+      "AAResults::getModRefInfo",
+      "getSyncEffects"
+    ]
+  }
+}
