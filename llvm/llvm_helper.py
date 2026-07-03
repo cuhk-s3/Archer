@@ -5,7 +5,11 @@ from pathlib import Path
 
 llvm_dir = os.environ["LAB_LLVM_DIR"]
 __llvm_build_dir = os.environ["LAB_LLVM_BUILD_DIR"]
-dataset_dir = os.environ["LAB_DATASET_DIR"]
+# Optional: defaults to the in-repo ``dataset`` directory (which also holds the
+# SQLite store).
+dataset_dir = os.environ.get("LAB_DATASET_DIR") or str(
+  Path(__file__).resolve().parent.parent / "dataset"
+)
 if "--quiet" not in subprocess.run(
   ["ninja", "--help"], capture_output=True
 ).stderr.decode("utf-8"):

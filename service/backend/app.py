@@ -9,11 +9,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
+from . import db_view
 from .config import ServiceConfig
 from .core import ArcherService
 from .dashboard import build_dashboard_html, detect_bug_found
 from .models import JobCreateRequest
-from .renderers import render_artifact_viewer
+from .renderers import (
+  build_pr_detail_html,
+  build_review_html_from_stats,
+  render_artifact_viewer,
+  render_trajectory_page,
+)
 
 config = ServiceConfig()
 service = ArcherService(config)
@@ -141,6 +147,60 @@ def api_create_job(req: JobCreateRequest) -> dict:
   except queue.Full:
     raise HTTPException(status_code=503, detail="Queue full")
   return asdict(job)
+
+
+# ---------------------------------------------------------------------------
+# DB-backed views: PR -> commit version -> review run -> bugs.
+# ---------------------------------------------------------------------------
+@app.get("/api/prs")
+def api_prs() -> dict:
+  """One summary row per PR, sourced from the SQLite store, with live-job overlay."""
+  return {"prs": db_view.pr_summaries(service.list_jobs())}
+
+
+@app.get("/api/prs/{pr_id}")
+def api_pr_detail(pr_id: int) -> dict:
+  detail = db_view.pr_detail(pr_id)
+  if detail is None:
+    raise HTTPException(status_code=404, detail=f"PR {pr_id} not found")
+  return detail
+
+
+@app.get("/pr/{pr_id}", response_class=HTMLResponse)
+def pr_page(pr_id: int) -> str:
+  detail = db_view.pr_detail(pr_id)
+  if detail is None:
+    raise HTTPException(status_code=404, detail=f"PR {pr_id} not found")
+  return build_pr_detail_html(detail)
+
+
+@app.get("/api/reviews/{review_id}")
+def api_review(review_id: int) -> dict:
+  view = db_view.review_view(review_id)
+  if view is None:
+    raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+  return view
+
+
+@app.get("/review/{review_id}", response_class=HTMLResponse)
+def review_page(review_id: int) -> str:
+  view = db_view.review_view(review_id)
+  if view is None:
+    raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+  return build_review_html_from_stats(view["stats_data"], view["meta"])
+
+
+@app.get("/trace/{review_id}", response_class=HTMLResponse)
+def trace_page(review_id: int) -> str:
+  hist = db_view.review_history(review_id)
+  if hist is None:
+    raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+  history = hist["history"]
+  if not isinstance(history, list) or not history:
+    raise HTTPException(
+      status_code=404, detail="No chat history stored for this review"
+    )
+  return render_trajectory_page(history, hist["sidecar_stats"])
 
 
 @app.post("/api/scan")

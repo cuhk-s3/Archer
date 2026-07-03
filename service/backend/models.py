@@ -25,6 +25,10 @@ class Job:
   history_path: Optional[str] = None
   review_path: Optional[str] = None
   log_path: Optional[str] = None
+  # Structured DB snapshot produced by a remote runner (run.db.json), and
+  # whether its contents have already been ingested into the local store.
+  db_path: Optional[str] = None
+  ingested: bool = False
   logs: List[str] = field(default_factory=list)
   title: str = ""
   author: str = ""

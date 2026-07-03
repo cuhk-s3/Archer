@@ -7,7 +7,6 @@ and saves them to the dataset directory.
 """
 
 import argparse
-import json
 import os
 import re
 import subprocess
@@ -18,10 +17,14 @@ import requests
 from unidiff import PatchSet
 
 sys.path.append(str(Path(__file__).parent.parent))
+# Project root, so the ``dataset`` package (the SQLite-backed source of truth)
+# is importable.
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 import hints
 
 import llvm.llvm_helper as llvm_helper
+from dataset import get_store
 
 if os.environ.get("LLVM_AUTOREVIEW_HOME_DIR") is None:
   print("Error: The llvm-autoreview environment has not been brought up.")
@@ -187,13 +190,12 @@ def main():
   parser.add_argument(
     "--skip-closed-check",
     action="store_true",
-    help="Skip the check for PR being closed (allow open/closed PRs).",
+    help="Deprecated no-op: open/closed no longer gates extraction (kept for compat).",
   )
   args = parser.parse_args()
 
   pr_id = args.pr_id
   force = args.force
-  skip_closed_check = args.skip_closed_check
 
   if force:
     print("Force override enabled")
@@ -207,25 +209,18 @@ def main():
     print(f"Error: PR #{pr_id} not found")
     exit(1)
 
-  # Determine if PR is open or closed
+  # PR state is kept only as metadata now; open/closed no longer decides where
+  # data is stored nor whether we process it. The commit SHA is the identity.
   pr_state = pr["state"]
-  if pr_state == "closed":
-    output_subdir = "closed"
-  else:
-    output_subdir = "open"
 
-  # Check if we should skip closed PRs (unless skip_closed_check is set)
-  if not skip_closed_check and pr_state != "closed":
-    print("Warning: PR is not closed. Use --skip-closed-check to process open PRs.")
-    # Don't exit, just warn
+  # The head commit identifies this version. Dedup on ``(pr_id, fix_commit)``.
+  fix_commit = pr["head"]["sha"]
 
-  # Prepare output path
-  pr_dir = Path(llvm_helper.dataset_dir) / output_subdir
-  pr_dir.mkdir(parents=True, exist_ok=True)
-  data_json_path = pr_dir / f"{pr_id}.json"
-
-  if not force and data_json_path.exists():
-    print(f"Error: Item {pr_id}.json already exists (--force not set).")
+  store = get_store()
+  if not force and store.has_version(pr_id, fix_commit):
+    print(
+      f"Item PR #{pr_id} @ {fix_commit[:10]} already exists in DB (--force not set)."
+    )
     exit(1)
 
   # Fetch the patch
@@ -256,9 +251,8 @@ def main():
     print("This PR does not modify any LLVM lib/include files")
     exit(1)
 
-  # Get commit information
+  # Get commit information (fix_commit was already read above for dedup).
   base_commit = pr["base"]["sha"]
-  fix_commit = pr["head"]["sha"]
 
   print(f"Base commit: {base_commit}")
   print(f"Head commit: {fix_commit}")
@@ -373,10 +367,17 @@ def main():
     "patch_location_funcname": patch_location_funcname,
   }
 
-  with open(data_json_path, "w") as f:
-    json.dump(pr_info, f, indent=2)
-
-  print(f"Successfully saved PR data to {data_json_path}")
+  version_id, created = store.upsert_pr_version(pr_info)
+  if created:
+    print(
+      f"Successfully saved PR #{pr_id} @ {fix_commit[:10]} to DB "
+      f"(version_id={version_id})."
+    )
+  else:
+    print(
+      f"PR #{pr_id} @ {fix_commit[:10]} already present in DB "
+      f"(version_id={version_id}); no changes."
+    )
 
 
 if __name__ == "__main__":

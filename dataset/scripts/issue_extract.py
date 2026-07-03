@@ -53,7 +53,9 @@ force = args.force
 if force:
   print("Force override")
 
-issue_dataset_dir = os.path.join(llvm_helper.dataset_dir, "issues")
+# Miscompilation issue data lives under ``subsystem/miscompilations/``.
+project_root = Path(__file__).resolve().parent.parent.parent
+issue_dataset_dir = os.path.join(project_root, "subsystem", "miscompilations")
 os.makedirs(issue_dataset_dir, exist_ok=True)
 data_json_path = os.path.join(issue_dataset_dir, f"{issue_id}.json")
 if not force and os.path.exists(data_json_path):
