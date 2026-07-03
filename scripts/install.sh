@@ -29,8 +29,8 @@ fi
 # LLVM
 #-================================
 
-# mkdir ${DEP_LLVM_DIR}
-# git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
+mkdir ${DEP_LLVM_DIR}
+git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
 cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_RTTI=ON \
