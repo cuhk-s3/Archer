@@ -109,5 +109,5 @@ ${PYTHON3} -m venv ${DEP_PY3_VENV_DIR}
 
 rm -rf ${DEP_LLVM_BUILD_DIR} \
   ${DEP_Z3_DIR} \
-  ${DEP_RE2C_DIR} 
+  ${DEP_RE2C_DIR}
 git -C ${DEP_LLVM_SOURCE_DIR} checkout main
