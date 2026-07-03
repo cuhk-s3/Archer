@@ -7,6 +7,7 @@ import time
 import zipfile
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
@@ -137,6 +138,8 @@ class ArcherService:
           history_path=job_data.get("history_path"),
           review_path=job_data.get("review_path"),
           log_path=job_data.get("log_path"),
+          db_path=job_data.get("db_path"),
+          ingested=job_data.get("ingested", False),
           logs=job_data.get("logs", []),
           title=job_data.get("title", ""),
           author=job_data.get("author", ""),
@@ -186,20 +189,16 @@ class ArcherService:
     return sorted(self.jobs.values(), key=lambda j: j.created_at, reverse=True)
 
   def _get_pr_info(self, pr_id: int) -> Optional[dict]:
-    dataset_roots = [
-      self.config.repo_root / "dataset",
-      self.config.repo_root.parent / "dataset",
-    ]
-    for dataset_dir in dataset_roots:
-      for sub in ["closed", "open"]:
-        path = dataset_dir / sub / f"{pr_id}.json"
-        if not path.exists():
-          continue
-        try:
-          return json.loads(path.read_text())
-        except Exception:
-          continue
-    return None
+    """Fetch stored PR info from the SQLite store (the single source of truth)."""
+    project_root = self.config.repo_root.parent
+    if str(project_root) not in sys.path:
+      sys.path.insert(0, str(project_root))
+    try:
+      from dataset import get_store
+
+      return get_store().to_pr_info(pr_id)
+    except Exception:
+      return None
 
   def _infer_components_from_files(self, diff_files: List[str]) -> List[str]:
     # Keep this behavior aligned with llvm/llvm_helper.py::infer_related_components.
@@ -633,14 +632,151 @@ class ArcherService:
     job.stats_path = pick_file("run.stats.json")
     job.history_path = pick_file("run.history.json")
     job.review_path = pick_file("run.review.md")
-    return bool(job.stats_path or job.history_path or job.review_path)
+    job.db_path = pick_file("run.db.json")
+    return bool(job.stats_path or job.history_path or job.review_path or job.db_path)
 
   def _needs_remote_artifact_sync(self, job: Job) -> bool:
     return (
       job.executor == "github-actions"
       and job.remote_run_status == "completed"
-      and not (job.stats_path and job.history_path and job.review_path)
+      and not job.ingested
     )
+
+  def _store(self):
+    """Return the local (front-end) SQLite store: the authoritative source."""
+    project_root = self.config.repo_root.parent
+    if str(project_root) not in sys.path:
+      sys.path.insert(0, str(project_root))
+    from dataset import get_store
+
+    return get_store()
+
+  def _ingest_db_snapshot(self, job: Job) -> bool:
+    """Replay a remote runner's ``run.db.json`` into the local store.
+
+    The snapshot is machine-independent (it carries PR/version/review/bug data,
+    not this-machine row ids), so we re-create the rows locally via the store's
+    normal write path. Idempotent: guarded by ``job.ingested`` so repeated polls
+    do not duplicate reviews.
+    """
+    if job.ingested:
+      return False
+    if not job.db_path or not Path(job.db_path).exists():
+      return False
+
+    try:
+      with open(job.db_path, encoding="utf-8") as f:
+        snapshot = json.load(f)
+    except Exception as e:
+      print(f"DB snapshot parse error for {job.id}: {e}", file=sys.stderr)
+      return False
+
+    pr_info = snapshot.get("pr_info") or {}
+    review = snapshot.get("review")
+    bugs = snapshot.get("bugs") or []
+    fixed_prev_commit = snapshot.get("fixed_prev_commit")
+    if not pr_info or not pr_info.get("pr_id"):
+      # Nothing structured to ingest (e.g. the run crashed before export).
+      # Mark ingested so we stop retrying this completed run.
+      job.ingested = True
+      return True
+
+    store = self._store()
+    # Re-create (or reuse) the PR + commit version in the local store.
+    version_id, _ = store.upsert_pr_version(pr_info)
+    fix_commit = str(pr_info.get("fix_commit", "") or "")
+    review_id = store.create_review(int(pr_info["pr_id"]), version_id, fix_commit)
+
+    status = str((review or {}).get("status") or "succeeded")
+    if status == "skipped":
+      store.skip_review(review_id, (review or {}).get("skipped_reason") or "")
+    elif review is not None:
+      stats_payload = dict(review)
+      # ``strategies`` / ``history`` are stored as JSON text in the source DB;
+      # the write path re-serializes them, so hand back parsed objects.
+      stats_payload["strategies"] = self._loads_json(review.get("strategies"), [])
+      stats_payload["history"] = self._loads_json(review.get("history"), None)
+      store.finish_review(review_id, stats_payload)
+
+    for bug in bugs:
+      bug_id = store.add_bug(
+        int(pr_info["pr_id"]),
+        version_id,
+        review_id,
+        {
+          "repro_kind": bug.get("repro_kind", "verify"),
+          "original_ir": bug.get("original_ir"),
+          "transformed_ir": bug.get("transformed_ir"),
+          "args": bug.get("args"),
+          "call_instr": bug.get("call_instr"),
+          "log": bug.get("log"),
+          "thoughts": bug.get("thoughts"),
+        },
+      )
+      if bug.get("baseline_checked") and bug.get("baseline_triggered") is not None:
+        store.set_bug_baseline(bug_id, bool(bug.get("baseline_triggered")))
+
+    # If the remote run's regression gate passed, this version fixed the
+    # previous version's active bugs. Replay that on the local store so the
+    # front-end can show the older bugs as "fixed in a later version". We locate
+    # the previous version by its commit sha (machine-independent) rather than a
+    # row id. Best-effort: if the front-end has not ingested that earlier version
+    # yet, we simply skip -- no earlier bugs to update here.
+    if fixed_prev_commit:
+      prev_ver = store.get_version_by_commit(
+        int(pr_info["pr_id"]), str(fixed_prev_commit)
+      )
+      if prev_ver is not None:
+        for prev_bug in store.list_active_bugs(int(prev_ver["id"])):
+          store.mark_bug_fixed(int(prev_bug["id"]), version_id)
+
+    job.ingested = True
+    return True
+
+  @staticmethod
+  def _loads_json(value, fallback):
+    if value is None:
+      return fallback
+    if not isinstance(value, str):
+      return value
+    try:
+      return json.loads(value)
+    except Exception:
+      return fallback
+
+  def _collect_and_ingest_remote(self, session: requests.Session, job: Job) -> bool:
+    """After a remote run completes: download artifacts + ingest the snapshot.
+
+    Returns True if any local state changed (so the caller can persist). This is
+    idempotent and self-terminating: once the snapshot is ingested -- or we have
+    confirmed a completed run produced no snapshot (e.g. it crashed before the
+    export step) -- the job is marked ``ingested`` and drops out of the poll set.
+    """
+    if job.ingested or job.remote_run_status != "completed" or not job.remote_run_id:
+      return False
+
+    changed = False
+    download_ok = True
+    if not (job.stats_path and job.history_path and job.review_path and job.db_path):
+      try:
+        if self._download_remote_artifacts(session, job, job.remote_run_id):
+          changed = True
+      except Exception as e:
+        download_ok = False
+        print(f"Artifact download error for {job.id}: {e}", file=sys.stderr)
+
+    try:
+      if self._ingest_db_snapshot(job):
+        changed = True
+    except Exception as e:
+      print(f"DB snapshot ingest error for {job.id}: {e}", file=sys.stderr)
+
+    # Download succeeded but the completed run has no structured snapshot to
+    # ingest: stop retrying so we don't re-download artifacts every poll.
+    if download_ok and not job.ingested and not job.db_path:
+      job.ingested = True
+      changed = True
+    return changed
 
   def _has_inflight_remote_job(self, exclude_job_id: Optional[str] = None) -> bool:
     for j in self.jobs.values():
@@ -697,14 +833,7 @@ class ArcherService:
       if run:
         self._apply_remote_run_state(job, run)
         if job.remote_run_id and job.remote_run_status == "completed":
-          try:
-            downloaded = self._download_remote_artifacts(
-              session, job, job.remote_run_id
-            )
-            if downloaded:
-              self._save_state()
-          except Exception as e:
-            print(f"Artifact download error for {job.id}: {e}", file=sys.stderr)
+          self._collect_and_ingest_remote(session, job)
       else:
         # Dispatch request already succeeded, but run is not visible yet.
         # Keep this as running so dashboard reflects in-flight remote work.
@@ -745,16 +874,7 @@ class ArcherService:
         job.remote_run_conclusion,
       )
       self._apply_remote_run_state(job, run)
-      downloaded = False
-      if (
-        job.remote_run_id
-        and job.remote_run_status == "completed"
-        and not (job.stats_path and job.history_path and job.review_path)
-      ):
-        try:
-          downloaded = self._download_remote_artifacts(session, job, job.remote_run_id)
-        except Exception as e:
-          print(f"Artifact sync download error for {job.id}: {e}", file=sys.stderr)
+      changed = self._collect_and_ingest_remote(session, job)
       after = (
         job.status,
         job.phase,
@@ -762,7 +882,7 @@ class ArcherService:
         job.remote_run_status,
         job.remote_run_conclusion,
       )
-      if before != after or downloaded:
+      if before != after or changed:
         self._save_state()
 
   def _enqueue_new_reviews(self) -> dict:
