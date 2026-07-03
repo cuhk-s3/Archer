@@ -1,9 +1,8 @@
-from llvm.lab_env import Environment
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
 
 
 class LangRefTool(FuncToolBase):
-  def __init__(self, env: Environment):
+  def __init__(self, env):
     self.env = env
 
   def spec(self) -> FuncToolSpec:

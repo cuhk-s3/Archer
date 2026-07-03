@@ -2,11 +2,9 @@
 import json
 import os
 import re
-import shutil
-import subprocess
 import time
 from argparse import ArgumentParser
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -14,18 +12,10 @@ import json_repair
 
 import prompts
 from base.console import get_boxed_console
+from llvm.lab_env import PREnvironment, PREnvironmentError, PRInfo
 from llvm.llvm import LLVM
 from llvm.llvm_helper import (
-  apply as apply_patch,
-)
-from llvm.llvm_helper import (
-  dataset_dir,
-  get_langref_desc,
-  get_llvm_build_dir,
-  git_execute,
   llvm_dir,
-  reset,
-  set_llvm_build_dir,
 )
 from lms.agent import AgentBase, RepeatedToolCallLimitExceeded
 from tools.difftest import DiffTestTool
@@ -160,149 +150,6 @@ def check_duplicate_tool_call(
   executed_tool_calls.add(call_signature)
   consecutive_duplicates[0] = 0
   return None
-
-
-@dataclass
-class PRInfo:
-  """Information extracted from a GitHub PR"""
-
-  pr_id: int
-  pr_url: str = ""
-  title: str = ""
-  author: str = ""
-  base_commit: str = ""
-  fix_commit: str = ""  # Latest commit in the PR
-  patch: str = ""
-  components: List[str] = field(default_factory=list)
-  state: str = ""
-  knowledge_cutoff: str = ""
-  description: str = ""
-  tests: List[dict] = field(default_factory=list)
-  labels: List[str] = field(default_factory=list)
-  comments: List[dict] = field(default_factory=list)
-  patch_location_lineno: dict = field(default_factory=dict)
-  patch_location_funcname: dict = field(default_factory=dict)
-
-
-class PREnvironment:
-  """Simplified environment class for PR review"""
-
-  def __init__(self, pr_info: PRInfo):
-    self.pr_info = pr_info
-    self.base_commit = pr_info.base_commit
-
-  def get_langref_desc(self, keywords):
-    """Get language reference descriptions for given keywords"""
-    return get_langref_desc(keywords, self.base_commit)
-
-  def get_tests(self):
-    """Get the tests extracted from PR patch"""
-    return self.pr_info.tests
-
-
-def extract_pr_info(pr_id: int) -> bool:
-  """Extract PR info using pr_extract.py script"""
-  pr_extract_script = Path(__file__).parent / "dataset" / "scripts" / "pr_extract.py"
-
-  try:
-    console.print(f"Extracting PR #{pr_id} information...")
-    result = subprocess.run(
-      ["python3", str(pr_extract_script), str(pr_id), "--skip-closed-check"],
-      capture_output=True,
-      text=True,
-      timeout=300,
-    )
-
-    if result.returncode != 0:
-      console.print(f"Failed to extract PR info: {result.stderr}", color="red")
-      return False
-
-    console.print(result.stdout)
-    return True
-  except subprocess.TimeoutExpired:
-    console.print("PR extraction timed out", color="red")
-    return False
-  except Exception as e:
-    console.print(f"Error extracting PR info: {e}", color="red")
-    return False
-
-
-def setup_llvm_environment(pr_info: PRInfo) -> bool:
-  """Setup LLVM environment by checking out base commit and applying patch"""
-  # Checkout base commit
-  console.print("Checking out the base commit ...")
-  try:
-    reset(pr_info.base_commit)
-  except Exception as e:
-    console.print(
-      f"Warning: Failed to reset HEAD to {pr_info.base_commit}: {e}",
-      color="yellow",
-    )
-    console.print("Sync the repository and try again.", color="yellow")
-    reset("main")
-    git_execute(["pull", "origin", "main"])
-    try:
-      reset(pr_info.base_commit)
-    except Exception as e:
-      panic(f"Failed to reset HEAD to {pr_info.base_commit}: {e}")
-
-  # Apply the patch
-  success, log = apply_patch(pr_info.patch)
-  if not success:
-    console.print(f"Failed to apply patch: {log}", color="red")
-    return False
-
-  return True
-
-
-def get_pr_info_path(pr_id: int) -> Optional[Path]:
-  """Get the path to PR info, checking both open/ and closed/ directories"""
-  # Check closed directory first (most PRs should be closed)
-  closed_path = Path(dataset_dir) / "closed" / f"{pr_id}.json"
-  if closed_path.exists():
-    return closed_path
-
-  # Check open directory
-  open_path = Path(dataset_dir) / "open" / f"{pr_id}.json"
-  if open_path.exists():
-    return open_path
-
-  return None
-
-
-def load_saved_pr_info(pr_id: int) -> Optional[PRInfo]:
-  """Load previously saved PR info"""
-  info_path = get_pr_info_path(pr_id)
-  if info_path is None:
-    return None
-  try:
-    with open(info_path, "r") as f:
-      data = json.load(f)
-    allowed_keys = {f.name for f in fields(PRInfo)}
-    filtered = {k: v for k, v in data.items() if k in allowed_keys}
-    return PRInfo(**filtered)
-  except Exception as e:
-    console.print(f"Warning: Failed to load saved PR info: {e}", color="yellow")
-    return None
-
-
-def pr_info_changed(old_pr_info: Optional[PRInfo], new_pr_info: PRInfo) -> bool:
-  """Check if PR info has changed by comparing fix_commit
-
-  If the latest commit in the PR has changed, we need to rebuild.
-  """
-  if old_pr_info is None:
-    return True  # No saved info, always need to rebuild
-
-  # Compare fix_commit (latest commit in PR)
-  if old_pr_info.fix_commit != new_pr_info.fix_commit:
-    console.print(
-      f"PR commit has changed: {old_pr_info.fix_commit[:7]} -> {new_pr_info.fix_commit[:7]}",
-      color="yellow",
-    )
-    return True
-
-  return False
 
 
 def get_tool_list(
@@ -811,65 +658,15 @@ def main():
   if args.debug:
     console.debug = True
 
-  # Load or extract PR information
-  pr_info = load_saved_pr_info(args.pr)
+  # Set up the PR environment: load/extract PR info, prepare the per-PR build
+  # directory, checkout the base commit, apply the patch and build LLVM.
+  try:
+    pr_env = PREnvironment.load(args.pr, console)
+    build_dir = pr_env.prepare(additional_cmake_args=ADDITIONAL_CMAKE_FLAGS)
+  except PREnvironmentError as e:
+    panic(str(e))
 
-  if pr_info is None:
-    # PR info not found, extract it using pr_extract.py
-    console.print(f"PR #{args.pr} data not found, extracting...")
-    if not extract_pr_info(args.pr):
-      panic("Failed to extract PR information")
-
-    # Try loading again
-    pr_info = load_saved_pr_info(args.pr)
-    if pr_info is None:
-      panic("Failed to load PR information after extraction")
-
-  # Setup build directory under pr/
-  base_build_dir = get_llvm_build_dir()
-  build_dir = os.path.join(base_build_dir, "pr", str(args.pr))
-
-  # Check if PR info has changed
-  saved_pr_info = load_saved_pr_info(args.pr)
-  pr_changed = pr_info_changed(saved_pr_info, pr_info)
-
-  if pr_changed and Path(build_dir).exists():
-    console.print(
-      "PR has changed. Removing old build directory...",
-      color="yellow",
-    )
-    console.print(f"Removing old build directory: {build_dir}", color="yellow")
-    shutil.rmtree(build_dir)
-
-  # Ensure build directory exists
-  os.makedirs(build_dir, exist_ok=True)
-  set_llvm_build_dir(build_dir)
-
-  # Setup LLVM environment
-  if not setup_llvm_environment(pr_info):
-    panic("Failed to setup LLVM environment")
-
-  # Build LLVM if not already built
-  opt_path = Path(build_dir) / "bin" / "opt"
-  if not opt_path.exists():
-    console.print("Building LLVM with the PR patch...")
-    from llvm import llvm_helper
-
-    success, log = llvm_helper.build(
-      max_build_jobs=int(
-        os.environ.get("LLVM_AUTOREVIEW_MAX_BUILD_JOBS", os.cpu_count())
-      ),
-      additional_cmake_args=ADDITIONAL_CMAKE_FLAGS,
-    )
-
-    if not success:
-      console.print("Build failed:", color="red")
-      console.print(log)
-      panic("Failed to build LLVM")
-
-    console.print("LLVM built successfully!", color="green")
-  else:
-    console.print(f"LLVM already built at {build_dir}", color="green")
+  pr_info = pr_env.pr_info
 
   # Set up LLM and agent
   if args.driver == "openai":
@@ -913,9 +710,6 @@ def main():
       panic(f"Review file {review_path} already exists.")
 
   llvm = LLVM()
-
-  # Create PR environment
-  pr_env = PREnvironment(pr_info)
 
   # Run PR review
   stats = RunStats(command=vars(args))
