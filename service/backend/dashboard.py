@@ -58,7 +58,7 @@ def build_dashboard_html() -> str:
 
     /* Stats — linear, hairline separated, no cards */
     .stats { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
-    .stat-card { padding: 15px 18px 14px; border-left: 1px solid var(--line); }
+    .stat-card { padding: 11px 18px 10px; border-left: 1px solid var(--line); }
     .stat-card:first-child { border-left: none; padding-left: 8px; }
     .stat-num { font-size: 24px; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
     .stat-card.run .stat-num { color: var(--run); }
@@ -67,7 +67,7 @@ def build_dashboard_html() -> str:
     .stat-label { display: block; margin-top: 8px; font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; font-weight: 600; }
 
     /* Toolbar */
-    .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 24px 0 0; }
+    .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 16px 0 0; }
     .search-box { display: flex; align-items: center; flex: 1 1 260px; min-width: 220px; height: 38px; background: var(--bg); border: 1px solid var(--line-strong); padding: 0 6px 0 12px; transition: border-color .15s; }
     .search-box:focus-within { border-color: var(--ink); }
     .search-ico { color: var(--faint); flex: 0 0 auto; display: flex; }
@@ -83,7 +83,7 @@ def build_dashboard_html() -> str:
     .seg-btn.active { background: var(--ink); color: #fff; }
 
     /* Table — no card, hairline rows */
-    .card { border-top: 1px solid var(--line); margin-top: 20px; }
+    .card { border-top: 1px solid var(--line); margin-top: 14px; }
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 620px; table-layout: fixed; }
     thead th { color: var(--muted); font-weight: 700; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.12em; text-align: left; padding: 13px 14px; border-bottom: 1px solid var(--line-strong); }

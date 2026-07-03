@@ -312,15 +312,15 @@ def build_review_html_from_stats(stats_data: dict) -> str:
     .head {{ margin-bottom: 20px; padding-bottom: 16px; border-bottom: 2px solid var(--ink); }}
     .title {{ margin: 0; font-size: 22px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }}
     .subtitle {{ margin-top: 9px; color: var(--sub); font-size: 11.5px; letter-spacing: 0.03em; }}
-    .section {{ margin: 18px 0 0; padding-top: 14px; border-top: 1px solid var(--line); }}
-    .section-title {{ font-size: 11px; font-weight: 700; margin-bottom: 12px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.12em; }}
+    .section {{ margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); }}
+    .section-title {{ font-size: 11px; font-weight: 700; margin-bottom: 10px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.12em; }}
 
     /* summary — linear hairline row, no cards */
     .summary-grid {{ display: flex; flex-wrap: wrap; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0; }}
-    .stat {{ flex: 1 1 120px; padding: 16px 18px; border-left: 1px solid var(--line); }}
+    .stat {{ flex: 1 1 120px; padding: 11px 18px; border-left: 1px solid var(--line); }}
     .stat:first-child {{ border-left: none; padding-left: 0; }}
     .stat-label {{ font-size: 10px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }}
-    .stat-value {{ margin-top: 9px; font-size: 22px; font-weight: 700; color: var(--ink); font-family: var(--mono); }}
+    .stat-value {{ margin-top: 6px; font-size: 22px; font-weight: 700; color: var(--ink); font-family: var(--mono); }}
     code {{ background: #f3f4f6; padding: 1px 5px; font-family: var(--mono); font-size: 12px; }}
     pre {{ background: #f7f8fa; padding: 12px; overflow-x: auto; line-height: 1.5; font-size: 12px; border: 1px solid var(--line); }}
     strong {{ font-weight: 700; }}
@@ -532,10 +532,10 @@ def render_artifact_viewer(target: Path) -> str:
     .title { margin: 0; font-size: 22px; line-height: 1.2; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }
     .sub { margin-top: 9px; color: var(--sub); font-size: 11.5px; word-break: break-all; letter-spacing: 0.03em; }
     .summary-grid { display: flex; flex-wrap: wrap; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 0 18px; }
-    .stat { flex: 1 1 120px; padding: 16px 18px; border-left: 1px solid var(--line); }
+    .stat { flex: 1 1 120px; padding: 11px 18px; border-left: 1px solid var(--line); }
     .stat:first-child { border-left: none; padding-left: 0; }
     .stat-label { font-size: 10px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
-    .stat-value { margin-top: 9px; font-size: 22px; font-weight: 700; color: var(--ink); font-family: var(--mono); }
+    .stat-value { margin-top: 6px; font-size: 22px; font-weight: 700; color: var(--ink); font-family: var(--mono); }
     .tools { border-bottom: 1px solid var(--line); padding: 4px 0 18px; margin-bottom: 20px; }
     .tools-title { font-size: 10px; color: var(--sub); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; }
     .tool-badges { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -546,6 +546,10 @@ def render_artifact_viewer(target: Path) -> str:
     .msg.assistant { border-left-color: #0f9d63; }
     .msg.system { border-left-color: var(--accent); }
     .msg.tool { border-left-color: #9aa1ac; }
+    .msg.tool-call { border-left-color: var(--accent); background: #fafaff; }
+    .msg.tool-call h3 { color: var(--accent); }
+    .msg.tool-output { border-left-color: #cbd0d8; }
+    .msg.tool-output h3 { color: var(--faint); }
     .msg-body { margin-top: 9px; white-space: pre-wrap; word-break: break-word; }
     pre.msg-body { background: #f7f8fa; border: none; padding: 11px 12px; font-size: 12px; line-height: 1.55; }
     .msg-fold { margin-top: 8px; position: relative; }
@@ -660,10 +664,10 @@ def render_artifact_viewer(target: Path) -> str:
       if msg_type == "function_call":
         name = str(msg.get("name", "tool"))
         args_text = content_to_text(msg.get("arguments", ""))
-        return "tool", f"TOOL CALL: {name}", args_text
+        return "tool tool-call", f"TOOL CALL: {name}", args_text
       if msg_type == "function_call_output":
         output_text = content_to_text(msg.get("output", ""))
-        return "tool", "TOOL OUTPUT", output_text
+        return "tool tool-output", "TOOL OUTPUT", output_text
       if msg_type:
         content_text = content_to_text(msg.get("content", msg))
         return "tool", f"EVENT: {msg_type}", content_text
