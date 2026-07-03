@@ -910,7 +910,27 @@ def main():
     run_baseline_check(pr_env, stats.bugs)
     # Persist review + bugs (with baseline flags) to the DB.
     persist_review(store, pr_info.pr_id, version_id, review_id, stats, agent)
-    save_outputs(stats, pr_info, agent, console, stats_path, history_path, review_path)
+    cur_version = store.get_version(version_id)
+    version_meta = {
+      "seq": int(cur_version["seq"]) if cur_version is not None else None,
+      "version_id": version_id,
+    }
+    if prev_version is not None:
+      version_meta["prev_fix_commit"] = prev_version["fix_commit"]
+      version_meta["gate_conclusion"] = (
+        "passed — previous version's bug(s) no longer trigger "
+        "(treated as fixed by this version)"
+      )
+    save_outputs(
+      stats,
+      pr_info,
+      agent,
+      console,
+      stats_path,
+      history_path,
+      review_path,
+      version_meta,
+    )
 
   print_results(stats, console)
 

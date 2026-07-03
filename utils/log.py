@@ -58,8 +58,20 @@ class RunStats:
     return asdict(self)
 
 
-def generate_review(pr_info: Any, stats: RunStats) -> str:
+def _patch_specificity_label(bug: Bug) -> str:
+  """One-line patch-specificity annotation for a bug in the review."""
+  if not bug.baseline_checked or bug.baseline_triggered is None:
+    return "Not checked"
+  if bug.non_patch_specific:
+    return "Non-patch-specific (also triggers on baseline)"
+  return "Patch-specific (introduced by this patch)"
+
+
+def generate_review(
+  pr_info: Any, stats: RunStats, version_meta: Optional[dict] = None
+) -> str:
   """Generate a markdown review from the PR review results"""
+  version_meta = version_meta or {}
   report_lines = []
 
   # Title
@@ -73,10 +85,32 @@ def generate_review(pr_info: Any, stats: RunStats) -> str:
   report_lines.append(f"- **URL**: {pr_info.pr_url}")
   report_lines.append(f"- **Base Commit**: `{pr_info.base_commit[:10]}`")
   report_lines.append(f"- **Fix Commit**: `{pr_info.fix_commit[:10]}`")
-  report_lines.append(f"- **Components**: {', '.join(pr_info.components)}\n")
+  report_lines.append(f"- **Components**: {', '.join(pr_info.components)}")
+
+  # Version identity (which version of this PR is being reviewed).
+  seq = version_meta.get("seq")
+  version_id = version_meta.get("version_id")
+  if seq is not None or version_id is not None:
+    parts = []
+    if seq is not None:
+      parts.append(f"seq #{seq}")
+    if version_id is not None:
+      parts.append(f"id={version_id}")
+    report_lines.append(f"- **Version**: {', '.join(parts)}")
+
+  # Multi-version PRs: show the previous version and the regression-gate result.
+  prev_fix_commit = version_meta.get("prev_fix_commit")
+  if prev_fix_commit:
+    report_lines.append(f"- **Previous Version**: `{prev_fix_commit[:10]}`")
+    gate_conclusion = version_meta.get("gate_conclusion")
+    if gate_conclusion:
+      report_lines.append(f"- **Regression Gate**: {gate_conclusion}")
+  report_lines.append("")
 
   # Executive Summary
   report_lines.append("## Executive Summary\n")
+  status = "failed" if stats.error else "succeeded"
+  report_lines.append(f"- **Review Status**: {status}")
   report_lines.append(f"- **Bugs Found**: {len(stats.bugs)}")
   report_lines.append(f"- **Total Time**: {stats.total_time_sec:.2f} seconds")
   report_lines.append(
@@ -101,6 +135,8 @@ def generate_review(pr_info: Any, stats: RunStats) -> str:
     report_lines.append("## Bugs Found\n")
     for idx, bug in enumerate(stats.bugs, 1):
       report_lines.append(f"### Bug #{idx}\n")
+
+      report_lines.append(f"- **Patch-specificity**: {_patch_specificity_label(bug)}\n")
 
       if bug.thoughts:
         report_lines.append(f"**Analysis:**\n{bug.thoughts}\n")
@@ -227,6 +263,7 @@ def save_outputs(
   stats_path: Optional[Path],
   history_path: Optional[Path],
   review_path: Optional[Path],
+  version_meta: Optional[dict] = None,
 ) -> None:
   """Write stats JSON, chat history JSON, and review Markdown to disk."""
   if stats_path:
@@ -240,7 +277,7 @@ def save_outputs(
     console.print(f"Chat history saved to {history_path}.")
 
   if review_path:
-    review_content = generate_review(pr_info, stats)
+    review_content = generate_review(pr_info, stats, version_meta)
     with review_path.open("w", encoding="utf-8") as fout:
       fout.write(review_content)
     console.print(f"Review saved to {review_path}.")
