@@ -204,6 +204,7 @@ by using `find` or `list` tools and reading them with `read` or `grep` tools.
 - `listN`: List files in the LLVM codebase to find relevant tests or code regions.
 - `readN`: Read the content of a file in the LLVM codebase to understand existing tests or the fix.
 - `grepN`: Search for specific patterns in the codebase to find relevant tests or code regions.
+- `langref`: Query the LLVM Language Reference Manual for specific instructions, semantics, or optimization details relevant to the fix.
 - `tests_manager`: Manage the list of test cases. You can list all tests to see their status, get the details of a specific test, or mark a test as tested. Your goal is to ensure all tests are tested.
 - `trans`: Run the `opt` tool with specific arguments to see how the LLVM IR code is transformed by the optimization pass.
 - `verify`: Use alive2 to verify if the transformation from original LLVM IR code to optimized LLVM IR code is correct, which can help check the validity of generated test cases in Phase 2.
