@@ -74,7 +74,7 @@ class GenericOpenAIAgent(GenericAgent):
           self.chat_stats["output_tokens"] += chunk.usage.completion_tokens
         if chunk.usage.total_tokens:
           self.chat_stats["total_tokens"] += chunk.usage.total_tokens
-        cost = getattr(completion.usage, "cost", None)
+        cost = getattr(chunk.usage, "cost", None)
         if cost is not None:
           self.chat_stats["total_cost"] += cost
 
