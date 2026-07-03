@@ -32,7 +32,10 @@ class ReportTool(FuncToolBase):
           "If you find any bug, provide the detailed thoughts for analyzing the bug including "
           '1. "Bug Triggering Analysis" for why the provided test can trigger the bug, and '
           '2. "Fix Weakness Analysis" for why the provided test can reveal the weakness.'
-          "If you cannot find any bug, provide the detailed thoughts for summarizing the fix. ",
+          "If you cannot find any bug, provide the detailed thoughts for summarizing the fix including ",
+          '1. "Fix Overview" for a brief overview of the fix, and '
+          '2. "Possible Weaknesses" for a list of possible weaknesses that the fix may not address. '
+          "Use ## to mark the section headers. ",
         ),
         FuncToolSpec.Param(
           "force",

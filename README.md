@@ -1,10 +1,12 @@
 # Archer
 
 > [!Note]
-> Archer's paper is available at [https://arxiv.org/abs/2607.01808](https://arxiv.org/abs/2607.01808). Feel free to check it out.
+> Archer's paper is available [here](https://arxiv.org/pdf/2607.01808). Feel free to check it out.
 >
 > Archer is actively reviewing new InstCombine and many other passes' PRs in LLVM.
 > You can follow its progress in the [review board](https://archer.top).
+
+## Overview
 
 Archer is an agentic code review tool for LLVM PRs, designed to deliver **precise, evidence-backed** reviews that minimize developers’ time spent reading, validating, and triaging comments.
 It currently focuses on patches related to middle-end optimizations and reports only issues that come with **a reproducible proof of concept**. Archer is fully self-contained and can be paired with any LLM.
@@ -13,7 +15,7 @@ This project is directly inspired by the Review Capacity issue logged in this [b
 
 ## Design
 
-> Details of the design and implementation are described in [our paper](https://arxiv.org/abs/2607.01808).
+> Details of the design and implementation are described in [our paper](https://arxiv.org/pdf/2607.01808).
 
 The key idea of Archer is to help the agent **think like an expert** when reviewing compiler code.
 To achieve this, Archer combines *subsystem knowledge* with a *compiler-specific toolkit*.
