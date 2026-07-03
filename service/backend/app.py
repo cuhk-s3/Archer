@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 from .config import ServiceConfig
 from .core import ArcherService
@@ -95,6 +95,14 @@ def shutdown_event() -> None:
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
   return build_dashboard_html()
+
+
+@app.get("/logo.png", include_in_schema=False)
+def logo() -> FileResponse:
+  logo_path = config.repo_root / "Archer.png"
+  if not logo_path.exists():
+    raise HTTPException(status_code=404, detail="Logo not found")
+  return FileResponse(logo_path, media_type="image/png")
 
 
 @app.get("/healthz")

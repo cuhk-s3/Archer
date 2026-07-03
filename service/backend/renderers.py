@@ -117,17 +117,21 @@ def markdown_to_html(md_text: str) -> str:
   return "".join(blocks) if blocks else "<p><em>(no content)</em></p>"
 
 
-def build_review_html_from_stats(stats_data: dict) -> str:
-  strategies = stats_data.get("strategies", [])
-  bugs = stats_data.get("bugs", [])
-  report_raw = stats_data.get("report", {})
+def _is_placeholder_text(value: object) -> bool:
+  return not isinstance(value, str) or value.strip() in ("", "<not-provided>")
 
-  report = report_raw
-  if isinstance(report_raw, str):
-    try:
-      report = json.loads(report_raw)
-    except Exception:
-      report = {}
+
+def build_review_html_from_stats(stats_data: dict) -> str:
+  raw_strategies = stats_data.get("strategies", []) or []
+  bugs = stats_data.get("bugs", []) or []
+
+  # Drop the "<not-provided>" placeholder strategy that RunStats seeds by default
+  # so that runs without real strategies do not render a fake card.
+  strategies = [
+    s
+    for s in raw_strategies
+    if isinstance(s, dict) and not _is_placeholder_text(s.get("name"))
+  ]
 
   strategies_html = ""
   for i, strat in enumerate(strategies, 1):
@@ -138,79 +142,150 @@ def build_review_html_from_stats(stats_data: dict) -> str:
     strategy_id = f"strategy_{i}"
 
     strategies_html += f"""
-    <div class="strategy-card">
-      <div class="strategy-fold" id="{strategy_id}">
-        <div class="strategy-head">
-          <h4 class="strategy-title"><span style="font-weight: 700;">{i}.</span> {esc(name)}</h4>
-          <button type="button" class="fold-toggle" data-target="{strategy_id}" title="展开/收起">
-            <span class="fold-icon" aria-hidden="true"></span>
-          </button>
+    <div class="strat" id="{strategy_id}">
+      <div class="strat-head" data-target="{strategy_id}">
+        <span class="strat-idx">{i}</span>
+        <span class="strat-name">{esc(name)}</span>
+        <span class="caret" aria-hidden="true"></span>
+      </div>
+      <div class="strat-body">
+        <div class="field">
+          <div class="field-label">Target</div>
+          <div class="field-val">{esc(target)}</div>
         </div>
-        <div class="strategy-body">
-          <div style="margin: 8px 0; font-size: 13px; line-height: 1.5;">
-            <strong style="color: #424a53;">Target:</strong><br>{esc(target)}
-          </div>
-          <div style="margin: 8px 0; font-size: 13px; line-height: 1.5;">
-            <strong style="color: #424a53;">Rationale:</strong><br>{esc(rationale)}
-          </div>
-          <div style="margin: 8px 0; font-size: 13px; line-height: 1.5;">
-            <strong style="color: #424a53;">Expected Issue:</strong><br>{esc(expected)}
-          </div>
+        <div class="field">
+          <div class="field-label">Rationale</div>
+          <div class="field-val">{esc(rationale)}</div>
+        </div>
+        <div class="field">
+          <div class="field-label">Expected Issue</div>
+          <div class="field-val">{esc(expected)}</div>
         </div>
       </div>
     </div>"""
+
+  if not strategies_html:
+    strategies_html = '<p class="empty">No test strategies recorded</p>'
 
   bugs_html = ""
   for i, bug in enumerate(bugs, 1):
     orig_ir = bug.get("original_ir", "")
     trans_ir = bug.get("transformed_ir", "")
     log = bug.get("log", "")
+    thoughts = bug.get("thoughts") or ""
 
     unique_id = f"bug_{i}_log"
-    orig_ir_html = f'<div class="bug-ir-body">{esc(orig_ir)}</div>'
-    trans_ir_html = f'<div class="bug-ir-body">{esc(trans_ir)}</div>'
-    log_html = (
+    thoughts_html = (
       (
-        f'<div class="bug-log-fold" id="{unique_id}">'
-        f'<div class="bug-log-body">{esc(log)}</div>'
-        f'<button type="button" class="fold-toggle" data-target="{unique_id}" title="展开/收起">'
-        f'<span class="fold-icon" aria-hidden="true"></span>'
+        '<div class="field">'
+        '<div class="field-label">Analysis</div>'
+        f'<div class="field-val md-body">{markdown_to_html(thoughts)}</div>'
+        "</div>"
+      )
+      if thoughts.strip()
+      else ""
+    )
+    if len(log) > 320:
+      log_html = (
+        f'<div class="log-fold" id="{unique_id}">'
+        f'<pre class="code log-body">{esc(log)}</pre>'
+        f'<button type="button" class="more-btn" data-target="{unique_id}">'
+        '<span class="more-label"></span>'
+        '<span class="caret" aria-hidden="true"></span>'
         "</button>"
         "</div>"
       )
-      if len(log) > 320
-      else (f'<div class="bug-log-body bug-log-body-static">{esc(log)}</div>')
-    )
+    else:
+      log_html = f'<pre class="code">{esc(log)}</pre>'
 
     bugs_html += f"""
-    <div style="margin-bottom: 24px; padding: 14px 16px; background: #fef3c7; border-left: 3px solid #d97706; border-radius: 4px;">
-      <h4 style="margin: 0 0 12px 0; color: #92400e; font-size: 15px;">Bug #{i}</h4>
-      <div style="margin: 12px 0; font-size: 12px;">
-        <strong style="color: #92400e; display: block; margin-bottom: 6px;">Original IR:</strong>
-        {orig_ir_html}
+    <div class="bug">
+      <div class="bug-head"><span class="bug-tag">BUG #{i}</span></div>
+      {thoughts_html}
+      <div class="field">
+        <div class="field-label">Original IR</div>
+        <pre class="code">{esc(orig_ir)}</pre>
       </div>
-      <div style="margin: 12px 0; font-size: 12px;">
-        <strong style="color: #92400e; display: block; margin-bottom: 6px;">Transformed IR:</strong>
-        {trans_ir_html}
+      <div class="field">
+        <div class="field-label">Transformed IR</div>
+        <pre class="code">{esc(trans_ir)}</pre>
       </div>
-      <div style="margin: 12px 0; font-size: 12px;">
-        <strong style="color: #92400e; display: block; margin-bottom: 6px;">Error/Output Log:</strong>
+      <div class="field">
+        <div class="field-label">Output Log</div>
         {log_html}
       </div>
     </div>"""
 
   if not bugs_html:
-    bugs_html = '<p style="color: #999; font-size: 13px;"><em>No bugs found</em></p>'
+    bugs_html = '<p class="empty">No bugs found</p>'
 
+  # stats.report is the agent's "thoughts" string (see main.py). Older/other runs
+  # may store the whole report tool JSON, so accept both shapes.
+  report_raw = stats_data.get("report")
   report_text = ""
-  if isinstance(report, dict) and "thoughts" in report:
-    report_text = report["thoughts"]
-  else:
+  if isinstance(report_raw, dict):
+    report_text = report_raw.get("thoughts") or ""
+  elif isinstance(report_raw, str) and report_raw.strip():
+    stripped = report_raw.strip()
+    parsed = None
+    if stripped.startswith("{"):
+      try:
+        parsed = json.loads(stripped)
+      except Exception:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("thoughts"), str):
+      report_text = parsed["thoughts"]
+    else:
+      report_text = report_raw
+
+  if not report_text.strip():
     report_text = "No analysis available"
 
   analysis_html = (
     '<div class="analysis-card">'
     f'<div class="analysis-body">{markdown_to_html(report_text)}</div>'
+    "</div>"
+  )
+
+  def _fmt_int(value: object) -> str:
+    return f"{value:,}" if isinstance(value, int) else "-"
+
+  def _fmt_duration(seconds: object) -> str:
+    try:
+      secs = float(seconds)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+      return "-"
+    if secs <= 0:
+      return "-"
+    if secs < 60:
+      return f"{secs:.1f}s"
+    minutes, rem = divmod(int(secs), 60)
+    if minutes < 60:
+      return f"{minutes}m {rem}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+  chat_rounds = stats_data.get("chat_rounds")
+  chat_cost = stats_data.get("chat_cost")
+
+  rounds_text = _fmt_int(chat_rounds)
+
+  cost_text = (
+    f"${chat_cost:.4f}" if isinstance(chat_cost, (int, float)) and chat_cost else "-"
+  )
+
+  summary_html = (
+    '<div class="summary-grid">'
+    f'<div class="stat"><div class="stat-label">Bugs Found</div>'
+    f'<div class="stat-value">{len(bugs)}</div></div>'
+    f'<div class="stat"><div class="stat-label">Total Time</div>'
+    f'<div class="stat-value">{_fmt_duration(stats_data.get("total_time_sec"))}</div></div>'
+    f'<div class="stat"><div class="stat-label">Chat Rounds</div>'
+    f'<div class="stat-value">{rounds_text}</div></div>'
+    f'<div class="stat"><div class="stat-label">Total Tokens</div>'
+    f'<div class="stat-value">{_fmt_int(stats_data.get("total_tokens"))}</div></div>'
+    f'<div class="stat"><div class="stat-label">Est. Cost</div>'
+    f'<div class="stat-value">{cost_text}</div></div>'
     "</div>"
   )
 
@@ -222,155 +297,101 @@ def build_review_html_from_stats(stats_data: dict) -> str:
   <title>Review</title>
   <style>
     :root {{
-      --ink: #1f2d3d;
-      --sub: #60758d;
-      --line: #eaf0f7;
+      --ink: #16181d;
+      --sub: #6b7280;
+      --faint: #9aa1ac;
+      --line: #e7e9ee;
+      --line-strong: #d3d7de;
+      --accent: #4f46e5;
+      --err: #dc2626;
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
     }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background: #ffffff; }}
-    .review-container {{ max-width: 1000px; margin: 0 auto; padding: 24px 32px; }}
-    .head {{ margin-bottom: 20px; padding-bottom: 0; }}
-    .title {{ margin: 0; font-size: 28px; font-weight: 700; }}
-    .subtitle {{ margin-top: 8px; color: var(--sub); font-size: 13px; }}
-    .section {{ margin: 28px 0; }}
-    .section-title {{ font-size: 16px; font-weight: 700; margin-bottom: 16px; color: var(--ink); }}
-    code {{ background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-family: 'Monaco', 'Menlo', monospace; font-size: 12px; }}
-    pre {{ background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto; line-height: 1.4; font-size: 12px; }}
-    strong {{ font-weight: 600; }}
-    a {{ color: #2f6fad; text-decoration: none; }}
+    body {{ margin: 0; padding: 0; font-family: var(--mono); font-size: 13px; color: var(--ink); background: #ffffff; -webkit-font-smoothing: antialiased; }}
+    .review-container {{ max-width: 900px; margin: 0 auto; padding: 42px 28px 80px; }}
+    .head {{ margin-bottom: 20px; padding-bottom: 16px; border-bottom: 2px solid var(--ink); }}
+    .title {{ margin: 0; font-size: 22px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }}
+    .subtitle {{ margin-top: 9px; color: var(--sub); font-size: 11.5px; letter-spacing: 0.03em; }}
+    .section {{ margin: 22px 0 0; padding-top: 18px; border-top: 1px solid var(--line); }}
+    .section-title {{ font-size: 11px; font-weight: 700; margin-bottom: 12px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.12em; }}
+
+    /* summary — linear hairline row, no cards */
+    .summary-grid {{ display: flex; flex-wrap: wrap; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0; }}
+    .stat {{ flex: 1 1 120px; padding: 16px 18px; border-left: 1px solid var(--line); }}
+    .stat:first-child {{ border-left: none; padding-left: 0; }}
+    .stat-label {{ font-size: 10px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }}
+    .stat-value {{ margin-top: 9px; font-size: 22px; font-weight: 700; color: var(--ink); font-family: var(--mono); }}
+    code {{ background: #f3f4f6; padding: 1px 5px; font-family: var(--mono); font-size: 12px; }}
+    pre {{ background: #f7f8fa; padding: 12px; overflow-x: auto; line-height: 1.5; font-size: 12px; border: 1px solid var(--line); }}
+    strong {{ font-weight: 700; }}
+    a {{ color: var(--accent); text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
-    .analysis-card {{ padding: 14px 16px; background: #eef5fc; border-left: 3px solid #2f6fad; border-radius: 4px; }}
-    .strategy-card {{ margin-bottom: 20px; padding: 14px 16px; background: #fafbfc; border-left: 3px solid #6e7681; border-radius: 4px; }}
-    .strategy-fold {{ position: relative; }}
-    .strategy-head {{ position: relative; padding-right: 34px; }}
-    .strategy-title {{ margin: 0; color: #1f2d3d; font-size: 15px; }}
-    .strategy-body {{ display: none; margin-top: 10px; }}
-    .strategy-fold.expanded .strategy-body {{ display: block; }}
-    .strategy-card .fold-icon {{ border-color: #cdd9e6; }}
-    .strategy-card .fold-icon::before, .strategy-card .fold-icon::after {{
-      border-right-color: #546b83;
-      border-bottom-color: #546b83;
-    }}
-    .strategy-card .fold-toggle:hover .fold-icon {{ background: #eef5fc; }}
-    .analysis-body {{ line-height: 1.6; font-size: 13px; color: #333; }}
-    .analysis-body h1, .analysis-body h2, .analysis-body h3 {{
-      margin: 0 0 12px 0;
-      color: #1f2d3d;
-      line-height: 1.35;
-    }}
-    .analysis-body h1 {{ font-size: 22px; }}
-    .analysis-body h2 {{ font-size: 16px; margin-top: 22px; }}
-    .analysis-body h3 {{ font-size: 14px; margin-top: 18px; }}
-    .analysis-body p {{ margin: 0 0 14px 0; }}
-    .analysis-body ul {{ margin: 0 0 14px 18px; padding: 0; }}
-    .analysis-body li {{ margin: 0 0 6px 0; }}
-    .analysis-body .md-code-block {{ margin: 0 0 14px 0; background: #f5f5f5; border-radius: 4px; overflow: hidden; }}
-    .analysis-body .md-code-lang {{ padding: 8px 12px 0 12px; font-size: 12px; color: #60758d; text-transform: lowercase; }}
-    .analysis-body .md-code-block pre {{ margin: 0; border-radius: 0; }}
-    .bug-ir-body {{
-      background: #fff7e6;
-      padding: 10px;
-      border-radius: 3px;
-      font-family: monospace;
-      overflow-x: auto;
-      overflow-y: auto;
-      max-height: 400px;
-      line-height: 1.4;
-      color: #333;
-      white-space: pre-wrap;
-      word-break: normal;
-      overflow-wrap: anywhere;
-    }}
-    .bug-log-fold {{ margin-top: 6px; position: relative; }}
-    .bug-log-body {{
-      background: #fff7e6;
-      padding: 10px;
-      border-radius: 3px;
-      font-family: monospace;
-      overflow-x: auto;
-      line-height: 1.4;
-      color: #555;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }}
-    .bug-log-fold .bug-log-body {{
-      margin-top: 0;
-      max-height: 9.5em;
-      overflow: hidden;
-      position: relative;
-      transition: max-height 0.18s ease;
-      padding-right: 34px;
-    }}
-    .bug-log-fold .bug-log-body::after {{
-      content: "";
-      position: absolute;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      height: 2.6em;
-      background: linear-gradient(to bottom, rgba(255, 247, 230, 0), #fff7e6 75%);
-      pointer-events: none;
-    }}
-    .bug-log-fold.expanded .bug-log-body {{
-      max-height: none;
-      overflow: visible;
-    }}
-    .bug-log-fold.expanded .bug-log-body::after {{
-      display: none;
-    }}
-    .bug-log-body-static {{ max-height: 400px; overflow-y: auto; }}
-    .fold-toggle {{
-      position: absolute;
-      right: 2px;
-      bottom: 2px;
-      width: 24px;
-      height: 24px;
-      border: none;
-      background: transparent;
-      padding: 0;
-      cursor: pointer;
-      z-index: 2;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }}
-    .fold-icon {{
-      position: relative;
-      width: 22px;
-      height: 22px;
-      border: 1px solid #e3c8a8;
-      border-radius: 11px;
-      background: #ffffff;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }}
-    .fold-icon::before, .fold-icon::after {{
-      content: "";
-      position: absolute;
-      left: 50%;
-      width: 6px;
-      height: 6px;
-      border-right: 2px solid #8a5a21;
-      border-bottom: 2px solid #8a5a21;
-      transform: translateX(-50%) rotate(45deg);
-    }}
-    .fold-icon::before {{ top: 4px; }}
-    .fold-icon::after {{ top: 9px; }}
-    .bug-log-fold.expanded .fold-icon::before, .bug-log-fold.expanded .fold-icon::after {{
-      transform: translateX(-50%) rotate(225deg);
-    }}
-    .fold-toggle:hover .fold-icon {{ background: #fff7e6; }}
+    .rounds-split {{ font-size: 11px; color: var(--sub); font-weight: 600; margin-left: 6px; font-family: var(--mono); }}
+    .empty {{ color: var(--sub); font-size: 12.5px; font-style: italic; margin: 0; }}
+
+    /* analysis — flat, left rule instead of card */
+    .analysis-card {{ padding: 2px 0 2px 16px; border-left: 2px solid var(--ink); }}
+    .analysis-body {{ line-height: 1.65; font-size: 13px; color: var(--ink); }}
+    .analysis-body h1, .analysis-body h2, .analysis-body h3 {{ margin: 0 0 10px 0; color: var(--ink); line-height: 1.35; font-weight: 700; }}
+    .analysis-body h1 {{ font-size: 16px; }}
+    .analysis-body h2 {{ font-size: 14px; margin-top: 18px; }}
+    .analysis-body h3 {{ font-size: 13px; margin-top: 14px; }}
+    .analysis-body p {{ margin: 0 0 10px 0; }}
+    .analysis-body ul {{ margin: 0 0 10px 18px; padding: 0; }}
+    .analysis-body li {{ margin: 0 0 5px 0; }}
+    .analysis-body .md-code-block {{ margin: 0 0 10px 0; background: #f7f8fa; border: 1px solid var(--line); overflow: hidden; }}
+    .analysis-body .md-code-lang {{ padding: 8px 12px 0 12px; font-size: 12px; color: var(--sub); font-family: var(--mono); }}
+    .analysis-body .md-code-block pre {{ margin: 0; border: none; }}
+
+    /* unified field layout */
+    .field {{ margin: 14px 0; }}
+    .field:first-child {{ margin-top: 0; }}
+    .field-label {{ font-size: 10px; font-weight: 700; color: var(--sub); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 7px; }}
+    .field-val {{ font-size: 13px; line-height: 1.6; color: var(--ink); }}
+
+    /* unified code / IR / log block */
+    .code {{ background: #f7f8fa; border: 1px solid var(--line); padding: 12px; margin: 0; font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--ink); white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; overflow-x: auto; max-height: 400px; overflow-y: auto; }}
+
+    /* strategy — hairline rows, no card */
+    .strat {{ border-bottom: 1px solid var(--line); }}
+    .strat:first-of-type {{ border-top: 1px solid var(--line); }}
+    .strat-head {{ display: flex; align-items: center; gap: 12px; padding: 13px 0; cursor: pointer; user-select: none; }}
+    .strat-head:hover .strat-name {{ color: var(--accent); }}
+    .strat-idx {{ flex: none; width: 22px; height: 22px; background: var(--ink); color: #fff; font-size: 11px; font-weight: 700; font-family: var(--mono); display: inline-flex; align-items: center; justify-content: center; }}
+    .strat-name {{ flex: 1; font-size: 13px; font-weight: 600; color: var(--ink); }}
+    .strat-body {{ display: none; padding: 2px 0 16px 34px; }}
+    .strat.expanded .strat-body {{ display: block; }}
+
+    /* bug — sharp left rule, no card */
+    .bug {{ border-left: 2px solid var(--err); padding: 2px 0 2px 16px; margin-bottom: 24px; }}
+    .bug-head {{ margin-bottom: 12px; }}
+    .bug-tag {{ display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: 0.1em; color: var(--err); text-transform: uppercase; }}
+
+    /* log fold */
+    .log-fold {{ position: relative; }}
+    .log-fold .log-body {{ position: relative; max-height: 9.5em; overflow: hidden; transition: max-height .18s ease; }}
+    .log-fold .log-body::after {{ content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2.8em; background: linear-gradient(to bottom, rgba(247,248,250,0), #f7f8fa 80%); pointer-events: none; }}
+    .log-fold.expanded .log-body {{ max-height: 600px; overflow: auto; }}
+    .log-fold.expanded .log-body::after {{ display: none; }}
+    .more-btn {{ margin-top: 8px; display: inline-flex; align-items: center; gap: 7px; background: #ffffff; border: 1px solid var(--line-strong); padding: 6px 12px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--sub); cursor: pointer; font-family: var(--mono); transition: all .15s; }}
+    .more-btn:hover {{ color: #fff; background: var(--ink); border-color: var(--ink); }}
+    .more-btn:hover .caret {{ border-color: #fff; }}
+    .more-btn .more-label::before {{ content: "Show full log"; }}
+    .log-fold.expanded .more-btn .more-label::before {{ content: "Collapse"; }}
+
+    /* clean caret shared by strategy heads and log toggle */
+    .caret {{ flex: none; width: 7px; height: 7px; border-right: 1.5px solid var(--sub); border-bottom: 1.5px solid var(--sub); transform: rotate(45deg); transition: transform .18s ease; }}
+    .strat.expanded .strat-head .caret {{ transform: rotate(225deg); }}
+    .log-fold.expanded .caret {{ transform: rotate(225deg); }}
     .back-btn {{
       position: fixed;
-      top: 24px;
-      left: 32px;
-      width: 32px;
-      height: 32px;
-      border: 1px solid #e6eef7;
-      background: #f7fbff;
-      color: #4f667d;
-      border-radius: 4px;
+      top: 22px;
+      left: 22px;
+      width: 36px;
+      height: 36px;
+      border: 1px solid var(--line-strong);
+      background: #ffffff;
+      color: var(--sub);
       padding: 0;
       cursor: pointer;
       display: flex;
@@ -379,10 +400,12 @@ def build_review_html_from_stats(stats_data: dict) -> str:
       font-size: 18px;
       z-index: 100;
       font-weight: 600;
+      transition: all .15s;
     }}
     .back-btn:hover {{
-      background: #eef6ff;
-      border-color: #d6e3f0;
+      color: #fff;
+      background: var(--ink);
+      border-color: var(--ink);
     }}
   </style>
 </head>
@@ -393,6 +416,8 @@ def build_review_html_from_stats(stats_data: dict) -> str:
       <h1 class="title">Review Report</h1>
       <div class="subtitle">Agent analysis and findings from PR review</div>
     </div>
+
+    {summary_html}
 
     <div class="section">
       <h2 class="section-title">Test Strategies (Phase 1)</h2>
@@ -405,17 +430,13 @@ def build_review_html_from_stats(stats_data: dict) -> str:
     </div>
 
     <div class="section">
-      <h2 class="section-title">Analysis & Findings</h2>
+      <h2 class="section-title">Analysis &amp; Findings</h2>
       {analysis_html}
     </div>
   </div>
   <script>
-    document.querySelectorAll('.bug-log-fold, .strategy-fold').forEach(function (box) {{
-      box.classList.remove('expanded');
-    }});
-
     document.addEventListener('click', function (ev) {{
-      const btn = ev.target.closest('.fold-toggle');
+      const btn = ev.target.closest('[data-target]');
       if (!btn) return;
       const id = btn.getAttribute('data-target');
       if (!id) return;
@@ -430,8 +451,60 @@ def build_review_html_from_stats(stats_data: dict) -> str:
   return html
 
 
+def render_markdown_page(md_text: str, title: str = "Review") -> str:
+  body = markdown_to_html(md_text)
+  return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{esc(title)}</title>
+  <style>
+    :root {{ --accent: #4f46e5; --line: #e7e9ee; --line-strong: #d3d7de; --sub: #6b7280; --ink: #16181d; --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; padding: 0; font-family: var(--mono); color: var(--ink); background: #ffffff; -webkit-font-smoothing: antialiased; }}
+    .review-container {{ max-width: 900px; margin: 0 auto; padding: 42px 28px 80px; line-height: 1.65; font-size: 13px; }}
+    .review-container h1 {{ font-size: 20px; margin: 0 0 18px 0; padding-bottom: 14px; border-bottom: 2px solid var(--ink); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }}
+    .review-container h2 {{ font-size: 15px; margin: 26px 0 10px 0; font-weight: 700; }}
+    .review-container h3 {{ font-size: 13px; margin: 18px 0 8px 0; font-weight: 700; }}
+    .review-container p {{ margin: 0 0 12px 0; }}
+    .review-container ul {{ margin: 0 0 12px 18px; padding: 0; }}
+    .review-container li {{ margin: 0 0 5px 0; }}
+    code {{ background: #f3f4f6; padding: 1px 5px; font-family: var(--mono); font-size: 12px; }}
+    pre {{ background: #f7f8fa; padding: 12px; overflow-x: auto; line-height: 1.5; font-size: 12px; border: 1px solid var(--line); }}
+    .md-code-block {{ margin: 0 0 12px 0; background: #f7f8fa; border: 1px solid var(--line); overflow: hidden; }}
+    .md-code-lang {{ padding: 8px 12px 0 12px; font-size: 12px; color: var(--sub); text-transform: lowercase; font-family: var(--mono); }}
+    .md-code-block pre {{ margin: 0; border: none; }}
+    a {{ color: var(--accent); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .back-btn {{ position: fixed; top: 22px; left: 22px; width: 36px; height: 36px; border: 1px solid var(--line-strong); background: #ffffff; color: var(--sub); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 18px; z-index: 100; font-weight: 600; transition: all .15s; }}
+    .back-btn:hover {{ color: #fff; background: var(--ink); border-color: var(--ink); }}
+  </style>
+</head>
+<body>
+  <button class="back-btn" type="button" title="Back to Review Board" onclick="window.location.href='/'">&larr;</button>
+  <div class="review-container">{body}</div>
+</body>
+</html>"""
+
+
 def render_artifact_viewer(target: Path) -> str:
   content = target.read_text()
+
+  # For the agent trajectory (history.json) the authoritative run metrics
+  # (tokens, chat rounds, phase split) live in the sibling stats.json, not in
+  # the per-message history (individual messages carry no usage data). Load it
+  # so the summary shows real numbers instead of "-"/0.
+  sidecar_stats: dict = {}
+  if str(target).endswith(".history.json"):
+    sibling_stats = Path(str(target).rsplit(".", 2)[0] + ".stats.json")
+    if sibling_stats.exists():
+      try:
+        loaded = json.loads(sibling_stats.read_text())
+        if isinstance(loaded, dict):
+          sidecar_stats = loaded
+      except Exception:
+        sidecar_stats = {}
 
   if str(target).endswith(".stats.json"):
     try:
@@ -451,6 +524,12 @@ def render_artifact_viewer(target: Path) -> str:
       except Exception:
         pass
 
+    # No sibling stats.json: render the markdown itself instead of dumping raw text.
+    return render_markdown_page(content, title="Review")
+
+  if str(target).endswith(".md"):
+    return render_markdown_page(content, title=target.name)
+
   try:
     data = json.loads(content)
     is_json = True
@@ -466,31 +545,37 @@ def render_artifact_viewer(target: Path) -> str:
   <title>Agent Trajectory</title>
   <style>
     :root {
-      --ink: #1f2d3d;
-      --sub: #60758d;
-      --line: #eaf0f7;
-      --blue-soft: #f4f9ff;
+      --ink: #16181d;
+      --sub: #6b7280;
+      --faint: #9aa1ac;
+      --line: #e7e9ee;
+      --line-strong: #d3d7de;
+      --accent: #4f46e5;
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
     }
-    body { margin: 0; padding: 16px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background: #ffffff; }
-    .viewer { max-width: 1100px; margin: 0 auto; padding: 8px 10px 24px; }
-    .head { margin-bottom: 12px; }
-    .title { margin: 0; font-size: 26px; line-height: 1.2; font-weight: 700; }
-    .sub { margin-top: 6px; color: var(--sub); font-size: 13px; word-break: break-all; }
-    .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 8px; margin: 12px 0; }
-    .stat { border: 1px solid var(--line); background: #f9fcff; padding: 8px 10px; }
-    .stat-label { font-size: 11px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.04em; }
-    .stat-value { margin-top: 4px; font-size: 18px; font-weight: 700; color: var(--ink); }
-    .tools { border: 1px solid var(--line); background: #f9fcff; padding: 10px; margin-bottom: 12px; }
-    .tools-title { font-size: 12px; color: var(--sub); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0; font-family: var(--mono); font-size: 13px; color: var(--ink); background: #ffffff; -webkit-font-smoothing: antialiased; }
+    .viewer { max-width: 940px; margin: 0 auto; padding: 42px 28px 80px; }
+    .head { margin-bottom: 22px; padding-bottom: 16px; border-bottom: 2px solid var(--ink); }
+    .title { margin: 0; font-size: 22px; line-height: 1.2; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }
+    .sub { margin-top: 9px; color: var(--sub); font-size: 11.5px; word-break: break-all; letter-spacing: 0.03em; }
+    .summary-grid { display: flex; flex-wrap: wrap; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 0 18px; }
+    .stat { flex: 1 1 120px; padding: 16px 18px; border-left: 1px solid var(--line); }
+    .stat:first-child { border-left: none; padding-left: 0; }
+    .stat-label { font-size: 10px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
+    .stat-value { margin-top: 9px; font-size: 22px; font-weight: 700; color: var(--ink); font-family: var(--mono); }
+    .tools { border-bottom: 1px solid var(--line); padding: 4px 0 18px; margin-bottom: 20px; }
+    .tools-title { font-size: 10px; color: var(--sub); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; }
     .tool-badges { display: flex; flex-wrap: wrap; gap: 6px; }
-    .tool-badge { border: 1px solid #d5e4f2; background: #ffffff; color: #35516c; padding: 3px 8px; font-size: 12px; }
-    pre { background: #f7fbff; padding: 12px; overflow-x: auto; border: 1px solid #eaf0f7; }
-    .msg { position: relative; margin: 10px 0; padding: 10px; border-left: 3px solid #2f6fad; background: var(--blue-soft); }
-    .msg.user { border-left-color: #c7821f; background: #fff9e6; }
-    .msg.assistant { border-left-color: #1f9956; background: #f0f9f0; }
-    .msg.system { border-left-color: #2f6fad; background: #eef5fc; }
-    .msg.tool { border-left-color: #7a8694; background: #f2f5f8; }
-    .msg-body { margin-top: 10px; white-space: pre-wrap; word-break: break-word; }
+    .tool-badge { border: 1px solid var(--line-strong); background: transparent; color: var(--ink); padding: 3px 9px; font-size: 11px; font-family: var(--mono); font-weight: 600; }
+    pre { background: #f7f8fa; padding: 12px; overflow-x: auto; border: 1px solid var(--line); font-family: var(--mono); font-size: 12px; }
+    .msg { position: relative; margin: 0; padding: 12px 0 12px 16px; border-left: 2px solid var(--line-strong); border-bottom: 1px solid var(--line); }
+    .msg.user { border-left-color: #d97706; }
+    .msg.assistant { border-left-color: #0f9d63; }
+    .msg.system { border-left-color: var(--accent); }
+    .msg.tool { border-left-color: #9aa1ac; }
+    .msg-body { margin-top: 9px; white-space: pre-wrap; word-break: break-word; }
+    pre.msg-body { background: #f7f8fa; border: none; padding: 11px 12px; font-size: 12px; line-height: 1.55; }
     .msg-fold { margin-top: 8px; position: relative; }
     .msg-fold .msg-body {
       margin-top: 0;
@@ -506,7 +591,7 @@ def render_artifact_viewer(target: Path) -> str:
       right: 0;
       bottom: 0;
       height: 2.6em;
-      background: linear-gradient(to bottom, rgba(247, 251, 255, 0), #f7fbff 75%);
+      background: linear-gradient(to bottom, rgba(247, 248, 250, 0), #f7f8fa 75%);
       pointer-events: none;
     }
     .msg-fold.expanded .msg-body {
@@ -518,8 +603,8 @@ def render_artifact_viewer(target: Path) -> str:
     }
     .fold-toggle {
       position: absolute;
-      right: 2px;
-      bottom: 2px;
+      right: 6px;
+      bottom: 6px;
       width: 24px;
       height: 24px;
       border: none;
@@ -533,42 +618,39 @@ def render_artifact_viewer(target: Path) -> str:
     }
     .fold-icon {
       position: relative;
-      width: 22px;
-      height: 22px;
-      border: 1px solid #cdd9e6;
-      border-radius: 11px;
+      width: 24px;
+      height: 24px;
+      border: 1px solid var(--line-strong);
       background: #ffffff;
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      transition: all .15s;
     }
-    .fold-icon::before, .fold-icon::after {
+    .fold-icon::before {
       content: "";
-      position: absolute;
-      left: 50%;
-      width: 6px;
-      height: 6px;
-      border-right: 2px solid #546b83;
-      border-bottom: 2px solid #546b83;
-      transform: translateX(-50%) rotate(45deg);
+      width: 7px;
+      height: 7px;
+      border-right: 1.5px solid var(--sub);
+      border-bottom: 1.5px solid var(--sub);
+      transform: translateY(-2px) rotate(45deg);
+      transition: transform .18s ease;
     }
-    .fold-icon::before { top: 4px; }
-    .fold-icon::after { top: 9px; }
-    .msg-fold.expanded .fold-icon::before, .msg-fold.expanded .fold-icon::after {
-      transform: translateX(-50%) rotate(225deg);
+    .msg-fold.expanded .fold-icon::before {
+      transform: translateY(1px) rotate(225deg);
     }
-    .fold-toggle:hover .fold-icon { background: #eef5fc; }
-    h3 { margin: 0; font-size: 12px; color: #60758d; }
+    .fold-toggle:hover .fold-icon { border-color: var(--ink); background: var(--ink); }
+    .fold-toggle:hover .fold-icon::before { border-color: #fff; }
+    h3 { margin: 0; font-size: 10px; color: var(--sub); text-transform: uppercase; letter-spacing: 0.1em; font-family: var(--mono); font-weight: 700; }
     .back-btn {
       position: fixed;
-      top: 24px;
-      left: 32px;
-      width: 32px;
-      height: 32px;
-      border: 1px solid #e6eef7;
-      background: #f7fbff;
-      color: #4f667d;
-      border-radius: 4px;
+      top: 22px;
+      left: 22px;
+      width: 36px;
+      height: 36px;
+      border: 1px solid var(--line-strong);
+      background: #ffffff;
+      color: var(--sub);
       padding: 0;
       cursor: pointer;
       display: flex;
@@ -577,10 +659,12 @@ def render_artifact_viewer(target: Path) -> str:
       font-size: 18px;
       z-index: 100;
       font-weight: 600;
+      transition: all .15s;
     }
     .back-btn:hover {
-      background: #eef6ff;
-      border-color: #d6e3f0;
+      color: #fff;
+      background: var(--ink);
+      border-color: var(--ink);
     }
   </style>
 </head>
@@ -755,10 +839,27 @@ def render_artifact_viewer(target: Path) -> str:
         )
       shown += 1
 
+    def sidecar_int(key):
+      val = sidecar_stats.get(key)
+      return val if isinstance(val, int) else None
+
+    stats_tokens = sidecar_int("total_tokens")
+    stats_rounds = sidecar_int("chat_rounds")
+    stats_phase1 = sidecar_int("phase1_round")
+    stats_phase2 = sidecar_int("phase2_round")
+
+    # Prefer authoritative stats.json values; fall back to history-derived ones.
+    if stats_tokens is not None and stats_tokens > 0:
+      token_total = stats_tokens
+      has_tokens = True
+    total_rounds = stats_rounds if stats_rounds is not None else tool_calls_total
+    phase1_rounds = stats_phase1 if stats_phase1 is not None else phase_rounds.get(1, 0)
+    phase2_rounds = stats_phase2 if stats_phase2 is not None else phase_rounds.get(2, 0)
+
     token_text = f"{token_total:,}" if has_tokens else "-"
-    total_rounds_text = str(tool_calls_total)
-    phase1_rounds_text = str(phase_rounds.get(1, 0))
-    phase2_rounds_text = str(phase_rounds.get(2, 0))
+    total_rounds_text = str(total_rounds)
+    phase1_rounds_text = str(phase1_rounds)
+    phase2_rounds_text = str(phase2_rounds)
     if tool_name_counts:
       sorted_tools = sorted(tool_name_counts.items(), key=lambda kv: (-kv[1], kv[0]))
       badges = "".join(
