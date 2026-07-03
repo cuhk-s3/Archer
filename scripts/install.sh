@@ -29,8 +29,8 @@ fi
 # LLVM
 #-================================
 
-# mkdir ${DEP_LLVM_DIR}
-# git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
+mkdir ${DEP_LLVM_DIR}
+git clone https://github.com/llvm/llvm-project ${DEP_LLVM_SOURCE_DIR}
 cmake -S ${DEP_LLVM_SOURCE_DIR}/llvm -B ${DEP_LLVM_BUILD_DIR} -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_RTTI=ON \
@@ -109,5 +109,5 @@ ${PYTHON3} -m venv ${DEP_PY3_VENV_DIR}
 
 rm -rf ${DEP_LLVM_BUILD_DIR} \
   ${DEP_Z3_DIR} \
-  ${DEP_RE2C_DIR} 
+  ${DEP_RE2C_DIR}
 git -C ${DEP_LLVM_SOURCE_DIR} checkout main
