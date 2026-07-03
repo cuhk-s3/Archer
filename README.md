@@ -1,10 +1,4 @@
-<p align="center">
-   <img src="service/Archer.png" alt="Archer logo" width="96" />
-</p>
-
-<h1 align="center">Archer</h1>
-
-<p align="center"><strong>Agentic code review for LLVM PRs</strong></p>
+# Archer
 
 > [!Note]
 > Archer's paper is available [here](https://arxiv.org/pdf/2607.01808). Feel free to check it out.
