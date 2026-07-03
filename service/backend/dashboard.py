@@ -202,6 +202,49 @@ def build_dashboard_html() -> str:
       return true;
     }
 
+    function jobSortTimestamp(job) {
+      const ts = Date.parse(job.created_at || job.updated_at || '');
+      return Number.isNaN(ts) ? 0 : ts;
+    }
+
+    function collapseJobsByPr(jobs) {
+      const latestByPr = new Map();
+      for (const job of jobs) {
+        const prId = String(job.pr_id || '');
+        if (!prId) continue;
+
+        const normalizedJob = {
+          ...job,
+          components: Array.isArray(job.components) ? [...job.components] : [],
+        };
+
+        const existing = latestByPr.get(prId);
+        if (!existing) {
+          latestByPr.set(prId, normalizedJob);
+          continue;
+        }
+
+        const normalizedExisting = {
+          ...existing,
+          components: Array.isArray(existing.components)
+            ? [...existing.components]
+            : [],
+        };
+        const useNewJob = jobSortTimestamp(normalizedJob) > jobSortTimestamp(normalizedExisting);
+        const latest = useNewJob ? normalizedJob : normalizedExisting;
+        const older = useNewJob ? normalizedExisting : normalizedJob;
+
+        if (!latest.title && older.title) latest.title = older.title;
+        if (!latest.author && older.author) latest.author = older.author;
+        if ((!latest.components || !latest.components.length) && older.components && older.components.length) {
+          latest.components = [...older.components];
+        }
+
+        latestByPr.set(prId, latest);
+      }
+      return Array.from(latestByPr.values());
+    }
+
     function applyFilters(options = {}) {
       const resetPage = options.resetPage !== false;
       const query = (document.getElementById('searchInput').value || '').trim().toLowerCase();
@@ -279,7 +322,8 @@ def build_dashboard_html() -> str:
       try {
         const resp = await fetch('/api/jobs');
         if (!resp.ok) throw new Error('Failed');
-        allJobs = (await resp.json()).jobs || [];
+        const jobs = (await resp.json()).jobs || [];
+        allJobs = collapseJobsByPr(jobs);
         applyFilters({ resetPage: false });
       } catch (err) {
         document.getElementById('pageInfo').textContent = 'Error: ' + err;

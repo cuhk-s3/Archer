@@ -27,6 +27,29 @@ def _resolve_run_file(run_id: str, file_path: str) -> Path:
     raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
   target_name = Path(file_path).name
+  artifact_attr_by_name = {
+    "run.review.md": "review_path",
+    "run.history.json": "history_path",
+    "run.stats.json": "stats_path",
+  }
+  artifact_attr = artifact_attr_by_name.get(target_name)
+  allowed_root = config.data_dir.resolve()
+
+  if artifact_attr and run_id.isdigit():
+    pr_id = int(run_id)
+    pr_jobs = [job for job in service.list_jobs() if job.pr_id == pr_id]
+    for job in pr_jobs:
+      artifact_path = getattr(job, artifact_attr, None)
+      if not artifact_path:
+        continue
+      target = Path(artifact_path).resolve()
+      if (
+        str(target).startswith(str(allowed_root))
+        and target.exists()
+        and target.is_file()
+      ):
+        return target
+
   candidates: list[Path] = []
 
   # Support both layouts:
@@ -41,7 +64,6 @@ def _resolve_run_file(run_id: str, file_path: str) -> Path:
       if file_path == target_name:
         candidates.append((child / target_name).resolve())
 
-  allowed_root = config.data_dir.resolve()
   for target in candidates:
     if (
       str(target).startswith(str(allowed_root)) and target.exists() and target.is_file()

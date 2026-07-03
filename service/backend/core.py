@@ -29,7 +29,6 @@ _TEST_PATH_PREFIXES: list[str] = [
   "llvm/test/Transforms/VectorCombine",
   "llvm/test/Transforms/SLPVectorizer",
   "llvm/test/Transforms/AggressiveInstCombine",
-  "llvm/test/Transforms/LoopVectorize",
 ]
 
 _SOURCE_PATH_PREFIXES: list[str] = [
@@ -58,7 +57,6 @@ _SOURCE_PATH_PREFIXES: list[str] = [
   "llvm/lib/Transforms/Vectorize/VectorCombine",
   "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp",
   "llvm/lib/Transforms/AggressiveInstCombine",
-  "llvm/lib/Transforms/Vectorize/LoopVectorize.cpp",
 ]
 
 ALL_KEYWORDS: list[str] = _TEST_PATH_PREFIXES + _SOURCE_PATH_PREFIXES
@@ -287,6 +285,17 @@ class ArcherService:
       existing_id = self.jobs_by_pr.get(pr_id)
       if existing_id and not force:
         return self.jobs[existing_id]
+      existing_job = self.jobs.get(existing_id) if existing_id else None
+      prior_jobs = sorted(
+        (j for j in self.jobs.values() if j.pr_id == pr_id),
+        key=lambda j: j.created_at,
+        reverse=True,
+      )
+      metadata_job = next(
+        (j for j in prior_jobs if j.title or j.author or j.components),
+        existing_job,
+      )
+      pr_info = self._get_pr_info(pr_id) or {}
       ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
       job_id = f"{source}-{pr_id}-{ts}"
       job = Job(
@@ -296,6 +305,21 @@ class ArcherService:
         status="queued",
         created_at=utc_now_iso(),
         updated_at=utc_now_iso(),
+        title=(
+          metadata_job.title
+          if metadata_job and metadata_job.title
+          else str(pr_info.get("title", ""))
+        ),
+        author=(
+          metadata_job.author
+          if metadata_job and metadata_job.author
+          else str(pr_info.get("author", ""))
+        ),
+        components=(
+          list(metadata_job.components)
+          if metadata_job and metadata_job.components
+          else self._resolve_components(pr_id)
+        ),
       )
       self.jobs[job_id] = job
       self.jobs_by_pr[pr_id] = job_id

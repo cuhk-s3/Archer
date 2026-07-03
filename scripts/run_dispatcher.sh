@@ -49,7 +49,7 @@ window.ARCHER_BACKEND_BASE_URL = "${BACKEND_BASE_URL}";
 EOF
 
 echo "Frontend runtime config written: ${FRONTEND_DIR}/runtime-config.js"
-echo "Dispatcher model=${ARCHER_MODEL}, driver=${ARCHER_DRIVER}, ref=${ARCHER_ACTIONS_REF}"
+echo "Dispatcher model=${ARCHER_MODEL}, driver=${ARCHER_DRIVER}, ref=${ARCHER_ACTIONS_REF}, auto_scan=${ARCHER_AUTO_SCAN}"
 
 echo "Starting dispatcher backend on ${ARCHER_SERVICE_HOST}:${ARCHER_SERVICE_PORT}"
 if [[ -x "${ROOT_DIR}/deps/py3_venv/bin/python" ]]; then
