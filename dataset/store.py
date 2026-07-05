@@ -65,7 +65,7 @@ class ArcherStore:
   def __init__(self, db_path: Optional[os.PathLike] = None):
     self.db_path = Path(db_path) if db_path else default_db_path()
     self.db_path.parent.mkdir(parents=True, exist_ok=True)
-    self._lock = threading.Lock()
+    self._lock = threading.RLock()
     self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
     self._conn.row_factory = sqlite3.Row
     self._conn.execute("PRAGMA foreign_keys = ON;")
@@ -188,6 +188,45 @@ class ArcherStore:
       self._conn.commit()
     return version_id, True
 
+  def replace_pr_version(self, pr: Dict[str, Any]) -> int:
+    """Overwrite the stored payload for an existing ``(pr_id, fix_commit)``.
+
+    This is used by extraction ``--force`` to repair stale/incomplete version
+    rows while preserving the version id and review/bug foreign keys.
+    """
+    self.upsert_pr(pr)
+    pr_id = int(pr["pr_id"])
+    fix_commit = str(pr.get("fix_commit", "") or "")
+    now = _now()
+    with self._lock:
+      row = self._version_by_commit_locked(pr_id, fix_commit)
+      if row is None:
+        version_id, _ = self.upsert_pr_version(pr)
+        return version_id
+
+      version_id = int(row["id"])
+      self._conn.execute(
+        """UPDATE pr_versions SET base_commit=?, patch=?, tests=?,
+           patch_location_lineno=?, patch_location_funcname=?, comments=?, state=?
+           WHERE id=?""",
+        (
+          pr.get("base_commit", ""),
+          pr.get("patch", ""),
+          _dumps(pr.get("tests", [])),
+          json.dumps(pr.get("patch_location_lineno", {}) or {}, ensure_ascii=False),
+          json.dumps(pr.get("patch_location_funcname", {}) or {}, ensure_ascii=False),
+          _dumps(pr.get("comments", [])),
+          pr.get("state", ""),
+          version_id,
+        ),
+      )
+      self._conn.execute(
+        "UPDATE prs SET latest_version_id=?, updated_at=? WHERE pr_id=?",
+        (version_id, now, pr_id),
+      )
+      self._conn.commit()
+      return version_id
+
   # ---------------------------------------------------------------------------
   # PR + version read path
   # ---------------------------------------------------------------------------
@@ -208,10 +247,7 @@ class ArcherStore:
 
   def has_version(self, pr_id: int, fix_commit: str) -> bool:
     with self._lock:
-      row = self._conn.execute(
-        "SELECT 1 FROM pr_versions WHERE pr_id=? AND fix_commit=?",
-        (int(pr_id), str(fix_commit)),
-      ).fetchone()
+      row = self._version_by_commit_locked(pr_id, fix_commit)
     return row is not None
 
   def get_version(self, version_id: int) -> Optional[sqlite3.Row]:
@@ -229,10 +265,29 @@ class ArcherStore:
 
   def get_version_by_commit(self, pr_id: int, fix_commit: str) -> Optional[sqlite3.Row]:
     with self._lock:
-      return self._conn.execute(
-        "SELECT * FROM pr_versions WHERE pr_id=? AND fix_commit=?",
-        (int(pr_id), str(fix_commit)),
-      ).fetchone()
+      return self._version_by_commit_locked(pr_id, fix_commit)
+
+  def _version_by_commit_locked(
+    self, pr_id: int, fix_commit: str
+  ) -> Optional[sqlite3.Row]:
+    fix_commit = str(fix_commit or "")
+    if not fix_commit:
+      return None
+    row = self._conn.execute(
+      "SELECT * FROM pr_versions WHERE pr_id=? AND fix_commit=?",
+      (int(pr_id), fix_commit),
+    ).fetchone()
+    if row is not None or len(fix_commit) < 10:
+      return row
+    return self._conn.execute(
+      """SELECT * FROM pr_versions
+         WHERE pr_id=?
+           AND length(fix_commit) >= 10
+           AND (? LIKE fix_commit || '%' OR fix_commit LIKE ? || '%')
+         ORDER BY length(fix_commit) DESC
+         LIMIT 1""",
+      (int(pr_id), fix_commit, fix_commit),
+    ).fetchone()
 
   def get_previous_version(self, version_id: int) -> Optional[sqlite3.Row]:
     """Return the immediately preceding version (by seq) of the same PR."""

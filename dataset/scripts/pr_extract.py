@@ -367,6 +367,13 @@ def main():
     "patch_location_funcname": patch_location_funcname,
   }
 
+  if force:
+    version_id = store.replace_pr_version(pr_info)
+    print(
+      f"Force-updated PR #{pr_id} @ {fix_commit[:10]} in DB (version_id={version_id})."
+    )
+    return
+
   version_id, created = store.upsert_pr_version(pr_info)
   if created:
     print(
