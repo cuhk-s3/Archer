@@ -35,7 +35,7 @@ class ReportTool(FuncToolBase):
           "If you cannot find any bug, provide the detailed thoughts for summarizing the fix including "
           '1. "Fix Overview" for a brief overview of the fix, and '
           '2. "Possible Weaknesses" for a list of possible weaknesses that the fix may not address. '
-          "Use ## to mark the section headers. ",
+          "Keep the review as short and concise as possible. Use ## to mark the section headers. ",
         ),
         FuncToolSpec.Param(
           "force",
