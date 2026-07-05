@@ -269,16 +269,71 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
       }
     )
 
+  for pr_id, live_job in job_by_pr.items():
+    if pr_id in seen_pr_ids:
+      continue
+    live_phase = _job_live_phase(live_job)
+    if live_phase is None:
+      continue
+    status = str(getattr(live_job, "status", "") or "")
+    outcome = "queued" if status == "queued" or live_phase == "queued" else "running"
+    summaries.append(
+      {
+        "pr_id": pr_id,
+        "title": str(getattr(live_job, "title", "") or ""),
+        "author": str(getattr(live_job, "author", "") or ""),
+        "url": f"https://github.com/llvm/llvm-project/pull/{pr_id}",
+        "state": "open",
+        "components": list(getattr(live_job, "components", []) or []),
+        "version_count": 0,
+        "review_count": 0,
+        "latest_commit": str(getattr(live_job, "head_sha", "") or ""),
+        "latest_seq": None,
+        "latest_review_id": None,
+        "latest_status": None,
+        "bug_count": 0,
+        "patch_specific_count": 0,
+        "fixed_bug_count": 0,
+        "outcome": outcome,
+        "live": live_phase,
+        "updated_at": str(
+          getattr(live_job, "updated_at", "")
+          or getattr(live_job, "created_at", "")
+          or ""
+        ),
+      }
+    )
+
   summaries.sort(key=lambda s: str(s.get("updated_at") or ""), reverse=True)
   return summaries
 
 
-def pr_detail(pr_id: int) -> Optional[Dict[str, Any]]:
+def _live_pr_detail(pr_id: int, jobs: Optional[List[Any]]) -> Optional[Dict[str, Any]]:
+  live_job = _latest_jobs_by_pr(jobs).get(int(pr_id))
+  if _job_live_phase(live_job) is None:
+    return None
+  return {
+    "pr": {
+      "pr_id": int(pr_id),
+      "title": str(getattr(live_job, "title", "") or ""),
+      "author": str(getattr(live_job, "author", "") or ""),
+      "url": f"https://github.com/llvm/llvm-project/pull/{int(pr_id)}",
+      "state": "open",
+      "components": list(getattr(live_job, "components", []) or []),
+      "description": "",
+      "live": _job_live_phase(live_job),
+      "latest_commit": str(getattr(live_job, "head_sha", "") or ""),
+    },
+    "versions": [],
+  }
+
+
+def pr_detail(pr_id: int, jobs: Optional[List[Any]] = None) -> Optional[Dict[str, Any]]:
   """Full PR tree: versions (commits) -> reviews -> bugs."""
   store = _get_store()
   pr = store.get_pr(pr_id)
   if pr is None:
-    return None
+    return _live_pr_detail(pr_id, jobs)
 
   versions_out: List[Dict[str, Any]] = []
   # Newest commit version first.

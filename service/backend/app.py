@@ -160,7 +160,7 @@ def api_prs() -> dict:
 
 @app.get("/api/prs/{pr_id}")
 def api_pr_detail(pr_id: int) -> dict:
-  detail = db_view.pr_detail(pr_id)
+  detail = db_view.pr_detail(pr_id, service.list_jobs())
   if detail is None:
     raise HTTPException(status_code=404, detail=f"PR {pr_id} not found")
   return detail
@@ -168,7 +168,7 @@ def api_pr_detail(pr_id: int) -> dict:
 
 @app.get("/pr/{pr_id}", response_class=HTMLResponse)
 def pr_page(pr_id: int) -> str:
-  detail = db_view.pr_detail(pr_id)
+  detail = db_view.pr_detail(pr_id, service.list_jobs())
   if detail is None:
     raise HTTPException(status_code=404, detail=f"PR {pr_id} not found")
   return build_pr_detail_html(detail)
