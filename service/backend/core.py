@@ -109,7 +109,10 @@ class ArcherService:
     self.jobs: Dict[str, Job] = {}
     self.jobs_by_pr: Dict[int, str] = {}
     self.queue: "queue.Queue[str]" = queue.Queue(maxsize=config.max_queue_size)
-    self.lock = threading.Lock()
+    # RLock (not Lock) so that ``_save_state`` -- which needs to iterate the
+    # jobs dict atomically -- can be safely called from a code path that
+    # already holds the lock (e.g. ``enqueue_pr``).
+    self.lock = threading.RLock()
     self.stop_flag = False
     self.worker_thread: Optional[threading.Thread] = None
     self.scanner_thread: Optional[threading.Thread] = None
@@ -172,7 +175,35 @@ class ArcherService:
             queued_jobs.append(j.id)
         self.jobs[j.id] = j
         self.jobs_by_pr[j.pr_id] = j.id
-      for job_id in queued_jobs:
+      # Enforce the "only newest commit per PR is queued" invariant on the
+      # loaded snapshot. If two queued jobs from before the last shutdown share
+      # a PR but sit on different commits, keep only the newest (by created_at)
+      # and supersede the rest -- the older ones were never worth running once
+      # the author pushed the newer commit.
+      by_pr_queued: Dict[int, List[Job]] = {}
+      for jid in queued_jobs:
+        j = self.jobs[jid]
+        by_pr_queued.setdefault(j.pr_id, []).append(j)
+      still_queued: List[str] = []
+      for pr_id, group in by_pr_queued.items():
+        group.sort(key=lambda x: x.created_at)
+        newest = group[-1]
+        for older in group[:-1]:
+          if older.head_sha and older.head_sha == newest.head_sha:
+            # Same sha, different job id -- keep the newest and drop the older
+            # one silently (this is a duplicate, not a supersede).
+            older.status = "skipped"
+            older.phase = "duplicate"
+            older.error = None
+          else:
+            older.status = "skipped"
+            older.phase = "superseded"
+            older.error = f"Superseded by newer commit {(newest.head_sha or '')[:10]}"
+          older.finished_at = utc_now_iso()
+          older.updated_at = older.finished_at
+        still_queued.append(newest.id)
+
+      for job_id in still_queued:
         try:
           self.queue.put(job_id, block=False)
         except queue.Full:
@@ -180,7 +211,27 @@ class ArcherService:
       self._save_state()
 
   def _save_state(self) -> None:
-    state = {"jobs": [asdict(j) for j in self.jobs.values()]}
+    """Persist the dispatcher's in-flight jobs to disk.
+
+    Only non-terminal jobs are written: a job whose lifecycle is complete
+    (``succeeded``/``failed``/``tokenlimit``/``skipped`` with any snapshot
+    already ingested) carries no runtime state we need to recover on restart.
+    The UI's long-term view of finished reviews comes from the SQLite store,
+    not from this file, so evicting terminal jobs keeps state.json bounded to
+    "what the orchestrator is currently working on".
+
+    As a side effect, terminal jobs are also removed from the in-memory ``jobs``
+    dict here, which prevents the process from accumulating hundreds of
+    thousands of finished-job records over long uptimes.
+    """
+    with self.lock:
+      to_evict = [jid for jid, j in self.jobs.items() if j.is_terminal()]
+      for jid in to_evict:
+        j = self.jobs.pop(jid)
+        if self.jobs_by_pr.get(j.pr_id) == jid:
+          # Only drop the reverse index entry if it was pointing at this job.
+          self.jobs_by_pr.pop(j.pr_id, None)
+      state = {"jobs": [asdict(j) for j in self.jobs.values()]}
     self.config.state_file.write_text(json.dumps(state, indent=2))
 
   def get_job(self, job_id: str) -> Optional[Job]:
@@ -283,9 +334,17 @@ class ArcherService:
   # --- Commit-level dedup helpers -------------------------------------------
   # The review identity is (pr_id, head_sha): a PR pushing a new commit must be
   # reviewed again, whereas the same commit must never be reviewed twice. This
-  # mirrors the store's (pr_id, fix_commit) versioning. A failed job is allowed
-  # to be retried; any other status counts as "already handled".
-  _REDO_STATUSES = {"failed"}
+  # mirrors the store's (pr_id, fix_commit) versioning.
+  #
+  # NOTE: an earlier version treated ``failed`` as "retry on next scan", which
+  # caused the scanner to re-enqueue the same commit every scan interval (up to
+  # dozens of times per commit) when a remote Actions run hit a transient
+  # infrastructure error. That both wasted CI budget and starved new commits'
+  # jobs behind an ever-growing retry backlog. We now consider *every* prior
+  # attempt (including ``failed``) as "already handled" for the automatic
+  # scanner: a failed commit stays failed until an operator retries it manually
+  # from the host process (there is no HTTP surface for this, see ``app.py``).
+  _REDO_STATUSES: set[str] = set()
 
   def _jobs_for_pr(self, pr_id: int) -> List[Job]:
     return sorted(
@@ -295,10 +354,29 @@ class ArcherService:
     )
 
   def _find_active_job_for_commit(self, pr_id: int, head_sha: str) -> Optional[Job]:
-    """Return an existing non-failed job for this exact (pr, commit), if any."""
+    """Return an existing job for this exact (pr, commit), if any.
+
+    Checks the in-memory job table first; if nothing matches, falls back to
+    the SQLite store: a committed ``pr_versions`` row for this ``(pr, commit)``
+    means the commit was already handled by an earlier run whose job record
+    has since been evicted from state.json. In that case we return a synthetic
+    "sentinel" Job (status=succeeded, ingested=True) purely to signal
+    "already handled" to callers -- the dispatcher no longer needs the full
+    runtime record, only the yes/no answer.
+    """
     for j in self._jobs_for_pr(pr_id):
       if j.head_sha == head_sha and j.status not in self._REDO_STATUSES:
         return j
+    # DB fallback: authoritative "was this commit ever reviewed?" record.
+    if head_sha and self._commit_already_reviewed(pr_id, head_sha):
+      return Job(
+        id=f"db-sentinel-{pr_id}-{head_sha[:10]}",
+        pr_id=pr_id,
+        head_sha=head_sha,
+        status="succeeded",
+        phase="done",
+        ingested=True,
+      )
     return None
 
   def _find_inflight_job_for_pr(self, pr_id: int) -> Optional[Job]:
@@ -352,6 +430,22 @@ class ArcherService:
         (j for j in prior_jobs if j.title or j.author or j.components),
         existing_job,
       )
+      # Supersede any older queued jobs of the same PR that were sitting on a
+      # *different* commit: only the newest head_sha is worth reviewing, so any
+      # intermediate commit still waiting to run gets skipped rather than run
+      # through the full review pipeline. We deliberately leave ``running``
+      # jobs alone: they are already burning CI time on the remote side and
+      # cancelling them would just orphan those runs without saving anything;
+      # they will finish naturally, ingest their commit's version + review, and
+      # the newer job we are about to enqueue will still be reviewed after.
+      if head_sha:
+        for j in prior_jobs:
+          if j.status == "queued" and j.head_sha and j.head_sha != head_sha:
+            j.status = "skipped"
+            j.phase = "superseded"
+            j.error = f"Superseded by newer commit {head_sha[:10]}"
+            j.finished_at = utc_now_iso()
+            j.updated_at = j.finished_at
       pr_info = self._get_pr_info(pr_id) or {}
       ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
       job_id = f"{source}-{pr_id}-{ts}"
@@ -751,6 +845,21 @@ class ArcherService:
       job.head_sha = fix_commit
     review_id = store.create_review(int(pr_info["pr_id"]), version_id, fix_commit)
 
+    # A commit is reviewed exactly once. ``create_review`` is now idempotent per
+    # ``(pr_id, version_id)``: if a review row for this commit already exists
+    # (e.g. from an earlier successful ingest of the same run, or from a prior
+    # job on the same commit) we get its id back and MUST NOT overwrite it --
+    # otherwise a re-ingest would double-write bugs and clobber a good result
+    # with a later re-run's failure. We only fill in fields when the review is
+    # still fresh (never finished). ``job.ingested`` will get set below so the
+    # remote poller stops touching this run either way.
+    existing = store.get_review(review_id)
+    already_finished = existing is not None and existing["finished_at"] is not None
+
+    if already_finished:
+      job.ingested = True
+      return True
+
     status = str((review or {}).get("status") or "succeeded")
     if status == "skipped":
       store.skip_review(review_id, (review or {}).get("skipped_reason") or "")
@@ -1143,8 +1252,14 @@ class ArcherService:
       try:
         job_id = self.queue.get(timeout=1)
         job = self.jobs.get(job_id)
-        if job:
-          self._run_job(job)
+        # A job may have been superseded (a newer commit arrived while it was
+        # waiting) between being pushed onto the FIFO queue and being pulled
+        # off. We cannot remove entries from the middle of ``queue.Queue``, so
+        # the worker double-checks the current status here and silently drops
+        # anything that is no longer ``queued``.
+        if job is None or job.status != "queued":
+          continue
+        self._run_job(job)
       except queue.Empty:
         continue
       except Exception as e:

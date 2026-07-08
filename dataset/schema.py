@@ -105,4 +105,10 @@ CREATE INDEX IF NOT EXISTS idx_reviews_ver   ON reviews(version_id);
 CREATE INDEX IF NOT EXISTS idx_bugs_pr       ON bugs(pr_id);
 CREATE INDEX IF NOT EXISTS idx_bugs_ver      ON bugs(version_id);
 CREATE INDEX IF NOT EXISTS idx_bugs_review   ON bugs(review_id);
+
+-- At most one review per (pr, commit version): a commit is reviewed exactly
+-- once. Any repeated attempt (scanner re-enqueue, remote runner ingest replay,
+-- CLI re-run of the same PR) must resolve to the same review row rather than
+-- inserting a new one. Enforced at the DB layer so no code path can bypass it.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_reviews_pr_ver ON reviews(pr_id, version_id);
 """

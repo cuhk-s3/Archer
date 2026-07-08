@@ -346,8 +346,24 @@ class ArcherStore:
   # Reviews
   # ---------------------------------------------------------------------------
   def create_review(self, pr_id: int, version_id: int, fix_commit: str = "") -> int:
+    """Return the review row id for a ``(pr_id, version_id)`` pair, idempotently.
+
+    The schema enforces at most one review per commit version (a commit is
+    reviewed exactly once). If a row already exists we return that row's id
+    instead of inserting a duplicate; callers can then decide whether to
+    overwrite the run (``finish_review``) or leave the previous result intact.
+    Returning the existing id -- rather than raising -- keeps the write paths
+    (local CLI run, remote-runner ingest, scanner replay) uniformly safe to
+    invoke on a commit that has already been handled.
+    """
     now = _now()
     with self._lock:
+      row = self._conn.execute(
+        "SELECT id FROM reviews WHERE pr_id=? AND version_id=?",
+        (int(pr_id), int(version_id)),
+      ).fetchone()
+      if row is not None:
+        return int(row["id"])
       cur = self._conn.execute(
         """INSERT INTO reviews(pr_id, version_id, fix_commit, status, created_at)
            VALUES (?,?,?, 'running', ?)""",

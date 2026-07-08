@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Archer online review service with FastAPI."""
 
-import queue
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,7 +12,6 @@ from . import db_view
 from .config import ServiceConfig
 from .core import ArcherService
 from .dashboard import build_dashboard_html, detect_bug_found
-from .models import JobCreateRequest
 from .renderers import (
   build_pr_detail_html,
   build_review_html_from_stats,
@@ -140,13 +138,13 @@ def api_job(job_id: str) -> dict:
   return item
 
 
-@app.post("/api/jobs")
-def api_create_job(req: JobCreateRequest) -> dict:
-  try:
-    job = service.enqueue_pr(pr_id=req.pr_id, source=req.source, force=req.force)
-  except queue.Full:
-    raise HTTPException(status_code=503, detail="Queue full")
-  return asdict(job)
+# NOTE: ``POST /api/jobs`` used to accept ``{pr_id, source, force}`` and forward
+# it to ``enqueue_pr``. It has been removed on purpose: the automatic scanner is
+# the only path that may enqueue new work, and manual reruns must be triggered
+# from the host (e.g. an ops script that imports ``ArcherService`` and calls
+# ``enqueue_pr(pr_id, force=True)`` in-process) -- never via the public HTTP
+# surface. This prevents anyone with network access to the dashboard from
+# forcing a re-review of a commit that has already been handled.
 
 
 # ---------------------------------------------------------------------------

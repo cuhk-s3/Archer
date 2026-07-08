@@ -115,7 +115,14 @@ def _review_stats_data(store, review_row) -> Dict[str, Any]:
 
 
 def _review_outcome(status: str, bug_count: int) -> str:
-  """Collapse a review's raw status + bug count into a single UI outcome."""
+  """Collapse a review's raw status + bug count into a single UI outcome.
+
+  This is the *per-review* outcome shown inside a PR's detail page. The
+  PR-level outcome shown on the board is sticky-buggy and is computed
+  separately in ``pr_summaries``, so ``skipped`` here stays as its own label
+  (a commit whose review was gated away by a still-triggering previous bug
+  never ran an agent; it isn't itself "buggy" or "clean", it's skipped).
+  """
   if status in ("running", "queued"):
     return status
   if status == "skipped":
@@ -157,14 +164,23 @@ def _review_summary(store, review_row) -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 def _latest_jobs_by_pr(jobs: Optional[List[Any]]) -> Dict[int, Any]:
   latest: Dict[int, Any] = {}
+
+  def priority(job) -> tuple:
+    status = str(getattr(job, "status", "") or "")
+    if not getattr(job, "finished_at", None) and status == "running":
+      status_rank = 2
+    elif not getattr(job, "finished_at", None) and status == "queued":
+      status_rank = 1
+    else:
+      status_rank = 0
+    return (status_rank, str(getattr(job, "created_at", "") or ""))
+
   for job in jobs or []:
     pr_id = int(getattr(job, "pr_id", 0) or 0)
     if pr_id <= 0:
       continue
     current = latest.get(pr_id)
-    if current is None or str(getattr(job, "created_at", "")) > str(
-      getattr(current, "created_at", "")
-    ):
+    if current is None or priority(job) > priority(current):
       latest[pr_id] = job
   return latest
 
@@ -176,8 +192,10 @@ def _job_live_phase(job) -> Optional[str]:
   status = str(getattr(job, "status", "") or "")
   if getattr(job, "finished_at", None):
     return None
-  if status in ("queued", "running"):
-    return str(getattr(job, "phase", "") or status)
+  if status == "queued":
+    return "queued"
+  if status == "running":
+    return "running"
   return None
 
 
@@ -214,14 +232,19 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
       _review_summary(store, latest_review) if latest_review is not None else None
     )
 
-    bug_count = latest_summary["bug_count"] if latest_summary else 0
-    patch_specific = latest_summary["patch_specific_count"] if latest_summary else 0
-
-    # Bugs of earlier versions that a later version has fixed (regression gate).
-    # Counted across the whole PR so the board can surface fix progress.
-    fixed_bug_count = sum(
-      1 for b in store.list_bugs_for_pr(pr_id) if b["status"] == "fixed"
+    # PR-level bug bookkeeping: "buggy" is sticky across commits. A PR is
+    # considered buggy as long as ANY of its bugs is still active (i.e. has not
+    # been marked fixed by a later version's regression gate). We surface the
+    # counts across the whole PR rather than only the latest review so a new
+    # clean commit does NOT visually clear an outstanding bug from a previous
+    # version -- the bug is still there, on some version of this PR.
+    all_bugs = list(store.list_bugs_for_pr(pr_id))
+    active_bugs = [b for b in all_bugs if b["status"] == "active"]
+    bug_count = len(active_bugs)
+    patch_specific = sum(
+      1 for b in active_bugs if patch_specificity(b) == "patch_specific"
     )
+    fixed_bug_count = sum(1 for b in all_bugs if b["status"] == "fixed")
 
     if live_phase == "queued" or (
       live_job is not None and str(getattr(live_job, "status", "")) == "queued"
@@ -229,6 +252,10 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
       outcome = "queued"
     elif live_phase is not None:
       outcome = "running"
+    elif bug_count > 0:
+      # Sticky: any active bug on any version of this PR keeps the PR "buggy",
+      # regardless of what the latest review's own outcome was.
+      outcome = "bug"
     elif latest_summary is not None:
       outcome = latest_summary["outcome"]
     else:
@@ -304,7 +331,17 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
       }
     )
 
-  summaries.sort(key=lambda s: str(s.get("updated_at") or ""), reverse=True)
+  def sort_key(summary: Dict[str, Any]) -> tuple:
+    outcome = str(summary.get("outcome") or "")
+    if outcome == "running":
+      status_rank = 2
+    elif outcome == "queued":
+      status_rank = 1
+    else:
+      status_rank = 0
+    return (status_rank, str(summary.get("updated_at") or ""))
+
+  summaries.sort(key=sort_key, reverse=True)
   return summaries
 
 

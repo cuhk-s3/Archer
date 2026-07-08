@@ -150,7 +150,7 @@ _DASHBOARD_BODY = """
       <div class="stat-card"><span class="stat-num" id="statTotal">0</span><span class="stat-label">PRs Tracked</span></div>
       <div class="stat-card run"><span class="stat-num" id="statRunning">0</span><span class="stat-label">Running</span></div>
       <div class="stat-card bug"><span class="stat-num" id="statBugs">0</span><span class="stat-label">Buggy PRs</span></div>
-      <div class="stat-card done"><span class="stat-num" id="statDone">0</span><span class="stat-label">Reviewed</span></div>
+      <div class="stat-card done"><span class="stat-num" id="statDone">0</span><span class="stat-label">Total Reviews</span></div>
     </section>
 
     <div class="toolbar">
@@ -167,7 +167,6 @@ _DASHBOARD_BODY = """
         <button class="seg-btn" data-outcome="bug">Buggy</button>
         <button class="seg-btn" data-outcome="clean">Clean</button>
         <button class="seg-btn" data-outcome="failed">Failed</button>
-        <button class="seg-btn" data-outcome="skipped">Skipped</button>
       </div>
     </div>
 
@@ -215,7 +214,6 @@ _DASHBOARD_SCRIPT = """
       bug: { label: 'Buggy', cls: 'bug' },
       clean: { label: 'Clean', cls: 'clean' },
       failed: { label: 'Failed', cls: 'failed' },
-      skipped: { label: 'Skipped', cls: 'skipped' },
       none: { label: 'Pending', cls: 'queued' },
     };
 
@@ -237,7 +235,7 @@ _DASHBOARD_SCRIPT = """
       document.getElementById('statTotal').textContent = allPrs.length;
       document.getElementById('statRunning').textContent = allPrs.filter(p => p.outcome === 'running' || p.outcome === 'queued').length;
       document.getElementById('statBugs').textContent = allPrs.filter(p => (p.bug_count || 0) > 0).length;
-      document.getElementById('statDone').textContent = allPrs.filter(p => p.review_count > 0).length;
+      document.getElementById('statDone').textContent = allPrs.reduce((sum, p) => sum + (p.review_count || 0), 0);
     }
 
     function applyFilters(options = {}) {

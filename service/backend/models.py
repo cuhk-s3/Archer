@@ -2,8 +2,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
-
 
 def utc_now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
@@ -48,8 +46,23 @@ class Job:
     if len(self.logs) > max_logs:
       self.logs = self.logs[-max_logs:]
 
+  # Terminal states: the job has finished all work the dispatcher owes it.
+  # ``succeeded/failed/tokenlimit/skipped`` are the possible outcomes; a remote
+  # job additionally needs its DB snapshot ingested before it is truly done.
+  # In-flight states (``queued/running``) are always non-terminal.
+  _FINAL_STATUSES = frozenset({"succeeded", "failed", "tokenlimit", "skipped"})
 
-class JobCreateRequest(BaseModel):
-  pr_id: int = Field(gt=0)
-  source: str = Field(default="manual")
-  force: bool = False
+  def is_terminal(self) -> bool:
+    """True iff the dispatcher has nothing left to do for this job.
+
+    Terminal jobs are the ones that can safely be evicted from the on-disk
+    state file: they carry no runtime state the orchestrator needs to recover
+    on restart. Anything the UI needs to display long-term about a finished
+    review lives in the SQLite store, not here.
+    """
+    if self.status not in Job._FINAL_STATUSES:
+      return False
+    # Remote runs still need their snapshot ingested before we drop them.
+    if self.executor == "github-actions" and self.db_path and not self.ingested:
+      return False
+    return True
