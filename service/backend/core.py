@@ -994,6 +994,12 @@ class ArcherService:
           "inputs": {
             "service_job_id": job.id,
             "pr_id": str(job.pr_id),
+            # Pin the exact head sha the scanner enqueued. Without this input
+            # the runner falls back to "whatever version is currently latest in
+            # the DB", which can be weeks stale for a PR that has pushed new
+            # commits since the last successful ingest (see main.py's
+            # ``--fix-commit`` handling).
+            "head_sha": str(job.head_sha or ""),
             "model": self.config.model,
             "driver": self.config.driver,
             "archer_ref": self.config.actions_ref,
@@ -1160,6 +1166,10 @@ class ArcherService:
       "--review",
       str(review_path),
     ]
+    # Pin the exact head sha this job was enqueued for; without it main.py
+    # falls back to "latest DB version", which may be days/weeks stale.
+    if job.head_sha:
+      cmd.extend(["--fix-commit", job.head_sha])
 
     env = {
       **subprocess.os.environ,

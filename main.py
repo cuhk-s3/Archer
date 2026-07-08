@@ -799,6 +799,12 @@ def parse_args():
     help="The PR ID to review.",
   )
   parser.add_argument(
+    "--fix-commit",
+    type=str,
+    default=None,
+    help=("The exact head commit sha to review."),
+  )
+  parser.add_argument(
     "--model",
     type=str,
     required=True,
@@ -868,7 +874,16 @@ def main():
   # Set up the PR environment: load/extract PR info, prepare the per-PR build
   # directory, checkout the base commit, apply the patch and build LLVM.
   try:
-    pr_env = PREnvironment.load(args.pr, console)
+    pr_env = PREnvironment.load(args.pr, console, fix_commit=args.fix_commit)
+    # If the caller asked for a specific head sha, refuse to silently downgrade
+    # to whatever the DB happened to have (the "started building an old commit"
+    # bug this flag exists to prevent).
+    if args.fix_commit and pr_env.pr_info.fix_commit != args.fix_commit:
+      panic(
+        f"--fix-commit {args.fix_commit[:10]} was requested, but the loaded "
+        f"PR info reports fix_commit={pr_env.pr_info.fix_commit[:10]}. Refusing "
+        "to build the wrong commit."
+      )
     build_dir = pr_env.prepare(additional_cmake_args=ADDITIONAL_CMAKE_FLAGS)
   except PREnvironmentError as e:
     panic(str(e))
