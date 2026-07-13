@@ -63,6 +63,29 @@ class FuncToolSpec:
       },
     }
 
+  def render_in_openai_responses_format(self) -> dict:
+    # The Responses API (/v1/responses) uses a flattened function-tool schema:
+    # the name / description / parameters live at the top level instead of
+    # being nested under a "function" key (as in Chat Completions).
+    return {
+      "type": "function",
+      "name": self.name,
+      "description": self.desc,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          p.name: (
+            {**p.schema, "description": p.desc}
+            if p.schema is not None
+            else {"type": p.type, "description": p.desc}
+          )
+          for p in self.params
+        },
+        "required": [p.name for p in self.params if p.req],
+        "additionalProperties": False,
+      },
+    }
+
   def render_in_simple_format(self) -> dict:
     return {
       "name": self.name,

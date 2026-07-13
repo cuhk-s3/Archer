@@ -815,7 +815,7 @@ def parse_args():
     type=str,
     default="openai",
     help="The LLM API to use (default: openai).",
-    choices=["openai", "anthropic", "openai-generic"],
+    choices=["openai", "anthropic", "openai-generic", "openai-responses"],
   )
   parser.add_argument(
     "--stats",
@@ -940,6 +940,12 @@ def main():
     from lms.openai_generic import GenericOpenAIAgent
 
     agent = GenericOpenAIAgent(
+      args.model, token_limit=MAX_CONSUMED_TOKENS, debug_mode=args.debug
+    )
+  elif args.driver == "openai-responses":
+    from lms.openai_responses import OpenAIResponsesAgent
+
+    agent = OpenAIResponsesAgent(
       args.model, token_limit=MAX_CONSUMED_TOKENS, debug_mode=args.debug
     )
   else:

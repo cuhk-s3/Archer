@@ -441,6 +441,64 @@ class ArcherStore:
       )
       self._conn.commit()
 
+  def record_dispatch_failure(
+    self,
+    pr_id: int,
+    fix_commit: str,
+    error: str,
+    errmsg: str = "",
+    title: str = "",
+    author: str = "",
+    components: Optional[List[str]] = None,
+  ) -> Tuple[int, int]:
+    """Record a failed dispatch as a permanent marker in the DB.
+
+    Used when a remote run finished but never produced a usable snapshot (for
+    example ``main.py`` panicked in extract/build before ever writing a review
+    row of its own), or when the local dispatch request itself failed. Writes:
+
+    1. a ``pr_versions`` row for ``(pr_id, fix_commit)`` (mostly-empty payload;
+       we only need the row to exist so ``get_version_by_commit`` finds it),
+    2. a ``reviews`` row with ``status='failed'``, carrying ``error`` /
+       ``errmsg`` for later diagnosis.
+
+    Returns ``(version_id, review_id)``.
+
+    Once this marker is in place, ``ArcherService._commit_already_reviewed``
+    will return True on the next scan and the scanner will refuse to re-enqueue
+    the same ``(pr, sha)`` -- enforcing "failed dispatches stay failed" without
+    re-triggering GitHub Actions every scan interval.
+    """
+    pr_stub: Dict[str, Any] = {
+      "pr_id": int(pr_id),
+      "pr_url": f"https://github.com/llvm/llvm-project/pull/{int(pr_id)}",
+      "title": title or "",
+      "author": author or "",
+      "components": list(components or []),
+      "labels": [],
+      "description": "",
+      "knowledge_cutoff": "",
+      "state": "open",
+      "base_commit": "",
+      "fix_commit": str(fix_commit),
+      "patch": "",
+      "tests": [],
+      "comments": [],
+      "patch_location_lineno": {},
+      "patch_location_funcname": {},
+    }
+    version_id, _created = self.upsert_pr_version(pr_stub)
+    review_id = self.create_review(int(pr_id), version_id, str(fix_commit))
+    now = _now()
+    with self._lock:
+      self._conn.execute(
+        """UPDATE reviews SET status='failed', error=?, errmsg=?, finished_at=?
+           WHERE id=?""",
+        (str(error), str(errmsg or ""), now, int(review_id)),
+      )
+      self._conn.commit()
+    return version_id, review_id
+
   # ---------------------------------------------------------------------------
   # Bugs
   # ---------------------------------------------------------------------------

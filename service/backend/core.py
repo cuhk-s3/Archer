@@ -945,8 +945,35 @@ class ArcherService:
       print(f"DB snapshot ingest error for {job.id}: {e}", file=sys.stderr)
 
     # Download succeeded but the completed run has no structured snapshot to
-    # ingest: stop retrying so we don't re-download artifacts every poll.
+    # ingest -- i.e. ``main.py`` on the remote runner exited before writing
+    # ``run.db.json`` (extract failed, build failed, --fix-commit mismatch,
+    # anything else that hits ``panic()`` before the review body runs). In
+    # that case we still want a permanent record so the scanner never
+    # re-enqueues this (pr, sha) again: write a ``failed`` review marker into
+    # the local store keyed by the sha the dispatcher was trying to review.
     if download_ok and not job.ingested and not job.db_path:
+      if job.head_sha:
+        try:
+          conclusion = job.remote_run_conclusion or "no snapshot"
+          error_label = "RemoteRunNoSnapshot"
+          errmsg = (
+            f"Remote workflow run {job.remote_run_id} finished with "
+            f"conclusion={conclusion} but produced no run.db.json. The archer "
+            f"process on the runner likely aborted before the review body ran "
+            f"(e.g. PR extract or build failure). Recorded as a failed marker "
+            f"so this commit is not retried."
+          )
+          self._store().record_dispatch_failure(
+            pr_id=int(job.pr_id),
+            fix_commit=str(job.head_sha),
+            error=error_label,
+            errmsg=errmsg,
+            title=str(job.title or ""),
+            author=str(job.author or ""),
+            components=list(job.components or []),
+          )
+        except Exception as e:
+          print(f"failed to record dispatch marker for {job.id}: {e}", file=sys.stderr)
       job.ingested = True
       changed = True
     return changed
@@ -1026,6 +1053,25 @@ class ArcherService:
       job.error = str(e)
       job.finished_at = utc_now_iso()
       job.updated_at = utc_now_iso()
+      # Persist a DB marker so the scanner does not re-enqueue this same sha
+      # on its next tick just because the local job record is about to be
+      # GC'd from state.json (terminal jobs are evicted on _save_state).
+      if job.head_sha:
+        try:
+          self._store().record_dispatch_failure(
+            pr_id=int(job.pr_id),
+            fix_commit=str(job.head_sha),
+            error="DispatchFailed",
+            errmsg=f"workflow_dispatch request failed: {e}",
+            title=str(job.title or ""),
+            author=str(job.author or ""),
+            components=list(job.components or []),
+          )
+        except Exception as marker_err:
+          print(
+            f"failed to record dispatch marker for {job.id}: {marker_err}",
+            file=sys.stderr,
+          )
       self._save_state()
     finally:
       session.close()
