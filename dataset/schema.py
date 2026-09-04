@@ -11,7 +11,7 @@ Design goals:
     version) for regression / patch-specificity checks.
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 PRAGMA foreign_keys = ON;
@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS bugs (
   non_patch_specific  INTEGER NOT NULL DEFAULT 0,          -- baseline also triggered
   status              TEXT    NOT NULL DEFAULT 'active',   -- active/fixed
   fixed_in_version_id INTEGER,
+  github_issue_number INTEGER,
+  github_issue_url     TEXT,
+  github_comment_id   INTEGER,
+  published_at        TEXT,
   created_at          TEXT    NOT NULL
 );
 

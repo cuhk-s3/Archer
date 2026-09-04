@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 import requests
 
 from .config import ServiceConfig
+from .github_issues import publish_pending_bug_issues
 from .models import Job, utc_now_iso
 
 _TEST_PATH_PREFIXES: list[str] = [
@@ -806,6 +807,30 @@ class ArcherService:
 
     return get_store()
 
+  def _publish_pending_issues(self) -> int:
+    """Publish verified findings; DB markers make repeated calls idempotent."""
+    if not self.config.publish_issues or not self.config.github_token:
+      return 0
+    session = self._github_session()
+    try:
+      return publish_pending_bug_issues(
+        self._store(),
+        session,
+        self.config.issues_repo,
+        self.config.github_repo,
+        self.config.public_base_url,
+      )
+    finally:
+      session.close()
+
+  def _try_publish_pending_issues(self) -> None:
+    try:
+      published = self._publish_pending_issues()
+      if published:
+        print(f"Published {published} Archer bug issue(s).")
+    except Exception as e:
+      print(f"GitHub issue publication error: {e}", file=sys.stderr)
+
   def _ingest_db_snapshot(self, job: Job) -> bool:
     """Replay a remote runner's ``run.db.json`` into the local store.
 
@@ -908,6 +933,7 @@ class ArcherService:
         for prev_bug in store.list_active_bugs(int(prev_ver["id"])):
           store.mark_bug_fixed(int(prev_bug["id"]), version_id)
 
+    self._try_publish_pending_issues()
     job.ingested = True
     return True
 
@@ -1291,6 +1317,7 @@ class ArcherService:
     job.log_path = str(log_path) if log_path.exists() else None
     job.finished_at = utc_now_iso()
     job.updated_at = utc_now_iso()
+    self._try_publish_pending_issues()
     self._save_state()
 
   def _run_job(self, job: Job) -> None:
@@ -1337,6 +1364,7 @@ class ArcherService:
             )
         except Exception as e:
           print(f"Auto scan error: {e}", file=sys.stderr)
+        self._try_publish_pending_issues()
       for _ in range(max(self.config.scan_interval_sec, 1)):
         if self.stop_flag:
           return
@@ -1348,6 +1376,7 @@ class ArcherService:
         time.sleep(1)
         continue
 
+      self._try_publish_pending_issues()
       jobs = [
         job
         for job in self.jobs.values()

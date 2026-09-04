@@ -35,6 +35,13 @@ class ServiceConfig:
     self.actions_poll_interval_sec = int(
       os.environ.get("ARCHER_ACTIONS_POLL_INTERVAL_SEC", "20")
     )
+    self.publish_issues = (
+      os.environ.get("ARCHER_PUBLISH_ISSUES", "true").lower() == "true"
+    )
+    self.issues_repo = os.environ.get("ARCHER_ISSUES_REPO", self.actions_repo)
+    self.public_base_url = os.environ.get(
+      "ARCHER_PUBLIC_BASE_URL", "https://archer.top"
+    ).rstrip("/")
 
     raw_cors_origins = os.environ.get("ARCHER_CORS_ORIGINS", "*")
     self.cors_origins = [

@@ -71,6 +71,9 @@ def _bug_full_dict(bug_row) -> Dict[str, Any]:
     "patch_specificity": patch_specificity(bug_row),
     "status": bug_row["status"],
     "fixed_in_version_id": bug_row["fixed_in_version_id"],
+    "github_issue_number": bug_row["github_issue_number"],
+    "github_issue_url": bug_row["github_issue_url"] or "",
+    "published_at": bug_row["published_at"],
   }
 
 
@@ -80,6 +83,8 @@ def _bug_compact_dict(bug_row) -> Dict[str, Any]:
     "repro_kind": bug_row["repro_kind"],
     "patch_specificity": patch_specificity(bug_row),
     "status": bug_row["status"],
+    "github_issue_number": bug_row["github_issue_number"],
+    "github_issue_url": bug_row["github_issue_url"] or "",
   }
 
 

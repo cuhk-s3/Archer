@@ -27,7 +27,7 @@ This deployment mode separates responsibilities into two roles:
 ### Dispatcher machine (Aliyun)
 
 ```bash
-export ARCHER_GITHUB_TOKEN=<github-token-with-actions-and-repo-scope>
+export ARCHER_GITHUB_TOKEN=<github-token-with-actions-and-issues-write-scope>
 export ARCHER_CORS_ORIGINS=https://<your-public-frontend-domain>
 export BACKEND_BASE_URL=https://<your-dispatcher-domain-or-ip>:8080
 bash scripts/run_dispatcher.sh
@@ -49,6 +49,9 @@ export ARCHER_ACTIONS_REPO=cuhk-s3/Archer
 export ARCHER_ACTIONS_WORKFLOW=archer-review-dispatch.yml
 export ARCHER_ACTIONS_REF=main
 export ARCHER_ACTIONS_POLL_INTERVAL_SEC=20
+export ARCHER_PUBLISH_ISSUES=true
+export ARCHER_ISSUES_REPO=cuhk-s3/Archer
+export ARCHER_PUBLIC_BASE_URL=https://archer.top
 ```
 
 ### Worker machine (School)
@@ -76,6 +79,10 @@ bash scripts/run_worker.sh
 5. Workflow uploads the files to GitHub Actions artifacts.
 6. Dispatcher downloads the artifacts and replays `run.db.json` into its authoritative `dataset/archer.db`.
 7. Dashboard reads from `/api/prs`, `/pr/{pr_id}`, `/review/{review_id}`, and `/trace/{review_id}`.
+8. For each PR with baseline-confirmed, patch-specific bugs, the dispatcher creates one issue in `ARCHER_ISSUES_REPO`. The issue body presents the earliest bug and links to the Archer review when additional bugs exist; its first comment contains the selected bug's analysis and a link to `/review/{review_id}` on `ARCHER_PUBLIC_BASE_URL`.
+9. Publication state is persisted on the bug row, so polling and service restarts do not intentionally duplicate issues or comments.
+
+Set `ARCHER_PUBLISH_ISSUES=false` to disable GitHub publication. `ARCHER_GITHUB_TOKEN` must be able to write issues in `ARCHER_ISSUES_REPO`.
 
 ## Data Model
 

@@ -74,11 +74,27 @@ class ArcherStore:
   def _init_schema(self) -> None:
     with self._lock:
       self._conn.executescript(DDL)
+      self._migrate_schema()
       self._conn.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
       )
       self._conn.commit()
+
+  def _migrate_schema(self) -> None:
+    """Add columns introduced after the initial SQLite schema."""
+    bug_columns = {
+      row["name"] for row in self._conn.execute("PRAGMA table_info(bugs)").fetchall()
+    }
+    migrations = {
+      "github_issue_number": "INTEGER",
+      "github_issue_url": "TEXT",
+      "github_comment_id": "INTEGER",
+      "published_at": "TEXT",
+    }
+    for column, column_type in migrations.items():
+      if column not in bug_columns:
+        self._conn.execute(f"ALTER TABLE bugs ADD COLUMN {column} {column_type}")
 
   def close(self) -> None:
     with self._lock:
@@ -531,6 +547,65 @@ class ArcherStore:
       )
       self._conn.commit()
       return int(cur.lastrowid)
+
+  def get_bug(self, bug_id: int) -> Optional[sqlite3.Row]:
+    with self._lock:
+      return self._conn.execute(
+        "SELECT * FROM bugs WHERE id=?", (int(bug_id),)
+      ).fetchone()
+
+  def list_bugs_pending_publication(self) -> List[sqlite3.Row]:
+    """Patch-specific active bugs whose issue or analysis comment is missing."""
+    with self._lock:
+      return list(
+        self._conn.execute(
+          """SELECT b.* FROM bugs b
+             JOIN reviews r ON r.id=b.review_id
+             WHERE b.status='active'
+               AND b.baseline_checked=1
+               AND b.baseline_triggered=0
+               AND b.non_patch_specific=0
+               AND r.status IN ('succeeded', 'tokenlimit')
+               AND (b.github_issue_number IS NULL OR b.github_comment_id IS NULL)
+             ORDER BY b.created_at ASC, b.id ASC"""
+        ).fetchall()
+      )
+
+  def list_publishable_bugs_for_pr(self, pr_id: int) -> List[sqlite3.Row]:
+    """All active, patch-specific bugs for a PR, oldest first."""
+    with self._lock:
+      return list(
+        self._conn.execute(
+          """SELECT b.* FROM bugs b
+             JOIN reviews r ON r.id=b.review_id
+             WHERE b.pr_id=?
+               AND b.status='active'
+               AND b.baseline_checked=1
+               AND b.baseline_triggered=0
+               AND b.non_patch_specific=0
+               AND r.status IN ('succeeded', 'tokenlimit')
+             ORDER BY b.created_at ASC, b.id ASC""",
+          (int(pr_id),),
+        ).fetchall()
+      )
+
+  def set_bug_github_issue(
+    self, bug_id: int, issue_number: int, issue_url: str
+  ) -> None:
+    with self._lock:
+      self._conn.execute(
+        "UPDATE bugs SET github_issue_number=?, github_issue_url=? WHERE id=?",
+        (int(issue_number), str(issue_url), int(bug_id)),
+      )
+      self._conn.commit()
+
+  def set_bug_github_comment(self, bug_id: int, comment_id: int) -> None:
+    with self._lock:
+      self._conn.execute(
+        "UPDATE bugs SET github_comment_id=?, published_at=? WHERE id=?",
+        (int(comment_id), _now(), int(bug_id)),
+      )
+      self._conn.commit()
 
   def set_bug_baseline(self, bug_id: int, triggered: bool) -> None:
     with self._lock:
