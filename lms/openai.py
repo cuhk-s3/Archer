@@ -114,13 +114,12 @@ class OpenAIAgent(AgentBase):
       completion = self._completion_with_backoff(
         model=self.model,
         messages=self.render_message_list(),
-        temperature=self.temperature,
-        top_p=self.top_p,
         max_tokens=self.max_tokens,
         tools=(
           [tool.spec().render_in_openai_format() for tool in remaining_tools]
           or NOT_GIVEN
         ),
+        tool_choice=("required" if remaining_tools else NOT_GIVEN),
       )
 
       if not isinstance(completion, str) and completion.usage:

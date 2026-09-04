@@ -48,8 +48,6 @@ class GenericOpenAIAgent(GenericAgent):
     completion = self._completion_with_backoff(
       model=self.model,
       messages=messages,
-      temperature=self.temperature,
-      top_p=self.top_p,
       max_tokens=self.max_tokens,
       stream=True,
       stream_options={"include_usage": True},

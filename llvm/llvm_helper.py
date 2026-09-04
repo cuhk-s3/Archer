@@ -135,6 +135,7 @@ def build(max_build_jobs: int, additional_cmake_args=[]):
         ".",
         "--target",
         "opt",
+        "lli",
         "-j",
         str(max_build_jobs),
         "--",
