@@ -57,6 +57,11 @@ class RunStats:
   def as_dict(self) -> dict:
     return asdict(self)
 
+  def review_status(self) -> str:
+    if self.error == "ReachTokenLimit":
+      return "tokenlimit"
+    return "failed" if self.error else "succeeded"
+
 
 def _patch_specificity_label(bug: Bug) -> str:
   """One-line patch-specificity annotation for a bug in the review."""
@@ -109,8 +114,10 @@ def generate_review(
 
   # Executive Summary
   report_lines.append("## Executive Summary\n")
-  status = "failed" if stats.error else "succeeded"
+  status = stats.review_status()
   report_lines.append(f"- **Review Status**: {status}")
+  if status == "tokenlimit":
+    report_lines.append("- **Analysis Status**: reached token limit")
   report_lines.append(f"- **Bugs Found**: {len(stats.bugs)}")
   report_lines.append(f"- **Total Time**: {stats.total_time_sec:.2f} seconds")
   report_lines.append(

@@ -235,7 +235,7 @@ _DASHBOARD_SCRIPT = """
       document.getElementById('statTotal').textContent = allPrs.length;
       document.getElementById('statRunning').textContent = allPrs.filter(p => p.outcome === 'running' || p.outcome === 'queued').length;
       document.getElementById('statBugs').textContent = allPrs.filter(p => (p.bug_count || 0) > 0).length;
-      document.getElementById('statDone').textContent = allPrs.reduce((sum, p) => sum + (p.review_count || 0), 0);
+      document.getElementById('statDone').textContent = allPrs.reduce((sum, p) => sum + (p.effective_review_count || 0), 0);
     }
 
     function applyFilters(options = {}) {

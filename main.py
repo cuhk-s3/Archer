@@ -687,7 +687,7 @@ def run_baseline_check(pr_env: PREnvironment, bugs: List[Bug]) -> None:
 
 def persist_review(store, pr_id: int, version_id: int, review_id: int, stats, agent):
   """Persist final review stats and its bugs (with baseline flags) to the DB."""
-  status = "failed" if stats.error else "succeeded"
+  status = stats.review_status()
   payload = stats.as_dict()
   payload["status"] = status
   try:

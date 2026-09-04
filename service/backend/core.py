@@ -167,7 +167,9 @@ class ArcherService:
           # not re-enqueued for a second workflow dispatch after restart.
           if (
             j.executor == "github-actions"
-            and j.phase in {"dispatching", "dispatched"}
+            and (
+              j.remote_run_id is not None or j.phase in {"dispatching", "dispatched"}
+            )
             and j.started_at
           ):
             pass
@@ -861,10 +863,13 @@ class ArcherService:
       return True
 
     status = str((review or {}).get("status") or "succeeded")
+    if review is not None and review.get("error") == "ReachTokenLimit":
+      status = "tokenlimit"
     if status == "skipped":
       store.skip_review(review_id, (review or {}).get("skipped_reason") or "")
     elif review is not None:
       stats_payload = dict(review)
+      stats_payload["status"] = status
       # ``strategies`` / ``history`` are stored as JSON text in the source DB;
       # the write path re-serializes them, so hand back parsed objects.
       stats_payload["strategies"] = self._loads_json(review.get("strategies"), [])
