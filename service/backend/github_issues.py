@@ -29,6 +29,13 @@ def _comment_marker(marker: str) -> str:
   return f"{marker}-analysis"
 
 
+def _issue_title(bug, pr_id: int) -> str:
+  transformed_ir = str(bug["transformed_ir"] or "").strip()
+  if transformed_ir == "<crash during transformation>":
+    return f"Compiler crash found in LLVM PR #{pr_id}"
+  return f"Miscompilation found in LLVM PR #{pr_id}"
+
+
 def _analysis_text(bug, review) -> str:
   report = review["report"]
   if report:
@@ -197,6 +204,7 @@ def publish_pending_bug_issues(
 
     fix_commit = str(version["fix_commit"] or "")
     marker = _marker(pr_id)
+    latest_title = _issue_title(representative, pr_id)
     issue_number = next(
       (
         bug["github_issue_number"]
@@ -212,7 +220,7 @@ def publish_pending_bug_issues(
         response = session.post(
           f"{_GITHUB_API}/repos/{issue_repo}/issues",
           json={
-            "title": f"Miscompilation found in LLVM PR #{pr_id}",
+            "title": latest_title,
             "body": _issue_body(
               representative,
               pr,
@@ -250,6 +258,7 @@ def publish_pending_bug_issues(
       )
       response.raise_for_status()
       issue = response.json()
+    current_title = str(issue.get("title") or "")
     current_body = str(issue.get("body") or "")
     latest_body = _issue_body(
       representative,
@@ -260,10 +269,10 @@ def publish_pending_bug_issues(
       len(publishable_bugs) - 1,
       f"{public_base_url.rstrip('/')}/review/{int(review['id'])}",
     )
-    if current_body != latest_body:
+    if current_title != latest_title or current_body != latest_body:
       response = session.patch(
         f"{_GITHUB_API}/repos/{issue_repo}/issues/{int(issue_number)}",
-        json={"body": latest_body},
+        json={"title": latest_title, "body": latest_body},
         timeout=30,
       )
       response.raise_for_status()
