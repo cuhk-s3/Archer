@@ -96,7 +96,8 @@ def _review_stats_data(store, review_row) -> Dict[str, Any]:
   the whole review report without a separate ``/review/<id>`` hop.
   """
   status = str(review_row["status"] or "")
-  if status == "failed":
+  bug_rows = store.list_bugs_for_review(int(review_row["id"]))
+  if status == "failed" and not bug_rows:
     return {
       "strategies": [],
       "bugs": [],
@@ -107,7 +108,6 @@ def _review_stats_data(store, review_row) -> Dict[str, Any]:
       "total_tokens": review_row["total_tokens"],
     }
 
-  bug_rows = store.list_bugs_for_review(int(review_row["id"]))
   return {
     "strategies": _loads(review_row["strategies"], []),
     "bugs": [_bug_full_dict(b) for b in bug_rows],
@@ -132,8 +132,10 @@ def _review_outcome(status: str, bug_count: int) -> str:
     return status
   if status == "skipped":
     return "skipped"
+  if bug_count > 0:
+    return "bug"
   if status in ("succeeded", "tokenlimit"):
-    return "bug" if bug_count > 0 else "clean"
+    return "clean"
   return "failed"
 
 
@@ -251,6 +253,15 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
     )
     fixed_bug_count = sum(1 for b in all_bugs if b["status"] == "fixed")
 
+    # "Effective" reviews exclude pure failure markers (a dispatch/extract/build
+    # failure recorded via record_dispatch_failure, or an agent run that errored
+    # out) -- those produced no actual review output. A PR whose reviews are ALL
+    # failed has therefore never really been reviewed and must not inflate the
+    # "Reviewed" stat on the board.
+    effective_review_count = sum(
+      1 for r in reviews if str(r["status"] or "") != "failed"
+    )
+
     if live_phase == "queued" or (
       live_job is not None and str(getattr(live_job, "status", "")) == "queued"
     ):
@@ -288,6 +299,7 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
         "components": _loads(pr["components"], []),
         "version_count": len(versions),
         "review_count": len(reviews),
+        "effective_review_count": effective_review_count,
         "latest_commit": latest_version["fix_commit"] if latest_version else "",
         "latest_seq": int(latest_version["seq"]) if latest_version else None,
         "latest_review_id": latest_summary["review_id"] if latest_summary else None,
@@ -319,6 +331,7 @@ def pr_summaries(jobs: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
         "components": list(getattr(live_job, "components", []) or []),
         "version_count": 0,
         "review_count": 0,
+        "effective_review_count": 0,
         "latest_commit": str(getattr(live_job, "head_sha", "") or ""),
         "latest_seq": None,
         "latest_review_id": None,

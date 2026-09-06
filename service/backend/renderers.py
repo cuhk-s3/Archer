@@ -780,7 +780,7 @@ def build_pr_detail_html(detail: dict) -> str:
         + "</div>"
       )
 
-    if status == "failed":
+    if status == "failed" and bug_count <= 0:
       return (
         f'<div class="rev {cls}">'
         '<div class="rev-top rev-top-static">'
