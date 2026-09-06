@@ -7,6 +7,7 @@ import requests
 
 _GITHUB_API = "https://api.github.com"
 _MAX_GITHUB_BODY = 65000
+_ISSUE_TYPE_LABELS = {"crash", "miscompilation"}
 
 
 def _trim(value: Any, limit: int = _MAX_GITHUB_BODY) -> str:
@@ -29,11 +30,28 @@ def _comment_marker(marker: str) -> str:
   return f"{marker}-analysis"
 
 
-def _issue_title(bug, pr_id: int) -> str:
+def _issue_type(bug) -> str:
   transformed_ir = str(bug["transformed_ir"] or "").strip()
   if transformed_ir == "<crash during transformation>":
+    return "crash"
+  return "miscompilation"
+
+
+def _issue_title(issue_type: str, pr_id: int) -> str:
+  if issue_type == "crash":
     return f"Compiler crash found in LLVM PR #{pr_id}"
   return f"Miscompilation found in LLVM PR #{pr_id}"
+
+
+def _issue_labels(issue: dict, issue_type: str) -> list[str]:
+  labels = []
+  for label in issue.get("labels") or []:
+    name = label.get("name") if isinstance(label, dict) else label
+    name = str(name or "").strip()
+    if name and name.lower() not in _ISSUE_TYPE_LABELS:
+      labels.append(name)
+  labels.append(issue_type)
+  return labels
 
 
 def _analysis_text(bug, review) -> str:
@@ -204,7 +222,8 @@ def publish_pending_bug_issues(
 
     fix_commit = str(version["fix_commit"] or "")
     marker = _marker(pr_id)
-    latest_title = _issue_title(representative, pr_id)
+    issue_type = _issue_type(representative)
+    latest_title = _issue_title(issue_type, pr_id)
     issue_number = next(
       (
         bug["github_issue_number"]
@@ -221,6 +240,7 @@ def publish_pending_bug_issues(
           f"{_GITHUB_API}/repos/{issue_repo}/issues",
           json={
             "title": latest_title,
+            "labels": [issue_type],
             "body": _issue_body(
               representative,
               pr,
@@ -260,6 +280,11 @@ def publish_pending_bug_issues(
       issue = response.json()
     current_title = str(issue.get("title") or "")
     current_body = str(issue.get("body") or "")
+    current_labels = _issue_labels(issue, issue_type)
+    existing_label_names = {
+      str(label.get("name") if isinstance(label, dict) else label).strip()
+      for label in issue.get("labels") or []
+    }
     latest_body = _issue_body(
       representative,
       pr,
@@ -269,10 +294,13 @@ def publish_pending_bug_issues(
       len(publishable_bugs) - 1,
       f"{public_base_url.rstrip('/')}/review/{int(review['id'])}",
     )
-    if current_title != latest_title or current_body != latest_body:
+    labels_changed = {name.lower() for name in existing_label_names} != {
+      name.lower() for name in current_labels
+    }
+    if current_title != latest_title or current_body != latest_body or labels_changed:
       response = session.patch(
         f"{_GITHUB_API}/repos/{issue_repo}/issues/{int(issue_number)}",
-        json={"title": latest_title, "body": latest_body},
+        json={"title": latest_title, "body": latest_body, "labels": current_labels},
         timeout=30,
       )
       response.raise_for_status()
