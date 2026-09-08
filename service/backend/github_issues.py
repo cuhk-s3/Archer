@@ -331,7 +331,7 @@ def publish_pending_bug_issues(
       comment = response.json()
     elif comment_id is None and str(comment.get("body") or "") != comment_body:
       response = session.patch(
-        f"{_GITHUB_API}/repos/{issue_repo}/issues/{int(issue_number)}/comments/{int(comment['id'])}",
+        f"{_GITHUB_API}/repos/{issue_repo}/issues/comments/{int(comment['id'])}",
         json={"body": comment_body},
         timeout=30,
       )
