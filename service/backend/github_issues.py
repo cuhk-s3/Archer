@@ -39,7 +39,7 @@ def _issue_type(bug) -> str:
 
 def _issue_title(issue_type: str, pr_id: int) -> str:
   if issue_type == "crash":
-    return f"Compiler crash found in LLVM PR #{pr_id}"
+    return f"Crash found in LLVM PR #{pr_id}"
   return f"Miscompilation found in LLVM PR #{pr_id}"
 
 
