@@ -4,7 +4,24 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from lms.tool import FuncToolCallException
-from tools.difftest import DiffTestTool
+from tools.difftest import DiffTestTool, has_immediate_ub
+
+
+class TestDiffTestOracle(unittest.TestCase):
+  def test_original_immediate_ub_is_not_a_bug(self):
+    output = {
+      "timed_out": False,
+      "return_code": 1,
+      "stdout": "",
+      "stderr": (
+        "UB triggered: load from poison pointer\n"
+        "Exited with immediate UB.\n"
+        "Stacktrace:\n    %Q = load i16, ptr %P, align 2"
+      ),
+      "executor": "llubi",
+    }
+
+    self.assertTrue(has_immediate_ub(output))
 
 
 class TestDiffTestTool(unittest.TestCase):

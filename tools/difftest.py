@@ -19,6 +19,18 @@ entry:
 """
 
 
+def has_immediate_ub(output: object) -> bool:
+  if not isinstance(output, dict):
+    return False
+  stderr = output.get("stderr")
+  return (
+    output.get("executor") == "llubi"
+    and output.get("return_code") == 1
+    and isinstance(stderr, str)
+    and "Exited with immediate UB." in stderr
+  )
+
+
 class DiffTestTool(FuncToolBase):
   def __init__(self, build_dir: str, llubi_path: str):
     self.build_dir = Path(build_dir).resolve().absolute()
@@ -31,7 +43,8 @@ class DiffTestTool(FuncToolBase):
       "difftest",
       "Perform differential testing on the input LLVM IR code and another transformed by opt, "
       "then use llubi (or lli as fallback) to execute to see if there is any difference. "
-      "You can also use this tool to confirm whether a previously found difference is a real bug."
+      "You can also use this tool to confirm whether a previously found difference is a real bug. "
+      "A difference is not a bug if the original execution has immediate UB. "
       "If you encountered a crash when using llubi, please set `use_lli` to true to use lli for execution. ",
       [
         FuncToolSpec.Param(
