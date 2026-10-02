@@ -38,7 +38,7 @@ from llvm.llvm_helper import (
   set_llvm_build_dir,
 )
 from lms.agent import AgentBase, RepeatedToolCallLimitExceeded
-from tools.difftest import DiffTestTool
+from tools.difftest import DiffTestTool, has_immediate_ub
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
 from tools.langref import LangRefTool
@@ -584,7 +584,12 @@ def generate_test_for_pr(
             except Exception:
               pass
 
-          if diff_result.get("found", False) and original_out != transformed_out:
+          original_has_ub = has_immediate_ub(original_out)
+          if (
+            diff_result.get("found", False)
+            and original_out != transformed_out
+            and not original_has_ub
+          ):
             log_msg = f"Confirmed as bug by agent.\nOriginal Output: {original_out}\nTransformed Output: {transformed_out}"
             stats.bugs.append(
               Bug(
@@ -594,6 +599,8 @@ def generate_test_for_pr(
                 thoughts=diff_result.get("thoughts"),
               )
             )
+          elif diff_result.get("found", False) and original_has_ub:
+            res = "Oracle rejected the agent confirmation: original execution has immediate UB."
         elif diff_result.get("action") == "test":
           return (True, res)
       except Exception:
