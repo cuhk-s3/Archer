@@ -16,8 +16,7 @@ class ReportTool(FuncToolBase):
           "test",
           "list[string, string]",
           True,
-          "A self-contained LLVM IR wrapped with ```llvm and ``` and the command to trigger the bug. "
-          "For example, ['```llvm\n; LLVM IR code\n```', 'the command to trigger the bug'].",
+          "Self-contained MLIR wrapped with ```mlir and ``` plus the veir-opt command that triggers the bug.",
           schema={
             "type": "array",
             "items": {"type": "string"},
@@ -52,11 +51,11 @@ class ReportTool(FuncToolBase):
       raise FuncToolCallException(f"Test must be a list of two elements: {test}")
     if not (
       isinstance(test[0], str)
-      and test[0].startswith("```llvm")
+      and test[0].startswith("```mlir")
       and test[0].endswith("```")
     ):
       raise FuncToolCallException(
-        f"The first element of test must be a self-contained LLVM IR wrapped with ```llvm and ```: {test[0]}"
+        f"The first element must be self-contained MLIR wrapped with ```mlir and ```: {test[0]}"
       )
     return json.dumps(
       {

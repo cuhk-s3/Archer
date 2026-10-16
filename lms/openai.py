@@ -46,8 +46,8 @@ class OpenAIAgent(AgentBase):
       token_limit=token_limit,
       debug_mode=debug_mode,
     )
-    end_point = os.environ.get("LLVM_AUTOREVIEW_LM_API_ENDPOINT")
-    token = os.environ.get("LLVM_AUTOREVIEW_LM_API_KEY")
+    end_point = os.environ.get("ARCHER_LM_API_ENDPOINT")
+    token = os.environ.get("ARCHER_LM_API_KEY")
     self.client = OpenAI(api_key=token, base_url=end_point)
 
   def render_message_list(self) -> List[dict]:

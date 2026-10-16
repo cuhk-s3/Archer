@@ -5,6 +5,9 @@ FRONTEND_DIR="${ROOT_DIR}/service/frontend"
 
 cd "${ROOT_DIR}"
 
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/scripts/upenv.sh"
+
 if [[ -z "${ARCHER_GITHUB_TOKEN:-}" && -z "${LAB_GITHUB_TOKEN:-}" ]]; then
   echo "Error: set ARCHER_GITHUB_TOKEN (or LAB_GITHUB_TOKEN) before starting dispatcher." >&2
   exit 1
@@ -19,8 +22,10 @@ export ARCHER_ACTIONS_WORKFLOW="${ARCHER_ACTIONS_WORKFLOW:-archer-review-dispatc
 export ARCHER_ACTIONS_REF="${ARCHER_ACTIONS_REF:-main}"
 export ARCHER_OPEN_PR_LIMIT="${ARCHER_OPEN_PR_LIMIT:-50}"
 export ARCHER_ACTIONS_POLL_INTERVAL_SEC="${ARCHER_ACTIONS_POLL_INTERVAL_SEC:-20}"
-export ARCHER_MODEL="${ARCHER_MODEL:-zai/glm-5.3-flash}"
-export ARCHER_DRIVER="${ARCHER_DRIVER:-openai-generic}"
+export ARCHER_MODEL="${ARCHER_MODEL:-gpt-5.6-sol}"
+export ARCHER_DRIVER="${ARCHER_DRIVER:-openai-responses}"
+export ARCHER_AUTO_SCAN="${ARCHER_AUTO_SCAN:-false}"
+export ARCHER_PUBLISH_ISSUES="${ARCHER_PUBLISH_ISSUES:-false}"
 
 export FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 export FRONTEND_PORT="${FRONTEND_PORT:-8090}"
@@ -40,8 +45,8 @@ else
   export ARCHER_CORS_ORIGINS="*"
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Error: python3 is required to serve dispatcher frontend static files." >&2
+if [[ ! -x "${ARCHER_VENV_DIR}/bin/python" ]]; then
+  echo "Error: .venv is missing; run scripts/setup.sh first." >&2
   exit 1
 fi
 
@@ -59,11 +64,7 @@ echo "Frontend runtime config written: ${FRONTEND_DIR}/runtime-config.js"
 echo "Dispatcher model=${ARCHER_MODEL}, driver=${ARCHER_DRIVER}, ref=${ARCHER_ACTIONS_REF}, auto_scan=${ARCHER_AUTO_SCAN}"
 
 echo "Starting dispatcher backend on ${ARCHER_SERVICE_HOST}:${ARCHER_SERVICE_PORT}"
-if [[ -x "${ROOT_DIR}/deps/py3_venv/bin/python" ]]; then
-  BACKEND_PYTHON="${ROOT_DIR}/deps/py3_venv/bin/python"
-else
-  BACKEND_PYTHON="${PYTHON_BIN:-python3}"
-fi
+BACKEND_PYTHON="${ARCHER_VENV_DIR}/bin/python"
 
 "${BACKEND_PYTHON}" -m uvicorn service.backend.app:app \
   --host "${ARCHER_SERVICE_HOST}" \
@@ -80,4 +81,5 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Starting dispatcher frontend on ${FRONTEND_HOST}:${FRONTEND_PORT}"
-exec python3 -m http.server "${FRONTEND_PORT}" --bind "${FRONTEND_HOST}" --directory "${FRONTEND_DIR}"
+"${BACKEND_PYTHON}" -m http.server "${FRONTEND_PORT}" \
+  --bind "${FRONTEND_HOST}" --directory "${FRONTEND_DIR}"

@@ -37,7 +37,7 @@ class ClaudeAgent(AgentBase):
       token_limit=token_limit,
       debug_mode=debug_mode,
     )
-    token = os.environ.get("LLVM_AUTOFIX_LM_API_KEY")
+    token = os.environ.get("ARCHER_LM_API_KEY")
     self.client = Anthropic(api_key=token)
 
   def run(

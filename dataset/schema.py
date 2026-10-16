@@ -11,7 +11,7 @@ Design goals:
     version) for regression / patch-specificity checks.
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DDL = """
 PRAGMA foreign_keys = ON;
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS bugs (
   pr_id               INTEGER NOT NULL,
   version_id          INTEGER NOT NULL REFERENCES pr_versions(id) ON DELETE CASCADE,
   review_id           INTEGER REFERENCES reviews(id) ON DELETE SET NULL,
-  repro_kind          TEXT    NOT NULL DEFAULT 'verify',  -- verify/trans/difftest
+  repro_kind          TEXT    NOT NULL DEFAULT 'verify',  -- verify/trans/difftest/rwenum
   original_ir         TEXT,
   transformed_ir      TEXT,
   args                TEXT,                                -- opt args (reproducer)
@@ -103,12 +103,32 @@ CREATE TABLE IF NOT EXISTS bugs (
   created_at          TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS insights (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  fingerprint    TEXT    NOT NULL UNIQUE,
+  components     TEXT    NOT NULL DEFAULT '[]',
+  topic          TEXT    NOT NULL,
+  kind           TEXT    NOT NULL DEFAULT 'observation',
+  content        TEXT    NOT NULL,
+  verified       INTEGER NOT NULL DEFAULT 0,
+  evidence_tool  TEXT,
+  evidence       TEXT,
+  pr_id          INTEGER,
+  version_id     INTEGER REFERENCES pr_versions(id) ON DELETE SET NULL,
+  review_id      INTEGER REFERENCES reviews(id) ON DELETE SET NULL,
+  fix_commit     TEXT    NOT NULL DEFAULT '',
+  created_at     TEXT    NOT NULL,
+  updated_at     TEXT    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_pr   ON pr_versions(pr_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_pr    ON reviews(pr_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_ver   ON reviews(version_id);
 CREATE INDEX IF NOT EXISTS idx_bugs_pr       ON bugs(pr_id);
 CREATE INDEX IF NOT EXISTS idx_bugs_ver      ON bugs(version_id);
 CREATE INDEX IF NOT EXISTS idx_bugs_review   ON bugs(review_id);
+CREATE INDEX IF NOT EXISTS idx_insights_topic ON insights(topic);
+CREATE INDEX IF NOT EXISTS idx_insights_verified ON insights(verified);
 
 -- At most one review per (pr, commit version): a commit is reviewed exactly
 -- once. Any repeated attempt (scanner re-enqueue, remote runner ingest replay,

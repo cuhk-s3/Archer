@@ -15,7 +15,7 @@ class ServiceConfig:
     self.driver = os.environ.get("ARCHER_DRIVER", "openai")
     self.executor = os.environ.get("ARCHER_EXECUTOR", "local").strip().lower()
     self.scan_interval_sec = int(os.environ.get("ARCHER_SCAN_INTERVAL_SEC", "300"))
-    self.auto_scan = os.environ.get("ARCHER_AUTO_SCAN", "true").lower() == "true"
+    self.auto_scan = os.environ.get("ARCHER_AUTO_SCAN", "false").lower() == "true"
     self.include_draft = (
       os.environ.get("ARCHER_INCLUDE_DRAFT", "false").lower() == "true"
     )
@@ -23,7 +23,7 @@ class ServiceConfig:
     self.max_logs_per_job = int(os.environ.get("ARCHER_MAX_LOGS_PER_JOB", "400"))
     self.max_queue_size = int(os.environ.get("ARCHER_MAX_QUEUE_SIZE", "200"))
 
-    self.github_repo = os.environ.get("ARCHER_GITHUB_REPO", "llvm/llvm-project")
+    self.github_repo = os.environ.get("ARCHER_GITHUB_REPO", "opencompl/veir")
     self.github_token = os.environ.get("ARCHER_GITHUB_TOKEN") or os.environ.get(
       "LAB_GITHUB_TOKEN"
     )
@@ -36,7 +36,7 @@ class ServiceConfig:
       os.environ.get("ARCHER_ACTIONS_POLL_INTERVAL_SEC", "20")
     )
     self.publish_issues = (
-      os.environ.get("ARCHER_PUBLISH_ISSUES", "true").lower() == "true"
+      os.environ.get("ARCHER_PUBLISH_ISSUES", "false").lower() == "true"
     )
     self.issues_repo = os.environ.get("ARCHER_ISSUES_REPO", self.actions_repo)
     self.public_base_url = os.environ.get(

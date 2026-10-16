@@ -13,24 +13,23 @@ import json_repair
 import prompts
 from base.console import get_boxed_console
 from dataset import get_store
-from llvm.lab_env import PREnvironment, PREnvironmentError, PRInfo
-from llvm.llvm import LLVM
-from llvm.llvm_helper import (
-  llvm_dir,
-)
+from veir.lab_env import PREnvironment, PREnvironmentError, PRInfo
+from veir.veir import VeIR
+from veir.helper import veir_dir
 from lms.agent import AgentBase, RepeatedToolCallLimitExceeded
-from repro import Reproducer, reproduce
-from tools.difftest import DiffTestTool, has_immediate_ub
+from repro import Reproducer
+from veir.repro import reproduce
+from tools.veir_verify import DiffTestTool, VerifyTool
 from tools.findn import FindNTool
 from tools.grepn import GrepNTool
-from tools.langref import LangRefTool
 from tools.listn import ListNTool
 from tools.readn import ReadNTool
 from tools.report import ReportTool
 from tools.stop import StopTool
 from tools.tests import Test, TestsTool
-from tools.trans import TransTool
-from tools.verify import VerifyTool
+from tools.veir_trans import TransTool
+from tools.rwenum import RwenumTool
+from tools.insight import InsightTool
 from utils.log import Bug, RunStats, collect_agent_stats, print_results, save_outputs
 
 # - ===============================================
@@ -43,29 +42,19 @@ MAX_TCS_GET_CONTEXT = 250
 MAX_ROLS_PER_TC = 250
 
 # - ================================================
-# - LLVM settings
+# - VeIR settings
 # - ================================================
 COMPILATION_FLAGS = "-O0"
 ADDITIONAL_CMAKE_FLAGS = [
   f"-DCMAKE_C_FLAGS_RELWITHDEBINFO={COMPILATION_FLAGS}",
   f"-DCMAKE_CXX_FLAGS_RELWITHDEBINFO={COMPILATION_FLAGS}",
 ]
-ALIVE_TV_PATH = os.environ.get("LAB_LLVM_ALIVE_TV", None)
-LLUBI_PATH = os.environ.get("LAB_LLVM_LLUBI", None)
-
 console = get_boxed_console(debug_mode=True)
 
 
 def panic(msg: str):
   console.print(f"Error: {msg}", color="red")
   exit(1)
-
-
-if not ALIVE_TV_PATH:
-  panic("LAB_LLVM_ALIVE_TV is not set")
-
-if not LLUBI_PATH:
-  panic("LAB_LLVM_LLUBI is not set")
 
 
 class NoAvailableBugFound(Exception):
@@ -116,10 +105,19 @@ def get_component_knowledge(component: List[str]) -> str:
     if candidate.exists():
       knowledge_file.append(candidate)
 
-  if not knowledge_file:
-    return "No specific knowledge provided for this component."
-
   knowledge = [f.read_text(encoding="utf-8") for f in knowledge_file]
+  insights = get_store().search_insights(
+    components=component, verified_only=True, limit=20
+  )
+  if insights:
+    knowledge.append("## Verified review insights\n\n" + "\n".join(
+      f"- [{item['kind']}] {item['topic']}: {item['content']} "
+      f"(PR {item.get('pr_id') or 'unknown'}, evidence: "
+      f"{item.get('evidence_tool') or 'repository record'})"
+      for item in insights
+    ))
+  if not knowledge:
+    return "No specific knowledge provided for this component."
   return "\n".join(knowledge)
 
 
@@ -156,35 +154,59 @@ def check_duplicate_tool_call(
 
 def get_tool_list(
   pr_env: PREnvironment,
-  llvm: LLVM,
+  veir: VeIR,
   build_dir: str,
+  stats: RunStats,
+  store,
+  pr_info: PRInfo,
+  version_id: int,
+  review_id: int,
   phase: int = 0,
 ):
   """Get tool list for different phases"""
   common_tools = [
-    (FindNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (GrepNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (ListNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (ReadNTool(llvm_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
-    (LangRefTool(pr_env), MAX_TCS_GET_CONTEXT),
+    (FindNTool(veir_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (GrepNTool(veir_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (ListNTool(veir_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
+    (ReadNTool(veir_dir, n=MAX_ROLS_PER_TC), MAX_TCS_GET_CONTEXT),
   ]
+
+  def latest_evidence(source_tool: str):
+    for raw in reversed(stats.test_traj):
+      try:
+        result = json_repair.loads(raw)
+      except Exception:
+        continue
+      if isinstance(result, dict) and result.get("tool") == source_tool:
+        return result
+    return None
+
+  insight = InsightTool(
+    store, pr_info.components, pr_info.pr_id, version_id, review_id,
+    pr_info.fix_commit, latest_evidence,
+  )
 
   if phase == 1:
     return common_tools + [
+      (insight, MAX_TCS_GET_CONTEXT),
       (StopTool(), MAX_TCS_GET_CONTEXT),
     ]
   elif phase == 2:
     return common_tools + [
+      (insight, MAX_TCS_GET_CONTEXT),
       (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
-      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
-      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
+      (VerifyTool(build_dir), MAX_TCS_GET_CONTEXT),
+      (DiffTestTool(build_dir), MAX_TCS_GET_CONTEXT * 2),
+      (RwenumTool(build_dir), MAX_TCS_GET_CONTEXT),
       (ReportTool(), MAX_TCS_GET_CONTEXT),
     ]
   else:
     return common_tools + [
+      (insight, MAX_TCS_GET_CONTEXT),
       (TransTool(build_dir), MAX_TCS_GET_CONTEXT),
-      (VerifyTool(build_dir, alive_path=ALIVE_TV_PATH), MAX_TCS_GET_CONTEXT),
-      (DiffTestTool(build_dir, llubi_path=LLUBI_PATH), MAX_TCS_GET_CONTEXT * 2),
+      (VerifyTool(build_dir), MAX_TCS_GET_CONTEXT),
+      (DiffTestTool(build_dir), MAX_TCS_GET_CONTEXT * 2),
+      (RwenumTool(build_dir), MAX_TCS_GET_CONTEXT),
       (StopTool(), MAX_TCS_GET_CONTEXT),
       (ReportTool(), MAX_TCS_GET_CONTEXT),
     ]
@@ -193,7 +215,7 @@ def get_tool_list(
 def generate_test_for_pr(
   agent: AgentBase,
   pr_env: PREnvironment,
-  llvm: LLVM,
+  veir: VeIR,
   stats: RunStats,
 ) -> Optional[str]:
   """Generate tests for PR (Phase 2) - following main.py's generate_test logic"""
@@ -388,7 +410,10 @@ def generate_test_for_pr(
             except Exception:
               pass
 
-          original_has_ub = has_immediate_ub(original_out)
+          original_has_ub = (
+            isinstance(original_out, dict)
+            and original_out.get("stdout") == "Undefined behavior"
+          )
           if (
             diff_result.get("found", False)
             and original_out != transformed_out
@@ -412,6 +437,31 @@ def generate_test_for_pr(
           return (True, res)
       except Exception:
         return (True, res)
+
+    if name == "rwenum":
+      try:
+        enum_result = json.loads(res)
+        stats.test_traj.append(res)
+        idx = enum_result.get("test_index")
+        cov = enum_result.get("covered_strategy")
+        if idx is not None and cov:
+          if cov not in tests_tool.all_strategies:
+            return True, (
+              f"Error: The strategy '{cov}' is not a valid Phase 1 strategy."
+            )
+          tests_tool.add_covered_strategy(idx, cov)
+        if enum_result.get("found"):
+          stats.bugs.append(Bug(
+            original_ir=enum_result.get("original_ir", "<missing>"),
+            transformed_ir=enum_result.get("transformed_ir", "<missing>"),
+            log=enum_result.get("validator_log") or enum_result.get("log", ""),
+            thoughts=enum_result.get("thoughts"),
+            repro_kind="rwenum",
+            args=None,
+            call_instr=json.dumps(enum_result.get("case", {})),
+          ))
+      except Exception:
+        pass
 
     if name == "report":
       report_data = json.loads(res)
@@ -452,10 +502,11 @@ def generate_test_for_pr(
         f"read{MAX_ROLS_PER_TC}",
         f"find{MAX_ROLS_PER_TC}",
         f"grep{MAX_ROLS_PER_TC}",
-        "langref",
         "trans",
         "verify",
         "difftest",
+        "rwenum",
+        "insight",
         "tests_manager",
         "report",
       ],
@@ -473,9 +524,12 @@ def run_pr_agent(
   agent: AgentBase,
   pr_info: PRInfo,
   pr_env: PREnvironment,
-  llvm: LLVM,
+  veir: VeIR,
   stats: RunStats,
   build_dir: str,
+  store,
+  version_id: int,
+  review_id: int,
 ) -> Optional[str]:
   """Main PR review agent"""
   agent.clear_history()
@@ -535,7 +589,7 @@ def run_pr_agent(
       f"read{MAX_ROLS_PER_TC}",
       f"find{MAX_ROLS_PER_TC}",
       f"grep{MAX_ROLS_PER_TC}",
-      "langref",
+      "insight",
       "stop",
     ],
     response_handler=response_handler,
@@ -567,7 +621,9 @@ def run_pr_agent(
   stats.reason_thou = reasoning_thoughts
   stats.strategies = [s.as_dict() for s in test_strategies]
 
-  tools_phase2 = get_tool_list(pr_env, llvm, build_dir, phase=2)
+  tools_phase2 = get_tool_list(
+    pr_env, veir, build_dir, stats, store, pr_info, version_id, review_id, phase=2
+  )
   try:
     if hasattr(agent.tools, "remove_tool"):
       agent.tools.remove_tool("stop")
@@ -585,7 +641,7 @@ def run_pr_agent(
   return generate_test_for_pr(
     agent=agent,
     pr_env=pr_env,
-    llvm=llvm,
+    veir=veir,
     stats=stats,
   )
 
@@ -647,9 +703,7 @@ def run_regression_gate(
         color="yellow",
       )
       continue
-    triggered, log = reproduce(
-      build_dir, repro, alive_path=ALIVE_TV_PATH, llubi_path=LLUBI_PATH
-    )
+    triggered, log = reproduce(build_dir, repro)
     console.print(f"  bug #{bug_row['id']} ({repro.kind}) triggered={triggered}")
     if triggered:
       still_triggering.append((bug_row, log))
@@ -681,9 +735,7 @@ def run_baseline_check(pr_env: PREnvironment, bugs: List[Bug]) -> None:
     if not repro.is_runnable():
       bug.baseline_triggered = None
       continue
-    triggered, _ = reproduce(
-      baseline_dir, repro, alive_path=ALIVE_TV_PATH, llubi_path=LLUBI_PATH
-    )
+    triggered, _ = reproduce(baseline_dir, repro)
     bug.baseline_triggered = triggered
     bug.non_patch_specific = triggered
     console.print(
@@ -750,6 +802,7 @@ def export_db_snapshot(
   version = store.get_version(version_id)
   review = store.get_review(review_id)
   bug_rows = store.list_bugs_for_review(review_id)
+  insight_rows = store.list_insights_for_review(review_id)
 
   snapshot = {
     "schema": 1,
@@ -762,6 +815,7 @@ def export_db_snapshot(
     },
     "review": dict(review) if review is not None else None,
     "bugs": [dict(b) for b in bug_rows],
+    "insights": insight_rows,
     # Commit of the previous version whose active bugs this run marked fixed
     # (only populated when the regression gate passed). None otherwise.
     "fixed_prev_commit": fixed_prev_commit,
@@ -777,13 +831,18 @@ def pr_review(
   agent: AgentBase,
   pr_info: PRInfo,
   pr_env: PREnvironment,
-  llvm: LLVM,
+  veir: VeIR,
   stats: RunStats,
   build_dir: str,
+  store,
+  version_id: int,
+  review_id: int,
 ):
   """Main PR review function"""
   # Register Phase 1 tools
-  tools_phase1 = get_tool_list(pr_env, llvm, build_dir, phase=1)
+  tools_phase1 = get_tool_list(
+    pr_env, veir, build_dir, stats, store, pr_info, version_id, review_id, phase=1
+  )
   for to, th in tools_phase1:
     agent.register_tool(to, th)
 
@@ -791,14 +850,17 @@ def pr_review(
     agent=agent,
     pr_info=pr_info,
     pr_env=pr_env,
-    llvm=llvm,
+    veir=veir,
     stats=stats,
     build_dir=build_dir,
+    store=store,
+    version_id=version_id,
+    review_id=review_id,
   )
 
 
 def parse_args():
-  parser = ArgumentParser(description="PR Review Tool for LLVM Pull Requests")
+  parser = ArgumentParser(description="PR Review Tool for VeIR Pull Requests")
   parser.add_argument(
     "--pr",
     type=int,
@@ -869,9 +931,6 @@ def parse_args():
 
 
 def main():
-  if os.environ.get("LLVM_AUTOREVIEW_HOME_DIR") is None:
-    panic("Error: The llvm-autoreview environment has not been brought up.")
-
   args = parse_args()
 
   # Set up console
@@ -879,7 +938,7 @@ def main():
     console.debug = True
 
   # Set up the PR environment: load/extract PR info, prepare the per-PR build
-  # directory, checkout the base commit, apply the patch and build LLVM.
+  # directory, checkout the base commit, apply the patch and build VeIR.
   try:
     pr_env = PREnvironment.load(args.pr, console, fix_commit=args.fix_commit)
     # If the caller asked for a specific head sha, refuse to silently downgrade
@@ -977,10 +1036,12 @@ def main():
     if review_path.exists() and not args.force:
       panic(f"Review file {review_path} already exists.")
 
-  llvm = LLVM()
+  veir = VeIR(veir_dir)
 
   # Open the review run in the DB now that the gate has passed.
   review_id = store.create_review(pr_info.pr_id, version_id, pr_info.fix_commit)
+  if args.force:
+    store.reset_review(review_id)
 
   # Run PR review
   stats = RunStats(command=vars(args))
@@ -991,9 +1052,12 @@ def main():
       agent=agent,
       pr_info=pr_info,
       pr_env=pr_env,
-      llvm=llvm,
+      veir=veir,
       stats=stats,
       build_dir=build_dir,
+      store=store,
+      version_id=version_id,
+      review_id=review_id,
     )
     stats.report = report
   except Exception as e:
