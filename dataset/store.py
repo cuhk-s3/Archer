@@ -12,6 +12,7 @@ Typical usage:
 """
 
 import json
+import hashlib
 import os
 import sqlite3
 import threading
@@ -23,6 +24,7 @@ from .schema import DDL, SCHEMA_VERSION
 
 # This package directory (``<project_root>/dataset``); the DB lives here.
 PACKAGE_DIR = Path(__file__).resolve().parent
+KNOWLEDGE_FILE = PACKAGE_DIR / "knowledge" / "insights.jsonl"
 
 
 def _now() -> str:
@@ -54,9 +56,17 @@ def _loads(value: Any, fallback: Any) -> Any:
   if value is None:
     return fallback
   try:
-    return json.loads(value)
-  except Exception:
+    decoded = json.loads(value)
+    return fallback if decoded is None else decoded
+  except (TypeError, ValueError):
     return fallback
+
+
+def _text(value: Any) -> Optional[str]:
+  """Return SQLite-safe text while preserving structured tool diagnostics."""
+  if value is None or isinstance(value, str):
+    return value
+  return json.dumps(value, ensure_ascii=False)
 
 
 class ArcherStore:
@@ -70,6 +80,7 @@ class ArcherStore:
     self._conn.row_factory = sqlite3.Row
     self._conn.execute("PRAGMA foreign_keys = ON;")
     self._init_schema()
+    self._import_verified_knowledge()
 
   def _init_schema(self) -> None:
     with self._lock:
@@ -394,6 +405,31 @@ class ArcherStore:
         "SELECT * FROM reviews WHERE id=?", (int(review_id),)
       ).fetchone()
 
+  def reset_review(self, review_id: int) -> None:
+    """Reset an unpublished review before an explicit ``--force`` rerun."""
+    with self._lock:
+      published = self._conn.execute(
+        """SELECT COUNT(*) FROM bugs WHERE review_id=? AND
+           (github_issue_number IS NOT NULL OR github_comment_id IS NOT NULL OR
+            published_at IS NOT NULL)""",
+        (int(review_id),),
+      ).fetchone()[0]
+      if published:
+        raise RuntimeError(
+          f"review {review_id} has published findings and cannot be reset"
+        )
+      self._conn.execute("DELETE FROM bugs WHERE review_id=?", (int(review_id),))
+      self._conn.execute(
+        """UPDATE reviews SET status='running', skipped_reason=NULL,
+           strategies='[]', reason_thou=NULL, report=NULL, chat_rounds=0,
+           phase1_round=0, phase2_round=0, input_tokens=0, output_tokens=0,
+           cached_tokens=0, total_tokens=0, chat_cost=0.0, total_time_sec=0.0,
+           error=NULL, errmsg=NULL, traceback=NULL, history=NULL,
+           finished_at=NULL WHERE id=?""",
+        (int(review_id),),
+      )
+      self._conn.commit()
+
   def list_reviews_for_version(self, version_id: int) -> List[sqlite3.Row]:
     """Reviews of a single version, newest first."""
     with self._lock:
@@ -487,7 +523,7 @@ class ArcherStore:
     """
     pr_stub: Dict[str, Any] = {
       "pr_id": int(pr_id),
-      "pr_url": f"https://github.com/llvm/llvm-project/pull/{int(pr_id)}",
+      "pr_url": f"https://github.com/opencompl/veir/pull/{int(pr_id)}",
       "title": title or "",
       "author": author or "",
       "components": list(components or []),
@@ -539,8 +575,8 @@ class ArcherStore:
           bug.get("original_ir"),
           bug.get("transformed_ir"),
           bug.get("args"),
-          bug.get("call_instr"),
-          bug.get("log"),
+          _text(bug.get("call_instr")),
+          _text(bug.get("log")),
           bug.get("thoughts"),
           now,
         ),
@@ -640,6 +676,155 @@ class ArcherStore:
           "SELECT * FROM bugs WHERE review_id=?", (int(review_id),)
         ).fetchall()
       )
+
+  # ---------------------------------------------------------------------------
+  # Durable review knowledge
+  # ---------------------------------------------------------------------------
+  def upsert_insight(
+    self,
+    *,
+    components: List[str],
+    topic: str,
+    kind: str,
+    content: str,
+    verified: bool = False,
+    evidence_tool: Optional[str] = None,
+    evidence: Any = None,
+    pr_id: Optional[int] = None,
+    version_id: Optional[int] = None,
+    review_id: Optional[int] = None,
+    fix_commit: str = "",
+  ) -> int:
+    normalized_components = sorted({str(c).strip() for c in components if str(c).strip()})
+    normalized = "\n".join([
+      ",".join(c.casefold() for c in normalized_components),
+      topic.strip().casefold(), kind.strip().casefold(), content.strip(),
+    ])
+    fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    now = _now()
+    with self._lock:
+      self._conn.execute(
+        """INSERT INTO insights(
+             fingerprint, components, topic, kind, content, verified,
+             evidence_tool, evidence, pr_id, version_id, review_id, fix_commit,
+             created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(fingerprint) DO UPDATE SET
+             verified=MAX(insights.verified, excluded.verified),
+             evidence_tool=COALESCE(excluded.evidence_tool, insights.evidence_tool),
+             evidence=COALESCE(excluded.evidence, insights.evidence),
+             pr_id=COALESCE(excluded.pr_id, insights.pr_id),
+             version_id=COALESCE(excluded.version_id, insights.version_id),
+             review_id=COALESCE(excluded.review_id, insights.review_id),
+             fix_commit=CASE WHEN excluded.fix_commit != '' THEN excluded.fix_commit
+                             ELSE insights.fix_commit END,
+             updated_at=excluded.updated_at""",
+        (
+          fingerprint, _dumps(normalized_components), topic.strip(), kind.strip(),
+          content.strip(), 1 if verified else 0, evidence_tool,
+          _text(evidence), pr_id, version_id, review_id, str(fix_commit or ""),
+          now, now,
+        ),
+      )
+      row = self._conn.execute(
+        "SELECT id FROM insights WHERE fingerprint=?", (fingerprint,)
+      ).fetchone()
+      self._conn.commit()
+      insight_id = int(row["id"])
+    if verified:
+      self.export_verified_knowledge()
+    return insight_id
+
+  def _import_verified_knowledge(self) -> None:
+    """Seed a fresh/local DB from the repository's reviewable knowledge file."""
+    if not KNOWLEDGE_FILE.is_file():
+      return
+    try:
+      records = [json.loads(line) for line in KNOWLEDGE_FILE.read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, ValueError):
+      return
+    for record in records:
+      self.upsert_insight(
+        components=record.get("components", []),
+        topic=record.get("topic", ""), kind=record.get("kind", "observation"),
+        content=record.get("content", ""), verified=True,
+        evidence_tool=record.get("evidence_tool"), evidence=record.get("evidence"),
+        pr_id=record.get("pr_id"), fix_commit=record.get("fix_commit", ""),
+      )
+
+  def export_verified_knowledge(self) -> None:
+    """Write verified knowledge as stable JSONL suitable for code review/versioning."""
+    with self._lock:
+      rows = self._conn.execute(
+        "SELECT * FROM insights WHERE verified=1 ORDER BY fingerprint"
+      ).fetchall()
+    records = []
+    for row in rows:
+      item = dict(row)
+      records.append({
+        "fingerprint": item["fingerprint"],
+        "components": _loads(item["components"], []),
+        "topic": item["topic"], "kind": item["kind"],
+        "content": item["content"], "evidence_tool": item["evidence_tool"],
+        "evidence": _loads(item["evidence"], item["evidence"]),
+        "pr_id": item["pr_id"], "fix_commit": item["fix_commit"],
+      })
+    KNOWLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+      for record in records)
+    tmp = KNOWLEDGE_FILE.with_suffix(".jsonl.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(KNOWLEDGE_FILE)
+
+  def search_insights(
+    self,
+    *,
+    components: Optional[List[str]] = None,
+    query: str = "",
+    verified_only: bool = False,
+    limit: int = 20,
+  ) -> List[Dict[str, Any]]:
+    clauses = []
+    params: List[Any] = []
+    if verified_only:
+      clauses.append("verified=1")
+    if query.strip():
+      clauses.append("(topic LIKE ? OR content LIKE ?)")
+      needle = f"%{query.strip()}%"
+      params.extend([needle, needle])
+    sql = "SELECT * FROM insights"
+    if clauses:
+      sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY verified DESC, updated_at DESC"
+    wanted = {c.casefold() for c in (components or []) if c}
+    with self._lock:
+      rows = self._conn.execute(sql, params).fetchall()
+    result = []
+    for row in rows:
+      item = dict(row)
+      item["components"] = _loads(item.get("components"), [])
+      if wanted and not wanted.intersection(c.casefold() for c in item["components"]):
+        continue
+      item["verified"] = bool(item["verified"])
+      result.append(item)
+      if len(result) >= max(1, min(int(limit), 100)):
+        break
+    return result
+
+  def list_insights_for_review(self, review_id: int) -> List[Dict[str, Any]]:
+    with self._lock:
+      rows = self._conn.execute(
+        "SELECT * FROM insights WHERE review_id=? ORDER BY created_at, id",
+        (int(review_id),),
+      ).fetchall()
+    result = []
+    for row in rows:
+      item = dict(row)
+      item["components"] = _loads(item.get("components"), [])
+      item["verified"] = bool(item["verified"])
+      result.append(item)
+    return result
 
   def list_bugs_for_version(self, version_id: int) -> List[sqlite3.Row]:
     with self._lock:

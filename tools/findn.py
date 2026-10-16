@@ -2,12 +2,12 @@ import glob
 from pathlib import Path
 
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
-from tools.llvm_mixins import LlvmDirMixin
+from tools.repo_mixins import RepoDirMixin
 
 
-class FindNTool(FuncToolBase, LlvmDirMixin):
-  def __init__(self, llvm_dir: str, n: int):
-    self.llvm_dir = Path(llvm_dir).resolve().absolute()
+class FindNTool(FuncToolBase, RepoDirMixin):
+  def __init__(self, repo_dir: str, n: int):
+    self.repo_dir = Path(repo_dir).resolve().absolute()
     self.n = n
 
   def spec(self) -> FuncToolSpec:
@@ -26,7 +26,7 @@ class FindNTool(FuncToolBase, LlvmDirMixin):
           "directory",
           "string",
           True,
-          "Find files in this directory (a relative path starting with llvm/).",
+          "Repository-relative directory to search.",
         ),
       ],
     )
@@ -36,7 +36,7 @@ class FindNTool(FuncToolBase, LlvmDirMixin):
       raise FuncToolCallException(
         f"The index k must be a positive integer, but {k} was given."
       )
-    dir_full_path = self.check_llvm_dir(directory)
+    dir_full_path = self.check_repo_dir(directory)
     try:
       results = glob.glob(pattern, root_dir=dir_full_path, recursive=True)
     except Exception as e:

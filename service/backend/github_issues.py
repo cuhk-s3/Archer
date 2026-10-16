@@ -18,7 +18,7 @@ def _trim(value: Any, limit: int = _MAX_GITHUB_BODY) -> str:
 
 
 def _marker(pr_id: int) -> str:
-  """Stable issue identity: one GitHub issue per LLVM PR."""
+  """Stable issue identity: one GitHub issue per VeIR PR."""
   return f"archer-pr-{pr_id}"
 
 
@@ -39,8 +39,8 @@ def _issue_type(bug) -> str:
 
 def _issue_title(issue_type: str, pr_id: int) -> str:
   if issue_type == "crash":
-    return f"Crash found in LLVM PR #{pr_id}"
-  return f"Miscompilation found in LLVM PR #{pr_id}"
+    return f"Crash found in VeIR PR #{pr_id}"
+  return f"Semantic bug found in VeIR PR #{pr_id}"
 
 
 def _issue_labels(issue: dict, issue_type: str) -> list[str]:
@@ -70,13 +70,13 @@ def _analysis_text(bug, review) -> str:
   return thoughts or "No additional analysis was recorded."
 
 
-def _evidence_body(bug, pr, version, llvm_repo: str, marker: str) -> str:
+def _evidence_body(bug, pr, version, veir_repo: str, marker: str) -> str:
   fix_commit = str(version["fix_commit"] or "")
   commit_marker = _commit_marker(marker, fix_commit)
-  commit_url = f"https://github.com/{llvm_repo}/commit/{fix_commit}"
+  commit_url = f"https://github.com/{veir_repo}/commit/{fix_commit}"
   args = str(bug["args"] or "").strip()
   call_instr = str(bug["call_instr"] or "").strip()
-  command = f"opt {args}" if args else str(bug["repro_kind"] or "verify")
+  command = f"veir-opt {args}" if args else str(bug["repro_kind"] or "verify")
   if call_instr:
     command += f"\ncall: {call_instr}"
 
@@ -85,7 +85,7 @@ Current commit: [`{fix_commit[:10]}`]({commit_url})
 
 ## Buggy Case
 
-~~~llvm
+~~~mlir
 {str(bug["original_ir"] or "").strip()}
 ~~~
 
@@ -97,9 +97,9 @@ Command:
 
 ## Verification Result
 
-Transformed LLVM IR:
+Transformed MLIR:
 
-~~~llvm
+~~~mlir
 {str(bug["transformed_ir"] or "").strip()}
 ~~~
 
@@ -115,13 +115,13 @@ def _issue_body(
   bug,
   pr,
   version,
-  llvm_repo: str,
+  veir_repo: str,
   marker: str,
   additional_bug_count: int = 0,
   review_url: str = "",
 ) -> str:
   pr_id = int(pr["pr_id"])
-  pr_url = str(pr["pr_url"] or f"https://github.com/{llvm_repo}/pull/{pr_id}")
+  pr_url = str(pr["pr_url"] or f"https://github.com/{veir_repo}/pull/{pr_id}")
   additional_note = ""
   if additional_bug_count > 0 and review_url:
     noun = "bug was" if additional_bug_count == 1 else "bugs were"
@@ -133,7 +133,7 @@ def _issue_body(
     f"""<!-- {marker} -->
 This issue tracks a verified reproducer found while reviewing {pr_url}.
 
-{_evidence_body(bug, pr, version, llvm_repo, marker).rstrip()}{additional_note}"""
+{_evidence_body(bug, pr, version, veir_repo, marker).rstrip()}{additional_note}"""
   )
 
 
@@ -200,7 +200,7 @@ def publish_pending_bug_issues(
   store,
   session: requests.Session,
   issue_repo: str,
-  llvm_repo: str,
+  veir_repo: str,
   public_base_url: str,
 ) -> int:
   """Publish one issue per PR, using its earliest patch-specific bug."""
@@ -245,7 +245,7 @@ def publish_pending_bug_issues(
               representative,
               pr,
               version,
-              llvm_repo,
+              veir_repo,
               marker,
               len(publishable_bugs) - 1,
               f"{public_base_url.rstrip('/')}/review/{int(review['id'])}",
@@ -289,7 +289,7 @@ def publish_pending_bug_issues(
       representative,
       pr,
       version,
-      llvm_repo,
+      veir_repo,
       marker,
       len(publishable_bugs) - 1,
       f"{public_base_url.rstrip('/')}/review/{int(review['id'])}",

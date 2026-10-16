@@ -1,12 +1,12 @@
 from pathlib import Path
 
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
-from tools.llvm_mixins import LlvmDirMixin
+from tools.repo_mixins import RepoDirMixin
 
 
-class ListNTool(FuncToolBase, LlvmDirMixin):
-  def __init__(self, llvm_dir: str, n: int):
-    self.llvm_dir = Path(llvm_dir).resolve().absolute()
+class ListNTool(FuncToolBase, RepoDirMixin):
+  def __init__(self, repo_dir: str, n: int):
+    self.repo_dir = Path(repo_dir).resolve().absolute()
     self.n = n
 
   def spec(self) -> FuncToolSpec:
@@ -18,7 +18,7 @@ class ListNTool(FuncToolBase, LlvmDirMixin):
           "directory",
           "string",
           True,
-          "The relative path (starting with llvm/) to the directory to list.",
+          "Repository-relative directory to list.",
         ),
         FuncToolSpec.Param(
           "k",
@@ -35,13 +35,13 @@ class ListNTool(FuncToolBase, LlvmDirMixin):
         f"The index k must be a positive integer, but {k} was given."
       )
     k -= 1  # Convert to 0-based index
-    dir_full_path = self.check_llvm_dir(directory)
+    dir_full_path = self.check_repo_dir(directory)
     try:
       contents = [path for path in dir_full_path.iterdir()]
       files = [path for path in contents if path.is_file()]
       dirs = [path for path in contents if path.is_dir()]
-      results = [str(path.relative_to(self.llvm_dir)) + "/" for path in dirs] + [
-        str(path.relative_to(self.llvm_dir)) for path in files
+      results = [str(path.relative_to(self.repo_dir)) + "/" for path in dirs] + [
+        str(path.relative_to(self.repo_dir)) for path in files
       ]
       results.sort()  # Sort the results alphabetically
     except Exception as e:

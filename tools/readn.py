@@ -1,12 +1,12 @@
 from pathlib import Path
 
 from lms.tool import FuncToolBase, FuncToolCallException, FuncToolSpec
-from tools.llvm_mixins import LlvmDirMixin
+from tools.repo_mixins import RepoDirMixin
 
 
-class ReadNTool(FuncToolBase, LlvmDirMixin):
-  def __init__(self, llvm_dir: str, n: int):
-    self.llvm_dir = Path(llvm_dir).resolve().absolute()
+class ReadNTool(FuncToolBase, RepoDirMixin):
+  def __init__(self, repo_dir: str, n: int):
+    self.repo_dir = Path(repo_dir).resolve().absolute()
     self.n = n
 
   def spec(self) -> FuncToolSpec:
@@ -18,7 +18,7 @@ class ReadNTool(FuncToolBase, LlvmDirMixin):
           "file",
           "string",
           True,
-          "The relative path to the file to read. The path should start with llvm/.",
+          "Repository-relative path to the file.",
         ),
         FuncToolSpec.Param(
           "position",
@@ -34,7 +34,7 @@ class ReadNTool(FuncToolBase, LlvmDirMixin):
       raise FuncToolCallException(
         f"Position must be a positive integer, but {position} was given."
       )
-    file_full_path = self.check_llvm_file(file)
+    file_full_path = self.check_repo_file(file)
     try:
       lines = file_full_path.read_text(encoding="utf-8").splitlines(keepends=True)
     except Exception as e:

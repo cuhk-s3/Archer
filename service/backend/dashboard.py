@@ -136,7 +136,7 @@ _DASHBOARD_BODY = """
         <img class="logo" id="brandLogo" src="/logo.png" alt="Archer" />
         <div class="brand-text">
           <span class="brand-name">Archer</span>
-          <span class="brand-tag">LLVM PR Review Board</span>
+          <span class="brand-tag">VeIR PR Review Board</span>
         </div>
       </div>
       <div class="topbar-right">
@@ -292,7 +292,7 @@ _DASHBOARD_SCRIPT = """
         if (p.latest_commit) subline += ' · latest <span class="commit">' + esc(shortSha(p.latest_commit)) + '</span>';
 
         const prCell = '<div class="pr-header">'
-          + '<a class="pr-link" href="https://github.com/llvm/llvm-project/pull/' + p.pr_id + '" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">#' + p.pr_id + '</a>'
+          + '<a class="pr-link" href="https://github.com/opencompl/veir/pull/' + p.pr_id + '" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">#' + p.pr_id + '</a>'
           + '<span class="pr-title-text">' + esc(p.title || '(no title)') + '</span></div>'
           + '<div class="subline">' + subline + '</div>'
           + (p.components && p.components.length ? '<div class="tags">' + p.components.map(c => '<span class="tag">' + esc(c) + '</span>').join('') + '</div>' : '');

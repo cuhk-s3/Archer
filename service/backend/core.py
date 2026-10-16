@@ -17,69 +17,29 @@ from .github_issues import publish_pending_bug_issues
 from .models import Job, utc_now_iso
 
 _TEST_PATH_PREFIXES: list[str] = [
-  "llvm/test/Transforms/InstCombine",
-  "llvm/test/Transforms/InstSimplify",
-  "llvm/test/Analysis/ValueTracking",
-  "llvm/test/Transforms/ConstraintElimination",
-  "llvm/test/Transforms/EarlyCSE",
-  "llvm/test/Transforms/GVN",
-  "llvm/test/Transforms/NewGVN",
-  "llvm/test/Transforms/Reassociate",
-  "llvm/test/Transforms/SCCP",
-  "llvm/test/Transforms/CorrelatedValuePropagation",
-  "llvm/test/Transforms/SimplifyCFG",
-  "llvm/test/Transforms/VectorCombine",
-  "llvm/test/Transforms/SLPVectorizer",
-  "llvm/test/Transforms/AggressiveInstCombine",
+  "Test/Passes/",
+  "Test/Interpreter/",
+  "Test/Verifier/",
+  "UnitTest/",
 ]
 
 _SOURCE_PATH_PREFIXES: list[str] = [
-  "llvm/lib/Transforms/InstCombine",
-  "llvm/lib/Analysis/InstructionSimplify",
-  "llvm/lib/Analysis/ValueTracking",
-  "llvm/lib/Analysis/ConstantFolding",
-  "llvm/lib/IR/ConstantFold",
-  "llvm/lib/IR/ConstantRange",
-  "llvm/lib/IR/ConstantFPRange",
-  "llvm/lib/Support/KnownBits",
-  "llvm/lib/Support/KnownFPClass",
-  "llvm/include/llvm/Analysis/InstructionSimplify.h",
-  "llvm/include/llvm/Analysis/ValueTracking.h",
-  "llvm/include/llvm/Analysis/ConstantFolding.h",
-  "llvm/include/llvm/Support/KnownBits.h",
-  "llvm/include/llvm/Support/KnownFPClass.h",
-  "llvm/lib/Transforms/ConstraintElimination",
-  "llvm/lib/Transforms/Scalar/EarlyCSE",
-  "llvm/lib/Transforms/Scalar/GVN",
-  "llvm/lib/Transforms/Scalar/NewGVN",
-  "llvm/lib/Transforms/Scalar/Reassociate",
-  "llvm/lib/Transforms/Scalar/SCCP",
-  "llvm/lib/Transforms/Scalar/CorrelatedValuePropagation",
-  "llvm/lib/Transforms/Utils/SimplifyCFG.cpp",
-  "llvm/lib/Transforms/Vectorize/VectorCombine",
-  "llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp",
-  "llvm/lib/Transforms/AggressiveInstCombine",
+  "Veir/Passes/",
+  "Veir/Interpreter/",
+  "Veir/Verifier",
+  "Veir/Dialects/",
+  "Veir/Analysis/",
+  "Veir/IR/",
+  "Veir/Rewriter/",
+  "Exe/VeirOpt.lean",
+  "Exe/VeirInterpret.lean",
 ]
 
 ALL_KEYWORDS: list[str] = _TEST_PATH_PREFIXES + _SOURCE_PATH_PREFIXES
 
-_EXCLUDED_TITLE_KEYWORDS: list[str] = [
-  "NFC",
-  "[DAG]",
-  "[GISEL]",
-  "GLOBALISEL",
-  "SELECTIONDAG",
-  "CODEGEN",
-]
+_EXCLUDED_TITLE_KEYWORDS: list[str] = []
 
-_EXCLUDED_FILE_SEGMENTS: list[str] = [
-  "/AsmParser/",
-  "/Bitcode/",
-  "/CodeGen/",
-  "/GlobalISel/",
-  "/SelectionDAG/",
-  "/Target/",
-]
+_EXCLUDED_FILE_SEGMENTS: list[str] = []
 
 
 def is_excluded_pr_title(title: str) -> bool:
@@ -256,16 +216,8 @@ class ArcherService:
       return None
 
   def _infer_components_from_files(self, diff_files: List[str]) -> List[str]:
-    # Keep this behavior aligned with llvm/llvm_helper.py::infer_related_components.
-    prefixes = [
-      "llvm/lib/Analysis/",
-      "llvm/lib/Transforms/Scalar/",
-      "llvm/lib/Transforms/Vectorize/",
-      "llvm/lib/Transforms/Utils/",
-      "llvm/lib/Transforms/IPO/",
-      "llvm/lib/Transforms/",
-      "llvm/lib/IR/",
-    ]
+    prefixes = ["Veir/Passes/", "Veir/Dialects/", "Veir/Analysis/",
+                "Veir/Interpreter/", "Veir/IR/", "Veir/Rewriter/"]
     components: List[str] = []
     seen = set()
     for file in diff_files:
@@ -275,27 +227,10 @@ class ArcherService:
         component_name = (
           file.removeprefix(prefix)
           .split("/")[0]
-          .removesuffix(".cpp")
-          .removesuffix(".h")
+          .removesuffix(".lean")
         )
         if component_name == "":
           break
-        if (
-          component_name.startswith("VPlan")
-          or component_name.startswith("LoopVectoriz")
-          or component_name.startswith("VPRecipe")
-        ):
-          component_name = "LoopVectorize"
-        if component_name.startswith("ScalarEvolution"):
-          component_name = "ScalarEvolution"
-        if component_name.startswith("ConstantFold"):
-          component_name = "ConstantFold"
-        if "AliasAnalysis" in component_name:
-          component_name = "AliasAnalysis"
-        if component_name.startswith("Attributor"):
-          component_name = "Attributor"
-        if file.startswith("llvm/lib/IR"):
-          component_name = "IR"
         if component_name not in seen:
           seen.add(component_name)
           components.append(component_name)
@@ -854,6 +789,7 @@ class ArcherService:
     pr_info = snapshot.get("pr_info") or {}
     review = snapshot.get("review")
     bugs = snapshot.get("bugs") or []
+    insights = snapshot.get("insights") or []
     fixed_prev_commit = snapshot.get("fixed_prev_commit")
     if not pr_info or not pr_info.get("pr_id"):
       # Nothing structured to ingest (e.g. the run crashed before export).
@@ -882,6 +818,21 @@ class ArcherService:
     # remote poller stops touching this run either way.
     existing = store.get_review(review_id)
     already_finished = existing is not None and existing["finished_at"] is not None
+
+    # Knowledge is independently idempotent by fingerprint. Import it even if
+    # this review row already finished, which also repairs older partial ingests.
+    for insight in insights:
+      store.upsert_insight(
+        components=self._loads_json(insight.get("components"), []),
+        topic=insight.get("topic", ""),
+        kind=insight.get("kind", "observation"),
+        content=insight.get("content", ""),
+        verified=bool(insight.get("verified")),
+        evidence_tool=insight.get("evidence_tool"),
+        evidence=self._loads_json(insight.get("evidence"), insight.get("evidence")),
+        pr_id=int(pr_info["pr_id"]), version_id=version_id,
+        review_id=review_id, fix_commit=fix_commit,
+      )
 
     if already_finished:
       job.ingested = True

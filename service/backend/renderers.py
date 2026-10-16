@@ -710,7 +710,7 @@ def build_pr_detail_html(detail: dict) -> str:
   versions = detail.get("versions") or []
 
   pr_id = pr.get("pr_id")
-  pr_url = pr.get("url") or f"https://github.com/llvm/llvm-project/pull/{pr_id}"
+  pr_url = pr.get("url") or f"https://github.com/opencompl/veir/pull/{pr_id}"
   title = pr.get("title") or "(no title)"
   components = pr.get("components") or []
   description = pr.get("description") or ""

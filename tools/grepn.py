@@ -6,14 +6,14 @@ from utils import cmdline
 
 
 class GrepNTool(FuncToolBase):
-  def __init__(self, llvm_dir: str, n: int):
-    self.llvm_dir = Path(llvm_dir).resolve().absolute()
+  def __init__(self, repo_dir: str, n: int):
+    self.repo_dir = Path(repo_dir).resolve().absolute()
     self.n = n
 
   def spec(self) -> FuncToolSpec:
     return FuncToolSpec(
       f"grep{self.n}",
-      f"Print lines that match a specified pattern in the llvm/ directory. This is exactly the same `grep` command in Linux, but with results being sorted alphabetically, and only returns {self.n} results starting from a given index.",
+      f"Search the VeIR repository with grep and return {self.n} sorted results from a given index.",
       [
         FuncToolSpec.Param(
           "k",
@@ -40,7 +40,7 @@ class GrepNTool(FuncToolBase):
         "No arguments provided. Please specify the pattern and files to search."
       )
     try:
-      result = cmdline.check_output(f"grep {args}", cwd=self.llvm_dir)
+      result = cmdline.check_output(f"grep {args}", cwd=self.repo_dir)
       lines = result.decode("utf-8").strip().splitlines(keepends=True)
     except CalledProcessError as e:
       if e.returncode == 1:

@@ -32,6 +32,11 @@ class TestsTool(FuncToolBase):
     if strategy in self.all_strategies:
       self.tests[index].covered_strategies.add(strategy)
 
+  def add_covered_strategies(self, index: int, strategies: List[str]):
+    """Record several strategies; retained as the public batch API."""
+    for strategy in strategies:
+      self.add_covered_strategy(index, strategy)
+
   def get_uncovered_strategies(self, index: int) -> List[str]:
     if index < 0 or index >= len(self.tests):
       return []

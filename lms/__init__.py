@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Literal, Tuple, Union
 
 from base.console import get_boxed_console
-from llvm.llvm_helper import remove_path_from_output
+from veir.helper import remove_path_from_output
 from lms.tool import FuncToolBase, ToolRegistry
 
 

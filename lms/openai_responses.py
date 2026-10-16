@@ -44,8 +44,8 @@ class OpenAIResponsesAgent(AgentBase):
       token_limit=token_limit,
       debug_mode=debug_mode,
     )
-    end_point = os.environ.get("LLVM_AUTOREVIEW_LM_API_ENDPOINT")
-    token = os.environ.get("LLVM_AUTOREVIEW_LM_API_KEY")
+    end_point = os.environ.get("ARCHER_LM_API_ENDPOINT")
+    token = os.environ.get("ARCHER_LM_API_KEY")
     self.client = OpenAI(api_key=token, base_url=end_point)
 
   def _render_instructions(self) -> str:
@@ -151,8 +151,16 @@ class OpenAIResponsesAgent(AgentBase):
         model=self.model,
         instructions=self._render_instructions() or NOT_GIVEN,
         input=self.render_input_list(),
-        temperature=self.temperature,
-        top_p=self.top_p,
+        # Current GPT-5/6 reasoning models reject sampling controls on the
+        # Responses API.  Omitting them also preserves provider defaults.
+        temperature=(
+          NOT_GIVEN if self.model.startswith(("gpt-5", "gpt-6"))
+          else self.temperature
+        ),
+        top_p=(
+          NOT_GIVEN if self.model.startswith(("gpt-5", "gpt-6"))
+          else self.top_p
+        ),
         max_output_tokens=self.max_tokens,
         tools=(
           [tool.spec().render_in_openai_responses_format() for tool in remaining_tools]

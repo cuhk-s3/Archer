@@ -11,7 +11,7 @@ This deployment mode separates responsibilities into two roles:
 
 1. Runs FastAPI service (`service.backend.app`) for the dashboard API and DB-backed PR/review pages.
 2. Runs static UI from `service/frontend/`.
-3. Scans LLVM PRs with existing filtering logic.
+3. Scans VeIR PRs that touch passes, interpreters, verifiers, dialects, or related tests.
 4. Dispatches work to GitHub Actions workflow.
 5. Polls workflow run status, downloads artifacts, and ingests `run.db.json` into the local `dataset/archer.db`.
 6. Serves the review board from the local SQLite DB.
@@ -68,7 +68,7 @@ bash scripts/run_worker.sh
 1. Workflow file: `.github/workflows/archer-review-dispatch.yml`
 2. Runner label on worker machine: `archer-school`
 3. Repository variable: `ARCHER_REPO_ROOT` (absolute Archer path on worker machine)
-4. Worker environment must already have model credentials and dependencies (`scripts/upenv.sh`)
+4. Worker environment must already be prepared with `scripts/setup.sh` and model credentials.
 
 ## Runtime Sequence
 

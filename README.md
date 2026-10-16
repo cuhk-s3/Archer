@@ -1,127 +1,40 @@
-# Archer
+# Archer for VeIR
 
-> [!Note]
-> Archer's paper is available [here](https://arxiv.org/pdf/2607.01808). Feel free to check it out.
->
-> Archer is actively reviewing new InstCombine and many other passes' PRs in LLVM.
-> You can follow its progress in the [review board](https://archer.top).
+Archer for VeIR reviews pull requests in [`opencompl/veir`](https://github.com/opencompl/veir). It keeps Archer's two-phase analysis and evidence-backed reporting, but uses VeIR's own tools:
 
-## Overview
+- `veir-opt` for pass execution and crash detection;
+- `veir-interpret` for before/after semantic differential testing;
+- VeIR MLIR/FileCheck tests as mutation seeds;
+- Lean source, verifier, interpreter and dialect definitions as review context.
 
-Archer is an agentic code review tool for LLVM PRs, designed to deliver **precise, evidence-backed** reviews that minimize developers’ time spent reading, validating, and triaging comments.
-It currently focuses on patches related to middle-end optimizations and reports only issues that come with **a reproducible proof of concept**. Archer is fully self-contained and can be paired with any LLM.
+## Setup
 
-This project is directly inspired by the Review Capacity issue logged in this [blog](https://www.npopov.com/2026/01/11/LLVM-The-bad-parts.html#review-capacity).
-
-## Design
-
-> Details of the design and implementation are described in [our paper](https://arxiv.org/pdf/2607.01808).
-
-The key idea of Archer is to help the agent **think like an expert** when reviewing compiler code.
-To achieve this, Archer combines *subsystem knowledge* with a *compiler-specific toolkit*.
-Subsystem knowledge summarizes review experience from historical bug reports and fixes, while the compiler-specific toolkit provides the agent with tools for interacting with the compiler and validating its findings.
-
-As a code review agent, Archer is designed to avoid verbosity issues and only provide **precise, evidence-backed** reviews.
-The final review is structed into minimal comments with a reproducible PoC and patch-specific analysis.
-
-## Quality
-
-Archer has been deployed on 398 LLVM PRs in two months (December 31st, 2025 - February 28th, 2026) and found 51 semantic bugs, with 15 bugs in open PRs and 36 in closed PRs.
-Archer's findings that *21%* of open PRs and *11%* of closed PRs are buggy expose **a critical gap in the capacity for code review** in large compiler projects and demonstrate **the practical value** of Archer as an additional reviewer.
-
-Archer is also evaluated on a set of 47 bisected LLVM bugs, where it found 18 bugs successfully.
-The false positive rate is relatively low, due to strict validation requirements.
-
-## Workflow
-
-Given a PR, Archer performs review in four steps:
-
-1. **Pass identification and knowledge loading.**
-   Archer first identifies the optimization pass relevant to the patch and loads the corresponding pass knowledge.
-
-2. **Analysis.**
-   Archer recovers the relevant code context, inspects the patch semantics, and forms semantic suspicions about potential correctness issues.
-
-3. **Validation.**
-   Archer turns these suspicions into concrete evidence by invoking validation tools and checking whether the suspected issue can be reproduced.
-
-4. **Structured reporting.**
-   Archer produces a structured review containing both detailed bug analysis and a verified proof of concept.
-
-## Environment Setup
-
-Archer requires LLVM, Alive2, llubi, and Python on Linux.
-
-### 1) Configure the environment
-
-Clone the repository and enter the project directory:
+Run the setup script once to prepare the VeIR review environment. Subsequent
+runs reuse the existing setup.
 
 ```bash
-git clone https://github.com/cuhk-s3/Archer.git
-cd Archer
-```
-
-Copy the example file and fill in your model service configuration:
-
-```bash
+bash scripts/setup.sh
 cp environments.example environments
 ```
 
-Set the dependency installation directory:
+Fill in `ARCHER_LM_API_ENDPOINT`, `ARCHER_LM_API_KEY`, and `LAB_GITHUB_TOKEN`, then load them:
 
 ```bash
-export LLVM_AUTOREVIEW_DEPS_DIR=$PWD/deps
-```
-
-### 2) Install dependencies
-
-From the project root, run:
-
-```bash
-bash scripts/install.sh
-```
-
-This script installs and builds the required dependencies, including LLVM, Alive2, llubi, ccache, and the Python environment.
-
-### 3) Activate the environment
-
-In each new terminal, run:
-
-```bash
+source environments
 source scripts/upenv.sh
 ```
 
-This loads Archer’s environment variables, activates the virtual environment, and installs or updates Python dependencies.
+Run `source scripts/upenv.sh` in each new terminal before using Archer.
 
-### 4) Optional development setup
-
-For local development, install:
+## Review a PR
 
 ```bash
-pip install -r requirements.dev.txt
-pre-commit install
+python main.py --pr 1634 --model <model> \
+  --review review.md --history history.json --stats stats.json
 ```
 
-## Usage
+The PR extractor targets `opencompl/veir`, checks out the PR base in the private VeIR clone, applies its code patch, builds VeIR, and stores the version and MLIR tests in `dataset/archer.db`.
 
-Run Archer with:
+## Durable review knowledge
 
-```bash
-python main.py --pr <PR_ID> --model <MODEL_NAME> [options]
-```
-
-### Arguments
-
-- `--pr`: LLVM Pull Request ID to review
-- `--model`: LLM model name
-- `--driver`: API driver (`openai`, `anthropic`, or `openai-generic`)
-- `--stats`: Path to save generation statistics
-- `--history`: Path to save chat history
-- `--review`: Path to save review
-- `--debug`: Enable verbose output
-
-### Example
-
-```bash
-python main.py --pr 12345 --model gpt-4 --stats stats.json --history history.json --review review.md --debug
-```
+The `insight` reviewer tool records reusable hypotheses and observations in SQLite. Only observations backed by an actual `verify`, `difftest`, or `rwenum` result can be marked verified. Verified records are automatically synchronized to `dataset/knowledge/insights.jsonl`, so knowledge is reviewable in Git and is imported into a fresh database on startup. Later PRs automatically receive only component-relevant verified insights; unverified hypotheses require an explicit search.

@@ -29,8 +29,8 @@ class GenericAzureAIAgent(GenericAgent):
       token_limit=token_limit,
       debug_mode=debug_mode,
     )
-    endpoint = os.environ.get("LLVM_AUTOFIX_LM_API_ENDPOINT")
-    token = os.environ.get("LLVM_AUTOFIX_LM_API_KEY")
+    endpoint = os.environ.get("ARCHER_LM_API_ENDPOINT")
+    token = os.environ.get("ARCHER_LM_API_KEY")
     self.client = ChatCompletionsClient(
       endpoint=endpoint,
       credential=AzureKeyCredential(token),

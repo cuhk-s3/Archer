@@ -12,7 +12,7 @@ class Bug:
   transformed_ir: str
   log: str
   thoughts: Optional[str] = None
-  # Reproducer info: enough to re-run the bug on any LLVM build (baseline or a
+  # Reproducer info: enough to re-run the bug on any VeIR build (baseline or a
   # newer commit version) for patch-specificity / regression checks.
   repro_kind: str = "verify"  # verify / trans / difftest
   args: Optional[str] = None  # opt arguments used to reproduce
@@ -148,19 +148,23 @@ def generate_review(
       if bug.thoughts:
         report_lines.append(f"**Analysis:**\n{bug.thoughts}\n")
 
-      report_lines.append("**Original LLVM IR:**")
-      report_lines.append("```llvm")
+      is_rwenum = bug.repro_kind == "rwenum"
+      report_lines.append("**Original LLVM IR:**" if is_rwenum else "**Original MLIR:**")
+      report_lines.append("```llvm" if is_rwenum else "```mlir")
       report_lines.append(bug.original_ir)
       report_lines.append("```\n")
 
-      report_lines.append("**Transformed LLVM IR:**")
-      report_lines.append("```llvm")
+      report_lines.append("**Transformed LLVM IR:**" if is_rwenum else "**Transformed MLIR:**")
+      report_lines.append("```llvm" if is_rwenum else "```mlir")
       report_lines.append(bug.transformed_ir)
       report_lines.append("```\n")
 
       report_lines.append("**Verification Log:**")
       report_lines.append("```")
-      report_lines.append(bug.log)
+      report_lines.append(
+        json.dumps(bug.log, ensure_ascii=False, indent=2)
+        if not isinstance(bug.log, str) else bug.log
+      )
       report_lines.append("```\n")
   else:
     report_lines.append("## Bugs Found\n")
@@ -180,13 +184,13 @@ def generate_review(
       test_payload = parsed_report.get("test")
       if isinstance(test_payload, list) and len(test_payload) >= 2:
         report_lines.append("### Reproducer\n")
-        report_lines.append("**LLVM IR:**")
+        report_lines.append("**MLIR:**")
         ir_text = test_payload[0]
         if isinstance(ir_text, str):
           if ir_text.strip().startswith("```"):
             report_lines.append(ir_text.strip())
           else:
-            report_lines.append("```llvm")
+            report_lines.append("```mlir")
             report_lines.append(ir_text.strip())
             report_lines.append("```")
         report_lines.append("")
@@ -299,9 +303,9 @@ def print_results(stats: RunStats, console) -> None:
     if bug.thoughts:
       console.print("Thoughts:")
       console.print(bug.thoughts)
-    console.print("Original LLVM IR:")
+    console.print("Original MLIR:")
     console.print(bug.original_ir)
-    console.print("Transformed LLVM IR:")
+    console.print("Transformed MLIR:")
     console.print(bug.transformed_ir)
     console.print("Verification Log:")
     console.print(bug.log)
