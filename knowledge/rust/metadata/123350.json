@@ -1,0 +1,116 @@
+{
+  "schema": 1,
+  "pr": {
+    "id": 123350,
+    "title": "Actually use the inferred `ClosureKind` from signature inference in coroutine-closures",
+    "url": "https://github.com/rust-lang/rust/pull/123350",
+    "description": "A follow-up to https://github.com/rust-lang/rust/pull/123349, which fixes another subtle bug: We were not taking into account the async closure kind we infer during closure signature inference.\r\n\r\nWhen I pass a closure directly to an arg like `fn(x: impl async FnOnce())`, that should have the side-effect of artificially restricting the kind of the async closure to `ClosureKind::FnOnce`. We weren't doing this -- that's a quick fix; however, it uncovers a second, more subtle bug with the way that `move`, async closures, and `FnOnce` interact.\r\n\r\nSpecifically, when we have an async closure like:\r\n```\r\nlet x = Struct;\r\nlet c = infer_as_fnonce(async move || {\r\n  println!(\"{x:?}\");\r\n}\r\n``` \r\n\r\nThe outer closure captures `x` by move, but the inner coroutine still immutably borrows `x` from the outer closure. Since we've forced the closure to by `async FnOnce()`, we can't actually *do* a self borrow, since the signature of `AsyncFnOnce::call_once` doesn't have a borrowed lifetime. This means that all `async move` closures that are constrained to `FnOnce` will fail borrowck.\r\n\r\nWe can fix that by detecting this case specifically, and making the *inner* async closure `move` as well. This is always beneficial to closure analysis, since if we have an `async FnOnce()` that's `move`, there's no reason to ever borrow anything, so `move` isn't artificially restrictive.",
+    "author": "compiler-errors",
+    "state": "closed",
+    "createdAt": "2024-04-02T02:35:44Z",
+    "mergedAt": "2024-04-05T17:27:41Z",
+    "headSha": "55e46612c1ccceb30a7a6acf11fd485f34e393e5",
+    "baseSha": "f2f8d8b722fdacc6a6e02c2289e3e36571749a68",
+    "baseShaProvenance": "isolated-merge-first-parent",
+    "mergeSha": "02ee8a8ceeff811adfb065028a48c1947d97ef91",
+    "files": [
+      "compiler/rustc_hir_typeck/src/closure.rs",
+      "compiler/rustc_hir_typeck/src/upvar.rs",
+      "compiler/rustc_mir_transform/src/coroutine/by_move_body.rs",
+      "src/tools/miri/tests/pass/async-closure-captures.rs",
+      "src/tools/miri/tests/pass/async-closure-captures.stdout",
+      "tests/ui/async-await/async-closures/captures.rs",
+      "tests/ui/async-await/async-closures/captures.run.stdout",
+      "tests/ui/async-await/async-closures/wrong-fn-kind.rs",
+      "tests/ui/async-await/async-closures/wrong-fn-kind.stderr"
+    ],
+    "components": [
+      "miri",
+      "rustc_hir_typeck",
+      "rustc_mir_transform"
+    ],
+    "labels": [
+      "T-compiler",
+      "S-waiting-on-bors"
+    ],
+    "patchHash": "117c7812521a0fbcec7c7967623340a093f4e2dab2964ab09328328c568c862e",
+    "patchSource": "github-pull-patch",
+    "patchUrl": "https://github.com/rust-lang/rust/pull/123350.patch"
+  },
+  "issues": [],
+  "classification": [
+    {
+      "id": "StateTransform",
+      "name": "StateTransform",
+      "kind": "pass",
+      "confidence": "high",
+      "evidence": [
+        "implementation: compiler/rustc_mir_transform/src/coroutine/by_move_body.rs"
+      ]
+    }
+  ],
+  "processing": {
+    "status": "inconclusive",
+    "model": "deepseek-flash",
+    "updatedAt": "2026-10-22T01:33:49.310Z",
+    "reason": "The historical defect in PR #123350 is not a value-producing miscompilation: the incorrect `ByMoveBody` early-return (`coroutine_kind == FnOnce` instead of `InstanceDef::CoroutineKindShim`) leaves the inner coroutine borrowing an upvar from a consumed `FnOnce` coroutine-closure. The PR's own evidence says this “will always result in a borrowck error” (E0597/`x does not live long enough`); the corresponding `.stderr` files are added by patch 1 and deleted by patch 2. The valid final behavior is simply that the previously rejected `force_fnonce(async move || println!(\\\"{x:?}\\\"))` cases compile and print `Hello(6)`/`Hello(7)`.\n\nConsequently there is no source-grounded original/transformed function pair that both pass Miri and compute different values. A by-move capture and an inner borrow of the same immutable upvar read the same value, so making both versions executable would produce identical output. Constructing a difference would require either (a) unsafe/dangling access or leaking the parent so the borrow outlives it, or (b) mutating the captured value after the move/borrow. Those are not the historical transformation: the former is UB or an artificial lifetime workaround, and the latter is the post-copy-overwrite conflation explicitly excluded by the preconditions/pitfalls. Encoding such behavior would manufacture an unrelated rewrite merely to force a runtime divergence. Therefore no valid counterexample pair can be validated for this borrowck-only fix.",
+    "evidence": [],
+    "attempts": 0
+  },
+  "analysis": {
+    "kind": "bug-fix",
+    "passIds": [
+      "StateTransform"
+    ],
+    "summary": "The coroutine by-move body transformation must not assume that an `FnOnce` coroutine kind means all upvars were already moved. For async closures whose kind is restricted to `FnOnce` by signature inference, an inner coroutine can still borrow an upvar from its parent closure, causing E0597. The fix detects `FnOnce` coroutine-closures and forces the inner coroutine capture clause to match the parent `move` closure, and changes the by-move-body skip condition to the `CoroutineKindShim` rather than `FnOnce`.",
+    "originalLogic": "The original by-move-body logic returned early when the coroutine kind resolved to `FnOnce`: \"We don't need to generate a by-move coroutine if the kind of the coroutine is already `FnOnce` -- that means that any upvars that the closure consumes have already been taken by-value.\" It then computed `coroutine_kind` and only inserted by-ref fields when the coroutine captured by ref and the parent captured by value.",
+    "incorrectTransformation": "The historically incorrect transformation equated `coroutine_kind == ty::ClosureKind::FnOnce` with \"all upvars already taken by-value\" and skipped the by-move rewriting. But the PR states: \"The outer closure captures `x` by move, but the inner coroutine still immutably borrows `x` from the outer closure.\" Because \"the signature of `AsyncFnOnce::call_once` doesn't have a borrowed lifetime\", this led to borrowck errors. Patch 2 corrected this by skipping only for `body.source.instance, ty::InstanceDef::CoroutineKindShim { .. }` and by adding an assertion that \"`FnOnce` coroutine-closures return coroutines that capture from their body; it will always result in a borrowck error!\" It also forced the inner coroutine to be `move` when the parent coroutine-closure was inferred `FnOnce`: \"we force the inner coroutine to also be `move`.\"",
+    "inputDomain": "Async closures (coroutine-closures desugared with `hir::CoroutineSource::Closure`) passed where the expected parameter type forces the closure kind, e.g. `fn force_fnonce<T>(f: impl async FnOnce() -> T) -> impl async FnOnce() -> T`. Include `async move` closures and non-`move` `async` closures capturing both owned values and references, where the inner coroutine only reads the captured value.",
+    "trigger": "An `async move` closure constrained to `ClosureKind::FnOnce` by signature inference, whose inner coroutine captures an upvar by reference instead of by move. The PR describes forcing a closure via `fn(x: impl async FnOnce())` as \"artificially restricting the kind of the async closure to `ClosureKind::FnOnce`.\"",
+    "preconditions": [
+      "The parent is an async closure desugared from a closure (`hir::CoroutineKind::Desugared(_, hir::CoroutineSource::Closure)`).",
+      "The parent closure kind was inferred or constrained to `ty::ClosureKind::FnOnce`, not merely the inner coroutine's kind.",
+      "The inner coroutine may capture an upvar by reference from the parent, especially when the body only reads the upvar.",
+      "The parent coroutine-closure is `move`; the PR notes that otherwise the closure itself borrows from the outer environment and there are no self-borrows."
+    ],
+    "pitfalls": [
+      "`FnOnce` coroutine kind alone does not prove that upvars were consumed by value; signature inference can make the kind more restrictive than the inner coroutine's captures.",
+      "Do not conflate borrowck restrictions with post-copy overwrites; the failing case here is a self-borrow from the parent coroutine-closure, not an overwrite after a copy.",
+      "`AsyncFnOnce::call_once` has no borrowed lifetime, so an async `FnOnce` coroutine cannot borrow from its parent closure: \"This would lead to an impossible to satisfy situation, since `AsyncFnOnce`\" coroutine bodies cannot borrow from their parent closure.",
+      "The correct skip condition for by-move body generation is `CoroutineKindShim`, not `FnOnce`: \"We don't need to generate a by-move coroutine if the kind of the coroutine is\" already `FnOnce` is not a valid reason to skip the rewrite.",
+      "Forcing the inner coroutine to `move` is described as safe because with an `async FnOnce()` that is `move`, \"there's no reason to ever borrow anything, so `move` isn't artificially restrictive.\""
+    ],
+    "testStrategy": "Use the paired UI and Miri regression tests `tests/ui/async-await/async-closures/captures.rs` and `src/tools/miri/tests/pass/async-closure-captures.rs`, which are explicitly kept in sync. Add a `force_fnonce` helper and cover both owned and reference captures under two cases: \"// Capture something with `move`, but infer to `AsyncFnOnce`\" and \"// Capture something by-ref, but infer to `AsyncFnOnce`\". In the final patch, the UI test is restored to `//@ run-pass` with `//@ check-run-results`, the E0597 `.stderr` expectation is deleted, and the expected output gains `Hello(6)` through `Hello(9)`. Also exercise `wrong-fn-kind.rs`: the mutation through an `async Fn`-bound closure now produces `cannot borrow `x` as mutable, as it is a captured variable in a `Fn` closure` (E0596) rather than only the old E0525 diagnostic. These are patch expectations; no compiler was built or executed.",
+    "evidence": [
+      "Actually use the inferred `ClosureKind` from signature inference in coroutine-closures",
+      "A follow-up to https://github.com/rust-lang/rust/pull/123349, which fixes another subtle bug: We were not taking into account the async closure kind we infer during closure signature inference.",
+      "When I pass a closure directly to an arg like `fn(x: impl async FnOnce())`, that should have the side-effect of artificially restricting the kind of the async closure to `ClosureKind::FnOnce`. We weren't doing this -- that's a quick fix; however, it uncovers a second, more subtle bug with the way that `move`, async closures, and `FnOnce` interact.",
+      "The outer closure captures `x` by move, but the inner coroutine still immutably borrows `x` from the outer closure. Since we've forced the closure to by `async FnOnce()`, we can't actually *do* a self borrow, since the signature of `AsyncFnOnce::call_once` doesn't have a borrowed lifetime. This means that all `async move` closures that are constrained to `FnOnce` will fail borrowck.",
+      "We can fix that by detecting this case specifically, and making the *inner* async closure `move` as well. This is always beneficial to closure analysis, since if we have an `async FnOnce()` that's `move`, there's no reason to ever borrow anything, so `move` isn't artificially restrictive."
+    ],
+    "analysisVersion": "nested-mir-diff-v2",
+    "model": "deepseek-flash",
+    "mergedAt": "2024-04-05T17:27:41Z",
+    "passes": [
+      {
+        "id": "StateTransform",
+        "name": "StateTransform",
+        "kind": "pass",
+        "confidence": "high",
+        "evidence": [
+          "implementation: compiler/rustc_mir_transform/src/coroutine/by_move_body.rs"
+        ]
+      }
+    ],
+    "prId": 123350,
+    "headSha": "55e46612c1ccceb30a7a6acf11fd485f34e393e5",
+    "sourceUrl": "https://github.com/rust-lang/rust/pull/123350",
+    "components": [
+      "miri",
+      "rustc_hir_typeck",
+      "rustc_mir_transform"
+    ],
+    "extractedAt": "2026-10-22T01:33:23.384Z",
+    "validation": "source-backed-not-reproduced"
+  }
+}

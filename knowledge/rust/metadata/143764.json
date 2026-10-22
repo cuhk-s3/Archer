@@ -1,0 +1,121 @@
+{
+  "schema": 1,
+  "pr": {
+    "id": 143764,
+    "title": "lower pattern bindings in the order they're written and base drop order on primary bindings' order",
+    "url": "https://github.com/rust-lang/rust/pull/143764",
+    "description": "Reference PR:\r\n\r\n- https://github.com/rust-lang/reference/pull/1953\r\n\r\nTo fix rust-lang/rust#142163, this PR does two things:\r\n- Makes match arms base their drop order on the first sub-branch instead of the last sub-branch. Together with the second change, this makes bindings' drop order correspond to the relative order of when each binding first appears (i.e. the order of the \"primary\" bindings).\r\n- Lowers pattern bindings in the order they're written (still treating the right-hand side of a `@` as coming before the binding on the left). In each sub-branch of a match arm, this is the order that would be obtained if the or-alternatives chosen in that sub-branch were inlined into the arm's pattern. This both affects drop order (making bindings in or-patterns not be dropped first) and fixes the issue in [this test](https://github.com/rust-lang/rust/blob/2a023bf80a6fbd6a06d5460a34eb247b986286ed/tests/ui/pattern/bindings-after-at/bind-by-copy-or-pat.rs) from rust-lang/rust#121716.\r\n\r\nMy approach to the second point is admittedly a bit trickier than may be necessary. To avoid passing around a counter when building `FlatPat`s, I've instead added just enough information to recover the original structure of the pattern's bindings from a `MatchTreeSubBranch`'s path through the `Candidate` tree. Some alternatives:\r\n- We could use a counter, then sort bindings by their ordinals when making `MatchTreeSubBranch`es.\r\n- I'd like to experiment with always merging sub-candidates and removing `test_remaining_match_pairs_after_or`; that would require lowering bindings and guards in a different way. That makes it a bigger change too, though, so I figure it might be simplest to start here.\r\n- For a very big change, we could track which or-alternatives succeed at runtime to base drop order on the binding order in the particular alternatives matched.\r\n\r\nThis is a breaking change. It will need a crater run, language team sign-off, and likely updates to the Reference.\r\n\r\nThis will conflict with rust-lang/rust#143376 and probably also rust-lang/rust#143028, so they shouldn't be merged at the same time.\r\n\r\nr? @matthewjasper or @Nadrieril ",
+    "author": "dianne",
+    "state": "closed",
+    "createdAt": "2025-07-11T01:53:20Z",
+    "mergedAt": "2025-08-07T17:28:20Z",
+    "headSha": "b7de53980572cfec3dadaf869fd554c755794d27",
+    "baseSha": "4529dd9192b5dccd3416e48f37c0263e55b852c0",
+    "baseShaProvenance": "isolated-merge-first-parent",
+    "mergeSha": "5e781d05f6595762b363521d0524badb25255439",
+    "files": [
+      "compiler/rustc_mir_build/src/builder/matches/match_pair.rs",
+      "compiler/rustc_mir_build/src/builder/matches/mod.rs",
+      "compiler/rustc_mir_build/src/builder/matches/util.rs",
+      "tests/mir-opt/match_arm_scopes.complicated_match.panic-abort.SimplifyCfg-initial.after-ElaborateDrops.after.diff",
+      "tests/mir-opt/match_arm_scopes.complicated_match.panic-unwind.SimplifyCfg-initial.after-ElaborateDrops.after.diff",
+      "tests/ui/drop/or-pattern-drop-order.rs",
+      "tests/ui/dropck/eager-by-ref-binding-for-guards.rs",
+      "tests/ui/dropck/eager-by-ref-binding-for-guards.stderr",
+      "tests/ui/pattern/bindings-after-at/bind-by-copy-or-pat.rs",
+      "tests/ui/pattern/bindings-after-at/bind-by-copy-or-pat.stderr"
+    ],
+    "components": [
+      "rustc_mir_build"
+    ],
+    "labels": [
+      "T-lang",
+      "S-waiting-on-bors",
+      "disposition-merge",
+      "finished-final-comment-period",
+      "I-lang-radar"
+    ],
+    "patchHash": "3fda94c47b4d2bd1a6a290d929863eef1f0231dd2bd6276a649b640cddcff90d",
+    "patchSource": "github-pull-diff",
+    "patchUrl": "https://github.com/rust-lang/rust/pull/143764.patch"
+  },
+  "issues": [
+    {
+      "number": 142163,
+      "title": "inconsistent drop order for pattern bindings in the presence of or-patterns",
+      "body": "When or-patterns are present in a pattern, the drop order for its bindings depends on the particular language construct used. To see it in action, see [this test](https://play.rust-lang.org/?version=stable&mode=debug&edition=2024&gist=190a0f41f5af1089cfa623894635e62e) (#142193), but in short:\n- `let pat;` treats the bindings in `pat` as being in the order they first appear in the pattern, and drops them in reverse order. This is the behavior I would expect.\n```rust\n// Drops are right-to-left: `z`, `y`, `x`.\nlet (x, Ok(y) | Err(y), z);\n// The first or-pattern alternative determines the bindings' drop order: `y`, `x`.\nlet ((true, x, y) | (false, y, x));\n```\n- `let pat = expr;`, `if let`, and `let`-`else` see bindings in or-patterns as being after other bindings, thus they're dropped first. i.e.\n```rust\n// Drops are right-to-left, treating `y` as rightmost: `y`, `z`, `x`.\nlet (x, Ok(y) | Err(y), z) = expr;\n// The first or-pattern alternative determines the bindings' drop order: `y`, `x`.\nlet ((true, x, y) | (false, y, x)) = expr;\n```\n- `match` arms see bindings in or-patterns as being after other bindings, and use the final or-pattern alternative's binding order, rather than the first. i.e.\n```rust\n// Drops are right-to-left, treating `y` as rightmost: `y`, `z`, `x`.\nmatch expr { (x, Ok(y) | Err(y), z) => {} }\n// The last or-pattern alternative determines the bindings' drop order: `x`, `y`.\nmatch expr { (true, x, y) | (false, y, x) => {} }\n```\n- Function parameters are dropped in the usual right-to-left order, but the bindings within a parameter's pattern see bindings in or-patterns as being rightmost. i.e.\n```rust\n// Among separate params, the drop order is right-to-left: `z`, `y`, `x`.\n(|x, (Ok(y) | Err(y)), z| {})(expr1, expr2, expr3);\n// Within a param's pattern, or-patterns are treated as rightmost: `y`, `z`, `x`.\n(|(x, Ok(y) | Err(y), z)| {})(expr);\n// The first or-pattern alternative determines the bindings' drop order: `y`, `x`.\n(|((true, x, y) | (false, y, x))| {})(expr);\n```\n\nImplementation-wise, this is due to differences in how pattern bindings are lowered to MIR.\n- For `let pat;`, we traverse the pattern in a natural order and schedule drops for bindings [here](https://github.com/rust-lang/rust/blob/321dde12528a6baf0990ec611d33122b68c33fca/compiler/rustc_mir_build/src/builder/block.rs#L294-L303).\n- For anything that involves pattern-matching, we use the ordering of bindings seen by match lowering, which tests or-patterns last. `match` using the final or-pattern alternative's binding order is a detail of how match guards are currently implemented [here](https://github.com/rust-lang/rust/blob/321dde12528a6baf0990ec611d33122b68c33fca/compiler/rustc_mir_build/src/builder/matches/mod.rs#L548-L584).\n- Function parameters' patterns are lowered left-to-right, using the usual pattern-matching lowering for each individual parameter with a non-trivial pattern [here](https://github.com/rust-lang/rust/blob/321dde12528a6baf0990ec611d33122b68c33fca/compiler/rustc_mir_build/src/builder/mod.rs#L977-L985).\n\nIf this should change, I imagine it will need a T-lang decision on what the correct behavior should be, so cc @rust-lang/lang\n\n@rustbot label: +T-compiler +T-lang +A-MIR +A-patterns +A-destructors",
+      "url": "https://github.com/rust-lang/rust/issues/142163"
+    }
+  ],
+  "classification": [
+    {
+      "id": "SimplifyCfg",
+      "name": "SimplifyCfg",
+      "kind": "pass",
+      "confidence": "high",
+      "evidence": [
+        "MIR dump: tests/mir-opt/match_arm_scopes.complicated_match.panic-abort.SimplifyCfg-initial.after-ElaborateDrops.after.diff",
+        "MIR dump: tests/mir-opt/match_arm_scopes.complicated_match.panic-unwind.SimplifyCfg-initial.after-ElaborateDrops.after.diff"
+      ]
+    }
+  ],
+  "processing": {
+    "status": "complete",
+    "model": "deepseek-flash",
+    "updatedAt": "2026-10-22T02:17:00.500Z",
+    "localCase": "../cases/143764/case.json"
+  },
+  "analysis": {
+    "kind": "bug-fix",
+    "summary": "Historical match lowering produced inconsistent drop/borrow order for pattern bindings under or-patterns. Match arms used the last lowered sub-branch to define arm drop order, and or-pattern bindings were appended after other bindings, so they dropped first instead of at the position of their primary syntactic occurrence. The fix reverses sub-branch lowering so the first source sub-branch supplies drop order, and records or-pattern binding placeholders so bindings are flattened in written order. Knowledge is observed through SimplifyCfg-initial.after-ElaborateDrops MIR diffs; the implementation change itself is in rustc_mir_build match lowering.",
+    "originalLogic": "Before the fix, match arms with or-patterns based their drop order on the last sub-branch, while bindings inside or-patterns were lowered after other bindings. The issue states: \"`match` arms see bindings in or-patterns as being after other bindings, and use the final or-pattern alternative's binding order, rather than the first.\" It also explains: \"For anything that involves pattern-matching, we use the ordering of bindings seen by match lowering, which tests or-patterns last.\" The old regression expectations encoded this, e.g. \"Drops are right-to-left, treating `y` as rightmost: `y`, `z`, `x`.\" and \"The last or-pattern alternative determines the bindings' drop order: `x`, `y`.\"",
+    "incorrectTransformation": "The historically incorrect lowering transformation lowered match-arm sub-branches such that the last sub-branch lowered determined arm drop order, and appended bindings from or-patterns after ordinary bindings. In source terms, for `match (LogDrop(o,3), Ok(LogDrop(o,1)), LogDrop(o,2)) { (x, Ok(y) | Err(y), z) => {} }` the old behavior dropped `y`, then `z`, then `x`, instead of basing order on primary binding occurrence (`z`, `y`, `x`). The fix states: \"Makes match arms base their drop order on the first sub-branch instead of the last sub-branch\" and \"Lowers pattern bindings in the order they're written (still treating the right-hand side of a `@` as coming before the binding on the left).\" This is not merely a different fixed implementation: the incorrect transformation is specifically last-sub-branch drop order plus or-pattern bindings treated as trailing/rightmost bindings.",
+    "inputDomain": "Rust patterns containing bindings and or-patterns (`|`), especially match arms, and likewise `let pat = expr;`, `if let`, `let`-`else`, and function parameters. Triggering inputs include or-pattern alternatives that bind the same names in different orders, bindings inside or-patterns interleaved with other bindings, nested and adjacent or-patterns, guards, and `@` bindings such as `x @ (A(a) | A(a))`. Drop order is observable through types with `Drop` logging (the test uses `LogDrop`). The corrected invariant is that drop order corresponds to the relative order in which each binding first appears in the pattern, i.e. the order of the \"primary\" bindings, with the right-hand side of `@` treated as coming before the left-hand binding.",
+    "trigger": "A match arm (or another pattern-matching construct) has an or-pattern whose alternatives bind names in a different order from other bindings, or has bindings inside an or-pattern that would previously have been treated as trailing. Guards make the last-sub-branch behavior especially visible because the old code retained the drop order of the final sub-branch lowered. Example from the regression test: `match (true, LogDrop(o,2), LogDrop(o,1)) { (true, x, y) | (false, y, x) => {} }` was expected to drop `x`, `y` but the corrected behavior is `y`, `x` based on the first alternative.",
+    "passIds": [
+      "SimplifyCfg"
+    ],
+    "preconditions": [
+      "The pattern contains an or-pattern with bindings, or interleaves or-pattern bindings with non-or bindings.",
+      "Drop order or borrow-check order of the bindings is observable (e.g. via a Drop impl or a dropck error).",
+      "For the guard-specific behavior, the match arm has a guard and may create eager by-ref bindings for alternatives with differing binding modes.",
+      "The MIR being inspected is the SimplifyCfg-initial after ElaborateDrops output where match lowering's sub-branch order and storage operations are visible."
+    ],
+    "pitfalls": [
+      "Do not infer the semantic change only from local numbering or block-number renumbering. Reversing sub-branches swaps StorageLive/StorageDead temporaries (e.g. `_9`/`_10` vs `_12`/`_13`) and branch targets; the meaningful change is which source-order sub-branch supplies binding/drop order, such as `_5 = copy (_2.0: bool)` versus `_5 = copy (_2.1: bool)` in the decoded diff.",
+      "Do not treat or-pattern bindings as rightmost/last. The corrected rule is to inline the or-alternatives chosen in a sub-branch as if they appeared at that point in the arm pattern.",
+      "Preserve the `@` rule: the right-hand side of `@` comes before the binding on the left. The bind-by-copy-or-pat test changes from `//@ known-bug: unknown` plus E0382 errors to `//@ run-pass` because bindings are now lowered in syntactic order.",
+      "Guards still need drop scheduling during guard binding so `StorageDead` is emitted on guard failure/break paths; the new code explicitly says it `always schedules storage drops`, then clears the top scope for non-final lowered sub-branches so only the final (source-first) sub-branch supplies arm drop order.",
+      "Only insert the `FromOrPattern` placeholder when the first alternative has bindings: the patch checks `!pats[0].extra_data.bindings.is_empty()` so or-patterns simplified by `merge_trivial_subcandidates` are skipped. Doing otherwise can misalign placeholder flattening.",
+      "Ill-formed or-patterns with mismatched bindings, such as `(x, _ | y)` and `x | _`, can leave no matching subcandidate bindings; the patch emits a `delayed_bug(\"mismatched or-pattern bindings but no error emitted\")` rather than silently dropping bindings.",
+      "Binding modes may differ between alternatives. The dropck test now reports the eager by-ref lifetime error on the first alternative (`&Err(short4) | Ok(short4)`) instead of the previous alternative (`Ok(short3) | &Err(short3)`), so tests must not assume the old alternative wins."
+    ],
+    "testStrategy": "Use focused UI drop-order tests with a logging `Drop` type and an `assert_drop_order` helper. Cover the same pattern shape across `let pat;`, `let pat = expr;`, `match`, `if let`, `let`-`else`, and function parameters, asserting the corrected order based on first/primary binding occurrence. Include alternatives that bind the same names in opposite orders (`(true, x, y) | (false, y, x)`), or-pattern bindings interleaved with ordinary bindings (`(x, Ok(y) | Err(y), z)`), and nested/adjacent or-patterns with a guard. Add a `bindings-after-at` run-pass test for `let x @ (A(a) | A(a)) = A(10);` to ensure bindings are lowered in written order and no E0382 appears. Update mir-opt SimplifyCfg-initial.after-ElaborateDrops expectations for `match_arm_scopes.complicated_match` in both panic-abort and panic-unwind modes, checking which copy (`_2.0` vs `_2.1`) feeds the binding and which sub-branch succeeds, not merely renumbered locals. For dropck, assert that the eager by-ref guard diagnostic follows the first or-pattern alternative. Do not claim these tests were executed here; they are source-backed test changes in the supplied patch.",
+    "evidence": [
+      "Makes match arms base their drop order on the first sub-branch instead of the last sub-branch."
+    ],
+    "analysisVersion": "nested-mir-diff-v2",
+    "model": "deepseek-flash",
+    "mergedAt": "2025-08-07T17:28:20Z",
+    "passes": [
+      {
+        "id": "SimplifyCfg",
+        "name": "SimplifyCfg",
+        "kind": "pass",
+        "confidence": "high",
+        "evidence": [
+          "MIR dump: tests/mir-opt/match_arm_scopes.complicated_match.panic-abort.SimplifyCfg-initial.after-ElaborateDrops.after.diff",
+          "MIR dump: tests/mir-opt/match_arm_scopes.complicated_match.panic-unwind.SimplifyCfg-initial.after-ElaborateDrops.after.diff"
+        ]
+      }
+    ],
+    "prId": 143764,
+    "headSha": "b7de53980572cfec3dadaf869fd554c755794d27",
+    "sourceUrl": "https://github.com/rust-lang/rust/pull/143764",
+    "components": [
+      "rustc_mir_build"
+    ],
+    "extractedAt": "2026-10-22T02:00:54.371Z",
+    "validation": "source-backed-not-reproduced"
+  }
+}

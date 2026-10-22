@@ -1,127 +1,82 @@
-# Archer
+# Archer for Rust
 
-> [!Note]
-> Archer's paper is available [here](https://arxiv.org/pdf/2607.01808). Feel free to check it out.
->
-> Archer is actively reviewing new InstCombine and many other passes' PRs in LLVM.
-> You can follow its progress in the [review board](https://archer.top).
+Archer reviews `rust-lang/rust` pull requests with an embedded [Pi](https://github.com/earendil-works/pi) TypeScript agent. It uses Archer's two-phase workflow: Phase 1 loads pass-specific knowledge and inspects source, ending with `stop` and structured strategies; Phase 2 freezes those strategies and enables compilation, Miri, differential testing, and reporting. The host enforces tool boundaries, checks strategy coverage, and records separate phase statistics.
 
-## Overview
+## Setup
 
-Archer is an agentic code review tool for LLVM PRs, designed to deliver **precise, evidence-backed** reviews that minimize developers’ time spent reading, validating, and triaging comments.
-It currently focuses on patches related to middle-end optimizations and reports only issues that come with **a reproducible proof of concept**. Archer is fully self-contained and can be paired with any LLM.
-
-This project is directly inspired by the Review Capacity issue logged in this [blog](https://www.npopov.com/2026/01/11/LLVM-The-bad-parts.html#review-capacity).
-
-## Design
-
-> Details of the design and implementation are described in [our paper](https://arxiv.org/pdf/2607.01808).
-
-The key idea of Archer is to help the agent **think like an expert** when reviewing compiler code.
-To achieve this, Archer combines *subsystem knowledge* with a *compiler-specific toolkit*.
-Subsystem knowledge summarizes review experience from historical bug reports and fixes, while the compiler-specific toolkit provides the agent with tools for interacting with the compiler and validating its findings.
-
-As a code review agent, Archer is designed to avoid verbosity issues and only provide **precise, evidence-backed** reviews.
-The final review is structed into minimal comments with a reproducible PoC and patch-specific analysis.
-
-## Quality
-
-Archer has been deployed on 398 LLVM PRs in two months (December 31st, 2025 - February 28th, 2026) and found 51 semantic bugs, with 15 bugs in open PRs and 36 in closed PRs.
-Archer's findings that *21%* of open PRs and *11%* of closed PRs are buggy expose **a critical gap in the capacity for code review** in large compiler projects and demonstrate **the practical value** of Archer as an additional reviewer.
-
-Archer is also evaluated on a set of 47 bisected LLVM bugs, where it found 18 bugs successfully.
-The false positive rate is relatively low, due to strict validation requirements.
-
-## Workflow
-
-Given a PR, Archer performs review in four steps:
-
-1. **Pass identification and knowledge loading.**
-   Archer first identifies the optimization pass relevant to the patch and loads the corresponding pass knowledge.
-
-2. **Analysis.**
-   Archer recovers the relevant code context, inspects the patch semantics, and forms semantic suspicions about potential correctness issues.
-
-3. **Validation.**
-   Archer turns these suspicions into concrete evidence by invoking validation tools and checking whether the suspected issue can be reproduced.
-
-4. **Structured reporting.**
-   Archer produces a structured review containing both detailed bug analysis and a verified proof of concept.
-
-## Environment Setup
-
-Archer requires LLVM, Alive2, llubi, and Python on Linux.
-
-### 1) Configure the environment
-
-Clone the repository and enter the project directory:
+Install Node.js 22.19 or newer, Git, rustup, and the native prerequisites used by the [Rust compiler build](https://rustc-dev-guide.rust-lang.org/building/how-to-build-and-run.html). Then run:
 
 ```bash
 git clone https://github.com/cuhk-s3/Archer.git
 cd Archer
-```
-
-Copy the example file and fill in your model service configuration:
-
-```bash
 cp environments.example environments
 ```
 
-Set the dependency installation directory:
-
-```bash
-export LLVM_AUTOREVIEW_DEPS_DIR=$PWD/deps
-```
-
-### 2) Install dependencies
-
-From the project root, run:
-
-```bash
-bash scripts/install.sh
-```
-
-This script installs and builds the required dependencies, including LLVM, Alive2, llubi, ccache, and the Python environment.
-
-### 3) Activate the environment
-
-In each new terminal, run:
+Set `ARCHER_LM_API_ENDPOINT` and `ARCHER_LM_API_KEY` in `environments`; optionally set `LAB_GITHUB_TOKEN` to raise GitHub API limits. Install the runtime and Miri with:
 
 ```bash
 source scripts/upenv.sh
+bash scripts/install.sh
 ```
 
-This loads Archer’s environment variables, activates the virtual environment, and installs or updates Python dependencies.
+The first review downloads Rust source and builds stage1 rustc for the PR base and patched tree.
 
-### 4) Optional development setup
+Source checkouts remain isolated under `build/rust/source/<PR>/<revision>/`. Compilers are shared across PRs under `build/rust/cache/rustc/<key>/`, keyed by revision, local patch, host, build configuration and native tool versions. LLVM has its own shared cache under `build/rust/cache/llvm/<key>/`, keyed by its pinned revision, bootstrap recipe, host and configuration. Completed cache hits validate the compiler and standard library and skip rebuilding; interrupted builds retain incremental output. Process locks serialize cache writers and protect source checkout preparation. Existing builds using the old directories can finish normally; they are not moved into the new cache automatically.
 
-For local development, install:
+Set `LAB_RUST_BUILD_TIMEOUT` (seconds) and `LAB_RUST_BUILD_DIR` to tune build caching. The model defaults to `deepseek-flash` and can be changed with `ARCHER_MODEL`. The validated endpoint uses DeepSeek thinking mode; Pi preserves `reasoning_content` across tool calls. `ARCHER_AGENT_TIMEOUT` defaults to 1200 seconds. On Node 24+, the CLI automatically honors environment proxy variables.
+
+## Use
 
 ```bash
-pip install -r requirements.dev.txt
-pre-commit install
+npm run review -- review <RUST_PR_ID>
+npm run review -- fetch <RUST_PR_ID>
+npm run review -- serve
 ```
 
-## Usage
+`fetch` prints PR metadata without building. `review` runs the full Pi tool workflow and stores review JSON/Markdown under `service_data/reviews/reviews/<PR>/`, with evidence-backed reusable notes in `service_data/reviews/knowledge/rust.jsonl`. The `serve` command hosts the review board at `http://127.0.0.1:8080` and provides `/api/prs`, `/api/prs/:id`, and `/api/reviews/:id`.
 
-Run Archer with:
+Miri rejects candidate tests that execute undefined behavior. A passing Miri run does not prove compiler correctness; a finding requires a reproducible difference from the base compiler on defined behavior.
+
+Runtime code is organized by workflow: `src/knowledge/` (acquisition, analysis, verification and pass synthesis), `src/review/` (the two review phases and tools), `src/rust/` (passes and toolchains), `src/infra/` (GitHub, Pi and subprocesses), and `src/service/` (HTTP service and storage). The root keeps only the CLI, configuration and shared types. Tests live beside their modules.
+
+Maintenance scripts are grouped under `scripts/knowledge/` and `scripts/review/`. Run `npm run format:check`, `npm run typecheck`, `npm test`, and `npm run build` to validate changes. Deployment and API details are in [service/SERVICE.md](service/SERVICE.md).
+
+## Historical pass knowledge (2024–2025)
+
+The active selection contains **833 independent PRs** merged from 2024-01-01 through 2025-12-31, verified with GitHub metadata. It combines MIR transform/dataflow implementation files and MIR optimization tests with MIR optimization label matches. Aggregate rollups, external subtree merge numbers and out-of-period changes are excluded. The selection is capped at 1,000 PRs in `history/selection.json`. Wider cached records are preserved but do not enter this run.
+
+`knowledge:prescreen` is an advanced importer for the existing local Git file index (`build/rust/historical-merge-files.txt`) and cached GitHub label searches (`build/rust/prescreen/label-*.json`). These runtime caches are not committed. Ordinary review uses the published knowledge and does not require them.
 
 ```bash
-python main.py --pr <PR_ID> --model <MODEL_NAME> [options]
+npm run knowledge:prescreen
+npm run review -- knowledge --collect-only
+npm run review -- knowledge-build --model deepseek-flash --follow
 ```
 
-### Arguments
+Final knowledge is versioned under [`knowledge/rust/`](knowledge/rust/README.md). `passes/` contains the summaries read directly by review, `catalog/` contains pass definitions and pinned sources, `metadata/` records 168 validated cases and 198 inconclusive cases with their descriptions; the 467 source-backed exclusions are omitted, and the ignored local `cases/` directory preserves retained Rust/MIR programs and validation observations. `history.json`, `cases.json` and `manifest.json` index those records and their provenance. The metadata, indexes and summaries are versioned; `cases/` is not committed. `localCase` references are available only after a local export. To export a completed runtime corpus, run `npm run knowledge:publish`; complete pipeline runs also publish automatically.
 
-- `--pr`: LLVM Pull Request ID to review
-- `--model`: LLM model name
-- `--driver`: API driver (`openai`, `anthropic`, or `openai-generic`)
-- `--stats`: Path to save generation statistics
-- `--history`: Path to save chat history
-- `--review`: Path to save review
-- `--debug`: Enable verbose output
+The three roles follow Archer's original knowledge workflow:
 
-### Example
+1. **A** analyzes the historical issue/patch into a transformation description, triggering conditions and testing strategy.
+2. **B** generates original and incorrectly transformed Rust/MIR program pairs from that description. The host uses one fixed modern Rust/Miri runtime: two Miri executions per variant and two native executions per variant at O0/O3. Defined, repeatable differences retain the case under its actual pass. Historical compiler builds are optional extra evidence.
+3. **C** summarizes **all retained descriptions for each pass**, identifying frequently missed elements and common patterns. C has no rejection role. Every retained case must be referenced; a summary failure never deletes B's validated case.
 
-```bash
-python main.py --pr 12345 --model gpt-4 --stats stats.json --history history.json --review review.md --debug
-```
+This is concrete-input transformation testing, not universal equivalence proof or a claim that current rustc contains the historical bug. Tool errors, UB, timeouts and unstable outputs do not certify differences. Inconclusive cases retain their reasons. A source-backed exclusion must identify unrelated or mechanical changes; missing labels or automatic pass matches alone are not exclusion reasons.
+
+Pass classification uses actual MIR registrations and implementation modules from pinned sources, plus exact MIR dump/EMIT_MIR names. GVN, CopyProp, JumpThreading, DataflowConstProp, DestinationPropagation, SimplifyCfg, SimplifyLocals, Inline and other actual passes have separate knowledge files. Shared helpers and ownership labels are not invented passes. Unresolved cases receive source inspection.
+
+The corpus lives under `service_data/reviews/knowledge/history/`:
+
+- `selection.json`, `selected-metadata/`, `inventory/`, `raw/`: bounded selection and complete source provenance.
+- `records/`, `classification/`, `skipped/`, `pending/`: A's descriptions and source-backed decisions.
+- `program-pairs/deepseek-flash/`: B's programs, execution matrices and certificates.
+- `synthesis/deepseek-flash/`, `synthesized-passes/deepseek-flash/`: C's summaries and one Markdown file per pass.
+- `collection.json`, `pipeline-status.json`: collection status and selected-case coverage.
+
+The pipeline resumes completed work and retries infrastructure failures. On Node 24+ it honors proxy environment variables. Native macOS subprocesses select installed Command Line Tools and their SDK per process. For local Git acceleration, configure `ARCHER_HISTORY_GIT_REPO` and retain `build/rust/historical-merge-files.txt`; GitHub diff and full Git-object fallback handle missing partial-clone objects.
+
+Phase 1 of review loads the identified passes' summarized knowledge, inspects the patch/source and finishes with `stop` plus structured strategies. Phase 2 freezes those strategies, runs defined differential tests and submits a report. The host enforces phase boundaries and strategy coverage.
+
+`validate-knowledge` remains an optional validation against historical before/after compiler builds.
+
+For an independent two-phase evaluation, run `npm run review:blind -- <PR>`. This exports a source snapshot at the actual PR merge, freezes the published knowledge input, and stores inputs, event traces and results under `service_data/blind-review/<PR>/`. The review tools cannot access later Git history or external selection notes. Keep known issue reports, fixes and reproducers outside that snapshot.

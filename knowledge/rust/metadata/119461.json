@@ -1,0 +1,125 @@
+{
+  "schema": 1,
+  "pr": {
+    "id": 119461,
+    "title": "Use an interpreter in MIR jump threading",
+    "url": "https://github.com/rust-lang/rust/pull/119461",
+    "description": "This allows to understand assignments of aggregate constants. This case appears more frequently with GVN promoting aggregates to constants.",
+    "author": "cjgillot",
+    "state": "closed",
+    "createdAt": "2023-12-31T02:13:53Z",
+    "mergedAt": "2024-01-21T11:15:36Z",
+    "headSha": "e72b2b18c01919e9146e2bfb7b6ea0f0ea72997c",
+    "baseSha": "3cd378cc1589ef1d575c06485316d3a2a5c1a503",
+    "baseShaProvenance": "isolated-merge-first-parent",
+    "mergeSha": "203cc6930eabc65577b167e343ba634440f754f4",
+    "files": [
+      "compiler/rustc_mir_transform/src/jump_threading.rs",
+      "tests/mir-opt/jump_threading.aggregate.JumpThreading.panic-abort.diff",
+      "tests/mir-opt/jump_threading.aggregate.JumpThreading.panic-unwind.diff",
+      "tests/mir-opt/jump_threading.rs"
+    ],
+    "components": [
+      "rustc_mir_transform"
+    ],
+    "labels": [
+      "T-compiler",
+      "S-waiting-on-bors",
+      "A-mir-opt"
+    ],
+    "patchHash": "adbc62656955ffedb4ea53bee9a07ddbb6a928921927494cfb45f1cc4136c52e",
+    "patchSource": "github-pull-patch",
+    "patchUrl": "https://github.com/rust-lang/rust/pull/119461.patch"
+  },
+  "issues": [],
+  "classification": [
+    {
+      "id": "JumpThreading",
+      "name": "JumpThreading",
+      "kind": "pass",
+      "confidence": "high",
+      "evidence": [
+        "implementation: compiler/rustc_mir_transform/src/jump_threading.rs",
+        "MIR dump: tests/mir-opt/jump_threading.aggregate.JumpThreading.panic-abort.diff",
+        "MIR dump: tests/mir-opt/jump_threading.aggregate.JumpThreading.panic-unwind.diff",
+        "// EMIT_MIR jump_threading.aggregate.JumpThreading.diff"
+      ]
+    }
+  ],
+  "processing": {
+    "status": "inconclusive",
+    "model": "deepseek-flash",
+    "updatedAt": "2026-10-22T00:44:43.962Z",
+    "reason": "This PR is a pure JumpThreading optimization enhancement, not a semantic bug fix. The pre-change pass simply failed to register a threading opportunity for aggregate constants, leaving `switchInt(move _5) -> [0: bb2, otherwise: bb1]` in place; the post-change pass evaluates the aggregate constant and replaces the switch with `goto -> bb2`. For the added regression test `const FOO: (u8, u8) = (5, 13); let (a, b) = FOO; if a == 7 { b } else { a }`, `a == 7` is false, so the original switch takes `bb2` and returns `a = 5`, while the threaded `goto -> bb2` also executes `_0 = _2` and returns `a = 5`. Both revisions are observationally identical for every defined input (the function ignores its `x` parameter). The \"historical incomplete transformation\" is only a missed optimization opportunity, not an incorrect value transformation, so there is no source-grounded original/transformed pair that produces differing defined results. Manufacturing a difference by changing the compared constant, collapsing the return slot incorrectly, or introducing an unrelated miscompile would not be justified by this PR.",
+    "evidence": [],
+    "attempts": 0
+  },
+  "analysis": {
+    "kind": "optimization",
+    "originalLogic": "Before this PR, jump threading handled constants through `Operand::Constant` only by direct scalar extraction: `let constant = constant.const_.normalize(self.tcx, self.param_env).try_to_scalar_int()?; conditions.iter_matches(constant).for_each(register_opportunity);`. Thus a value assigned from an aggregate constant (e.g. a tuple constant destructured into fields) could not be resolved element-by-element, so conditions on projections of that aggregate were not tied to the switch target.",
+    "incorrectTransformation": "The historically incomplete transformation failed to register a threading opportunity when the compared value originated from a projection of an aggregate constant. For `const FOO: (u8, u8) = (5, 13); let (a, b) = FOO; if a == 7 { b } else { a }`, the pre-change MIR kept `_4 = const _; _2 = (_4.0: u8); _5 = Eq(move _6, const 7_u8); switchInt(move _5) -> [0: bb2, otherwise: bb1];`, whereas the intended transformed output threads to `goto -> bb2;`. The fix evaluates aggregate constants with an interpreter and walks projected values (`Field`, `Variant`, `Discriminant`, `DerefLen`) so each tracked place is matched against the constant.",
+    "inputDomain": "MIR functions where a value compared against a scalar constant is obtained by reading fields/variants/discriminants/pointer lengths from a constant aggregate (tuple, array, ADT, enum, references), typically after `let` destructuring of a `const` aggregate and especially common when GVN promotes aggregates to constants.",
+    "trigger": "An `Assign` from `Operand::Constant` whose constant is an aggregate (not a plain scalar), followed by projections into that place and a comparison that value_analysis has recorded as a condition leading to a switch target.",
+    "preconditions": [
+      "The value_analysis Map can find the assigned place/projection (`self.map.find`/`try_get_idx`).",
+      "The aggregate constant can be interpreted with `self.ecx.eval_mir_constant(&constant.const_, None, None)` using the pass's InterpCx over `DummyMachine` and the same param_env.",
+      "Each projection element is resolvable: `TrackElem::Field` via `project_field`, `TrackElem::Variant` via `project_downcast`, `TrackElem::Discriminant` via `read_discriminant`/`discriminant_for_variant`, `TrackElem::DerefLen` via `deref_pointer`/`len`.",
+      "The projected immediate is `Immediate::Scalar(Scalar::Int(int))`, since only integer scalars are matched with `iter_matches`.",
+      "Layouts must be obtainable through the interpreter (`self.ecx.layout_of(...)`) rather than only `tcx.layout_of(param_env.and(ty))`."
+    ],
+    "pitfalls": [
+      "Do not thread through a `SetDiscriminant` that may be a no-op for the untagged variant of a niche encoding; the code checks `writes_discriminant` and skips when `*variant_index == untagged_variant`.",
+      "Unions are deliberately unsupported: `AggregateKind::Adt(.., Some(_)) => return None`.",
+      "Enum aggregates must apply `TrackElem::Variant(*variant_index)` after handling the discriminant, otherwise field projections are attached to the wrong place.",
+      "Only integer scalar immediates can be matched; non-integer or non-scalar immediates simply yield no opportunity.",
+      "The interpreter must be constructed with the pass param_env and `DummyMachine`; using an unrelated evaluation context could disagree with layout/discriminant computations."
+    ],
+    "testStrategy": "Add a mir-opt regression test `aggregate` in `tests/mir-opt/jump_threading.rs` with `const FOO: (u8, u8) = (5, 13); let (a, b) = FOO; if a == 7 { b } else { a }`, assert `// CHECK-LABEL: fn aggregate(` and `// CHECK-NOT: switchInt(`, register `// EMIT_MIR jump_threading.aggregate.JumpThreading.diff`, and validate both `panic-abort` and `panic-unwind` revisions show the switch replaced by a direct `goto -> bb2;`. Also keep the existing mir-opt cases intact and ensure `fn main` has the label check.",
+    "summary": "JumpThreading was extended to use an interpreter so aggregate constants (tuples/ADTs/enums) can be projected and matched against tracked conditions. Previously only scalar constants could seed threading opportunities, so destructuring a constant aggregate and comparing one field left the `switchInt` unthreaded.",
+    "passIds": [
+      "JumpThreading"
+    ],
+    "evidence": [
+      "This allows to understand assignments of aggregate constants. This case appears more frequently with GVN promoting aggregates to constants.",
+      "let constant = self.ecx.eval_mir_constant(&constant.const_, None, None).ok()?;",
+      "self.map.for_each_projection_value(",
+      "TrackElem::Field(idx) => self.ecx.project_field(op, idx.as_usize()).ok(),",
+      "TrackElem::Discriminant => {",
+      "if let Immediate::Scalar(Scalar::Int(int)) = *rhs {",
+      "// `SetDiscriminant` may be a no-op if the assigned variant is the untagged variant",
+      "// Do not support unions.",
+      "_5 = Eq(move _6, const 7_u8);",
+      "switchInt(move _5) -> [0: bb2, otherwise: bb1];",
+      "goto -> bb2;",
+      "/// Verify that we can thread jumps when we assign from an aggregate constant.",
+      "const FOO: (u8, u8) = (5, 13);",
+      "// CHECK-NOT: switchInt(",
+      "// EMIT_MIR jump_threading.aggregate.JumpThreading.diff"
+    ],
+    "analysisVersion": "nested-mir-diff-v2",
+    "model": "deepseek-flash",
+    "mergedAt": "2024-01-21T11:15:36Z",
+    "passes": [
+      {
+        "id": "JumpThreading",
+        "name": "JumpThreading",
+        "kind": "pass",
+        "confidence": "high",
+        "evidence": [
+          "implementation: compiler/rustc_mir_transform/src/jump_threading.rs",
+          "MIR dump: tests/mir-opt/jump_threading.aggregate.JumpThreading.panic-abort.diff",
+          "MIR dump: tests/mir-opt/jump_threading.aggregate.JumpThreading.panic-unwind.diff",
+          "// EMIT_MIR jump_threading.aggregate.JumpThreading.diff"
+        ]
+      }
+    ],
+    "prId": 119461,
+    "headSha": "e72b2b18c01919e9146e2bfb7b6ea0f0ea72997c",
+    "sourceUrl": "https://github.com/rust-lang/rust/pull/119461",
+    "components": [
+      "rustc_mir_transform"
+    ],
+    "extractedAt": "2026-10-22T00:44:29.766Z",
+    "validation": "source-backed-not-reproduced"
+  }
+}

@@ -1,99 +1,29 @@
-# Archer Dispatcher + Worker Deployment
+# TypeScript review service
 
-This deployment mode separates responsibilities into two roles:
-
-1. Dispatcher (Aliyun): scan PRs, dispatch jobs, poll job status, and serve UI.
-2. Worker (School machine): execute `main.py` through GitHub Actions self-hosted runner.
-
-## Responsibilities
-
-### Dispatcher
-
-1. Runs FastAPI service (`service.backend.app`) for the dashboard API and DB-backed PR/review pages.
-2. Runs static UI from `service/frontend/`.
-3. Scans LLVM PRs with existing filtering logic.
-4. Dispatches work to GitHub Actions workflow.
-5. Polls workflow run status, downloads artifacts, and ingests `run.db.json` into the local `dataset/archer.db`.
-6. Serves the review board from the local SQLite DB.
-
-### Worker
-
-1. Runs GitHub Actions self-hosted runner with label `archer-school`.
-2. Executes workflow job by running `main.py`.
-3. Uploads `run.stats.json`, `run.history.json`, `run.review.md`, and `run.db.json` to GitHub Actions.
-
-## One-Command Startup
-
-### Dispatcher machine (Aliyun)
+Archer uses Node.js and the Pi SDK for review execution. The browser dashboard reads the same JSON records written by the CLI.
 
 ```bash
-export ARCHER_GITHUB_TOKEN=<github-token-with-actions-and-issues-write-scope>
-export ARCHER_CORS_ORIGINS=https://<your-public-frontend-domain>
-export BACKEND_BASE_URL=https://<your-dispatcher-domain-or-ip>:8080
-bash scripts/run_dispatcher.sh
+bash scripts/install.sh
+bash scripts/web.sh
 ```
 
-`run_dispatcher.sh` is self-contained: it starts backend API + scanner, writes `service/frontend/runtime-config.js`, and serves the frontend static UI.
+The service listens on `127.0.0.1:8080` with `npm start`, or `0.0.0.0:8080` with `scripts/web.sh`. Set `ARCHER_HOST` and `ARCHER_PORT` to override these values. Use `ARCHER_OUTPUT_DIR` to select the artifact store (default `service_data/reviews`).
 
-Default ports:
-
-1. Dispatcher API: `ARCHER_SERVICE_PORT` (default `8080`)
-2. Dispatcher UI: `FRONTEND_PORT` (default `8090`)
-
-Common overrides:
+Run reviews on the host:
 
 ```bash
-export ARCHER_SERVICE_PORT=8080
-export FRONTEND_PORT=8090
-export ARCHER_ACTIONS_REPO=cuhk-s3/Archer
-export ARCHER_ACTIONS_WORKFLOW=archer-review-dispatch.yml
-export ARCHER_ACTIONS_REF=main
-export ARCHER_ACTIONS_POLL_INTERVAL_SEC=20
-export ARCHER_PUBLISH_ISSUES=true
-export ARCHER_ISSUES_REPO=cuhk-s3/Archer
-export ARCHER_PUBLIC_BASE_URL=https://archer.top
+npm run review -- review 162593 --model deepseek-flash
 ```
 
-### Worker machine (School)
+The CLI builds base and patched Rust stage1 compilers, runs Pi with TypeScript source inspection and validation tools, and writes review JSON/Markdown and extracted knowledge. It requires `submit_report`, a saved test strategy, and at least one completed differential test before accepting a successful review. Set `ARCHER_AGENT_TIMEOUT` to change the agent timeout in seconds (default 1200).
 
-```bash
-export ACTIONS_RUNNER_DIR=/path/to/actions-runner
-bash scripts/run_worker.sh
-```
+Read-only endpoints:
 
-`run_worker.sh` starts `run.sh` in the self-hosted runner directory.
+- `/healthz`: runtime health.
+- `/api/prs`: PR summaries for the dashboard.
+- `/api/prs/:id`: PR metadata and its review versions.
+- `/api/reviews/:id`: full report, test sources, evidence and knowledge.
+- `/pr/:id`: review history page.
+- `/review/:id`: human-readable report and test evidence.
 
-## GitHub Actions Setup
-
-1. Workflow file: `.github/workflows/archer-review-dispatch.yml`
-2. Runner label on worker machine: `archer-school`
-3. Repository variable: `ARCHER_REPO_ROOT` (absolute Archer path on worker machine)
-4. Worker environment must already have model credentials and dependencies (`scripts/upenv.sh`)
-
-## Runtime Sequence
-
-1. Dispatcher scans PRs and enqueues jobs.
-2. Dispatcher dispatches workflow runs.
-3. Worker runner pulls the workflow job and runs `main.py`.
-4. `main.py` writes local stats/history/review files and exports a structured `run.db.json` snapshot.
-5. Workflow uploads the files to GitHub Actions artifacts.
-6. Dispatcher downloads the artifacts and replays `run.db.json` into its authoritative `dataset/archer.db`.
-7. Dashboard reads from `/api/prs`, `/pr/{pr_id}`, `/review/{review_id}`, and `/trace/{review_id}`.
-8. For each PR with baseline-confirmed, patch-specific bugs, the dispatcher creates one issue in `ARCHER_ISSUES_REPO`. The issue body presents the earliest bug and links to the Archer review when additional bugs exist; its first comment contains the selected bug's analysis and a link to `/review/{review_id}` on `ARCHER_PUBLIC_BASE_URL`.
-9. Publication state is persisted on the bug row, so polling and service restarts do not intentionally duplicate issues or comments.
-
-Set `ARCHER_PUBLISH_ISSUES=false` to disable GitHub publication. `ARCHER_GITHUB_TOKEN` must be able to write issues in `ARCHER_ISSUES_REPO`.
-
-## Data Model
-
-- `dataset/archer.db` on the dispatcher is the authoritative dashboard store.
-- `run.db.json` is the machine-independent result snapshot sent from worker to dispatcher.
-- `run.stats.json`, `run.history.json`, and `run.review.md` are still saved as run artifacts for debugging and inspection.
-- With a single runner, copy the dispatcher's `dataset/archer.db` to the runner before starting if regression-gate history is needed there.
-
-## Network Requirements
-
-1. Dispatcher can access GitHub API.
-2. Worker can access GitHub Actions service.
-3. Browser can access Dispatcher UI/API.
-4. Worker does not need public inbound access.
+GitHub Actions can also run the CLI on the configured self-hosted runner. Configure `ARCHER_REPO_ROOT`, model endpoint/key and GitHub token as workflow variables/secrets. Artifacts are uploaded from the shared output directory. Scanning, dispatching and remote artifact ingestion from the previous Python service are not implemented in this TypeScript service.

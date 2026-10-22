@@ -1,0 +1,134 @@
+{
+  "schema": 1,
+  "pr": {
+    "id": 143704,
+    "title": "Be a bit more careful around exotic cycles in in the inliner",
+    "url": "https://github.com/rust-lang/rust/pull/143704",
+    "description": "Copied from the comment here: https://github.com/rust-lang/rust/issues/143700#issuecomment-3053810353\r\n\r\n---\r\n\r\n```rust\r\n#![feature(fn_traits)]\r\n\r\n#[inline]\r\npub fn a() {\r\n    FnOnce::call_once(a, ());\r\n    FnOnce::call_once(b, ());\r\n}\r\n\r\n#[inline]\r\npub fn b() {\r\n    FnOnce::call_once(b, ());\r\n    FnOnce::call_once(a, ());\r\n}\r\n```\r\n\r\nThis should demonstrate the issue. For ease of discussion, I'm gonna call the two fn-def types `{a}` and `{b}`.\r\n\r\nWhen collecting the cyclic local callees in `mir_callgraph_cyclic` for `a`, we first check the first call terminator in `a`. We end up calling process on `<{a} as FnOnce>::call_once`, which ends up visiting `a`'s instance again. This is cyclical. However, we don't end up marking `FnOnce::call_once` as a cyclical def id because it's a foreign item. That's fine.\r\n\r\nWhen visiting the second call terminator in `a`, which is `<{b} as FnOnce>::call_once`, we end up recursing into `b`. We check the first terminator, which is `<{b} as FnOnce>::call_once`, but although that is its own mini cycle, it doesn't consider itself a cycle for the purpose of this query because it doesn't involve the *root*. However, when we visit the *second* terminator in `b`, which is `<{a} as FnOnce>::call_once`, we end up **erroneously** *not* considering that call to be cyclical since we've already inserted it into our set of seen instances, and as a consequence we don't recurse into it. This means that we never collect `b` as recursive.\r\n\r\nDo this in the flipped case too, and we end up having two functions which mututally do not consider each other to be recursive participants. This leads to a query cycle.\r\n\r\n---\r\n\r\nI ended up also renaming some variables so I could more clearly understand their responsibilities in this code. Let me know if the renames are not welcome.\r\n\r\nFixes https://github.com/rust-lang/rust/issues/143700\r\nr? @cjgillot",
+    "author": "compiler-errors",
+    "state": "closed",
+    "createdAt": "2025-07-09T20:02:40Z",
+    "mergedAt": "2025-07-19T14:09:03Z",
+    "headSha": "3b9c16bc0e90e57ed4ff548a50a577ea4dd7a50c",
+    "baseSha": "44ee51de0b053a3cd56db91982e95eb0c8f3132e",
+    "baseShaProvenance": "isolated-merge-first-parent",
+    "mergeSha": "3b4d79c949ec707ca477053392167e6f0d24e0dd",
+    "files": [
+      "compiler/rustc_mir_transform/src/inline/cycle.rs",
+      "tests/mir-opt/inline_double_cycle.a.Inline.panic-abort.diff",
+      "tests/mir-opt/inline_double_cycle.a.Inline.panic-unwind.diff",
+      "tests/mir-opt/inline_double_cycle.b.Inline.panic-abort.diff",
+      "tests/mir-opt/inline_double_cycle.b.Inline.panic-unwind.diff",
+      "tests/mir-opt/inline_double_cycle.rs"
+    ],
+    "components": [
+      "rustc_mir_transform"
+    ],
+    "labels": [
+      "T-compiler",
+      "S-waiting-on-bors"
+    ],
+    "patchHash": "2ef749fe0bee75ad3efbc69e3644bdb7d635a75f85008ae0a94eb880f23fb10f",
+    "patchSource": "github-pull-diff",
+    "patchUrl": "https://github.com/rust-lang/rust/pull/143704.patch"
+  },
+  "issues": [],
+  "classification": [
+    {
+      "id": "Inline",
+      "name": "Inline",
+      "kind": "pass",
+      "confidence": "high",
+      "evidence": [
+        "shared implementation file: compiler/rustc_mir_transform/src/inline/cycle.rs; pass ambiguous",
+        "MIR dump: tests/mir-opt/inline_double_cycle.a.Inline.panic-abort.diff",
+        "MIR dump: tests/mir-opt/inline_double_cycle.a.Inline.panic-unwind.diff",
+        "MIR dump: tests/mir-opt/inline_double_cycle.b.Inline.panic-abort.diff",
+        "MIR dump: tests/mir-opt/inline_double_cycle.b.Inline.panic-unwind.diff",
+        "//@ test-mir-pass: Inline",
+        "// EMIT_MIR inline_double_cycle.a.Inline.diff",
+        "// EMIT_MIR inline_double_cycle.b.Inline.diff"
+      ]
+    }
+  ],
+  "processing": {
+    "status": "complete",
+    "model": "deepseek-flash",
+    "updatedAt": "2026-10-22T02:17:00.500Z",
+    "localCase": "../cases/143704/case.json"
+  },
+  "analysis": {
+    "kind": "bug-fix",
+    "summary": "The MIR inliner's cycle query (`mir_callgraph_cyclic` in `inline/cycle.rs`) used an `FxHashSet` named `seen` to avoid revisiting instances. That lost the information that an already-visited callee reaches the root, so when a recursive callee was reachable through more than one path, the second path was skipped and the local caller was never added to `involved` as recursive. Two mutually recursive functions could therefore each fail to consider the other a recursion participant, producing a query cycle. Fix: `seen` becomes `FxHashMap<Instance, bool>` caching \"reaches root\"; direct target hits are inserted as `true`, cached values are propagated on revisits, and `involved` is populated whenever a callee reaches the root.",
+    "originalLogic": "In `process`, `seen: &mut FxHashSet<ty::Instance>` tracks instances already visited. For each resolved callee: if `callee.def_id() == target.to_def_id()`, set `cycle_found = true` (but do not record the target in `seen`). Otherwise, after skipping constructors/non-inlined callees, `if seen.insert(callee) { ... recurse ... if found_recursion { involved.insert(local def); cycle_found = true; } }`. A callee already present in `seen` is skipped entirely, so no information about whether it reaches the root is propagated to the current caller. The function returns `cycle_found`. `mir_callgraph_cyclic` initializes with `&mut FxHashSet::default()`.",
+    "incorrectTransformation": "The historically incorrect behavior is the early-out `if seen.insert(callee)` combined with a set: when `seen.insert(callee)` returns `false` (callee already visited), the loop skips the callee and does not mark the current caller as reaching the root, even if that callee is on a path back to the root. The direct target match also does not record the target instance in `seen`. Consequently, a callee that reaches the root via cycle A but has already been visited while exploring cycle B is treated as if it did not reach the root on the B path; the enclosing local function is never inserted into `involved`, so mutually recursive functions can each omit the other as a recursion participant, leading to a query cycle. The corrected transformation replaces the set with a map from instance to \"reaches root\", records `true` on direct target match, and on a revisit propagates the cached boolean instead of dropping it.",
+    "inputDomain": "Rust MIR/optimization input for the `Inline` pass: functions compiled with `-Zinline-mir`, especially mutually recursive `#[inline]` functions that call each other through function-item `FnOnce::call_once` (requiring `#![feature(fn_traits)]` and edition 2021). The cycle graph must contain a callee reachable by multiple paths where a foreign item (e.g. the `FnOnce::call_once` shim) lies on the cycle, and at least one function has multiple call terminators. The regression test uses `EMIT_MIR_FOR_EACH_PANIC_STRATEGY`, `test-mir-pass: Inline`, `-Zinline-mir --crate-type=lib`, emitting `inline_double_cycle.a.Inline.diff` and `inline_double_cycle.b.Inline.diff` under both panic-abort and panic-unwind. More generally, the domain is any DFS cycle reachability query where the same cyclic node can be reached through more than one branch (diamond/multiple-cycle graphs), not only the concrete fn_traits example.",
+    "passIds": [
+      "Inline"
+    ],
+    "trigger": "A recursive callee is encountered more than once during the cycle DFS: the first visit recurses (possibly discovering that it reaches the root), but the second visit sees the instance already in `seen` and is skipped. If the second occurrence is the one that would have propagated \"reaches root\" to the current caller, that caller is not added to `involved`. In the fn_traits example, `<{a} as FnOnce>::call_once` recurses into `a` (a cyclical path through a foreign item not marked as a cyclic def id), then `<{b} as FnOnce>::call_once` recurses into `b`; when `b` calls `<{a} as FnOnce>::call_once`, `a` is already in `seen`, so the recursion is not propagated, `b` is not collected as recursive, and similarly in the flipped direction this yields two functions that do not consider each other recursive, causing a query cycle.",
+    "preconditions": [
+      "The inliner's cyclic-callgraph query is running (`mir_callgraph_cyclic` / `process`) as part of the Inline pass.",
+      "At least two local functions participate in a mutually recursive call graph.",
+      "A cycle passes through a non-local/foreign item such as the `FnOnce::call_once` shim, which is not recorded as a cyclical def id.",
+      "A recursive instance is reachable through multiple call paths, so the same instance appears again after already being inserted into `seen`.",
+      "The function has multiple call terminators, allowing one branch to revisit an instance first seen on another branch."
+    ],
+    "pitfalls": [
+      "Treating `seen` as a plain set only answers 'have we visited this instance', not 'does this instance reach the root'; memoized reachability must be stored per instance.",
+      "Directly matching the target (`callee.def_id() == target.to_def_id()`) must record that callee as reaching the root; otherwise later revisits cannot propagate it.",
+      "Non-local def ids (foreign items such as `FnOnce::call_once`) cannot be added to `involved` because calling `optimized_mir` on them cannot cycle, but their cycle participation still must be propagated.",
+      "Recursion-limit exhaustion pessimistically returns true; this interacts with the cached boolean and should not be confused with a confirmed cycle.",
+      "Test diff changes showing `call_once` shims being inlined are the corrected output, not evidence that a replacement pass is wrong; the historical bug was missing recursion detection, not a bad inline rewrite.",
+      "DFS traversal order must not determine whether a mutually recursive function is recognized; both directions (`a` and `b` roots) need coverage."
+    ],
+    "testStrategy": "Add a `tests/mir-opt` regression test with two mutually recursive `#[inline]` functions using `FnOnce::call_once` on their own function-item types. Use `// EMIT_MIR_FOR_EACH_PANIC_STRATEGY`, `//@ test-mir-pass: Inline`, `//@ edition: 2021`, `//@ compile-flags: -Zinline-mir --crate-type=lib`, and emit both `a` and `b` Inline MIR diffs. This exercises the cycle query from both roots and both panic strategies. The expected corrected MIR shows the `call_once` shims inlined into calls through temporary function pointers (e.g. `_1 = move _5()` with `scope 1 (inlined <fn() {a} as FnOnce<()>>::call_once - shim(fn() {a}))`), rather than the pre-inline `_1 = <fn() {a} as FnOnce<()>>::call_once(a, move _2)`. To isolate the transformation, compare an implementation that caches root-reachability per visited instance against one that only stores a set and drops revisits; keep the same mutually recursive program and assert that both functions are recognized as recursive / no query cycle occurs. Note: no compiler was built here, so this is a testing design, not a reproduction claim.",
+    "evidence": [
+      "-    seen: &mut FxHashSet<ty::Instance<'tcx>>,",
+      "+    seen: &mut FxHashMap<ty::Instance<'tcx>, bool>,",
+      "-        if seen.insert(callee) {",
+      "+        let callee_reaches_root = if let Some(&c) = seen.get(&callee) {",
+      "Even if we have seen this callee before, and thus don't need",
+      "end up reaching that same recursive callee through some *other* cycle.",
+      "+            reaches_root = true;",
+      "we don't end up marking `FnOnce::call_once` as a cyclical def id because it's a foreign item.",
+      "This means that we never collect `b` as recursive.",
+      "Do this in the flipped case too, and we end up having two functions which mututally do not consider each other to be recursive participants. This leads to a query cycle.",
+      "// Calling `optimized_mir` of a non-local definition cannot cycle.",
+      "//@ test-mir-pass: Inline",
+      "//@ compile-flags: -Zinline-mir --crate-type=lib",
+      "// EMIT_MIR inline_double_cycle.a.Inline.diff",
+      "// EMIT_MIR_FOR_EACH_PANIC_STRATEGY",
+      "scope 1 (inlined <fn() {a} as FnOnce<()>>::call_once - shim(fn() {a})) {"
+    ],
+    "analysisVersion": "nested-mir-diff-v2",
+    "model": "deepseek-flash",
+    "mergedAt": "2025-07-19T14:09:03Z",
+    "passes": [
+      {
+        "id": "Inline",
+        "name": "Inline",
+        "kind": "pass",
+        "confidence": "high",
+        "evidence": [
+          "shared implementation file: compiler/rustc_mir_transform/src/inline/cycle.rs; pass ambiguous",
+          "MIR dump: tests/mir-opt/inline_double_cycle.a.Inline.panic-abort.diff",
+          "MIR dump: tests/mir-opt/inline_double_cycle.a.Inline.panic-unwind.diff",
+          "MIR dump: tests/mir-opt/inline_double_cycle.b.Inline.panic-abort.diff",
+          "MIR dump: tests/mir-opt/inline_double_cycle.b.Inline.panic-unwind.diff",
+          "//@ test-mir-pass: Inline",
+          "// EMIT_MIR inline_double_cycle.a.Inline.diff",
+          "// EMIT_MIR inline_double_cycle.b.Inline.diff"
+        ]
+      }
+    ],
+    "prId": 143704,
+    "headSha": "3b9c16bc0e90e57ed4ff548a50a577ea4dd7a50c",
+    "sourceUrl": "https://github.com/rust-lang/rust/pull/143704",
+    "components": [
+      "rustc_mir_transform"
+    ],
+    "extractedAt": "2026-10-22T01:54:36.952Z",
+    "validation": "source-backed-not-reproduced"
+  }
+}

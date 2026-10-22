@@ -1,0 +1,131 @@
+{
+  "schema": 1,
+  "pr": {
+    "id": 138073,
+    "title": "Break critical edges in inline asm before code generation",
+    "url": "https://github.com/rust-lang/rust/pull/138073",
+    "description": "An inline asm terminator defines outputs along its target edges -- a\r\nfallthrough target and labeled targets. Code generation implements this\r\nby inserting code directly into the target blocks. This approach works\r\nonly if the target blocks don't have other predecessors.\r\n\r\nEstablish required invariant by extending existing code that breaks\r\ncritical edges before code generation.\r\n\r\nFixes #137867.\r\n\r\nr? @bjorn3 ",
+    "author": "tmiasko",
+    "state": "closed",
+    "createdAt": "2025-03-05T22:30:11Z",
+    "mergedAt": "2025-03-07T16:48:56Z",
+    "headSha": "02d7fc167fea5013e2300b1c5a3ca75f7a048664",
+    "baseSha": "f42c933c29aa9babe918740a502d75017c02cc40",
+    "baseShaProvenance": "isolated-merge-first-parent",
+    "mergeSha": "1155f01c5a599a06a0ee3b8ccd0d6ba411ad62d3",
+    "files": [
+      "compiler/rustc_mir_transform/src/add_call_guards.rs",
+      "tests/codegen/asm/critical.rs"
+    ],
+    "components": [
+      "rustc_mir_transform"
+    ],
+    "labels": [
+      "T-compiler",
+      "S-waiting-on-bors"
+    ],
+    "patchHash": "db4e909b3ce3dee8b8d8ce2efa8f6af56318b098599cb0ec20cf91ae04ca1aa4",
+    "patchSource": "github-pull-diff",
+    "patchUrl": "https://github.com/rust-lang/rust/pull/138073.patch"
+  },
+  "issues": [
+    {
+      "number": 137867,
+      "title": "asm_goto_with_outputs miscompilation",
+      "body": "This should return `7`, but returns `a`, with or without optimizations.\n```rust\n#![feature(asm_goto)]\n#![feature(asm_goto_with_outputs)]\n\n#[unsafe(no_mangle)]\npub fn asm_goto_test(\n    mut a: i16,\n) -> i16 {\n    unsafe {\n        std::arch::asm!(\n            \"jmp {op}\",\n            inout(\"eax\") a,\n            op = label { a = 7; },\n            options(nostack,nomem)\n        );\n        a\n    }\n}\n```\nhttps://godbolt.org/z/Efze66G84\n\nAs far as I can tell, the MIR looks correct:\n```rust\nfn asm_goto_test(_1: i16) -> i16 {\n    debug a => _1;\n    let mut _0: i16;\n\n    bb0: {\n        asm!(\"jmp {1}\", inout(\"ax\") copy _1 => _1, label 1, options(NOMEM | NOSTACK)) -> [return: bb1, label: bb2, unwind unreachable];\n    }\n\n    bb1: {\n        _0 = copy _1;\n        return;\n    }\n\n    bb2: {\n        _1 = const 7_i16;\n        goto -> bb1;\n    }\n}\n```\nIn particular, the value assigned to `_1` in `bb2` is returned in `bb1`.\n\nThe LLVM-IR is incorrect, as `bb2` stores the value to `ptr %a`, but `bb1` then overwrites that with the previous value in `%2`.\n```llvm\ndefine i16 @asm_goto_test(i16 %0) unnamed_addr {\nstart:\n  %a = alloca [2 x i8], align 2\n  store i16 %0, ptr %a, align 2\n  %1 = load i16, ptr %a, align 2\n  %2 = callbr i16 asm sideeffect inteldialect \"jmp ${2:l}\", \"=&{ax},0,!i,~{dirflag},~{fpsr},~{flags}\"(i16 %1) #1\n          to label %bb1 [label %bb2]\n\nbb2:\n  store i16 %2, ptr %a, align 2\n  store i16 7, ptr %a, align 2\n  br label %bb1\n\nbb1:\n  store i16 %2, ptr %a, align 2\n  %_0 = load i16, ptr %a, align 2\n  ret i16 %_0\n}\n```\n\n`rustc --version --verbose`:\n```\nrustc 1.86.0-nightly (f85c6de55 2025-01-26)\nbinary: rustc\ncommit-hash: f85c6de55206dbee5ffedfd821df1503a7b92346\ncommit-date: 2025-01-26\nhost: x86_64-unknown-linux-gnu\nrelease: 1.86.0-nightly\nLLVM version: 19.1.7\n```\n\nasm_goto tracking issue: https://github.com/rust-lang/rust/issues/119364\n\n@rustbot label +F-asm +A-inline-assembly +T-compiler",
+      "url": "https://github.com/rust-lang/rust/issues/137867"
+    }
+  ],
+  "classification": [
+    {
+      "id": "AddCallGuards",
+      "name": "AddCallGuards",
+      "kind": "pass",
+      "confidence": "high",
+      "evidence": [
+        "implementation: compiler/rustc_mir_transform/src/add_call_guards.rs"
+      ]
+    }
+  ],
+  "processing": {
+    "status": "complete",
+    "model": "deepseek-flash",
+    "updatedAt": "2026-10-22T02:17:00.492Z",
+    "localCase": "../cases/138073/case.json"
+  },
+  "analysis": {
+    "originalLogic": "Before the patch, `AddCallGuards` only broke critical edges for `TerminatorKind::Call`. It computed predecessor counts (the guard uses `pred_count[*destination] > 1`) and, when the call's return target had more than one predecessor and the unwind action generated an invoke (`UnwindAction::Cleanup(_) | UnwindAction::Terminate(_)`) or the pass ran as `AllCallEdges`, it redirected the call to a fresh empty `Goto` block (`*destination = BasicBlock::new(idx)`) so the call edge no longer entered a shared block. The `TerminatorKind::InlineAsm { asm_macro, targets, operands, unwind, .. }` terminator was not matched at all, so its fallthrough/label target edges were never split, even though code generation relies on the same single-predecessor invariant.",
+    "incorrectTransformation": "Historically incorrect transformation (the actual pre-patch behavior): leave all inline-asm target edges intact. For an `InlineAsm` terminator that has outputs (`InlineAsmOperand::InOut { .. }` or `Out { .. }`) and either labels (`InlineAsmOperand::Label { .. }`) or an invoke-generating unwind, a target with `pred_count[*target] > 1` was still passed directly to codegen. Because codegen implements asm output definition by inserting the output store directly into each target block, a shared target received the asm output writeback on paths that did not originate from that asm edge. Concretely in issue #137867, the label block `bb2` executes `store i16 7, ptr %a` and then `br label %bb1`, but the shared return block `bb1` also receives `store i16 %2, ptr %a` (the asm output), overwriting `7` with the stale asm result; the expected `7` is returned as `a`. The corrected transformation adds the `InlineAsm` arm guarded by `if self == &CriticalCallEdges` that splits each over-shared target with an empty `Goto` bridge: `*target = new_block(source_info, block.is_cleanup, *target)`.",
+    "inputDomain": "MIR containing a `TerminatorKind::InlineAsm { asm_macro: InlineAsmMacro::Asm, .. }` whose `operands` include at least one output (`InOut`/`Out`) and which has labels or an unwind action in `Cleanup`/`Terminate`; at least one entry of `targets` is also reachable from another predecessor (e.g. a label body that falls through to the same return block used as the asm fallthrough). The regression test targets `x86_64` with `-C no-prepopulate-passes` and uses `asm!` with two `label {}` operands and `inout(\"eax\") a`; the issue reproducer uses `inout(\"eax\") a`, one `label { a = 7; }`, `options(nostack,nomem)`, and returns `a` expecting `7`.",
+    "passIds": [
+      "AddCallGuards"
+    ],
+    "summary": "Bug fix in `AddCallGuards`: the pass previously split critical edges only for calls, not for inline-asm terminators. Inline asm defines outputs along its fallthrough and label target edges, and codegen writes those outputs directly into each target block; if a target has other predecessors, the asm output store is emitted on the wrong path and can overwrite values assigned by a label body. The fix extends the critical-edge splitting to `InlineAsm` when the asm has outputs and either labels or an invoke unwind.",
+    "kind": "bug-fix",
+    "trigger": "An `InlineAsm` terminator with an output operand (`InOut` or `Out`) and labels and/or an unwind that generates an invoke, where an asm target block has more than one predecessor. In the issue reproducer the asm's fallthrough return block is also the fallthrough successor of the label block, so the output writeback to `%a` is emitted in that shared return block after the label block stores `7`.",
+    "preconditions": [
+      "The MIR pass runs as `CriticalCallEdges` (`if self == &CriticalCallEdges`), not merely `AllCallEdges`.",
+      "The inline asm terminator is a real `InlineAsmMacro::Asm` (not other asm macros).",
+      "At least one operand is `InlineAsmOperand::InOut { .. }` or `InlineAsmOperand::Out { .. }`.",
+      "The asm has at least one `InlineAsmOperand::Label { .. }`, or `generates_invoke(unwind)` is true (`Cleanup`/`Terminate`).",
+      "Some target in `targets` has `pred_count[*target] > 1`, i.e. the asm edge entering it is critical and needs an empty `Goto` bridge.",
+      "The new bridge block inherits `block.is_cleanup` and the terminator's `source_info`."
+    ],
+    "pitfalls": [
+      "Do not split inline-asm edges unconditionally: the code only splits when `has_outputs && (has_labels || generates_invoke(unwind))`; an asm with no outputs needs no output writeback and an asm with neither labels nor invoke has only the fallthrough edge.",
+      "The critical-edge test is `pred_count[*target] > 1`, not `>= 1`; splitting a target with a single predecessor would add a redundant block and can disturb codegen output.",
+      "The unwind predicate must treat `UnwindAction::Continue | UnwindAction::Unreachable` as non-invoke and `Cleanup`/`Terminate` as invoke-generating; this is factored into `generates_invoke` and reused for calls.",
+      "Splitting only the label target, or only the fallthrough target, is insufficient: every target in `targets` must be checked, since each edge receives an output store.",
+      "The bug is about where the asm output store lands, not about a borrow restriction or a normal call-return critical edge; do not conflate the asm case with ordinary `Call` edge splitting.",
+      "The fixed IR must have each asm target store the callbr output exactly once and then `br` to the join block; the failing IR had a store to the asm output in a block after a label body had already stored its own value."
+    ],
+    "testStrategy": "Add a `tests/codegen` regression test gated to `//@ only-x86_64` with `//@ compile-flags: -C no-prepopulate-passes`, `#![feature(asm_goto)]`, `#![feature(asm_goto_with_outputs)]`, and `#![crate_type = \"lib\"]`. Define an `#[unsafe(no_mangle)] pub unsafe fn f(mut a: u32) -> u32` containing `asm!(\"jmp {}\\n jmp {}\", label {}, label {}, inout(\"eax\") a);` followed by returning `a`. Use FileCheck patterns that lock the corrected structure: `[[OUT:%.*]] = callbr i32 asm`, `to label %[[BB0:.*]] [label %[[BB1:.*]], label %[[BB2:.*]]]`, and for each of `[[BB1]]`, `[[BB2]]`, `[[BB0]]` exactly `store i32 [[OUT]], ptr %a` followed by `br label %[[BBR:.*]]`, then at `[[BBR]]` a load from `%a` and `ret i32`. Additionally use an execution/semantic test equivalent to the issue reproducer (one label assigning `a = 7`, `inout(\"eax\") a`, return `a`) asserting the result is `7` and not the original `a`, and confirm output with and without optimizations as reported in the issue.",
+    "evidence": [
+      "An inline asm terminator defines outputs along its target edges -- a",
+      "fallthrough target and labeled targets. Code generation implements this",
+      "Establish required invariant by extending existing code that breaks",
+      "Fixes #137867.",
+      "if self == &CriticalCallEdges",
+      "let has_outputs = operands.iter().any(|op| {",
+      "matches!(op, InlineAsmOperand::InOut { .. } | InlineAsmOperand::Out { .. })",
+      "let has_labels =",
+      "matches!(op, InlineAsmOperand::Label { .. })",
+      "if has_outputs && (has_labels || generates_invoke(unwind)) {",
+      "if pred_count[*target] > 1 {",
+      "*target = new_block(source_info, block.is_cleanup, *target);",
+      "/// Returns true if this unwind action is code generated as an invoke as opposed to a call.",
+      "UnwindAction::Continue | UnwindAction::Unreachable => false,",
+      "UnwindAction::Cleanup(_) | UnwindAction::Terminate(_) => true,",
+      "// Regression test for #137867. Check that critical edges have been split before code generation,",
+      "// and so all stores to the asm output occur on disjoint paths without any of them jumping to",
+      "// another callbr label.",
+      "// CHECK-NEXT:    store i32 [[OUT]], ptr %a",
+      "// CHECK-NEXT:    br label %[[BBR:.*]]",
+      "The LLVM-IR is incorrect, as `bb2` stores the value to `ptr %a`, but `bb1` then overwrites that with the previous value in `%2`.",
+      "In particular, the value assigned to `_1` in `bb2` is returned in `bb1`.",
+      "This should return `7`, but returns `a`, with or without optimizations."
+    ],
+    "analysisVersion": "nested-mir-diff-v2",
+    "model": "deepseek-flash",
+    "mergedAt": "2025-03-07T16:48:56Z",
+    "passes": [
+      {
+        "id": "AddCallGuards",
+        "name": "AddCallGuards",
+        "kind": "pass",
+        "confidence": "high",
+        "evidence": [
+          "implementation: compiler/rustc_mir_transform/src/add_call_guards.rs"
+        ]
+      }
+    ],
+    "prId": 138073,
+    "headSha": "02d7fc167fea5013e2300b1c5a3ca75f7a048664",
+    "sourceUrl": "https://github.com/rust-lang/rust/pull/138073",
+    "components": [
+      "rustc_mir_transform"
+    ],
+    "extractedAt": "2026-10-22T01:48:20.342Z",
+    "validation": "source-backed-not-reproduced"
+  }
+}

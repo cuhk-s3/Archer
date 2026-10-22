@@ -1,0 +1,131 @@
+{
+  "schema": 1,
+  "pr": {
+    "id": 123660,
+    "title": "Make the computation of `coroutine_captures_by_ref_ty` more sophisticated",
+    "url": "https://github.com/rust-lang/rust/pull/123660",
+    "description": "Currently, we treat all the by-(mut/)ref borrows of a coroutine-closure as having a \"closure env\" borrowed lifetime.\r\n\r\nWhen we have the given code:\r\n```rust\r\nlet x: &'a i32 = ...;\r\nlet c = async || {\r\n    let _x = *x;\r\n};\r\n```\r\n\r\nThen when we call:\r\n```rust\r\nc()\r\n// which, because `AsyncFn` takes a `&self`, we insert an autoref:\r\n(&c /* &'env {coroutine-closure} */)()\r\n```\r\n\r\nWe will return a future whose captures contain `&'env i32` instead of `&'a i32`, which is way more restrictive than necessary. We should be able to drop `c` while the future is alive since it's not actually borrowing any data *originating from within* the closure's captures, but since the capture has that `'env` lifetime, this is not possible.\r\n\r\nThis wouldn't be true, for example, if the closure captured `i32` instead of `&'a i32`, because the `'env` lifetime is actually *necessary* since the data (`i32`) is owned by the closure.\r\n\r\nThis PR identifies two criteria where we *need* to take the borrow with the closure env lifetime:\r\n1. If the closure borrows data from inside the closure's captures. This is not true if the parent capture is by-ref, OR if the parent capture is by-move and the child capture begins with a deref projection. This is the example described above.\r\n2. If we're dealing with mutable references, since we cannot reborrow `&'env mut &'a mut i32` into `&'a mut i32`, *only* `&'env mut i32`.\r\n\r\nSee the documentation on `should_reborrow_from_env_of_parent_coroutine_closure` for more info.\r\n\r\n**important:** As disclaimer states on that function, luckily, if this heuristic is not correct, then the program is not unsound, since we still borrowck and validate the choices made from this function -- the only side-effect is that the user may receive unnecessary borrowck errors.\r\n\r\nFixes #123241",
+    "author": "compiler-errors",
+    "state": "closed",
+    "createdAt": "2024-04-09T01:11:26Z",
+    "mergedAt": "2024-04-11T17:47:59Z",
+    "headSha": "599d456a7532aa5de020b42fd1d9d936fa647573",
+    "baseSha": "62cffeedcf353d8d5bd78cff9898c3def3e3cb84",
+    "baseShaProvenance": "isolated-merge-first-parent",
+    "mergeSha": "ee736603685a932817c7f21b385d6187ae548617",
+    "files": [
+      "compiler/rustc_hir_typeck/src/upvar.rs",
+      "compiler/rustc_middle/src/ty/closure.rs",
+      "compiler/rustc_middle/src/ty/mod.rs",
+      "compiler/rustc_mir_transform/src/coroutine/by_move_body.rs",
+      "tests/ui/async-await/async-borrowck-escaping-closure-error.rs",
+      "tests/ui/async-await/async-borrowck-escaping-closure-error.stderr",
+      "tests/ui/async-await/async-closures/moro-example.rs",
+      "tests/ui/async-await/async-closures/no-borrow-from-env.rs",
+      "tests/ui/async-await/async-closures/without-precise-captures-we-are-powerless.rs",
+      "tests/ui/async-await/async-closures/without-precise-captures-we-are-powerless.stderr"
+    ],
+    "components": [
+      "rustc_hir_typeck",
+      "rustc_middle",
+      "rustc_mir_transform"
+    ],
+    "labels": [
+      "T-compiler",
+      "S-waiting-on-bors"
+    ],
+    "patchHash": "f409de4e01ab4962119c0fe87174c0c1e27d5c0a1d1c4fba96131bc6ea4510fe",
+    "patchSource": "github-pull-patch",
+    "patchUrl": "https://github.com/rust-lang/rust/pull/123660.patch"
+  },
+  "issues": [
+    {
+      "number": 123241,
+      "title": "Async closures are not allowed to reference all captured lifetimes if one of them is invariant",
+      "body": "[Full example](https://play.rust-lang.org/?version=nightly&mode=debug&edition=2021&gist=6738bf50bccfd1eb8bf30107c41b1f40)\r\n\r\n```rust\r\nasync fn go<'a>(value: &'a i32) {\r\n    let closure = async |scope: ScopeRef<'_, 'a>| {\r\n        let _future1 = scope.spawn(async {\r\n            let _v = *value;\r\n        });\r\n    };\r\n}\r\n```\r\n\r\nyields\r\n\r\n```\r\nerror: lifetime may not live long enough\r\n  --> examples/repro.rs:52:63\r\n   |\r\n52 |       let closure = async |scope: ScopeRef<'_, 'a, i32>| -> i32 {\r\n   |  ___________________-------------------------------------------_^\r\n   | |                   |                      |\r\n   | |                   |                      let's call the lifetime of this reference `'2`\r\n   | |                   lifetime `'1` represents this closure's body\r\n53 | |         let _future1 = scope.spawn(async { value });\r\n54 | |         22\r\n55 | |     };\r\n   | |_____^ closure was supposed to return data with lifetime `'2` but it is returning data with lifetime `'1`\r\n   |\r\n   = note: closure implements `Fn`, so references to captured variables can't escape the closure\r\n   = note: requirement occurs because of the type `Scope<'_, '_, i32>`, which makes the generic argument `'_` invariant\r\n   = note: the struct `Scope<'scope, 'env, R>` is invariant over the parameter `'scope`\r\n```\r\n\r\n> closure was supposed to return data with lifetime `'2` (`'scope`) but it is returning data with lifetime `'1` (closure body)\r\n\r\nIt's reasonable that we would create a lifetime representing the closure body, but naturally, the future should be allowed to reference it. The invariant lifetime must be mucking things up somehow.\r\n\r\n(`spawn` has no lifetime params so I would not expect there to be a new lifetime created when it is called.)\r\n\r\n> note: closure implements `Fn`, so references to captured variables can't escape the closure\r\n\r\nThe closure definitely shouldn't try to implement `Fn` in this case, I don't know why it does.\r\n\r\n> note: requirement occurs because of the type `Scope<'_, '_, i32>`, which makes the generic argument `'_` invariant\r\n> note: the struct `Scope<'scope, 'env, R>` is invariant over the parameter `'scope`\r\n\r\nIt's correct that this lifetime is invariant. We must write to a vec of futures that outlive `'scope`, so any variance would be unsound.\r\n\r\ncc @compiler-errors ",
+      "url": "https://github.com/rust-lang/rust/issues/123241"
+    }
+  ],
+  "classification": [
+    {
+      "id": "StateTransform",
+      "name": "StateTransform",
+      "kind": "pass",
+      "confidence": "high",
+      "evidence": [
+        "implementation: compiler/rustc_mir_transform/src/coroutine/by_move_body.rs"
+      ]
+    }
+  ],
+  "processing": {
+    "status": "complete",
+    "model": "deepseek-flash",
+    "updatedAt": "2026-10-22T02:17:00.474Z",
+    "localCase": "../cases/123660/case.json"
+  },
+  "analysis": {
+    "originalLogic": "For coroutine-closures, the by-ref capture type tuple (`coroutine_captures_by_ref_ty`) was built from the flattened child coroutine captures after skipping the arguments, and each capture was passed to `apply_capture_kind_on_capture_ty` with `Some(closure_env_region)` unconditionally. Thus every by-(mut/)ref child capture was typed as borrowing for the parent coroutine-closure's env lifetime. Separately, `ByMoveBody` zipped parent and child captures inline with a peekable iterator to build `field_remapping`, handling the case where one parent capture corresponds to multiple child captures from edition-2021 precise captures.",
+    "incorrectTransformation": "The historically overly restrictive transformation was: use the closure-env lifetime for every by-ref borrow of a coroutine-closure. In the example where `x: &'a i32` is captured by move and the child only dereferences it, the resulting future captures `&'env i32` rather than `&'a i32`, so the closure cannot be dropped while the future lives even though the data is not owned by the closure. The corrected computation uses the child capture's own region when no reborrow from the parent env is needed: `if needs_ref { Some(closure_env_region) } else { child_capture.region }`. It still uses the env lifetime when the parent capture is by-move and the child does not begin with a deref projection after the parent prefix, or when the child capture is a mutable borrow.",
+    "inputDomain": "Async/coroutine closures (`async ||`, `async move ||`) capturing references, e.g. `let x: &'a i32; let c = async || { let _x = *x; }` or `async move || { let _x = *x; }`, field captures such as `S<'a>` / `&S<'a>`, and mutable-reference captures such as `let mut x; async || { x = 1; }`. Variants that differ only in the capture/reborrow shape: by-move parent plus a child deref projection (can use the child region `'a`) versus a by-ref parent or a child borrowing data owned by the closure (must use `'env`), and immutable versus mutable child borrows. Edition 2021 exercises precise captures; edition 2018 is a no-ICE control where the desired borrowck result may be unattainable.",
+    "passIds": [
+      "StateTransform"
+    ],
+    "summary": "Bug fix for async/coroutine closures: instead of assigning the closure-env lifetime to every by-ref child capture, zip each parent capture with its child captures and only reborrow from the parent env when the child borrows closure-owned data or is a mutable borrow. This allows immutable references captured by value to retain their original lifetime, e.g. `&'a i32` rather than `&'env i32`. The historical behavior caused unnecessary borrowck restrictions (issue #123241); the heuristic is not a soundness boundary because borrowck still validates the resulting choices.",
+    "kind": "bug-fix",
+    "trigger": "Triggered when computing `coroutine_captures_by_ref_ty` for coroutine-closures, especially when a parent capture is by-move and the child capture starts with a deref projection after the parent's projection prefix (e.g. capturing `&'a i32` by move and dereferencing it), or when a child capture is a mutable by-ref borrow. The old unconditional env-lifetime assignment made the future borrow for `'env` instead of the underlying reference lifetime.",
+    "preconditions": [
+      "The parent capture must be a prefix of the child capture; `analyze_coroutine_closure_captures` asserts this and that every parent is used at least once.",
+      "Flattened child captures include argument-move captures first; these must be skipped by the number of tuple fields before zipping with parent captures.",
+      "One parent capture may correspond to several child captures because of edition-2021 precise captures, so matching is done by the shared projection prefix.",
+      "The deref exception applies only when the parent capture is by-move and the next child projection after the parent prefix is `ProjectionKind::Deref`; by-ref parent captures still need the env lifetime.",
+      "Mutable child captures always need the parent coroutine-closure env lifetime because `&'env mut &'a mut i32` cannot be reborrowed as `&'a mut i32`.",
+      "Edition 2018 without precise captures may still produce borrowck errors; the guarantee there is only that compilation does not ICE."
+    ],
+    "pitfalls": [
+      "Do not apply the deref-projection exception when the parent capture is by-ref or when the child borrow is mutable; those still require the parent env lifetime.",
+      "Do not treat every child capture as needing `'env`, nor every child capture as safe with its own region; the decision must be made per parent/child pair.",
+      "Reusing the parent/child zipping logic must preserve the invariant that every parent capture is used and no child captures are left over, otherwise precise captures can be silently mis-mapped.",
+      "A wrong heuristic here is not an unsoundness bug by itself: borrowck still validates it, so the observable failure mode is unnecessary borrowck errors rather than unsound code.",
+      "The `ByMoveBody` refactor in patch 1 is mechanical extraction of the zipping helper; it is not the correctness fix for the lifetime choice."
+    ],
+    "testStrategy": "Add UI tests for async closures under edition 2021: a check-pass test where `*value` is borrowed with `'a` rather than the containing coroutine-closure lifetime (moro-example.rs), and no-borrow-from-env.rs covering `async` and `async move` closures with `&'a i32`, field captures `S<'a>`, and `&S<'a>`, passed both directly and through an `async FnOnce` helper. Add an edition-2018 version (`without-precise-captures-we-are-powerless.rs`) with expected borrowck errors and a `.stderr` file to ensure no ICE. Update `async-borrowck-escaping-closure-error` expectations to remove the spurious extra `E0515` temporary-value error. Include mutable-reference cases to ensure those still use the env lifetime.",
+    "evidence": [
+      "Currently, we treat all the by-(mut/)ref borrows of a coroutine-closure as having a \"closure env\" borrowed lifetime.",
+      "We will return a future whose captures contain `&'env i32` instead of `&'a i32`, which is way more restrictive than necessary.",
+      "This PR identifies two criteria where we *need* to take the borrow with the closure env lifetime:",
+      "If the closure borrows data from inside the closure's captures. This is not true if the parent capture is by-ref, OR if the parent capture is by-move and the child capture begins with a deref projection.",
+      "If we're dealing with mutable references, since we cannot reborrow `&'env mut &'a mut i32` into `&'a mut i32`, *only* `&'env mut i32`.",
+      "luckily, if this heuristic is not correct, then the program is not unsound, since we still borrowck and validate the choices made from this function -- the only side-effect is that the user may receive unnecessary borrowck errors.",
+      "if needs_ref { Some(closure_env_region) } else { child_capture.region }",
+      "This is `no-borrow-from-env.rs`, but under edition 2018 we still want to make",
+      "// sure that we don't ICE or anything, even if precise closure captures means",
+      "// One parent capture may correspond to several child captures if we end up",
+      "// refining the set of captures via edition-2021 precise captures.",
+      "we captured {parent_capture:#?} but it was not used in the child coroutine?"
+    ],
+    "analysisVersion": "nested-mir-diff-v2",
+    "model": "deepseek-flash",
+    "mergedAt": "2024-04-11T17:47:59Z",
+    "passes": [
+      {
+        "id": "StateTransform",
+        "name": "StateTransform",
+        "kind": "pass",
+        "confidence": "high",
+        "evidence": [
+          "implementation: compiler/rustc_mir_transform/src/coroutine/by_move_body.rs"
+        ]
+      }
+    ],
+    "prId": 123660,
+    "headSha": "599d456a7532aa5de020b42fd1d9d936fa647573",
+    "sourceUrl": "https://github.com/rust-lang/rust/pull/123660",
+    "components": [
+      "rustc_hir_typeck",
+      "rustc_middle",
+      "rustc_mir_transform"
+    ],
+    "extractedAt": "2026-10-22T01:33:29.514Z",
+    "validation": "source-backed-not-reproduced"
+  }
+}

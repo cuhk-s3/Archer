@@ -1,0 +1,36 @@
+# ReferencePropagation
+Model: deepseek-flash
+Scope: historical-transformation-program-pair; concrete tested inputs, not a current rustc bug claim or universal proof.
+
+## Elements Frequently Missed
+- Do not model this as a general SsaLocals fix: the supplied description states the approach explicitly avoids changing SsaLocals because that "seems to have wide-ranging regressions in MIR optimizations".
+- Changing the PlaceContext of Operand::Move to a MutatingUseContext is not the chosen fix and "seems to have borrow checker implications".
+- Do not generalize the rewrite to all moves: it is gated by `is_any_ptr()`, so non-pointer moves are outside the transformation.
+- Operand::Move has special pointer semantics: it is pass-by-pointer and "Miri always considers the place deinitialized", even though the MIR visitor system and SsaLocals treat it as a read.
+- Downstream MIR dumps may change `move` to `copy`, but the transforming pass is ReferencePropagation; do not attribute the behavior to GVN or SimplifyLocals.
+- Copying a reference changes ownership/liveness reasoning relative to moving it; the justification is that "pointers should be by-value anyway", not that move and copy are universally interchangeable.
+- Do not claim that finite MIR or runtime pairs prove universal equivalence, or that modern rustc is buggy; use them as focused historical regression evidence.
+
+## Patterns Not Well Handled
+
+### Pointer-typed Operand::Move is treated as a read by SSA but must invalidate reference propagation
+ReferencePropagation can propagate SSA-based reference values while SsaLocals considers Operand::Move to be a read, leaving a moved pointer/reference local eligible for single-assignment reuse. For pointers/references this is unsound: Move is pass-by-pointer, so the callee may overwrite the caller's local or its pointee. The required invariant is to rewrite every pointer-typed move to a copy before SSA propagation, because pointers should be by-value anyway; non-pointer moves remain unchanged. Historical evidence: "The SSA analysis done by [`SsaLocals`] treats [`Operand::Move`] as a read, even though in general [`Operand::Move`] represents pass-by-pointer where the callee can overwrite the pointee"; and with Move "the callee may have done arbitrary writes to the caller's Local that the Operand wraps (because `Move` is pass-by-pointer)". The historical root cause was that SsaLocals "does not consider `Operand::Move` to be a write" while "Miri always considers the place deinitialized". The fix condition was: "if place.ty(self.local_decls, self.tcx).ty.is_any_ptr() { *operand = Operand::Copy(place); }".
+Preconditions: The ReferencePropagation MIR pass executes on the body.; An Operand::Move wraps a place whose type satisfies `is_any_ptr()`, including reference and raw-pointer types such as `&u32`, `&mut usize`, `*const T`, or `*mut T`.; SsaLocals classifies that move as a read, so the moved local remains eligible for SSA-based reference propagation or reuse.; There is a later read or alias of the moved local or its pointee, optionally after a call that may write through the moved pointer.; For the historical runtime pair, an alias is taken before an opaque call and the callee modifies only its copied parameter, so correct behavior returns the original value while reuse after the move returns the overwritten value.
+Pitfalls: Do not model this as a general SsaLocals fix: the supplied description states the approach explicitly avoids changing SsaLocals because that "seems to have wide-ranging regressions in MIR optimizations".; Changing the PlaceContext of Operand::Move to a MutatingUseContext is not the chosen fix and "seems to have borrow checker implications".; Do not generalize the rewrite to all moves: it is gated by `is_any_ptr()`, so non-pointer moves are outside the transformation.; Operand::Move has special pointer semantics: it is pass-by-pointer and "Miri always considers the place deinitialized", even though the MIR visitor system and SsaLocals treat it as a read.; Downstream MIR dumps may change `move` to `copy`, but the transforming pass is ReferencePropagation; do not attribute the behavior to GVN or SimplifyLocals.; Copying a reference changes ownership/liveness reasoning relative to moving it; the justification is that "pointers should be by-value anyway", not that move and copy are universally interchangeable.; Do not claim that finite MIR or runtime pairs prove universal equivalence, or that modern rustc is buggy; use them as focused historical regression evidence.
+Test strategy: Add a focused MIR pass test declared with `//@ test-mir-pass: ReferencePropagation`. Build a custom-MIR body that assigns a reference local, aliases it, passes the local via `Move(...)` to an inline-never opaque call, then reads through the alias after the call. Check that the call operand is rewritten from move to copy, for example `// CHECK: _9 = opaque::<&u8, &u64>(copy (_2.1: &u8), copy _6)`. Complement with existing reference-propagation MIR dumps for `&T`, `&mut T`, `*const T`, and `*mut T`, and update downstream dump expectations. For a differential pair, compile or inspect the same body once with move-to-copy preprocessing disabled and once enabled, differing only in whether a pointer-typed `Operand::Move(place)` remains a move or becomes `Operand::Copy(place)`, then compare the resulting MIR. For a historical runtime pair, use `a = 7i64, b = 42i64; call subject(7, 42)` with an alias taken before the call: the corrected copy behavior yields `a=7`, while reuse of the moved local after the callee overwrites it yields `b=42`; do not claim runtime reproduction unless a compiler was actually built.
+Cases: 142185-9aa8cfaf2f80a25711b115a3f09682ecbb0a06ab
+Source: https://github.com/rust-lang/rust/pull/142185
+> Convert moves of references to copies in ReferencePropagation
+> This is a fix for https://github.com/rust-lang/rust/issues/141101.
+> The root cause of this miscompile is that the SsaLocals analysis that MIR transforms use is supposed to detect locals that are only written to once, in their single assignment. But that analysis is subtly wrong; it does not consider `Operand::Move` to be a write even though the meaning ascribed to `Operand::Move` (at least as a function parameter) by Miri is that the callee may have done arbitrary writes to the caller's Local that the Operand wraps (because `Move` is pass-by-pointer). So Miri conwiders `Operand::Move` to be a write but both the MIR visitor system considers it a read, and so does SsaLocals.
+> +/// pointee (Miri always considers the place deinitialized). CopyProp has a similar trick to
+> +/// pass we just turn all moves of pointers into copies because pointers should be by-value anyway.
+> +        move_to_copy_pointers(tcx, body);
+> +            if let Operand::Move(place) = *operand {
+> +                if place.ty(self.local_decls, self.tcx).ty.is_any_ptr() {
+> +                    *operand = Operand::Copy(place);
+> +//@ test-mir-pass: ReferencePropagation
+> +    // CHECK: _9 = opaque::<&u8, &u64>(copy (_2.1: &u8), copy _6) -> [return: bb1, unwind unreachable];
+> +            Call(n = opaque(_2.1, Move(_6)), ReturnTo(bb1), UnwindUnreachable())
+> +            _2.0 = *_7;
+> move_to_copy_pointers
