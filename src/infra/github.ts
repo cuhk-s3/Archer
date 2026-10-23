@@ -62,6 +62,12 @@ export async function fetchRustPr(
     );
   const pr = (await response.json()) as any;
   const files: string[] = [];
+  const filePatches: Array<{
+    filename: string;
+    previous_filename?: string;
+    status: string;
+    patch?: string;
+  }> = [];
   for (let page = 1; ; page++) {
     const fileResponse = await githubRequest(
       `${API}/pulls/${id}/files?per_page=100&page=${page}`,
@@ -71,17 +77,45 @@ export async function fetchRustPr(
       throw new Error(
         `GitHub PR files lookup failed (${fileResponse.status}): ${await fileResponse.text()}`,
       );
-    const batch = (await fileResponse.json()) as Array<{ filename: string }>;
+    const batch = (await fileResponse.json()) as Array<{
+      filename: string;
+      previous_filename?: string;
+      status: string;
+      patch?: string;
+    }>;
     files.push(...batch.map((file) => file.filename));
+    filePatches.push(...batch);
     if (batch.length < 100) break;
   }
   if (typeof pr.changed_files === "number" && files.length !== pr.changed_files)
     throw new Error(
       `Incomplete PR file list: received ${files.length}/${pr.changed_files}; do not classify a partial patch`,
     );
-  const patchResponse = await githubRequest(pr.patch_url as string, headers);
-  if (!patchResponse.ok)
-    throw new Error(`GitHub PR patch lookup failed (${patchResponse.status})`);
+  const patchFromFiles = () =>
+    filePatches
+      .map((file) => {
+        const oldPath = file.previous_filename ?? file.filename;
+        const oldName = file.status === "added" ? "/dev/null" : `a/${oldPath}`;
+        const newName = file.status === "removed" ? "/dev/null" : `b/${file.filename}`;
+        return [
+          `diff --git a/${oldPath} b/${file.filename}`,
+          `--- ${oldName}`,
+          `+++ ${newName}`,
+          file.patch,
+        ].join("\n");
+      })
+      .join("\n");
+  let patch: string;
+  if (filePatches.length === files.length && filePatches.every((f) => f.patch)) {
+    // Prefer exact per-file hunks when available; the aggregate .patch host can
+    // time out even though GitHub's API and every file diff are reachable.
+    patch = patchFromFiles();
+  } else {
+    const patchResponse = await githubRequest(pr.patch_url as string, headers);
+    if (!patchResponse.ok)
+      throw new Error(`GitHub PR patch lookup failed (${patchResponse.status})`);
+    patch = await patchResponse.text();
+  }
   const components = new Set<string>();
   for (const file of files) {
     const parts = file.split("/");
@@ -104,7 +138,6 @@ export async function fetchRustPr(
     else if (parts[0] === "src" && parts[1]?.startsWith("librustc_"))
       components.add(parts[1].replace(/^lib/, ""));
   }
-  const patch = await patchResponse.text();
   return {
     id,
     url: pr.html_url,

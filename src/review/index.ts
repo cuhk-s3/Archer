@@ -9,9 +9,9 @@ import { loadPassKnowledge } from "../knowledge/history.js";
 import { classifyPasses } from "../rust/passes.js";
 import { runTwoPhases, type PhaseStats } from "./phases.js";
 
-const SYSTEM_GUIDANCE = `You review Rust compiler optimization pull requests for reproducible miscompilations. Inspect the patch and the relevant Rust source/tests before proposing focused standalone Rust programs.
+const SYSTEM_GUIDANCE = `You review Rust compiler optimization pull requests for reproducible miscompilations and internal compiler errors (ICEs). Inspect the patch and the relevant Rust source/tests before proposing focused standalone Rust programs.
 
-Follow Archer's enforced two phases. In Phase 1, inspect the checkout and historical knowledge, reason about transformation invariants and triggering conditions, then call stop with thoughts and a small set of concrete test strategies. In Phase 2, implement those frozen strategies, run Miri and differential_test on defined deterministic programs, and submit_report with evidence and limitations. Avoid pointer/address-layout assumptions, randomness, concurrency, and cfg(miri) behavior changes. Compile errors, Miri UB, unsupported operations, tool failures and timeouts alone are not compiler bugs. Save reusable knowledge only when supported; leaving it empty is acceptable.`;
+Follow Archer's enforced two phases. In Phase 1, inspect the checkout and historical knowledge, reason about transformation invariants and triggering conditions, then call stop with thoughts and a small set of concrete test strategies. In Phase 2, implement those frozen strategies, use differential_test for behavior changes and ice_test to compile with base and patched rustc, and submit_report with evidence and limitations. ICEs/crashes must be distinguished from ordinary compile errors and confirmed with valid deterministic Rust input; check whether the base compiler already fails. Miri can identify UB but is not an equivalence oracle. Avoid pointer/address-layout assumptions, randomness, concurrency, and cfg(miri) behavior changes. Compile errors, Miri UB, unsupported operations, tool failures and timeouts alone are not compiler bugs. Save reusable knowledge only when supported; leaving it empty is acceptable.`;
 
 export interface ReviewOptions {
   /** A prepared, revision-pinned source snapshot and real before/after compilers. */
@@ -69,7 +69,7 @@ ${pr.body}
 Patch:
 ${pr.patch}
 
-The base and patched stage1 rustc compilers are already built. Start by inspecting the changed code and related tests. Analyze each identified pass separately using its own knowledge. Submit strategies via stop at the end of Phase 1, including the exact passId from the classification for every strategy. Do not invent a pass for shared/unclassified code. Exercise relevant generated tests with differential_test; use compile_rust/run_miri for useful narrower checks. At the end, submit_report. `;
+The base and patched stage1 rustc compilers are already built. Start by inspecting the changed code and related tests. Analyze each identified pass separately using its own knowledge. Submit strategies via stop at the end of Phase 1, including the exact passId from the classification for every strategy. Do not invent a pass for shared/unclassified code. Exercise behavior strategies with differential_test and compiler-crash strategies with ice_test; use compile_rust/run_miri for useful narrower checks. At the end, submit_report. `;
   console.log(`Reviewing Rust PR #${pr.id} with Pi (${config.model})`);
   let phases: PhaseStats[];
   try {
@@ -83,10 +83,13 @@ The base and patched stage1 rustc compilers are already built. Start by inspecti
     );
     if (
       !context.evidence.some(
-        (item) => item.tool === "differential_test" && item.status === "ok",
+        (item) =>
+          (item.tool === "differential_test" && item.status === "ok") ||
+          (item.tool === "ice_test" &&
+            ["ok", "ice_found"].includes(item.status)),
       )
     )
-      throw new Error("No completed differential test in Phase 2");
+      throw new Error("No completed differential or ICE test in Phase 2");
   } finally {
     session.dispose();
   }

@@ -386,6 +386,37 @@ export class RustToolchain {
                 );
               }
               await access(join(source, "x.py"));
+              const checkedOutLlvm = (
+                await checked(
+                  "git",
+                  ["-C", join(source, "src/llvm-project"), "rev-parse", "HEAD"],
+                  { env },
+                )
+              ).trim();
+              if (checkedOutLlvm !== llvmRevision) {
+                await checked(
+                  "git",
+                  [
+                    "-C",
+                    join(source, "src/llvm-project"),
+                    "fetch",
+                    "origin",
+                    llvmRevision,
+                  ],
+                  { env, timeoutMs: this.timeoutMs },
+                );
+                await checked(
+                  "git",
+                  [
+                    "-C",
+                    join(source, "src/llvm-project"),
+                    "checkout",
+                    "--detach",
+                    llvmRevision,
+                  ],
+                  { env },
+                );
+              }
               // Both leases track the compiler group while nested LLVM construction is active.
               await bootstrap(
                 source,

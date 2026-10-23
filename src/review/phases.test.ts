@@ -1,6 +1,10 @@
 import { expect, it, vi } from "vitest";
 import { runTwoPhases, PHASE1_TOOLS, PHASE2_TOOLS } from "./phases.js";
-import { createReviewTools, type ReviewToolContext } from "./tools.js";
+import {
+  classifyRustcFailure,
+  createReviewTools,
+  type ReviewToolContext,
+} from "./tools.js";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 const strategy = {
@@ -99,6 +103,44 @@ it("blocks execution in Phase 1 and rejects unknown strategies or untested repor
   ).rejects.toThrow("exact Phase 1");
   await expect(execute("submit_report", { report: "clean" })).rejects.toThrow(
     "Untested strategies",
+  );
+});
+
+it("requires each strategy to have a behavioral or ICE test, and classifies compiler failures", async () => {
+  const ctx = context();
+  ctx.strategies = [strategy];
+  const tools = createReviewTools(ctx);
+  const execute = (name: string, params: any) =>
+    tools
+      .find((t) => t.name === name)!
+      .execute("test", params, undefined, undefined, {} as any);
+  ctx.phase = 2;
+  await expect(execute("submit_report", { report: "clean" })).rejects.toThrow(
+    "Untested strategies",
+  );
+  ctx.evidence.push({
+    tool: "ice_test",
+    status: "ok",
+    strategy: strategy.name,
+  });
+  await expect(
+    execute("submit_report", { report: "clean" }),
+  ).resolves.toBeTruthy();
+
+  expect(
+    classifyRustcFailure({ code: 1, stderr: "error: mismatched types" }),
+  ).toBe("compile_error");
+  expect(
+    classifyRustcFailure({
+      code: 101,
+      stderr: "error: internal compiler error: query stack during panic",
+    }),
+  ).toBe("ice");
+  expect(classifyRustcFailure({ code: 1, stderr: "", signal: "SIGABRT" })).toBe(
+    "crash",
+  );
+  expect(classifyRustcFailure({ code: -1, stderr: "", timedOut: true })).toBe(
+    "timeout",
   );
 });
 

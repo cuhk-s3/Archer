@@ -55,6 +55,8 @@ npm run review -- knowledge-build --model deepseek-flash --follow
 
 Final knowledge is versioned under [`knowledge/rust/`](knowledge/rust/README.md). `passes/` contains the summaries read directly by review, `catalog/` contains pass definitions and pinned sources, `metadata/` records 168 validated cases and 198 inconclusive cases with their descriptions; the 467 source-backed exclusions are omitted, and the ignored local `cases/` directory preserves retained Rust/MIR programs and validation observations. `history.json`, `cases.json` and `manifest.json` index those records and their provenance. The metadata, indexes and summaries are versioned; `cases/` is not committed. `localCase` references are available only after a local export. To export a completed runtime corpus, run `npm run knowledge:publish`; complete pipeline runs also publish automatically.
 
+Review supports both behavioral-difference checks and compiler ICE/crash checks. `ice_test` compiles each frozen Phase 1 strategy with base and patched rustc at O0 and O3, separating compiler ICEs/crashes from ordinary source errors and timeouts. It marks a failure as introduced only when patched rustc fails and base rustc succeeds at the same optimization level. Confirm the input is valid and deterministic before treating an ICE as a finding; Miri is available as a UB check, not an equivalence oracle.
+
 The three roles follow Archer's original knowledge workflow:
 
 1. **A** analyzes the historical issue/patch into a transformation description, triggering conditions and testing strategy.
@@ -80,3 +82,4 @@ Phase 1 of review loads the identified passes' summarized knowledge, inspects th
 `validate-knowledge` remains an optional validation against historical before/after compiler builds.
 
 For an independent two-phase evaluation, run `npm run review:blind -- <PR>`. This exports a source snapshot at the actual PR merge, freezes the published knowledge input, and stores inputs, event traces and results under `service_data/blind-review/<PR>/`. The review tools cannot access later Git history or external selection notes. Keep known issue reports, fixes and reproducers outside that snapshot.
+

@@ -9,6 +9,7 @@ export const PHASE2_TOOLS = [
   "compile_rust",
   "run_miri",
   "differential_test",
+  "ice_test",
   "save_knowledge",
   "submit_report",
 ];
@@ -55,7 +56,7 @@ export async function runTwoPhases(
       const instruction =
         phase === 1
           ? `${prompt}\n\nPHASE 1 ONLY: inspect source and submit your reasoning and complete structured strategy list via stop. Test execution is unavailable. Ordinary text does not end this phase.`
-          : `PHASE 2: The Phase 1 strategies are frozen. Implement focused Rust tests and validate each strategy with differential_test. Pass its exact strategy name to each testing tool. Compile failures and Miri failures are not compiler bugs. Submit the evidence-backed report with submit_report. Explain coverage and limitations.\n${JSON.stringify(context.analysis, null, 2)}`;
+          : `PHASE 2: The Phase 1 strategies are frozen. Implement focused Rust tests. Use differential_test for behavioral differences and ice_test for compiler ICE/crash detection; pass the exact strategy name to every testing tool. Miri can help establish that inputs are defined, but is not an equivalence oracle. Ordinary compile errors, timeouts, and tool failures are not ICE findings. Confirm any ICE on a valid, deterministic input and distinguish it from an existing base-compiler failure. Submit the evidence-backed report with submit_report and explain coverage and limitations.\n${JSON.stringify(context.analysis, null, 2)}`;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           await session.prompt(

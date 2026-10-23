@@ -25,6 +25,23 @@ export interface RustTestOptions {
   mirOptLevel?: number;
   mirPasses?: string[];
 }
+
+export function classifyRustcFailure(result: {
+  code: number;
+  stderr: string;
+  timedOut?: boolean;
+  signal?: string | null;
+}): "ok" | "ice" | "compile_error" | "timeout" | "crash" {
+  if (result.timedOut) return "timeout";
+  if (
+    /internal compiler error|compiler unexpectedly panicked|thread 'rustc' panicked|query stack during panic/i.test(
+      result.stderr,
+    )
+  )
+    return "ice";
+  if (result.signal) return "crash";
+  return result.code === 0 ? "ok" : "compile_error";
+}
 export function rustTestFlags(options: RustTestOptions = {}): string[] {
   if (
     options.mirOptLevel !== undefined &&
@@ -412,6 +429,72 @@ export function createReviewTools(
       },
     }),
     defineTool({
+      name: "ice_test",
+      label: "Check for compiler ICEs",
+      description:
+        "Compile a standalone Rust program with both base and PR rustc at O0 and O3. Reports internal compiler errors or compiler crashes separately from ordinary source errors and timeouts. Use valid, deterministic Rust inputs; optionally run_miri to check defined behavior. This test does not compare program outputs.",
+      parameters: Type.Object({
+        source: Type.String(),
+        strategy: Type.Optional(Type.String()),
+      }),
+      execute: async (_id, p) => {
+        const runs: Array<Record<string, unknown>> = [];
+        for (const [level, rustc] of [
+          ["0", context.build.baselineRustc],
+          ["0", context.build.patchedRustc],
+          ["3", context.build.baselineRustc],
+          ["3", context.build.patchedRustc],
+        ] as const) {
+          const label = `${rustc === context.build.baselineRustc ? "base" : "patched"}-O${level}`;
+          try {
+            const compiled = await runRustc(rustc, p.source, level);
+            const classification = classifyRustcFailure(compiled);
+            runs.push({
+              label,
+              result: classification,
+              code: compiled.code,
+              signal: compiled.signal,
+              stdout: compiled.stdout,
+              stderr: compiled.stderr,
+            });
+            await rm(compiled.dir, { recursive: true, force: true });
+          } catch (error) {
+            runs.push({ label, result: "tool_error", error: String(error) });
+          }
+        }
+        const iceRuns = runs.filter(
+          (r) => r.result === "ice" || r.result === "crash",
+        );
+        const complete =
+          runs.length === 4 &&
+          runs.every((r) => ["ok", "ice", "crash"].includes(String(r.result)));
+        const introduced = (["0", "3"] as const).some((level) => {
+          const base = runs.find((r) => r.label === `base-O${level}`)?.result;
+          const patched = runs.find(
+            (r) => r.label === `patched-O${level}`,
+          )?.result;
+          return base === "ok" && (patched === "ice" || patched === "crash");
+        });
+        const result = {
+          tool: "ice_test",
+          status: iceRuns.length
+            ? "ice_found"
+            : complete
+              ? "ok"
+              : "inconclusive",
+          found: introduced,
+          introduced,
+          iceObserved: iceRuns.length > 0,
+          source: p.source,
+          runs,
+          strategy: p.strategy,
+          note: "found/introduced means the patched compiler ICEs or crashes at an optimization level where the base compiler succeeds. Base-only failures are pre-existing; same-version failures require separate triage. Confirm valid deterministic input before reporting.",
+        };
+        context.evidence.push(result);
+        return textResult(JSON.stringify(result));
+      },
+    }),
+    defineTool({
       name: "save_knowledge",
       label: "Extract PR knowledge",
       description:
@@ -470,7 +553,9 @@ export function createReviewTools(
         throw new Error("Phase 1 strategies are frozen");
       if (
         context.phase === 2 &&
-        ["compile_rust", "run_miri", "differential_test"].includes(tool.name)
+        ["compile_rust", "run_miri", "differential_test", "ice_test"].includes(
+          tool.name,
+        )
       ) {
         const strategy = (args[1] as { strategy?: string }).strategy;
         if (!context.strategies.some((s) => s.name === strategy))
@@ -480,7 +565,9 @@ export function createReviewTools(
         const missing = context.strategies.filter(
           (s) =>
             !context.evidence.some(
-              (e) => e.tool === "differential_test" && e.strategy === s.name,
+              (e) =>
+                ["differential_test", "ice_test"].includes(e.tool) &&
+                e.strategy === s.name,
             ),
         );
         if (missing.length)
