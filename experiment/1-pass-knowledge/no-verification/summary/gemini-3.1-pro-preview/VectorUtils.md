@@ -1,0 +1,17 @@
+# Subsystem Knowledge for VectorUtils
+## Elements Frequently Missed
+
+*   **Conditional Execution Contexts for Pointer Arithmetic**: The optimization pass frequently misses the distinction between unconditionally and conditionally dereferenced pointers. It fails to recognize that no-wrap flags (like `inbounds` or `nusw`) only yield poison values—not immediate undefined behavior—if the pointer wraps but is never actually dereferenced due to control flow (e.g., an `if` statement) bypassing the memory access.
+*   **Operand-Level Constraints During Type Shrinking**: When reducing the bit width of instructions based on demanded bits (e.g., due to a subsequent truncation), the pass misses validating whether the original operands are semantically valid in the narrower type. A common missed element is checking if a constant shift amount exceeds the newly reduced bit width.
+*   **Interleave Group Closure Upon Memory Dependencies**: During bottom-up interleaved memory access analysis, the pass misses the critical step of marking an active load group as "complete" or closed when it encounters a conflicting memory operation (such as a store that creates a read-after-write dependence).
+
+## Patterns Not Well Handled
+
+### Pattern 1: Conditional Memory Accesses with Poison-Generating Pointer Arithmetic
+This pattern involves a loop containing pointer arithmetic instructions marked with no-wrap flags (`inbounds`, `nusw`), where the resulting pointer is only dereferenced inside a conditional block. The vectorization and dependence analysis passes are not well equipped to handle this because they incorrectly extrapolate the no-wrap assumption to the entire loop. By failing to account for the fact that the pointer might wrap when the condition is false (which is perfectly legal and only generates poison), the compiler calculates incorrect dependence distances. This leads to unsafe loop vectorization or invalid load forwarding.
+
+### Pattern 2: Demanded-Bits Type Shrinking with Incompatible Operands
+This pattern occurs when an instruction's result is truncated to a narrower type within a loop, prompting the Loop Vectorizer to shrink the bit width of the operations producing that result. It is poorly handled because the transformation logic focuses solely on the demanded bits of the result and neglects to verify the compatibility of the operands with the new type. For example, if a shift operation is shrunk, but its constant shift amount is greater than or equal to the new bit width, the resulting vectorized code will execute a shift out of bounds, leading to undefined behavior, poison values, or incorrect zero-evaluations.
+
+### Pattern 3: Bottom-Up Interleaved Access Grouping Across Conflicting Stores
+This pattern consists of a specific program-order sequence of memory operations: an early load, a subsequent conflicting store, and a later load that has a read-after-write (RAW) dependence on the store. The bottom-up interleaved access analyzer handles this poorly because, while it detects the dependence between the later load and the store, it fails to terminate the active interleave group. Consequently, it continues scanning upwards and incorrectly merges the early load into the same group. Because the vectorized interleaved load is inserted at the location of the earliest load in the group, the later load is illegally hoisted above the conflicting store, causing the program to read stale memory values.

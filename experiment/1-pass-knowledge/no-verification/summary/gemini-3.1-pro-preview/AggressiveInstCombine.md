@@ -1,0 +1,15 @@
+# Subsystem Knowledge for AggressiveInstCombine
+## Elements Frequently Missed
+
+* **Target-Native Pointer Index Types**: The optimization pass frequently misses or ignores the target's native pointer index type (e.g., 64-bit) during address reconstruction, incorrectly defaulting to smaller, fixed-width integers (e.g., 32-bit). This leads to unintended truncation of pointer offsets.
+* **Sign Bit Preservation in Large Offsets**: When accumulating and applying large constant offsets, the pass misses the implications of the sign bit in truncated representations. This causes large positive offsets to be incorrectly sign-extended into negative offsets during pointer arithmetic.
+* **Unit Distinctions in Memory Access Sizes (Bits vs. Bytes)**: The pass frequently confuses bit widths with byte sizes when defining memory footprints. Passing a bit width instead of a byte size to alias analysis results in an inaccurately large or malformed memory region check.
+* **True Base Addresses for Combined Operations**: When combining multiple memory accesses, the pass misses the calculation of the absolute or true base address of the new combined operation, mistakenly relying on the base pointer of a single original load (often the one at the insertion point).
+
+## Patterns Not Well Handled
+
+### Pattern 1: Address Reconstruction for Combined Loads with Large Constant Offsets
+When the compiler attempts to fold a sequence of consecutive memory loads into a single, wider load, it must reconstruct a new starting address by stripping and accumulating constant offsets from the original base pointer. This pattern is poorly handled because the pass fails to maintain the correct integer bit-width for the accumulated offset. By instantiating the offset as a smaller fixed-width integer (e.g., 32 bits instead of 64 bits), large offsets have their sign bit set. When this truncated offset is applied to the new pointer arithmetic, it is incorrectly sign-extended, altering the actual memory address (e.g., turning a large forward offset into a backward offset). This results in the wider load reading from completely incorrect memory locations.
+
+### Pattern 2: Memory Location Construction for Alias Analysis during Load Hoisting
+To safely combine contiguous or overlapping loads, the pass must ensure no intervening instructions (like stores) modify the accessed memory region. It does this by querying the Alias Analysis (AA) framework. However, the pattern of constructing the `MemoryLocation` for the combined load is highly error-prone. The pass constructs a malformed memory query by using the bit width of the combined load instead of its byte size, and by using the base pointer of the load at the insertion point rather than the true base address of the combined memory region. Because the AA framework receives an incorrect memory footprint, it fails to detect overlaps with intervening stores (returning `NoAlias`). This flaw allows the pass to illegally hoist the combined load above a modifying store, causing the program to read stale data.

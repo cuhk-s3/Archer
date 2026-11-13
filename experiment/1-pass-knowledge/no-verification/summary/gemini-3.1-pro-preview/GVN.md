@@ -1,0 +1,14 @@
+# Subsystem Knowledge for GVN
+## Elements Frequently Missed
+
+* **Restrictive Return Attributes (`range`, `nonnull`, etc.)**: During instruction replacement, GVN frequently misses the need to intersect, merge, or strip restrictive return attributes on function calls and intrinsics. This oversight causes the optimization to incorrectly preserve attributes that are only valid for the dominating instruction's specific control-flow context.
+* **Instruction Deletion Notifications**: GVN relies on internal analysis caches (like memory dependence or value numbering) keyed by instruction memory addresses. It frequently misses cache invalidation when underlying utility functions (such as PHI deduplication) silently delete and free instructions without notifying the main optimization pass.
+* **Context-Specific `poison` Generation**: GVN misses the subtle differences in `poison` semantics between two otherwise identical instructions. A dominating instruction might evaluate to `poison` due to restrictive attributes, but this `poison` is safely masked by control flow. GVN misses that propagating this instruction to replace a well-defined dominated instruction will illegally leak `poison` to new uses.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Improper Attribute Reconciliation During Call Replacement
+When GVN or CSE identifies two identical function calls or intrinsics, it attempts to replace the dominated call with the dominating call. However, this pattern is not well handled when the dominating call possesses more restrictive return attributes (such as `range` or `nonnull`) than the dominated call. Because GVN fails to intersect or strip these incompatible attributes during the replacement, the dominating call may evaluate to `poison` for certain inputs where the original dominated call would have been well-defined. Consequently, the uses of the dominated call incorrectly receive a `poison` value, leading to a miscompilation where the optimized program is more poisonous than the original source.
+
+### Pattern 2: Stale Pointer Caching After Silent Instruction Deletion
+GVN maintains internal analysis caches (e.g., MemoryDependenceAnalysis) that use instruction memory addresses (pointers) as keys. This caching pattern is not well handled when combined with in-place IR simplification utilities, such as duplicate PHI node elimination. If a utility deletes an instruction and frees its memory without explicitly notifying the GVN pass to invalidate the corresponding cache entries, stale pointers remain in the cache. If the compiler subsequently allocates a new instruction at the exact same memory address, GVN will incorrectly look up and apply the stale analysis data to the new instruction. This leads to invalid assumptions about data flow and memory dependencies, ultimately causing incorrect transformations.

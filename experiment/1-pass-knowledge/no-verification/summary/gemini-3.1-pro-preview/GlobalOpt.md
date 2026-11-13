@@ -1,0 +1,16 @@
+# Subsystem Knowledge for GlobalOpt
+## Elements Frequently Missed
+
+*   **Variadic Function Semantics (`...`)**: The optimization pass frequently misses the implicit dependencies between variadic arguments and specific memory-layout attributes. It fails to recognize that variadic arguments do not follow standard parameter passing rules and rely heavily on the pre-allocated argument blocks.
+*   **`inalloca` Attribute Constraints**: The pass misses the critical role of the `inalloca` attribute in the calling convention of variadic functions. It incorrectly assumes that standard safety checks (e.g., function address not taken, absence of `musttail` callers) are sufficient to strip the attribute.
+*   **Type Padding (Bit Size vs. Store Size)**: The pass misses the distinction between a type's semantic bit size (e.g., `i9`) and its actual physical store size in memory (e.g., 16 bits). It fails to account for the existence of padding bits when evaluating memory contents.
+*   **Padding Bit Semantics**: The pass frequently misses the fact that padding bits are either undefined or zero-extended by the backend. It erroneously assumes that uniform constant patterns (e.g., all ones) extend into these padding bits.
+*   **Target Endianness Impact**: The pass misses how target endianness (particularly big-endian layouts) dictates the physical placement of padding bits, leading to incorrect constant folding when a load directly reads the padded memory region.
+
+## Patterns Not Well Handled
+
+### Pattern 1: Signature and Attribute Optimization of Variadic Functions
+The optimization pass aggressively attempts to optimize internal functions by modifying their signatures or stripping seemingly unnecessary attributes to improve performance. However, it does not well handle the pattern where a function is variadic (`...`) and utilizes the `inalloca` attribute. The pass applies standard interprocedural attribute removal logic—checking if the function's address is taken or if it has `musttail` callers—and concludes it is safe to remove `inalloca`. This causes severe miscompilations because the varargs mechanism inherently relies on the `inalloca` allocation to pass the variable arguments as a single block. Stripping the attribute breaks the ABI, causing the backend to generate incorrect assembly that pushes pointers as standard arguments instead of treating them as the required argument block.
+
+### Pattern 2: Constant Folding of Loads from Padded Memory
+The pass attempts to optimize memory accesses by constant-folding loads from global variables or memory locations initialized with uniform constants. This pattern is poorly handled when the underlying data type requires memory padding (i.e., the type's bit size is not a multiple of bytes, such as `i9`). The optimization logic incorrectly extrapolates the uniform constant pattern across the entire memory representation, including the padding bits. Because padding bits are actually undefined or zero-extended in the lowered assembly, this assumption is fundamentally flawed. When a subsequent load instruction reads from this memory—especially on big-endian targets where the load might directly target the padding bytes—the compiler erroneously folds the load into the uniform constant value instead of the actual zeroed or undefined memory content, resulting in a miscompilation.
