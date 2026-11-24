@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     "--experiment",
     type=str,
     required=True,
-    choices=["archer", "mswe", "direct-llm"],
+    choices=["archer", "mswe", "mswe-no-validation-tools", "direct-llm"],
     help="Experiment type to run.",
   )
   parser.add_argument(
@@ -73,11 +73,17 @@ def parse_args() -> argparse.Namespace:
     "--knowledge-source",
     type=str,
     default="summary",
-    choices=["summary", "passes"],
+    choices=["summary", "passes", "no-verification"],
     help=(
-      "Knowledge source for archer: 'summary' -> 1-pass-knowledge/summary/non-regression, "
-      "'passes' -> 1-pass-knowledge/passes-non-regression."
+      "Knowledge source for archer or MSWE with --with-knowledge: 'summary' -> 1-pass-knowledge/summary/non-regression, "
+      "'passes' -> 1-pass-knowledge/summary/passes-non-regression, "
+      "'no-verification' -> 1-pass-knowledge/no-verification/summary/gemini-3.1-pro-preview."
     ),
+  )
+  parser.add_argument(
+    "--with-knowledge",
+    action="store_true",
+    help="Load component knowledge for MSWE and save to a separate result directory.",
   )
   parser.add_argument(
     "--no-knowledge",
@@ -102,11 +108,11 @@ def resolve_experiment_config(name: str) -> dict[str, str | bool]:
       "output_prefix": "archer",
       "supports_no_knowledge": True,
     }
-  if name == "mswe":
+  if name in {"mswe", "mswe-no-validation-tools"}:
     return {
       "script": "scripts/mswe.py",
       "needs_review": False,
-      "output_prefix": "mswe",
+      "output_prefix": name,
       "supports_no_knowledge": False,
     }
   if name == "direct-llm":
@@ -178,6 +184,14 @@ def resolve_knowledge_dir(base_dir: Path, source: str) -> Path:
     return base_dir.parent / "1-pass-knowledge" / "summary" / "non-regression"
   if source == "passes":
     return base_dir.parent / "1-pass-knowledge" / "summary" / "passes-non-regression"
+  if source == "no-verification":
+    return (
+      base_dir.parent
+      / "1-pass-knowledge"
+      / "no-verification"
+      / "summary"
+      / "gemini-3.1-pro-preview"
+    )
   raise ValueError(f"Unsupported knowledge source: {source}")
 
 
@@ -185,6 +199,12 @@ def run() -> int:
   args = parse_args()
   experiment = args.experiment
   config = resolve_experiment_config(experiment)
+  if args.with_knowledge and (
+    experiment not in {"mswe", "mswe-no-validation-tools"} or args.no_knowledge
+  ):
+    raise ValueError(
+      "--with-knowledge requires an MSWE experiment without --no-knowledge"
+    )
 
   base_dir = Path(__file__).resolve().parent
   dataset_dir = args.dataset_dir
@@ -193,8 +213,12 @@ def run() -> int:
 
   model = args.model
   model_dir = resolve_model_dir(model, args.model_dir)
+  if args.with_knowledge:
+    model_dir = f"{model_dir}-with-knowledge-{args.knowledge_source}"
   if experiment == "archer" and args.knowledge_source == "passes":
     model_dir = f"{model_dir}-all-knowledge"
+  if experiment == "archer" and args.knowledge_source == "no-verification":
+    model_dir = f"{model_dir}-no-verification-knowledge"
   rag_enabled = bool(args.rag and experiment == "archer")
   if rag_enabled:
     model_dir = f"{model_dir}-rag"
@@ -251,7 +275,7 @@ def run() -> int:
   failed_issues: list[str] = []
   debug_enabled = not args.no_debug
   knowledge_dir: Path | None = None
-  if experiment == "archer":
+  if experiment == "archer" or args.with_knowledge:
     knowledge_dir = resolve_knowledge_dir(base_dir, args.knowledge_source)
 
   for dataset_file in issue_files:
@@ -273,6 +297,8 @@ def run() -> int:
       no_knowledge_enabled=no_knowledge_enabled,
       rag_enabled=rag_enabled,
     )
+    if experiment == "mswe-no-validation-tools":
+      cmd.append("--with-non-validation-tools")
 
     print(f"[{issue}] running...")
     if args.dry_run:

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,7 @@ from tools.verify import VerifyTool
 os.environ["MSWEA_SILENT_STARTUP"] = "1"  # Silent startup
 os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] = "3"  # Retry 3 times
 import yaml
-from minisweagent import Model
+from minisweagent import Model, package_dir
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import Submitted
@@ -141,6 +142,25 @@ class HistoryEnvironment:
     return res, log
 
 
+def load_component_knowledge(knowledge_dir: Path, components):
+  """Use the same component-to-file mapping as the Archer regression runner."""
+  if not knowledge_dir.is_dir():
+    raise FileNotFoundError(f"Knowledge directory not found: {knowledge_dir}")
+  texts, files = [], []
+  for component in components:
+    candidate = knowledge_dir / f"{component}.md"
+    if candidate.is_file():
+      content = candidate.read_bytes()
+      texts.append(content.decode("utf-8"))
+      files.append(
+        {
+          "path": str(candidate.resolve()),
+          "sha256": hashlib.sha256(content).hexdigest(),
+        }
+      )
+  return "\n".join(texts) or "No specific knowledge provided for this component.", files
+
+
 @dataclass
 class Patch:
   type: str
@@ -168,6 +188,13 @@ class MyModel(LitellmModel):
       },
       cost_tracking="ignore_errors",
     )
+    if "deepseek" in model.lower():
+      # Use mini-swe-agent's bundled output truncation for both bash and tools.
+      default_config = yaml.safe_load(
+        (package_dir / "config" / "default.yaml").read_text()
+      )
+      self.config.observation_template = default_config["model"]["observation_template"]
+    self.extra_tools = None
     self.token_limit = token_limit
     self.round_limit = round_limit
     self.chat_stats = {
@@ -184,7 +211,18 @@ class MyModel(LitellmModel):
     if self.token_limit > 0 and self.chat_stats["total_tokens"] >= self.token_limit:
       raise ReachTokenLimit()
 
-    response = super()._query(messages, **kwargs)
+    if self.extra_tools is None:
+      response = super()._query(messages, **kwargs)
+    else:
+      import litellm
+      from minisweagent.models.utils.actions_toolcall import BASH_TOOL
+
+      response = litellm.completion(
+        model=self.config.model_name,
+        messages=messages,
+        tools=[BASH_TOOL, *self.extra_tools.specs()],
+        **(self.config.model_kwargs | kwargs),
+      )
 
     console.print(
       f"Executing round #{self.chat_stats['chat_rounds']}, chat statistics so far: {self.chat_stats}"
@@ -200,6 +238,14 @@ class MyModel(LitellmModel):
 
     return response
 
+  def _parse_actions(self, response):
+    if self.extra_tools is None:
+      return super()._parse_actions(response)
+    return self.extra_tools.parse_actions(
+      response.choices[0].message.tool_calls or [],
+      format_error_template=self.config.format_error_template,
+    )
+
   def query(self, messages, **kwargs):
     console.printb(message=messages[-1]["content"], title=messages[-1]["role"])
     response = super().query(messages, **kwargs)
@@ -213,6 +259,7 @@ class MyEnvironment(LocalEnvironment):
     self.shim_path = os.path.join("/", "tmp", "mswe_myenv_shim.sh")
     self._create_shim()
     self.stats = stats
+    self.extra_tools = None
 
   def _create_shim(self):
     shim_content = "#!/bin/bash\n"
@@ -232,6 +279,12 @@ class MyEnvironment(LocalEnvironment):
   ) -> dict[str, Any]:
     cmd = action.get("command", "")
     cwd = cwd or self.config.cwd or os.getcwd()
+    if self.extra_tools is not None:
+      result = self.extra_tools.execute(action)
+      if result is not None:
+        if result.pop("submitted", False):
+          raise Submitted({"role": "exit", "content": result["output"]})
+        return result
     if cmd == "report":
       raise Submitted(
         {
@@ -280,7 +333,14 @@ class MyEnvironment(LocalEnvironment):
 
 
 class MyAgent(DefaultAgent):
-  def __init__(self, model: Model, stats: RunStats, workdir: str) -> None:
+  def __init__(
+    self,
+    model: Model,
+    stats: RunStats,
+    workdir: str,
+    *,
+    with_non_validation_tools: bool = False,
+  ) -> None:
     config = yaml.safe_load(
       Path(
         os.path.join(os.environ.get("LLVM_AUTOREVIEW_HOME_DIR"), "mswe.yaml")
@@ -296,6 +356,7 @@ class MyAgent(DefaultAgent):
     self.stats = stats
     self.issue = None
     self.fixenv = None
+    self.with_non_validation_tools = with_non_validation_tools
 
   def setup_llvm(self, issue: str):
     console.print("Setting up the buggy LLVM environment ...")
@@ -333,6 +394,15 @@ class MyAgent(DefaultAgent):
     if not (Path(build_dir) / "bin" / "opt").exists():
       self.fixenv.build()
     self.verifytool = VerifyTool(build_dir, alive_path=ALIVE_TV_PATH)
+    if self.with_non_validation_tools:
+      from mswe_tools import ExtraTools
+
+      from main import MAX_ROLS_PER_TC
+
+      self.env.extra_tools = ExtraTools(
+        llvm_dir, self.fixenv, self.stats, page_size=MAX_ROLS_PER_TC
+      )
+      self.model.extra_tools = self.env.extra_tools
 
   def setup_patch(self) -> Patch:
     return Patch(
@@ -340,12 +410,26 @@ class MyAgent(DefaultAgent):
     )
 
   def step(self):
-    console.print("Remaining tools: [report]")
+    if self.env.extra_tools is not None:
+      console.print(f"Available tools: {['bash', *self.env.extra_tools.tools]}")
+    else:
+      console.print("Remaining tools: [report]")
     return super().step()
 
 
 def parse_args():
   parser = ArgumentParser(description="mini-swe-agent (llvm-autoreview-regression)")
+  parser.add_argument(
+    "--knowledge-dir",
+    type=str,
+    default=None,
+    help="Optional component knowledge directory; omitted means no knowledge.",
+  )
+  parser.add_argument(
+    "--with-non-validation-tools",
+    action="store_true",
+    help="Add non-validation function tools alongside the default bash tool.",
+  )
   parser.add_argument(
     "--issue",
     type=str,
@@ -384,6 +468,8 @@ def main():
     panic("The llvm-autoreview environment has not been brought up.")
 
   args = parse_args()
+  if args.knowledge_dir and not Path(args.knowledge_dir).is_dir():
+    panic(f"Knowledge directory not found: {args.knowledge_dir}")
 
   if args.debug:
     global console
@@ -401,10 +487,27 @@ def main():
       panic(f"History file {history_path} already exists.")
 
   stats = RunStats(command=vars(args))
-  agent = MyAgent(args.model, stats, workdir=llvm_dir)
+  agent = MyAgent(
+    args.model,
+    stats,
+    workdir=llvm_dir,
+    with_non_validation_tools=args.with_non_validation_tools,
+  )
   try:
     agent.setup_llvm(args.issue)
     patch = agent.setup_patch()
+    knowledge = ""
+    if args.knowledge_dir:
+      knowledge, files = load_component_knowledge(
+        Path(args.knowledge_dir), agent.fixenv.get_hint_components()
+      )
+      stats.command["knowledge_files"] = files
+      agent.config.instance_template += (
+        "\n\nFor reference, here are key points about the relevant components. "
+        "Start from the patch semantics and use these to cross-check your reasoning."
+        "\n\n{{component_knowledge}}\n"
+      )
+      console.print(f"Knowledge files loaded: {len(files)}")
     stats.total_time_sec = time.time()
     console.print("Starting to review the patch ...")
 
@@ -419,6 +522,7 @@ def main():
         **patch.as_dict(),
         forbidden_tools=", ".join(FORBIDDEN_TOOLS),
         workdir=llvm_dir,
+        component_knowledge=knowledge,
       )
     finally:
       os.environ["PATH"] = old_path

@@ -7,6 +7,8 @@ from base.console import get_boxed_console
 from llvm.llvm_helper import remove_path_from_output
 from lms.tool import FuncToolBase, ToolRegistry
 
+MAX_TOOL_CALL_OUTPUT_CHARS = 10_000
+
 
 @dataclass
 class ChatMessage:
@@ -160,12 +162,25 @@ class AgentBase:
       message=f"{name}({arguments})",
     )
 
-  def append_function_tool_call_output(self, call_id: str, result: str):
+  def append_function_tool_call_output(self, call_id: str, result: str) -> str:
+    # Only shorten the model observation. Tool handlers still need complete JSON
+    # for bug records, coverage tracking, and report/stop decisions.
+    if len(result) > MAX_TOOL_CALL_OUTPUT_CHARS:
+      half = MAX_TOOL_CALL_OUTPUT_CHARS // 2
+      omitted = len(result) - MAX_TOOL_CALL_OUTPUT_CHARS
+      result = (
+        "<warning>Tool output was too long and has been truncated. "
+        "Use a more selective tool call to retrieve missing content.</warning>\n"
+        f"<output_head>\n{result[:half]}\n</output_head>\n"
+        f"<elided_chars>{omitted} characters elided</elided_chars>\n"
+        f"<output_tail>\n{result[-half:]}\n</output_tail>"
+      )
     self.history.append(ChatMessageFunctionCallOutput(call_id=call_id, output=result))
     self.console.printb(
       title=f"Function Call Output (id = {call_id})",
       message=result,
     )
+    return result
 
   def perform_tool_call(self, tool_name: str, tool_args: dict) -> str:
     if self.tool_pre_check_handler:
@@ -175,13 +190,7 @@ class AgentBase:
         )
         return skip_msg
 
-    MAX_TOOL_CALL_OUTPUT_LINES = 500
-    res = remove_path_from_output(self.tools.call(tool_name, **tool_args))
-    lines = res.splitlines()
-    if len(lines) > MAX_TOOL_CALL_OUTPUT_LINES:
-      res = "\n".join(lines[:MAX_TOOL_CALL_OUTPUT_LINES])
-      res += f"\n... (truncated, total {len(lines)} lines)"
-    return res
+    return remove_path_from_output(self.tools.call(tool_name, **tool_args))
 
   def _get_remaining_tools_from(self, activated_tools: List[str]) -> List[str]:
     # Ensure we always pass the correct tool names

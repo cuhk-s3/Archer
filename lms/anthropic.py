@@ -102,7 +102,9 @@ class ClaudeAgent(AgentBase):
             flag, result = tool_call_handler(name, args_text, result)
             if not flag:
               return result
-            self.append_function_tool_call_output(call_id=call_id, result=result)
+            result = self.append_function_tool_call_output(
+              call_id=call_id, result=result
+            )
             messages.append(
               {
                 "role": "user",
